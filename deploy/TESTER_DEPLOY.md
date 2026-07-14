@@ -121,6 +121,29 @@ the whole install:
   that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to that
   SMIB's machine.
 
+## When something breaks — send me a support bundle
+
+One command gathers everything I need (service journals, CabiNet logs, state
+snapshots, network + system info) into a single `.tar.gz` — read-only, works
+even when the services are down:
+
+```sh
+# on the host box:
+python3 deploy/support_bundle.py
+
+# on a satellite Pi (SAS SMIB / reader), same script:
+python3 ~/CasinoNet/deploy/support_bundle.py
+```
+
+It prints the file it wrote — attach that to your report along with **what
+went wrong and roughly when** (clock time matters; the journals are
+timestamped). Run it with `sudo` if it says it couldn't read the unit
+journals. If the problem is at one machine, send bundles from **both** the
+host and that machine's Pi.
+
+The bundle contains your floor's data (machine ids, player names, fun-money
+balances, protocol traffic) — send it to me directly, don't post it publicly.
+
 ## Ground rules (the things that break it)
 
 1. **No other DHCP server on the slot segment.** Ever. That's why it's a dumb
