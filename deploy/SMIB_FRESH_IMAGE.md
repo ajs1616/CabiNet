@@ -99,6 +99,8 @@ It is idempotent and does, over SSH:
 5. **Reboots** (config.txt changed) and verifies `/dev/ttyAMA0` + the service.
 
 **Wire the RS-232 level shifter** to the machine's SAS port: TX→RX, RX→TX, GND↔GND.
+(Any "MAX3232 RS232 to TTL" converter board works — ~$5; wire its TTL side to the
+Pi's GPIO14/15 + 3.3V/GND, the DB9/screw-terminal side to the SAS harness.)
 Set the SAS **address** (default 1) and **enable the SAS channel** in the machine's
 operator menu.
 
