@@ -446,6 +446,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="mi-title">MACHINE</div>
   <div id="mi-rows">
     <div class="mi-l">NICKNAME</div>       <div class="mi-v" id="mi-nick">&#8212;</div>
+    <div class="mi-l">EGM ID</div>         <div class="mi-v" id="mi-egm">&#8212;</div>
     <div class="mi-l">SIGNED IN</div>      <div class="mi-v" id="mi-who">&#8212;</div>
     <div class="mi-l">SINCE</div>          <div class="mi-v" id="mi-since">&#8212;</div>
     <div class="mi-l">HUB LINK</div>       <div class="mi-v" id="mi-link">&#8212;</div>
@@ -824,7 +825,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
 
   function updateTexts() {
-    var place = nick || egmId || '';
+    // Attract + menu headers show the NICKNAME only — never the EGM id
+    // (serial-derived; keeping it off menu screens makes machine photos
+    // shareable — AJ, 2026-07-14). Diagnostics keep it: MACHINE INFO panel.
+    var place = nick || '';
     var brand = brandName();
     setText('at-brand', brand);
     // Fit the attract brand on ONE line (256px glass): step the size + tracking
@@ -872,6 +876,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           ' stays carded') : ' — friend stays carded'))
       : 'ADMIN');
     setText('mi-nick', nick || '\u2014');
+    setText('mi-egm', egmId || '\u2014');
     setText('mi-who', who ? (who + ' \u00b7 ' + tier) : '\u2014');
     setText('mi-since', fmtSince(sinceIso));
     setText('mi-link', hubOffline ? 'OFFLINE' : 'online');
@@ -1198,8 +1203,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function renderSettings(status, d) {
     var el = $('se-rows');
     if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    // EGM ID deliberately absent — serial-derived ids stay off the glass so
-    // machine photos are shareable (AJ, 2026-07-14).
+    // EGM ID deliberately absent from this MENU screen (serial-derived —
+    // stays off menu screens so machine photos are shareable; AJ 2026-07-14).
+    // Diagnostics still show it: the MACHINE INFO panel.
     var rows = [['NICKNAME', d.nick],
                 ['PROTOCOL', d.protocol], ['SAS LINK', fmtLink(d.sasLink)]];
     var html = '', i;
