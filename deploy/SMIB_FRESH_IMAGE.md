@@ -22,9 +22,9 @@ image.
 
 | Board | SAS? | Notes |
 |-------|------|-------|
-| **Pi Zero 2 W** | ✅ | the reference SMIB; `disable-bt` frees ttyAMA0 |
-| **Pi 3A+** | ✅ | best Zero-2-W substitute — same SoC family, compact, cheap |
-| **Pi 3B / 3B+** | ✅ | cheapest used option **+ built-in Ethernet** (skips the #8 HAT for a wired cabinet) |
+| **Pi 3B / 3B+** | ✅ | **RECOMMENDED** — cheapest used option **+ built-in Ethernet** (the floor is wired-only, so this skips the HAT entirely) |
+| **Pi Zero 2 W** | ✅ | the original reference SMIB (`disable-bt` frees ttyAMA0) — but it has **no Ethernet**, so it needs a USB-Ethernet HAT on the wired floor |
+| **Pi 3A+** | ✅ | compact and cheap, same SoC family as the 3B+ — but like the Zero it has no Ethernet |
 | **Pi 4B (1–2 GB)** | ✅✅ | native Ethernet + SPARE PL011s (`dtoverlay=uart3` → keep Bluetooth); also the Pro-tier touchscreen board |
 | **Pi Zero W (v1)** | ⚠️ | single-core ARMv6, untested, slow to admin — last resort |
 | **Pi 5** | ✅ (hub) | UARTs on the RP1; it's the hub already — wasteful as a bare SMIB |
