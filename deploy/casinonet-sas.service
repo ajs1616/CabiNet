@@ -1,0 +1,32 @@
+[Unit]
+Description=CabiNet SAS host (backup channel, RS232 HAT on /dev/ttyAMA0)
+After=multi-user.target
+# GR-20 storm cap, same rationale as casinonet-g2s.service. Note sas_host.py
+# retries a missing/unopenable serial device INTERNALLY (30s backoff, unit
+# stays active) — the HAT not being installed yet never trips this limit.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aj
+Group=aj
+# /dev/ttyAMA0 is root:dialout (aj is a member; SupplementaryGroups makes the
+# unit robust if the login groups ever change).
+SupplementaryGroups=dialout
+WorkingDirectory=/home/aj/CasinoNet/SAS
+# The out-of-tree venv from deploy/zero2w_sas_setup.sh carries pyserial/crcmod/loguru
+# (system python has only pyserial). /dev/ttyAMA0 = the Pi 5 GPIO14/15 PL011
+# (dtparam=uart0=on) — NEVER /dev/serial0, which is the ttyAMA10 debug
+# connector on Pi 5. SAS wakeup = mark/space parity; PL011 only.
+# --hub: report machine state into the G2S host's floor registry
+# (/api/sas/report) so the ONE Home UI shows the whole mixed-protocol floor.
+# 127.0.0.1 = a SAS host co-located on the host box. A Zero SMIB reports to
+# the host's wired slot-net IP http://192.168.50.2:8081 (zero2w_sas_setup.sh's
+# default). Satellites are wired-only — the Wi-Fi path is retired.
+ExecStart=/home/aj/venvs/casinonet/bin/python -u sas_host.py /dev/ttyAMA0 --address 1 --hub http://127.0.0.1:8081
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

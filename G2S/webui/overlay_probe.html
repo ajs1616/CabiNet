@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<!-- FUNCINO overlay-window probe v2 (#18 stage 2 — the no-carve menu chip).
+     v1 verdict (live, dev 4 Play Area, 2026-07-10): the page RENDERS and
+     the window overlays the game, but the base background painted OPAQUE
+     WHITE — CSS `background:transparent` alone doesn't punch through (the
+     window host owns the base plane). v2 CYCLES candidate backgrounds
+     every 5s so ONE push adjudicates them all; some embedded compositors
+     CHROMA-KEY a specific color (magenta/green are the classics, and
+     IGT's own default content is Flash where wmode=transparent exists —
+     black may also key). The big label names the active mode: AJ just
+     watches for the game to appear and reads the label out.
+     ES5 / Qt 4.8 WebKit, self-contained. -->
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>Funcino overlay probe v2</title>
+<style type="text/css">
+  html, body { margin:0; padding:0; width:1280px; height:1024px;
+               overflow:hidden; }
+  #label { position:absolute; left:24px; top:16px; padding:6px 14px;
+           background:#0b0f14; color:#e8c266; font-family:Arial,sans-serif;
+           font-size:22px; font-weight:bold; }
+  #hint  { position:absolute; left:24px; top:64px; padding:4px 14px;
+           background:#0b0f14; color:#9fb2c8; font-family:Arial,sans-serif;
+           font-size:15px; }
+  #chip { position:absolute; right:28px; bottom:28px; width:200px;
+          height:76px; background:#e8c266; color:#0b0f14;
+          font-family:Arial,sans-serif; font-size:24px; font-weight:bold;
+          text-align:center; line-height:76px; cursor:pointer;
+          border:3px solid #0b0f14; }
+</style>
+</head>
+<body>
+<div id="label">probe starting&hellip;</div>
+<div id="hint">game visible? read the label above out loud &mdash; that mode wins</div>
+<div id="chip" onclick="chipTap()">&#9776; MENU</div>
+<script type="text/javascript">
+  // Cycle the candidate base backgrounds (5s each, loops forever). If NO
+  // mode reveals the game, HTML transparency isn't host-enabled on this
+  // window and the overlay chip needs another route (host-side option,
+  // or stay with the follow-card hide model).
+  var MODES = [
+    ['1: CSS transparent',   'transparent'],
+    ['2: rgba(0,0,0,0)',     'rgba(0,0,0,0)'],
+    ['3: solid BLACK',       '#000000'],
+    ['4: MAGENTA key',       '#ff00ff'],
+    ['5: GREEN key',         '#00ff00']
+  ];
+  var i = 0;
+  function applyMode() {
+    var m = MODES[i % MODES.length];
+    document.documentElement.style.background = m[1];
+    document.body.style.background = m[1];
+    document.getElementById('label').innerHTML = m[0];
+    i++;
+    window.setTimeout(applyMode, 5000);
+  }
+  applyMode();
+  // The tap only proves touch reaches the overlay: the hub journal line
+  // (GLASS PING src=overlay-chip) is the evidence.
+  function chipTap() {
+    var c = document.getElementById('chip');
+    c.style.background = '#9fb2c8';
+    var x = new XMLHttpRequest();
+    x.open('GET', '/api/glass/ping?src=overlay-chip', true);
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) {
+        c.style.background = '#e8c266';
+        c.innerHTML = (x.status === 200) ? 'TOUCH \u2713' : 'hub?';
+        window.setTimeout(function () {
+          c.innerHTML = '\u2630 MENU';
+        }, 1500);
+      }
+    };
+    x.send(null);
+  }
+</script>
+</body>
+</html>

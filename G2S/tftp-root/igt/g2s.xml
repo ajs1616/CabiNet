@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<G2SConfig>
+    <Host id="1">
+        <Name>CabiNet</Name>
+        <Address>192.168.50.2</Address>
+        <Port>8081</Port>
+        <Protocol>SOAP</Protocol>
+        <Endpoint>/G2S</Endpoint>
+        <Timeout>30000</Timeout>
+    </Host>
+</G2SConfig>

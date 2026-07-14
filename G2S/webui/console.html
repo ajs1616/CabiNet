@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>CabiNet G2S Console</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#141a26; --panel2:#1b2333; --line:#26304a;
+    --txt:#e6ecf5; --dim:#8a97b0; --accent:#ffce54; --good:#39d98a;
+    --bad:#ff6b6b; --warn:#ffa94d; --info:#4dabf7;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--txt);
+    font:15px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  header{display:flex;align-items:center;gap:14px;padding:12px 18px;
+    background:linear-gradient(90deg,#161d2c,#10141d);border-bottom:1px solid var(--line);
+    position:sticky;top:0;z-index:10}
+  header h1{font-size:18px;margin:0;letter-spacing:.5px}
+  header h1 .g{color:var(--accent)}
+  .pill{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;
+    border:1px solid var(--line);background:var(--panel2);white-space:nowrap}
+  .pill.good{color:var(--good);border-color:#1c5} .pill.bad{color:var(--bad);border-color:#622}
+  .pill.warn{color:var(--warn)} .pill.info{color:var(--info)}
+  .spacer{flex:1}
+  #egm-select{background:var(--panel2);color:var(--info);border:1px solid var(--line);
+    border-radius:20px;padding:5px 30px 5px 13px;font-size:13px;font-weight:600;
+    cursor:pointer;max-width:44vw;text-overflow:ellipsis;
+    appearance:none;-webkit-appearance:none;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><path d='M1 3l4 4 4-4' stroke='%238a97b0' stroke-width='1.5' fill='none'/></svg>");
+    background-repeat:no-repeat;background-position:right 11px center}
+  #egm-select:hover{border-color:var(--accent)}
+  #egm-select:focus{outline:none;border-color:var(--accent)}
+  #egm-select option{background:var(--panel2);color:var(--txt)}
+  #poll{font-size:12px;color:var(--dim)}
+  main{padding:16px;display:grid;gap:14px;
+    grid-template-columns:repeat(auto-fit,minmax(320px,1fr));max-width:1600px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    overflow:hidden;display:flex;flex-direction:column}
+  .card h2{margin:0;padding:11px 14px;font-size:13px;text-transform:uppercase;
+    letter-spacing:.8px;color:var(--dim);background:var(--panel2);
+    border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+  .card .body{padding:12px 14px;flex:1}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px}
+  .kv .k{color:var(--dim)} .kv .v{text-align:right;font-variant-numeric:tabular-nums}
+  .big{font-size:26px;font-weight:700;letter-spacing:.5px}
+  .events{grid-column:1/-1}
+  .feed{max-height:340px;overflow:auto;font-size:14px}
+  .ev{display:flex;gap:10px;padding:7px 4px;border-bottom:1px solid #1c2434;align-items:baseline}
+  .ev:last-child{border-bottom:0}
+  .ev .ic{font-size:16px;width:22px;text-align:center;flex:none}
+  .ev .lb{flex:1} .ev .lb small{color:var(--dim)}
+  .ev .tm{color:var(--dim);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .cat-cabinet .lb{color:#ffe08a} .cat-noteAcceptor .lb{color:#9ae6b4}
+  .cat-handpay .lb{color:#ffd6a5} .cat-gamePlay .lb{color:#a5d8ff}
+  .cat-voucher .lb{color:#d0bfff} .cat-printer .lb{color:#bee3f8}
+  .metergrid{max-height:240px;overflow:auto;font-size:13px}
+  .metergrid .row{display:flex;justify-content:space-between;gap:12px;padding:3px 0;
+    border-bottom:1px solid #1a2130}
+  .metergrid .row .mn{color:var(--dim)} .metergrid .row .mv{font-variant-numeric:tabular-nums}
+  .devlist{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font-size:12px;padding:3px 8px;border-radius:6px;background:var(--panel2);
+    border:1px solid var(--line);color:var(--dim)}
+  .chip.own{color:var(--good);border-color:#295}
+  .panel-cmds{grid-column:1/-1}
+  .grp{margin-bottom:12px}
+  .grp h3{margin:0 0 7px;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+  .btns{display:flex;flex-wrap:wrap;gap:8px}
+  button.cmd{appearance:none;border:1px solid var(--line);background:var(--panel2);
+    color:var(--txt);padding:9px 13px;border-radius:9px;font-size:13px;cursor:pointer;
+    min-height:42px;transition:.12s;font-weight:600}
+  button.cmd:hover{border-color:var(--accent);background:#232d40}
+  button.cmd:active{transform:translateY(1px)}
+  button.cmd.danger{border-color:#733;color:var(--bad)}
+  button.cmd.danger:hover{background:#2a1414;border-color:var(--bad)}
+  button.cmd.hot{border-color:#584;color:var(--good)}
+  #toast{position:fixed;right:16px;bottom:16px;max-width:380px;display:flex;
+    flex-direction:column;gap:8px;z-index:50}
+  .t{background:var(--panel2);border:1px solid var(--line);border-left-width:4px;
+    border-radius:8px;padding:10px 12px;font-size:13px;box-shadow:0 6px 20px #0008;
+    animation:sl .2s ease}
+  .t.ok{border-left-color:var(--good)} .t.err{border-left-color:var(--bad)}
+  @keyframes sl{from{transform:translateX(20px);opacity:0}}
+  .muted{color:var(--dim)} .none{color:var(--dim);font-style:italic}
+  @media (max-width:600px){main{padding:10px;gap:10px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎰 Cabi<span class="g">Net</span> · G2S Console</h1>
+  <span id="conn" class="pill">connecting…</span>
+  <span id="stage" class="pill" style="display:none"></span>
+  <span class="spacer"></span>
+  <span id="mcount-h" class="muted"></span>
+  <select id="egm-select" title="Select machine"><option>—</option></select>
+  <span id="poll">—</span>
+</header>
+<main id="main">
+  <div class="card"><h2>Connection</h2><div class="body" id="c-conn"></div></div>
+  <div class="card"><h2>🖥️ Cabinet</h2><div class="body" id="c-cab"></div></div>
+  <div class="card"><h2>📊 Meters <span id="mcount" class="muted"></span></h2>
+    <div class="body"><div class="metergrid" id="c-meters"></div></div></div>
+  <div class="card"><h2>🔧 Ownership &amp; Devices</h2><div class="body" id="c-own"></div></div>
+  <div class="card events"><h2>🔔 Event feed <span id="ecount" class="muted"></span></h2>
+    <div class="body"><div class="feed" id="c-events"></div></div></div>
+  <div class="card panel-cmds"><h2>🎛️ Test Panel</h2><div class="body" id="c-panel"></div></div>
+</main>
+<div id="toast"></div>
+<script>
+const POLL_MS = 1500;
+let CUR_EGM = null;       // the machine the console + Test Panel currently target
+let LAST_DATA = null;     // last /api/status payload (for instant re-render on select)
+let LAST_EGM_SIG = "";    // signature of the connected-machine set (rebuild guard)
+
+// Test Panel command groups. `danger` => confirm (disables play / changes config).
+const GROUPS = [
+  { name:"Live data (safe reads)", cmds:[
+    ["getCabinetStatus","Cabinet status"],["getCabinetProfile","Cabinet profile"],
+    ["getDateTime","EGM clock"],["getMeterInfo","Pull meters"],
+    ["getCommHostList","Host list"],["getDescriptor","Descriptors"],
+    ["getCommConfigProfile","commConfig profile"],
+    ["getCommConfigModeStatus","commConfig mode"],
+  ]},
+  { name:"Events", cmds:[
+    ["getEventHandlerProfile","EH profile"],["getSupportedEvents","Supported events"],
+    ["setEventSub","Re-subscribe (firehose)"],["keepAlive","Ping keepAlive"],
+  ]},
+  { name:"⚠️ Ownership / config — DISABLES PLAY", danger:true, cmds:[
+    ["claimOwnership","🔑 Claim ownership (run cycle)"],
+    ["enterCommConfigMode","Enter config mode"],
+  ]},
+];
+
+function h(html){const d=document.createElement("div");d.innerHTML=html.trim();return d.firstChild;}
+function esc(s){return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function timeShort(iso){if(!iso)return"";const m=String(iso).match(/T(\d\d:\d\d:\d\d)/);return m?m[1]:iso;}
+
+function toast(msg,ok){
+  const t=h(`<div class="t ${ok?'ok':'err'}">${esc(msg)}</div>`);
+  document.getElementById("toast").appendChild(t);
+  setTimeout(()=>t.remove(),4200);
+}
+
+async function cmd(action,danger){
+  if(danger && !confirm(
+      action+"\n\nThis DISABLES game play on the machine until the change "+
+      "applies or is cancelled. Only run with the machine idle at 0 credits.\n\nProceed?"))
+    return;
+  try{
+    const r=await fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(CUR_EGM?{action,egmId:CUR_EGM}:{action})});
+    const j=await r.json();
+    toast((j.ok?"✓ ":"✗ ")+action+(j.ok?` (state=${j.commsState})`:`: ${j.error||r.status}`),j.ok);
+  }catch(e){toast("✗ "+action+": "+e,false);}
+}
+
+function renderPanel(){
+  const el=document.getElementById("c-panel");
+  if(el.dataset.built)return; el.dataset.built="1";
+  for(const g of GROUPS){
+    const grp=h(`<div class="grp"><h3>${esc(g.name)}</h3><div class="btns"></div></div>`);
+    const btns=grp.querySelector(".btns");
+    for(const [a,label] of g.cmds){
+      const b=h(`<button class="cmd ${g.danger?'danger':(a==='claimOwnership'?'hot':'')}">${esc(label)}</button>`);
+      b.onclick=()=>cmd(a,g.danger);
+      btns.appendChild(b);
+    }
+    el.appendChild(grp);
+  }
+}
+
+// Populate the machine selector from every connected EGM. Rebuilds the <option>
+// structure only when the SET of machines changes (so an open dropdown / the
+// user's selection isn't clobbered every poll); refreshes each option's live
+// state label in place every tick. Selecting a machine re-renders instantly.
+function rebuildEgmSelect(egms, data){
+  const sel=document.getElementById("egm-select");
+  const sig=egms.join(",");
+  if(sig!==LAST_EGM_SIG){
+    LAST_EGM_SIG=sig;
+    sel.innerHTML=egms.map(id=>`<option value="${esc(id)}"></option>`).join("");
+    sel.onchange=()=>{CUR_EGM=sel.value; if(LAST_DATA) render(LAST_DATA);};
+  }
+  for(const opt of sel.options){
+    const st=(data[opt.value]||{}).commsState||"—";
+    opt.textContent=`🎰 ${opt.value} · ${st}`;
+  }
+  if(CUR_EGM) sel.value=CUR_EGM;
+  document.getElementById("mcount-h").textContent=
+    egms.length>1?`${egms.length} machines`:"";
+}
+
+function badge(state){
+  const s=(state||"").toLowerCase();
+  if(s==="online")return`<span class="pill good">● onLine</span>`;
+  if(s==="closed"||s==="opening"||s==="sync")return`<span class="pill warn">◐ ${esc(state)}</span>`;
+  return`<span class="pill bad">○ ${esc(state||"offline")}</span>`;
+}
+
+function render(data){
+  LAST_DATA=data;
+  const egms=Object.keys(data).filter(k=>k!=="_engine"&&k!=="activity"&&k!=="sas"&&k!=="names"&&k!=="uiStamp");
+  const eng=data._engine||{};
+  if(!egms.length){
+    document.getElementById("conn").className="pill bad";
+    document.getElementById("conn").textContent="no machine connected";
+    LAST_EGM_SIG="";
+    document.getElementById("egm-select").innerHTML="<option>—</option>";
+    document.getElementById("mcount-h").textContent="";
+    document.getElementById("c-conn").innerHTML='<p class="none">Waiting for an EGM to join…</p>';
+    return;
+  }
+  CUR_EGM = CUR_EGM && egms.includes(CUR_EGM) ? CUR_EGM : egms[0];
+  const s=data[CUR_EGM];
+
+  // header
+  const cn=document.getElementById("conn");
+  cn.outerHTML=badge(s.commsState).replace('class="pill','id="conn" class="pill');
+  rebuildEgmSelect(egms, data);
+  const st=document.getElementById("stage");
+  if(s.commConfigStage){st.style.display="";st.textContent="own: "+s.commConfigStage;
+    st.className="pill "+(s.commConfigStage==="applied"?"good":s.commConfigStage==="failed"?"bad":"warn");}
+  else st.style.display="none";
+
+  // connection card
+  const kaAge=s.lastKeepAlive?Math.round(Date.now()/1000-s.lastKeepAlive):null;
+  document.getElementById("c-conn").innerHTML=`
+    <div class="kv">
+      <div class="k">State</div><div class="v">${esc(s.commsState)}</div>
+      <div class="k">Joined</div><div class="v">${esc(timeShort(s.joinedAt)||"—")}</div>
+      <div class="k">commsOnLine seen</div><div class="v">${s.commsOnLineSeen}</div>
+      <div class="k">keepAlive age</div><div class="v">${kaAge==null?"—":kaAge+"s"}</div>
+      <div class="k">Subscribed</div><div class="v">${s.subscribed?'<span style="color:var(--good)">yes</span>':'<span style="color:var(--warn)">no</span>'}</div>
+      <div class="k">Supported events</div><div class="v">${s.supportedEventCount}</div>
+      <div class="k">Outbound ok/fail</div><div class="v">${s.outboundOk}/${s.outboundFail}</div>
+      <div class="k">egmLocation</div><div class="v" style="font-size:12px">${esc(s.egmLocation||"—")}</div>
+    </div>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">engine: keepalive ${eng.keepaliveMs/1000||0}s ·
+      harvest ${eng.harvest?"on":"off"} · subscribe ${eng.subscribe?"on":"off"}</p>`;
+
+  // cabinet card
+  const cab=s.cabinet||{};
+  const doors=Object.keys(cab).filter(k=>/door|tilt/i.test(k));
+  document.getElementById("c-cab").innerHTML=`
+    <div class="big">${esc(cab.egmState||"—")}</div>
+    <div class="kv" style="margin-top:8px">
+      <div class="k">EGM clock</div><div class="v">${esc(cab.egmDateTime||"—")}</div>
+      <div class="k">Host enabled</div><div class="v">${esc(cab.hostEnabled||"—")}</div>
+      <div class="k">Host locked</div><div class="v">${esc(cab.hostLocked||"—")}</div>
+    </div>
+    <div style="margin-top:10px">${
+      doors.length? doors.map(d=>{
+        const on=String(cab[d]).toLowerCase()==="true";
+        return `<span class="chip" style="${on?'color:var(--bad);border-color:#722':''}">${esc(d)}: ${esc(cab[d])}</span>`;
+      }).join(" ") : '<span class="none">no door/tilt data yet — hit “Cabinet status”</span>'}</div>`;
+
+  // meters
+  document.getElementById("mcount").textContent=s.meterCount?`(${s.meterCount})`:"";
+  const meters=s.meters||{};
+  const mkeys=Object.keys(meters).sort();
+  document.getElementById("c-meters").innerHTML= mkeys.length?
+    mkeys.map(k=>`<div class="row"><span class="mn">${esc(k)}</span><span class="mv">${esc(meters[k])}</span></div>`).join("")
+    : '<p class="none">no meters yet — hit “Pull meters” (may be ownership-gated)</p>';
+
+  // ownership + devices
+  const hi=s.hostItems||{};
+  const hostRows=Object.keys(hi).map(hid=>{
+    const hh=hi[hid];
+    return `<div style="margin-bottom:6px"><b>host ${esc(hid)}</b> <span class="muted">idx ${esc(hh.hostIndex)} · owns ${hh.owned.length}</span>
+      <div class="devlist" style="margin-top:4px">${hh.owned.map(d=>`<span class="chip own">${esc(d)}</span>`).join("")||'<span class="none">none</span>'}</div></div>`;
+  }).join("");
+  const cfg=(s.configDevices||[]);
+  const claim=(s.ownedClaim||[]);
+  document.getElementById("c-own").innerHTML=`
+    <div class="kv"><div class="k">commConfig stage</div><div class="v">${esc(s.commConfigStage||"—")}</div>
+      <div class="k">config-sync devices</div><div class="v">${s.configDeviceCount}</div>
+      <div class="k">descriptors</div><div class="v">${s.descriptorCount}</div></div>
+    <h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">HOST OWNERSHIP MAP</h3>
+    ${hostRows||'<span class="none">not read yet (getCommHostList is silent pre-ownership)</span>'}
+    ${claim.length?`<h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">LAST CLAIM</h3>
+      <div class="devlist">${claim.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}
+    ${cfg.length?`<h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">CONFIG-SYNC INVENTORY</h3>
+      <div class="devlist">${cfg.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}`;
+
+  // events
+  document.getElementById("ecount").textContent=s.eventCount?`(${s.eventCount} total)`:"";
+  const evs=(s.recentEvents||[]).slice().reverse();
+  document.getElementById("c-events").innerHTML= evs.length?
+    evs.map(e=>`<div class="ev cat-${esc(e.category||'other')}">
+      <span class="ic">${esc(e.icon||'•')}</span>
+      <span class="lb">${esc(e.label||e.eventCode)}
+        <small>${esc(e.eventCode)} · ${esc(e.deviceClass)}/${esc(e.deviceId)}${e.affectedMeters?` · ${e.affectedMeters} meters`:""}${e.eventText?` · ${esc(e.eventText)}`:""}</small></span>
+      <span class="tm">${esc(timeShort(e.seenAt))}</span></div>`).join("")
+    : '<p class="none">no events yet. On this AVP the event stream is gated behind ownership — run the ownership cycle, or trigger a door/bill once subscribed.</p>';
+}
+
+async function tick(){
+  try{
+    const r=await fetch("/api/status",{cache:"no-store"});
+    const data=await r.json();
+    render(data);
+    document.getElementById("poll").textContent="updated "+timeShort(new Date().toISOString());
+  }catch(e){
+    document.getElementById("poll").textContent="poll error";
+    document.getElementById("conn").className="pill bad";
+    document.getElementById("conn").textContent="host unreachable";
+  }
+}
+renderPanel();
+tick();
+setInterval(tick,POLL_MS);
+</script>
+</body>
+</html>

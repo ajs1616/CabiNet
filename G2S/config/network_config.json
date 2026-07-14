@@ -1,0 +1,49 @@
+{
+  "_comment": "Slot-net ground truth (2026-07-01): interface eth0 on the Pi 5, server/G2S host = 192.168.50.2, pool .100-.200, VLAN 50 = 192.168.50.0/24. LIVE CONFIG for the running casinonet-dns unit: tools/run_dns_discovery.py loads this exact file (default config_path, unit WorkingDirectory=G2S/) and its CLI overrides ONLY dhcp.enabled/interface/server_ip and the 'auto' hostname targets - every other key here, notably forward_dns, is live, not a fallback. Do NOT set interface to 'auto' - auto-detect can leak the home-LAN IP (rogue-DHCP hazard, see project notes 2026-06-15).",
+  "dhcp": {
+    "enabled": true,
+    "interface": "eth0",
+    "ip_range": {
+      "start": "192.168.50.100",
+      "end": "192.168.50.200",
+      "subnet": "192.168.50.0/24",
+      "gateway": "192.168.50.2"
+    },
+    "lease_time": 3600,
+    "static_leases": {
+      "comment": "Add static MAC to IP mappings here",
+      "example": "aa:bb:cc:dd:ee:ff: 192.168.50.50"
+    },
+    "options": {
+      "dns_servers": ["192.168.50.2"],
+      "domain_name": "casinonet.local"
+    }
+  },
+  "dns": {
+    "enabled": true,
+    "port": 53,
+    "hostname_mappings": {
+      "g2s.local": "auto",
+      "g2shost.local": "auto",
+      "casinonet.local": "auto",
+      "slothost.local": "auto",
+      "casino.local": "auto",
+      "openg2s.local": "auto"
+    },
+    "forward_dns": [],
+    "_forward_dns_comment": "Intentionally EMPTY - the slot net is offline by design. Forwarding (previously 8.8.8.8/8.8.4.4) leaked home-LAN DNS answers onto the slot net (EGMs got public IPs they cannot reach, polluting the does-it-use-our-DNS bench data) and, because process_dns_query forwards inline in the single-threaded DNS loop with 2s/upstream timeouts, an unreachable uplink stalled ALL DNS answers (g2s.local included) up to ~4s per unknown query. Unmapped names now simply get no answer."
+  },
+  "security": {
+    "restrict_to_ethernet": false,
+    "allowed_interfaces": ["eth0"],
+    "rate_limiting": {
+      "dhcp_max_per_minute": 60,
+      "dns_max_per_minute": 300
+    }
+  },
+  "logging": {
+    "log_dhcp_assignments": true,
+    "log_dns_queries": true,
+    "max_log_entries": 1000
+  }
+}

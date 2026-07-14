@@ -1,0 +1,1283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CabiNet · G2S Bench Console</title>
+<!--
+  G2S-36 Test Panel — the bench cockpit. Served by g2s_host.py at / (and
+  /webui/index.html). Single self-contained page: inline CSS + vanilla JS,
+  NO external/CDN assets (the slot VLAN is offline). Polls /api/status every
+  2s and drives POST /api/command. Supersedes webui/console.html (first cut,
+  still served at /console). Sized for the Pi's 800x480 DSI touchscreen and
+  desktop browsers alike.
+-->
+<style>
+  :root{
+    --bg:#0f0c07; --panel:#171208; --panel2:#201a0e; --inset:#0b0906;
+    --line:#332a18; --line2:#241d10;
+    --txt:#f0e7d2; --dim:#a09070; --faint:#6f6248;
+    --amber:#ffb92e; --ok:#46d97f; --bad:#ff5f56; --info:#59b7ff;
+    --mono:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",Menlo,monospace;
+    --sans:-apple-system,"Segoe UI",Roboto,"DejaVu Sans",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--txt);font:14px/1.45 var(--sans);
+    padding-bottom:64px;-webkit-font-smoothing:antialiased;touch-action:manipulation}
+  :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+
+  /* ---- top bar ------------------------------------------------------- */
+  #topbar{display:flex;align-items:baseline;gap:14px;padding:9px 16px;
+    background:linear-gradient(180deg,#181307,#120e07);
+    border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  .brand{font:700 15px var(--mono);letter-spacing:.32em;white-space:nowrap}
+  .brand .net{color:var(--amber)}
+  .brand .sub{font:600 10px var(--sans);letter-spacing:.22em;color:var(--dim);
+    margin-left:12px}
+  #engine{font:11px var(--mono);color:var(--faint);letter-spacing:.04em;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .spacer{flex:1}
+  #poll{font:11px var(--mono);color:var(--dim);white-space:nowrap}
+  #poll.err{color:var(--bad)}
+  #home-link{font:600 10px var(--sans);letter-spacing:.18em;color:var(--amber);
+    text-decoration:none;border:1px solid var(--line);border-radius:12px;
+    padding:4px 11px;white-space:nowrap}
+  #home-link:hover{border-color:var(--amber)}
+
+  /* ---- machine section ------------------------------------------------ */
+  main{padding:12px 14px;max-width:1500px;margin:0 auto}
+  .empty-hero{margin:9vh auto 0;max-width:560px;text-align:center;color:var(--dim)}
+  .empty-hero .lamp{margin:0 auto 18px}
+  .empty-hero h2{font:700 16px var(--mono);letter-spacing:.18em;color:var(--txt);margin:0 0 8px}
+  .empty-hero p{font-size:13px;margin:4px 0}
+
+  .egm{margin-bottom:18px}
+  .banner{display:flex;flex-wrap:wrap;align-items:center;gap:10px 22px;
+    background:linear-gradient(180deg,#1b1509,#151006);border:1px solid var(--line);
+    border-radius:12px;padding:12px 18px;margin-bottom:12px}
+  .lamps{display:flex;gap:18px}
+  .lampu{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:58px}
+  .lampu label{font:600 9px var(--sans);letter-spacing:.18em;color:var(--dim)}
+  .lampu .lval{font:11px var(--mono);color:var(--dim);min-height:14px}
+  .lamp{width:16px;height:16px;border-radius:50%;background:#39301d;
+    box-shadow:inset 0 2px 3px #0009,0 0 0 3px #0b0906,0 0 0 4px var(--line2)}
+  .lamp.ok{background:var(--ok);box-shadow:inset 0 -2px 4px #0653,0 0 12px 2px rgba(70,217,127,.5),0 0 0 3px #0b0906,0 0 0 4px var(--line2)}
+  .lamp.warn{background:var(--amber);box-shadow:inset 0 -2px 4px #6408,0 0 12px 2px rgba(255,185,46,.5),0 0 0 3px #0b0906,0 0 0 4px var(--line2)}
+  .lamp.bad{background:var(--bad);box-shadow:inset 0 -2px 4px #6008,0 0 12px 2px rgba(255,95,86,.55),0 0 0 3px #0b0906,0 0 0 4px var(--line2)}
+  @media (prefers-reduced-motion:no-preference){
+    .lamp.ok{animation:breathe 3.2s ease-in-out infinite}
+    @keyframes breathe{50%{box-shadow:inset 0 -2px 4px #0653,0 0 6px 1px rgba(70,217,127,.3),0 0 0 3px #0b0906,0 0 0 4px var(--line2)}}
+  }
+  .ident{min-width:200px}
+  .ident .egmid{font:700 17px var(--mono);letter-spacing:.06em}
+  .ident .below{font:11px var(--mono);color:var(--dim);margin-top:3px}
+  .bstats{display:flex;flex-wrap:wrap;gap:6px;margin-left:auto;align-items:center}
+
+  .chip{display:inline-block;font:11px var(--mono);padding:3px 8px;border-radius:6px;
+    background:var(--panel2);border:1px solid var(--line2);color:var(--dim);
+    white-space:nowrap}
+  .chip.ok{color:var(--ok);border-color:#2a4d31}
+  .chip.warn{color:var(--amber);border-color:#54431c}
+  .chip.bad{color:var(--bad);border-color:#5a2723}
+  .chip.info{color:var(--info);border-color:#274158}
+
+  .grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line2);border-radius:10px;
+    overflow:hidden;display:flex;flex-direction:column;min-width:0}
+  .card>h2{margin:0;padding:8px 12px;font:600 10px var(--sans);letter-spacing:.2em;
+    text-transform:uppercase;color:var(--dim);background:var(--panel2);
+    border-bottom:1px solid var(--line2);display:flex;gap:8px;align-items:baseline}
+  .card>h2 .hn{font:10px var(--mono);color:var(--faint);letter-spacing:0;text-transform:none}
+  .card .body{padding:10px 12px;flex:1;min-height:52px}
+  .card .body.scroll{max-height:238px;overflow-y:auto}
+  .card.wide{grid-column:1/-1}
+  .none{color:var(--faint);font-style:italic;font-size:12.5px}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 14px;font-size:13px}
+  .kv .k{color:var(--dim)}
+  .kv .v{text-align:right;font:12.5px var(--mono);overflow:hidden;text-overflow:ellipsis}
+  .bigval{font:700 21px var(--mono);letter-spacing:.04em;margin-bottom:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+  .seclab{font:600 9px var(--sans);letter-spacing:.18em;color:var(--faint);
+    text-transform:uppercase;margin:10px 0 5px}
+  .seclab:first-child{margin-top:0}
+
+  .mrow{display:flex;justify-content:space-between;gap:12px;padding:3px 0;
+    border-bottom:1px solid var(--line2);font:12px var(--mono)}
+  .mrow:last-child{border-bottom:0}
+  .mrow .mc{color:var(--faint);flex:none}
+  .mrow .mn{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis}
+  .mrow .mv{color:var(--txt);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  .ev{display:flex;gap:9px;padding:5px 0;border-bottom:1px solid var(--line2);
+    align-items:baseline;font-size:13px}
+  .ev:last-child{border-bottom:0}
+  .ev .ic{flex:none;width:20px;text-align:center}
+  .ev .lb{flex:1;min-width:0}
+  .ev .lb small{color:var(--faint);font:10.5px var(--mono);display:block}
+  .ev .tm{color:var(--dim);font:11px var(--mono);white-space:nowrap}
+
+  /* ---- live activity tape (G2S-13) ------------------------------------ */
+  #actwrap{max-width:1500px;margin:0 auto;padding:0 14px 12px;display:none}
+  #actwrap.on{display:block}
+  #act-body .ev .tm{min-width:56px;text-align:right}
+
+  .gpdev{border:1px solid var(--line2);border-radius:8px;padding:8px 10px;
+    margin-bottom:8px;background:var(--inset)}
+  .gpdev:last-child{margin-bottom:0}
+  .gpdev .gphead{font:600 12.5px var(--mono);margin-bottom:2px}
+  .gpdev .gphead .devno{color:var(--amber)}
+  .gpdev .gpsub{font:11px var(--mono);color:var(--dim)}
+  .gpdev .gpbtns{display:flex;gap:7px;margin-top:7px;flex-wrap:wrap}
+  .gpdev .gpbtns .cmd{padding:6px 10px}
+  .gpdev .gpbtns .cmd .bl{font-size:12px}
+
+  .vrow{display:flex;gap:10px;padding:4px 0;border-bottom:1px solid var(--line2);
+    font:12px var(--mono);align-items:baseline}
+  .vrow:last-child{border-bottom:0}
+  .vrow .vk{flex:none;width:52px;color:var(--info)}
+  .vrow .vk.commit{color:var(--dim)}
+  .vrow .vk.redeem{color:var(--amber)}
+  .vrow .va{flex:none;font-weight:700}
+  .vrow .vd{flex:1;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vrow .tm{color:var(--dim);font-size:11px}
+
+  /* ---- handpay card (G2S-25) ------------------------------------------ */
+  .hprow{border:1px solid #54431c;border-radius:8px;padding:9px 10px;
+    margin-bottom:8px;background:var(--inset)}
+  .hprow:last-child{margin-bottom:0}
+  .hprow .amt{font:700 20px var(--mono);color:var(--amber)}
+  .hprow .hpsub{font:11px var(--mono);color:var(--dim);margin:3px 0 8px;
+    display:flex;flex-wrap:wrap;gap:5px;align-items:baseline}
+  button.hpclear{width:100%;border-color:#2a4d31;background:#12291a;
+    min-height:52px;text-align:center}
+  button.hpclear .bl{color:var(--ok);font-size:15px;letter-spacing:.05em}
+  button.hpclear .ba{color:var(--faint)}
+  button.hpclear:hover{border-color:var(--ok)}
+  .hprow details{margin-top:6px}
+  .hprow summary{cursor:pointer;color:var(--faint);font:11px var(--sans)}
+  .hprow .alt{display:flex;gap:7px;margin-top:7px;flex-wrap:wrap}
+
+  /* ---- test panel ------------------------------------------------------ */
+  #panel{max-width:1500px;margin:0 auto;padding:2px 14px 10px}
+  #panel>h2{font:600 10px var(--sans);letter-spacing:.24em;color:var(--dim);
+    text-transform:uppercase;border-top:1px solid var(--line);padding-top:12px;
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  #target-wrap{display:flex;gap:6px;letter-spacing:0}
+  .tchip{font:11px var(--mono);padding:4px 10px;border-radius:14px;cursor:pointer;
+    background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
+  .tchip.sel{color:var(--amber);border-color:var(--amber)}
+  .grp{margin:10px 0 2px}
+  .grp h3{margin:0 0 7px;font:600 9.5px var(--sans);letter-spacing:.2em;
+    color:var(--faint);text-transform:uppercase}
+  .grp h3 .note{color:var(--bad);letter-spacing:.04em;text-transform:none;
+    font:11px var(--sans);margin-left:8px}
+  .btns{display:flex;flex-wrap:wrap;gap:7px;align-items:stretch}
+  button.cmd{appearance:none;border:1px solid var(--line);border-radius:9px;
+    background:var(--panel2);color:var(--txt);cursor:pointer;text-align:left;
+    padding:7px 12px;min-height:48px;min-width:118px;font-family:var(--sans);
+    transition:border-color .12s,background .12s}
+  button.cmd .bl{display:block;font-size:13px;font-weight:600}
+  button.cmd .ba{display:block;font:10px var(--mono);color:var(--faint);margin-top:2px}
+  button.cmd:hover{border-color:var(--amber)}
+  button.cmd:active{transform:translateY(1px)}
+  button.cmd.flash-ok{border-color:var(--ok);background:#12291a}
+  button.cmd.flash-err{border-color:var(--bad);background:#2a1210}
+  button.cmd.danger{border-color:#5a2723}
+  button.cmd.danger .bl{color:var(--bad)}
+  button.cmd.danger:hover{border-color:var(--bad)}
+  button.cmd.danger.armed{border-color:var(--bad);
+    background:repeating-linear-gradient(135deg,#3d1512 0 10px,#28100d 10px 20px)}
+  button.cmd.danger.armed .bl{color:#fff}
+  button.cmd.danger.armed .ba{color:#f3b3ad}
+  .gp-devwrap{display:flex;flex-direction:column;justify-content:center;gap:2px;
+    border:1px dashed var(--line);border-radius:9px;padding:5px 10px}
+  .gp-devwrap label{font:600 9px var(--sans);letter-spacing:.16em;color:var(--faint)}
+  #gp-dev{width:64px;background:var(--inset);border:1px solid var(--line);
+    color:var(--amber);border-radius:6px;font:14px var(--mono);padding:4px 6px}
+  #void-vid{width:186px;background:var(--inset);border:1px solid var(--line);
+    color:var(--amber);border-radius:6px;font:13px var(--mono);padding:4px 6px}
+  .tk-lookup{display:flex;flex-wrap:wrap;gap:7px;width:100%;align-items:center;
+    border:1px dashed var(--line);border-radius:9px;padding:6px 8px;margin-top:2px}
+  #tk-vid{width:186px;background:var(--inset);border:1px solid var(--line);
+    color:var(--amber);border-radius:6px;font:13px var(--mono);padding:4px 6px}
+  #tk-result{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .tk-facts{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+  .tk-facts .tk-sub{font:11px var(--mono);color:var(--dim)}
+  .tk-err{font:12px var(--sans);color:var(--bad)}
+  .opt-fields{display:flex;flex-wrap:wrap;gap:6px;width:100%;
+    border:1px dashed var(--line);border-radius:9px;padding:6px 8px;margin-top:2px}
+  .opt-fields .of{display:flex;flex-direction:column;gap:2px;flex:1;min-width:120px}
+  .opt-fields .of.narrow{flex:0 0 64px;min-width:64px}
+  .opt-fields label{font:600 9px var(--sans);letter-spacing:.14em;color:var(--faint)}
+  .opt-fields input{width:100%;background:var(--inset);border:1px solid var(--line);
+    color:var(--amber);border-radius:6px;font:13px var(--mono);padding:4px 6px}
+
+  /* ---- reply tape ------------------------------------------------------ */
+  #tape{position:fixed;left:0;right:0;bottom:0;z-index:30;
+    background:rgba(11,9,6,.97);border-top:1px solid var(--line)}
+  #tape .bar{display:flex;align-items:center;gap:10px;padding:8px 14px;
+    cursor:pointer;font:12px var(--mono);min-height:38px}
+  #tape .bar .cue{color:var(--faint);flex:none;font-size:10px;letter-spacing:.18em}
+  #tape .bar .last{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #tape .bar .togl{color:var(--faint);flex:none}
+  #tape .hist{display:none;max-height:42vh;overflow-y:auto;
+    border-top:1px solid var(--line2);padding:6px 14px}
+  #tape.open .hist{display:block}
+  .trow{display:flex;gap:10px;padding:3px 0;font:11.5px var(--mono);
+    border-bottom:1px solid var(--line2);align-items:baseline}
+  .trow:last-child{border-bottom:0}
+  .trow .tm{color:var(--faint);flex:none}
+  .trow .ac{flex:none;font-weight:700}
+  .trow.ok .ac{color:var(--ok)} .trow.err .ac{color:var(--bad)}
+  .trow .js{flex:1;color:var(--dim);word-break:break-all;white-space:pre-wrap}
+
+  @media (max-width:560px){
+    main,#panel{padding-left:8px;padding-right:8px}
+    .banner{padding:10px 12px;gap:8px 14px}
+    .brand .sub{display:none}
+    #engine{display:none}
+  }
+</style>
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">CABI<span class="net">NET</span><span class="sub">G2S BENCH CONSOLE</span></div>
+  <span id="engine"></span>
+  <span class="spacer"></span>
+  <!-- G2S-40: the Home UI front door ( / prefers it; this panel stays at
+       /test — home.html links back here the same way) -->
+  <a id="home-link" href="/home">HOME UI</a>
+  <span id="poll">connecting…</span>
+</header>
+
+<main id="machines"></main>
+
+<!-- G2S-13 live activity tape: semantic entries from the host's typed event
+     hooks (doors, tilts, bills, games, handpays, tickets, power) — one tape
+     across EGMs, newest on top, hidden until the first hook fires. -->
+<section id="actwrap">
+  <div class="card"><h2>Live activity <span class="hn" id="act-n"></span></h2>
+    <div class="body scroll" id="act-body"></div></div>
+</section>
+
+<section id="panel">
+  <h2>Test panel <span id="target-wrap"></span></h2>
+  <div id="groups"></div>
+</section>
+
+<div id="tape">
+  <div class="bar" id="tape-bar" title="Command replies — tap to expand">
+    <span class="cue">TAPE</span>
+    <span class="last" id="tape-last">command replies land here</span>
+    <span class="togl" id="tape-togl">&#9650;</span>
+  </div>
+  <div class="hist" id="tape-hist"></div>
+</div>
+
+<script>
+"use strict";
+const POLL_MS = 2000;
+
+/* Every action POST /api/command understands, straight from the host's
+   dispatch table in g2s_host.py — keep the two lists in sync. */
+const GROUPS = [
+  {name:"Reads", cmds:[
+    ["getCabinetStatus","Cabinet status"],
+    ["getCabinetProfile","Cabinet profile"],
+    ["getMeterInfo","Pull meters"],
+    ["getGamePlayStatus","Game status",1],
+    ["getGamePlayProfile","Game profile",1],
+    ["getGameDenoms","Game denoms",1],
+    ["getNoteAcceptorStatus","Bill acceptor status"],
+    ["getNoteAcceptorProfile","Bill acceptor profile"],
+    ["getDescriptor","Descriptors"],
+    ["getCommHostList","Host list"],
+    ["getCommConfigProfile","commConfig profile"],
+    ["getCommConfigModeStatus","commConfig mode"],
+    ["getEventHandlerProfile","Event profile"],
+    ["getSupportedEvents","Supported events"],
+    ["getEventHandlerLog","Backfill event log"],
+    // gameSweep (G2S-21): on-demand status/profile/denoms trickle of EVERY
+    // gamePlay device — deliberately NOT auto-fired at join (FIFO starvation)
+    ["gameSweep","Sweep all games"],
+    // getOptionList (GR-10): full-wildcard optionConfig inventory refresh
+    ["getOptionList","Refresh option inventory"],
+  ]},
+  {name:"Subscriptions", cmds:[
+    ["setEventSub","Subscribe events"],
+    ["setMeterSub","Subscribe meters"],
+    ["getMeterSub","Read meter subs"],
+    ["clearMeterSub","Clear meter subs"],
+    ["keepAlive","Ping keepAlive"],
+    ["setKeepAlive","Set keepAlive interval"],
+  ]},
+  {name:"Clock", cmds:[
+    ["getDateTime","Read EGM clock"],
+    ["setDateTime","Push host time"],
+  ]},
+  {name:"Handpay", cmds:[
+    // safe path — clears the OLDEST pending lockup straight to the credit
+    // meter (G2S_remoteCredit); the per-lockup buttons live on the card
+    ["clearHandpay","Clear handpay → credits"],
+  ]},
+  {name:"Vouchers", cmds:[
+    // voucher device reads (G2S-40): status/profile fold into /api/status
+    // voucherDevice; the profile's maxValIds drives the issuance cap
+    ["getVoucherStatus","Ticket device status"],
+    ["getVoucherProfile","Ticket device profile"],
+    ["getVoucherLogStatus","Ticket log high-water"],
+    // getVoucherLog (G2S-40 reconcile): the EGM's voucherLogList MERGES
+    // into the durable VoucherStore — tickets that moved while the host
+    // was down get synthesized records (idempotent; mash away)
+    ["getVoucherLog","Reconcile EGM ticket log"],
+    // bench unstick (G2S-26 tier 2): marks the id void in the host's store
+    // so redemption rejects it (hostException 99). Store-only — nothing is
+    // sent to the EGM, play is never disabled.
+    ["voidValidationId","Void validation id","vid"],
+    // (the ticket-lookup widget rides in this group too — buildPanel
+    // injects it; it hits GET /api/vouchers?vid= directly, not
+    // /api/command. NO QR preview: cut 2026-07-07 — the machines print
+    // barcoded tickets phones scan directly)
+  ]},
+  {name:"Ticketing", danger:true,
+   note:"changes machine behavior — turns ticket printing off (valIdListLife expires; re-enable restarts the validation-id dance)",
+   cmds:[
+    // setVoucherState (G2S-40): host printing toggle. DISABLE gets the
+    // two-step confirm; ENABLE is the safe restore path (4th slot truthy).
+    ["setVoucherState","Disable ticketing","tkOff"],
+    ["setVoucherState","Enable ticketing","tkOn",1],
+  ]},
+  {name:"WAT · cashless credits", danger:true,
+   note:"moves money — Add credits pushes real credits onto the machine from an account (MILLICENTS on the wire; $ in the box)",
+   cmds:[
+    // addCredits (G2S-39): THE killer feature. Two-step confirm — it moves
+    // money. Amount/account/device ride from the fields below.
+    ["addCredits","Add credits → machine","watAdd"],
+    // cancel is money-PROTECTIVE (only works pre-authorize, §22.27) and
+    // the reads are read-only — all safe (4th slot truthy), no confirm.
+    ["watCancel","Cancel pending push","watReq",1],
+    ["watStatus","WAT status","watDev",1],
+    ["watProfile","WAT profile","watDev",1],
+    ["getWatLog","Read WAT log","watDev",1],
+    ["getWatLogStatus","WAT log high-water","watDev",1],
+    // enable is the safe restore; disable + cash-out routing change confirm
+    ["watEnable","Enable WAT","watDev",1],
+    ["watDisable","Disable WAT","watOff"],
+    ["setWatCashOut","Cash-out → WAT on","watCoOn"],
+    ["setWatCashOut","Cash-out → WAT off","watCoOff",1],
+  ]},
+  {name:"Note acceptor", danger:true,
+   note:"changes machine behavior — toggles bill acceptance (persists across EGM restart)",
+   cmds:[
+    // setNoteAcceptorState (G2S-23): owner-only, point-to-point so the
+    // noteAcceptorStatus response confirms. Two-step confirm like the
+    // ownership group — it changes what the machine accepts.
+    ["setNoteAcceptorState","Disable bill acceptor","naOff"],
+    ["setNoteAcceptorState","Enable bill acceptor","naOn"],
+  ]},
+  {name:"Game control", danger:true,
+   note:"disables ONE game (hostEnabled) — applies at 0 credits + idle",
+   cmds:[
+    // setGamePlayState (G2S-22): per-device hostEnabled toggle, deviceId
+    // from the gamePlay spinner. DISABLE gets the two-step confirm; the
+    // ENABLE restore path (4th tuple slot truthy = safe) fires
+    // immediately — never gate the way back on. The gamePlayStatus
+    // response confirms; per-game toggles also live on the gamePlay card.
+    ["setGamePlayState","Disable game","gpOff"],
+    ["setGamePlayState","Enable game","gpOn",1],
+  ]},
+  {name:"Cabinet control", danger:true,
+   note:"disables the WHOLE machine — persists across EGM restart",
+   cmds:[
+    // setCabinetState (rest of G2S-20): DISABLE gets the two-step confirm;
+    // the ENABLE restore path (4th tuple slot truthy = safe) fires
+    // immediately — never gate the way back on. The host always sends the
+    // full Table 3.2 state; the cabinetStatus response confirms.
+    ["setCabinetState","Disable machine","cabOff"],
+    ["setCabinetState","Enable machine","cabOn",1],
+  ]},
+  {name:"Power", danger:true,
+   note:"reboots the machine — warm restart, NVRAM survives; script path is idle-gated (APX999 while tilted — retry untilted). Verdict shows in /api/status.lastResetProbe",
+   cmds:[
+    // resetProcessor = cabinet.resetProcessor (§3.16). Bench-proven
+    // 2026-07-07: THIS AVP (AVP014 R2) answers G2S_APX008 (optional
+    // command, unimplemented) — harmless refusal; kept because other
+    // machines may honor it. Both buttons keep the two-step confirm — they
+    // reboot the machine when honored.
+    ["resetProcessor","Reboot machine (cabinet)"],
+    // rebootEgmScript = download setDownloadState + setScript systemCmd
+    // G2S_resetEgm (§10.30/§10.37) — plan B, CONFIRMED SUPPORTED on this
+    // AVP but idle-gated. Fresh scriptId per attempt (DLX006 = reused id;
+    // POST {"scriptId": N} by hand to override).
+    ["rebootEgmScript","Reboot machine (script)"],
+  ]},
+  {name:"Ownership", danger:true,
+   note:"NOT a prerequisite for anything (d556ad2 — host 1 already owns ~145 devices); bench tool, disables play while the cycle runs",
+   cmds:[
+    // commConfig ownership cycle (G2S-19): kept as a deliberate bench tool
+    // — the old "reads are gated behind ownership" theory was DISPROVEN
+    // 2026-07-02 (the double-wrapped sync-ack bug), so never run this as a
+    // prerequisite. Bench-retest tonight: the July-1 'entering' stall
+    // predates d556ad2 and was likely the same blocker bug.
+    ["claimOwnership","Claim ownership (full cycle)"],
+    ["enterCommConfigMode","Enter config mode (raw step)"],
+  ]},
+  {name:"Advanced · optionConfig change", danger:true,
+   note:"RECONFIGURES the machine — NO rollback once applied (§9.16)",
+   cmds:[
+    // setOption (G2S-27): the full guarded setOptionChange -> authorize ->
+    // apply cycle for ONE option value. Two-step confirm (it can change what
+    // the machine does). Reads its target from the option fields below. The
+    // host validates the option against the config-sync inventory and refuses
+    // unknowns. cancelOption (abort) + getOptionChangeStatus (read) are the
+    // safe siblings — 4th tuple slot truthy = fire immediately, no confirm.
+    ["setOption","Apply option change","optSet"],
+    ["cancelOption","Cancel pending change","",1],
+    ["getOptionChangeStatus","Read change log","",1],
+    // enableRemoteHandpay (G2S-25/27): the purpose-built bench flip — one
+    // multi-param setOptionChange enabling remote key-off-to-credits on
+    // G2S_handpay/1 (no-op if already enabled). Same no-rollback warning.
+    ["enableRemoteHandpay","Enable remote handpay key-off"],
+  ]},
+];
+
+let TARGET = null;        // egmId the Test Panel drives
+let EGM_SIG = "";         // signature of the connected-machine set
+let ARMED = null;         // {btn, timer} for the two-step danger confirm
+const HTML_SIG = new WeakMap();  // element -> last innerHTML (skip no-op writes)
+const TAPE = [];
+
+/* ---- tiny helpers ----------------------------------------------------- */
+const $ = id => document.getElementById(id);
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function setHTML(el, html){
+  if(!el || HTML_SIG.get(el)===html) return;
+  HTML_SIG.set(el, html); el.innerHTML = html;
+}
+function sid(egm){return egm.replace(/[^A-Za-z0-9_-]/g,"_");}
+function hhmmss(d){return d.toTimeString().slice(0,8);}
+function clock(iso){const t=Date.parse(iso);return isNaN(t)?String(iso||"—"):hhmmss(new Date(t));}
+function fmtDur(sec){
+  sec=Math.max(0,Math.round(sec));
+  if(sec<60) return sec+"s";
+  if(sec<3600) return Math.floor(sec/60)+"m"+String(sec%60).padStart(2,"0")+"s";
+  return Math.floor(sec/3600)+"h"+String(Math.floor(sec/60)%60).padStart(2,"0")+"m";
+}
+function ago(iso){const t=Date.parse(iso);return isNaN(t)?"—":fmtDur((Date.now()-t)/1000)+" ago";}
+function fmtSkew(s){
+  if(s==null) return null;
+  return (s>=0?"+":"−")+fmtDur(Math.abs(s));
+}
+function fmtAmt(mc){ // G2S amounts are millicents: 100000 = $1.00
+  const n=Number(mc); if(!isFinite(n)) return String(mc);
+  return "$"+(n/100000).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+function fmtDenom(mc){ // denomId millicents -> 25¢ / $1 / $2.50
+  const c=Number(mc)/1000; if(!isFinite(c)) return String(mc);
+  if(c<100) return (c%1?c.toFixed(1):c)+"¢";
+  return "$"+((c/100)%1?(c/100).toFixed(2):(c/100));
+}
+function fmtInt(v){const n=Number(v);return isFinite(n)?n.toLocaleString("en-US"):esc(v);}
+function chip(txt, cls){return `<span class="chip ${cls||""}">${esc(txt)}</span>`;}
+
+/* ---- reply tape -------------------------------------------------------- */
+function tape(action, egm, ok, text){
+  TAPE.push({t:hhmmss(new Date()), action, egm, ok, text});
+  if(TAPE.length>60) TAPE.shift();
+  const last=TAPE[TAPE.length-1];
+  $("tape-last").innerHTML =
+    `<span class="trow ${last.ok?"ok":"err"}" style="border:0;padding:0">`+
+    `<span class="tm">${last.t}</span> <span class="ac">${esc(last.action)}</span> `+
+    `<span class="js">${esc(last.text)}</span></span>`;
+  setHTML($("tape-hist"), TAPE.slice().reverse().map(e=>
+    `<div class="trow ${e.ok?"ok":"err"}"><span class="tm">${e.t}</span>`+
+    `<span class="ac">${esc(e.action)}</span>`+
+    `<span class="js">${esc(e.egm?e.egm+" ":"")}${esc(e.text)}</span></div>`).join(""));
+}
+$("tape-bar").onclick=()=>{
+  const t=$("tape");
+  t.classList.toggle("open");
+  $("tape-togl").innerHTML=t.classList.contains("open")?"&#9660;":"&#9650;";
+};
+
+/* ---- command firing ----------------------------------------------------- */
+function disarm(){
+  if(!ARMED) return;
+  clearTimeout(ARMED.timer);
+  ARMED.btn.classList.remove("armed");
+  ARMED.btn.querySelector(".bl").textContent=ARMED.label;
+  ARMED.btn.querySelector(".ba").textContent=ARMED.action;
+  ARMED=null;
+}
+async function fire(action, btn, extra){
+  // extra: 1 = take deviceId from the gamePlay spinner; "vid" = take
+  // validationId from the void input (voidValidationId, G2S-26 tier 2);
+  // "naOn"/"naOff" = the setNoteAcceptorState toggle (G2S-23);
+  // "cabOn"/"cabOff" = the setCabinetState pair (rest of G2S-20);
+  // "gpOn"/"gpOff" = the setGamePlayState pair (G2S-22) — deviceId rides
+  // from the gamePlay spinner like the reads;
+  // "tkOn"/"tkOff" = the setVoucherState pair (G2S-40 ticketing toggle);
+  // "watAdd"/"watDev"/"watReq"/"watOff"/"watCoOn"/"watCoOff" = the WAT
+  // group (G2S-39) — amount/account/device/requestId ride from its fields
+  const body={action};
+  if(TARGET) body.egmId=TARGET;
+  if(extra===1) body.deviceId=$("gp-dev").value||"1";
+  if(extra==="vid") body.validationId=($("void-vid").value||"").trim();
+  if(extra==="naOn") body.enable=true;
+  if(extra==="naOff"){body.enable=false;body.disableText="Bill acceptor disabled from CabiNet";}
+  if(extra==="cabOn") body.enable=true;
+  if(extra==="cabOff"){body.enable=false;body.disableText="Machine disabled from CabiNet";}
+  if(extra==="gpOn"||extra==="gpOff") body.deviceId=$("gp-dev").value||"1";
+  if(extra==="gpOn") body.enable=true;
+  if(extra==="gpOff"){body.enable=false;body.disableText="Game disabled from CabiNet";}
+  if(extra==="tkOn") body.enable=true;
+  if(extra==="tkOff"){body.enable=false;body.disableText="Ticketing paused from CabiNet";}
+  if(extra==="watAdd"){ // dollars in the box -> MILLICENTS on the wire
+    body.cashableMillicents=Math.round(parseFloat($("wat-amt").value||"0")*100000);
+    body.accountId=($("wat-acct").value||"house").trim()||"house";
+    body.deviceId=$("wat-dev").value||"1";
+  }
+  if(extra==="watDev"||extra==="watOff"||extra==="watCoOn"||extra==="watCoOff")
+    body.deviceId=$("wat-dev").value||"1";
+  if(extra==="watOff") body.disableText="WAT disabled from CabiNet";
+  if(extra==="watCoOn") body.enable=true;
+  if(extra==="watCoOff") body.enable=false;
+  if(extra==="watReq"){const rq=($("wat-req").value||"").trim();if(rq)body.requestId=rq;}
+  if(extra==="optSet"){ // optionConfig change (G2S-27) — read the option fields
+    body.deviceClass=($("opt-class").value||"").trim();
+    body.deviceId=($("opt-dev").value||"1").trim();
+    body.optionId=($("opt-id").value||"").trim();
+    body.value=($("opt-value").value||"").trim();
+    const g=($("opt-group").value||"").trim(); if(g) body.optionGroupId=g;
+    const p=($("opt-param").value||"").trim(); if(p) body.paramId=p;
+  }
+  let ok=false, text="";
+  try{
+    const r=await fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    text=await r.text();
+    try{ok=JSON.parse(text).ok===true;}catch(e){ok=r.ok;}
+  }catch(e){text=String(e);}
+  tape(action+(extra===1?" dev="+body.deviceId
+              :extra==="vid"?" vid="+(body.validationId||"—")
+              :extra==="gpOn"?" dev="+body.deviceId+" enable"
+              :extra==="gpOff"?" dev="+body.deviceId+" disable"
+              :extra==="optSet"?" "+(body.optionId||"?")+"="+(body.value||"?")
+              :extra==="watAdd"?" $"+((body.cashableMillicents||0)/100000).toFixed(2)+" from "+body.accountId
+              :extra==="watReq"?(body.requestId?" req="+body.requestId:" (latest)")
+              :extra==="watDev"?" dev="+body.deviceId
+              :extra==="watCoOn"?" dev="+body.deviceId+" on"
+              :extra==="watCoOff"?" dev="+body.deviceId+" off"
+              :extra==="naOn"||extra==="cabOn"||extra==="tkOn"?" enable"
+              :extra==="naOff"||extra==="cabOff"||extra==="tkOff"||extra==="watOff"?" disable":""),
+       body.egmId||"", ok, text);
+  btn.classList.add(ok?"flash-ok":"flash-err");
+  setTimeout(()=>btn.classList.remove("flash-ok","flash-err"),900);
+}
+/* Ticket lookup (G2S-40): exact-match GET /api/vouchers?vid=. Browse-side —
+   never touches /api/command. The 18-digit id itself is what you type into
+   the machine/scan off the printed ticket; no QR preview by decision. */
+async function tkLookup(){
+  const vid=($("tk-vid").value||"").replace(/\D/g,"");
+  const box=$("tk-result");
+  if(vid.length!==18){
+    box.innerHTML='<span class="tk-err">need all 18 digits</span>';
+    return;
+  }
+  box.innerHTML='<span class="tk-err" style="color:var(--faint)">looking up…</span>';
+  let j=null, text="";
+  try{
+    const r=await fetch("/api/vouchers?vid="+encodeURIComponent(vid),{cache:"no-store"});
+    text=await r.text(); j=JSON.parse(text);
+  }catch(e){text=String(e);}
+  tape("ticket lookup vid="+vid,"",!!(j&&j.total),
+       j?(j.total?JSON.stringify(j.vouchers[0]):"unknown validationId"):text);
+  if(!j||!j.total){
+    box.innerHTML='<span class="tk-err">unknown validationId — never minted by this host</span>';
+    return;
+  }
+  const v=j.vouchers[0];
+  const stCls=v.state==="redeemed"?"ok":v.state==="issued"?"info":
+              v.state==="void"||v.state==="expired"?"bad":"warn";
+  box.innerHTML=
+    `<div class="tk-facts">${chip(v.state,stCls)} ${chip(fmtAmt(v.amountMillicents),"info")}`+
+    `<div class="tk-sub">${esc((v.creditType||"").replace("G2S_",""))}`+
+    `${v.egmId?" · "+esc(v.egmId):""}${v.issuedAt?" · issued "+ago(v.issuedAt):""}`+
+    `${v.redeemedAt?" · redeemed "+ago(v.redeemedAt):""}`+
+    `${v.voidedAt?" · voided "+ago(v.voidedAt):""}</div></div>`;
+}
+/* Handpay card buttons (G2S-25): clear a SPECIFIC pending lockup. The
+   reset-to-credits default needs no confirm — it is the safe path (never
+   disables play; the EGM enforces key-off permissions). Reads its target
+   from data- attributes because the card is re-rendered by every poll. */
+async function hpFire(btn){
+  const body={action:"clearHandpay", egmId:btn.dataset.egm, hpId:btn.dataset.hp};
+  if(btn.dataset.kot) body.keyOffType=btn.dataset.kot;
+  let ok=false, text="";
+  try{
+    const r=await fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    text=await r.text();
+    try{ok=JSON.parse(text).ok===true;}catch(e){ok=r.ok;}
+  }catch(e){text=String(e);}
+  tape("clearHandpay"+(body.keyOffType?" "+body.keyOffType:"")+" hp="+body.hpId,
+       body.egmId||"", ok, text);
+  btn.classList.add(ok?"flash-ok":"flash-err");
+  setTimeout(()=>btn.classList.remove("flash-ok","flash-err"),900);
+}
+/* Per-game toggles on the gamePlay card (setGamePlayState, G2S-22). The
+   card is re-rendered by every poll, so targets ride data- attributes like
+   the handpay buttons. DISABLE keeps the two-step confirm (it stops play
+   on that game once the EGM hits 0 credits + idle); the ENABLE restore
+   path fires immediately — never gate the way back on. Own armed slot:
+   a re-render may replace the node (isConnected guards the restore). */
+let GPARM=null;
+function gpDisarm(){
+  if(!GPARM) return;
+  clearTimeout(GPARM.timer);
+  if(GPARM.btn.isConnected){
+    GPARM.btn.classList.remove("armed");
+    GPARM.btn.querySelector(".bl").textContent=GPARM.label;
+    GPARM.btn.querySelector(".ba").textContent=GPARM.sub;
+  }
+  GPARM=null;
+}
+async function gpFire(btn){
+  const enable=btn.dataset.en==="1";
+  if(!enable){
+    if(!(GPARM&&GPARM.btn===btn)){       // two-step guarded switch: arm first…
+      gpDisarm();
+      GPARM={btn,label:btn.querySelector(".bl").textContent,
+             sub:btn.querySelector(".ba").textContent,
+             timer:setTimeout(gpDisarm,6000)};
+      btn.classList.add("armed");
+      btn.querySelector(".bl").textContent="CONFIRM: disable game";
+      btn.querySelector(".ba").textContent="applies at 0 credits + idle · tap again to send";
+      return;
+    }
+    gpDisarm();                          // …second tap sends
+  }
+  const body={action:"setGamePlayState",egmId:btn.dataset.egm,
+              deviceId:btn.dataset.dev,enable};
+  if(!enable) body.disableText="Game disabled from CabiNet";
+  let ok=false, text="";
+  try{
+    const r=await fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    text=await r.text();
+    try{ok=JSON.parse(text).ok===true;}catch(e){ok=r.ok;}
+  }catch(e){text=String(e);}
+  tape("setGamePlayState dev="+body.deviceId+(enable?" enable":" disable"),
+       body.egmId||"", ok, text);
+  btn.classList.add(ok?"flash-ok":"flash-err");
+  setTimeout(()=>btn.classList.remove("flash-ok","flash-err"),900);
+}
+function onCmd(btn, action, label, wantsDev, danger, note){
+  // wantsDev rides through the confirm fire so a guarded action keeps its
+  // extra (the naOn/naOff toggle); ownership actions have none — unchanged.
+  if(!danger){disarm();return fire(action,btn,wantsDev);}
+  if(ARMED && ARMED.btn===btn){disarm();return fire(action,btn,wantsDev);}
+  disarm();                       // two-step guarded switch: arm first…
+  ARMED={btn,action,label,timer:setTimeout(disarm,6000)};
+  btn.classList.add("armed");
+  btn.querySelector(".bl").textContent="CONFIRM: "+label;
+  btn.querySelector(".ba").textContent=
+    (note||"disables play — machine must be idle at 0 credits")+" · tap again to send";
+}
+
+/* ---- build the panel once ----------------------------------------------- */
+function buildPanel(){
+  const root=$("groups");
+  for(const g of GROUPS){
+    const grp=document.createElement("div"); grp.className="grp";
+    grp.innerHTML=`<h3>${esc(g.name)}${g.danger?`<span class="note">${esc(g.note)}</span>`:""}</h3><div class="btns"></div>`;
+    const btns=grp.querySelector(".btns");
+    for(const [action,label,wantsDev,safe] of g.cmds){
+      // `safe` (4th slot) opts a button OUT of its group's two-step confirm
+      // — the setCabinetState ENABLE restore path must fire immediately.
+      const danger=g.danger&&!safe;
+      const b=document.createElement("button");
+      b.className="cmd"+(danger?" danger":"");
+      b.innerHTML=`<span class="bl">${esc(label)}</span><span class="ba">${esc(action)}</span>`;
+      b.onclick=()=>onCmd(b,action,label,wantsDev,danger,g.note);
+      btns.appendChild(b);
+      if(action==="getGameDenoms"){    // deviceId spinner rides with the gamePlay reads
+        const w=document.createElement("div"); w.className="gp-devwrap";
+        w.innerHTML=`<label for="gp-dev">GAMEPLAY DEV</label>`+
+          `<input id="gp-dev" type="number" min="1" step="1" value="1" inputmode="numeric">`;
+        btns.appendChild(w);
+      }
+      if(action==="voidValidationId"){ // validation-id entry rides with the void button
+        const w=document.createElement("div"); w.className="gp-devwrap";
+        w.innerHTML=`<label for="void-vid">VALIDATION ID (18 DIGITS)</label>`+
+          `<input id="void-vid" type="text" maxlength="18" placeholder="tap a redemption row to fill" inputmode="numeric">`;
+        btns.appendChild(w);
+        // ticket lookup (G2S-40): hits GET /api/vouchers?vid= directly
+        // (browse-side, not /api/command)
+        const tk=document.createElement("div"); tk.className="tk-lookup";
+        tk.innerHTML=
+          `<div class="gp-devwrap" style="border:0;padding:0">`+
+            `<label for="tk-vid">TICKET LOOKUP (18 DIGITS)</label>`+
+            `<input id="tk-vid" type="text" maxlength="18" placeholder="validation id" inputmode="numeric" `+
+              `onkeydown="if(event.key==='Enter')tkLookup()"></div>`+
+          `<button class="cmd" onclick="tkLookup()">`+
+            `<span class="bl">Look up ticket</span>`+
+            `<span class="ba">/api/vouchers?vid=</span></button>`+
+          `<div id="tk-result"></div>`;
+        btns.appendChild(tk);
+      }
+      if(action==="addCredits"){ // WAT fields ride with the money button
+        const w=document.createElement("div"); w.className="opt-fields";
+        w.innerHTML=
+          `<div class="of narrow"><label for="wat-amt">AMOUNT $</label>`+
+            `<input id="wat-amt" type="number" min="0" step="0.25" value="5.00" inputmode="decimal"></div>`+
+          `<div class="of"><label for="wat-acct">ACCOUNT ID</label>`+
+            `<input id="wat-acct" type="text" value="house" placeholder="house"></div>`+
+          `<div class="of narrow"><label for="wat-dev">WAT DEV</label>`+
+            `<input id="wat-dev" type="number" min="1" step="1" value="1" inputmode="numeric"></div>`+
+          `<div class="of"><label for="wat-req">REQUEST ID (cancel; blank = latest)</label>`+
+            `<input id="wat-req" type="text" placeholder="from the addCredits reply"></div>`;
+        btns.appendChild(w);
+      }
+      if(action==="setOption"){ // optionConfig change fields (G2S-27) — tap a
+        // config-option chip on the Ownership card to prefill these
+        const w=document.createElement("div"); w.className="opt-fields";
+        w.innerHTML=
+          `<div class="of"><label for="opt-class">DEVICE CLASS</label>`+
+            `<input id="opt-class" type="text" placeholder="G2S_handpay"></div>`+
+          `<div class="of narrow"><label for="opt-dev">DEV</label>`+
+            `<input id="opt-dev" type="text" value="1"></div>`+
+          `<div class="of"><label for="opt-group">OPTION GROUP (optional)</label>`+
+            `<input id="opt-group" type="text" placeholder="auto"></div>`+
+          `<div class="of"><label for="opt-id">OPTION ID</label>`+
+            `<input id="opt-id" type="text" placeholder="G2S_handpayOptions"></div>`+
+          `<div class="of"><label for="opt-param">PARAM ID (optional)</label>`+
+            `<input id="opt-param" type="text" placeholder="G2S_enabledRemoteCredit"></div>`+
+          `<div class="of narrow"><label for="opt-value">VALUE</label>`+
+            `<input id="opt-value" type="text" placeholder="true"></div>`;
+        btns.appendChild(w);
+      }
+    }
+    root.appendChild(grp);
+  }
+}
+
+/* ---- renderers ----------------------------------------------------------- */
+function lampCls(kind, s, kaAge){
+  if(kind==="link"){
+    const st=String(s.commsState||"");     // host reports "onLine"/"sync(expected)"/"opening"
+    if(/onLine$/i.test(st)) return "ok";
+    if(/opening|sync/i.test(st)) return "warn";
+    return st?"bad":"";
+  }
+  if(kind==="ka"){
+    if(kaAge==null) return "";
+    return kaAge<15?"ok":kaAge<30?"warn":"bad";
+  }
+  // owned
+  if(s.commConfigStage==="applied") return "ok";
+  if(s.commConfigStage==="failed") return "bad";
+  return s.commConfigStage?"warn":"";
+}
+
+function renderBanner(el, s){
+  const kaAge = s.lastKeepAlive ? Math.max(0, Date.now()/1000 - s.lastKeepAlive) : null;
+  const skew = s.egmClockSkewSec;
+  const skewCls = skew==null ? "" : Math.abs(skew)>30 ? "bad" : Math.abs(skew)>5 ? "warn" : "ok";
+  const cs = s.clockSync||{};
+  const outFail = s.outboundFail||0;
+  setHTML(el, `
+    <div class="lamps">
+      <div class="lampu"><span class="lamp ${lampCls("link",s)}"></span><label>LINK</label>
+        <span class="lval">${esc((s.commsState||"—").replace("G2S_",""))}</span></div>
+      <div class="lampu"><span class="lamp ${lampCls("ka",s,kaAge)}"></span><label>KEEPALIVE</label>
+        <span class="lval">${kaAge==null?"never":fmtDur(kaAge)}</span></div>
+      <div class="lampu"><span class="lamp ${lampCls("own",s)}"></span><label>OWNED</label>
+        <span class="lval">${esc(s.commConfigStage||"—")}</span></div>
+    </div>
+    <div class="ident">
+      <div class="egmid">${esc(s.egmId)}</div>
+      <div class="below">${s.joinedAt?`joined ${ago(s.joinedAt)}`:"not joined yet"}
+        · onLine ×${s.commsOnLineSeen||0}</div>
+    </div>
+    <div class="bstats">
+      ${chip(`out ${s.outboundOk||0}/${outFail} ${outFail?"fail":"ok"}`, outFail?"bad":"ok")}
+      ${skew==null?chip("clock —",""):chip("clock "+fmtSkew(skew), skewCls)}
+      ${cs.result?chip("sync "+cs.result, cs.result==="confirmed"?"ok":cs.result==="timeout"||String(cs.result).startsWith("error")?"bad":"warn"):""}
+      ${chip(s.egmLocation||"no egmLocation","info")}
+    </div>`);
+}
+
+function renderCabinet(el, s){
+  const cab=s.cabinet||{}, prof=cab.profile||{};
+  // setCabinetState tracking (rest of G2S-20): sent/acked pending, confirmed
+  // good, disagree/error:*/timeout bad — mirrors the banner's clock-sync chip.
+  const csc=s.cabinetStateChange||{};
+  const cscChip=csc.result?chip(
+    (csc.enable==="false"?"disable ":"enable ")+csc.result,
+    csc.result==="confirmed"?"ok"
+    :csc.result==="sent"||csc.result==="acked"?"warn":"bad"):"";
+  const doors=Object.keys(cab).filter(k=>/door|tilt/i.test(k)&&k!=="profile");
+  const rows=[
+    ["EGM clock", cab.egmDateTime?clock(cab.egmDateTime):"—"],
+    ["hostEnabled", cab.hostEnabled??"—"],
+    ["egmEnabled", cab.egmEnabled??"—"],
+    ["hostLocked", cab.hostLocked??"—"],
+  ];
+  if(prof.currencyId) rows.push(["currency", prof.currencyId]);
+  if(prof.machineNum) rows.push(["machine #", prof.machineNum]);
+  if(prof.cabinetType) rows.push(["cabinet", prof.cabinetType]);
+  setHTML(el, `
+    <div class="bigval">${esc(cab.egmState||"—")}${cscChip?` ${cscChip}`:""}</div>
+    <div class="kv">${rows.map(([k,v])=>`<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join("")}</div>
+    <div class="chips">${doors.length? doors.map(d=>{
+        const on=String(cab[d]).toLowerCase()==="true";
+        return chip(d.replace(/^g2s/i,"")+": "+cab[d], on?"bad":"");
+      }).join("") : '<span class="none">no door/tilt data yet — run Cabinet status</span>'}</div>`);
+}
+
+function renderMeters(el, cntEl, s){
+  const meters=s.meters||{};
+  const keys=Object.keys(meters).sort();
+  setHTML(cntEl, keys.length?`${keys.length} · ${s.lastMeterReportType||""} ${s.lastMeterReport?clock(s.lastMeterReport):""}`:"");
+  const subs=s.meterSubs||{};
+  const subChips=Object.keys(subs).map(t=>{
+    const sub=subs[t];
+    const lab=t.replace("G2S_on","")+(sub.active?(sub.periodicInterval?" "+(sub.periodicInterval/1000)+"s":""):" off");
+    return chip(lab, sub.active?"ok":"");
+  }).join("");
+  const rows=keys.map(k=>{
+    const parts=k.split("/");                     // deviceClass/deviceId/meterName
+    const name=(parts[2]||k).replace(/^G2S_/,"");
+    const dev=(parts[0]||"").replace(/^G2S_/,"")+"/"+(parts[1]||"");
+    const v=/Amt$/.test(name)?esc(fmtAmt(meters[k])):fmtInt(meters[k]);
+    return `<div class="mrow"><span class="mc">${esc(dev)}</span><span class="mn">${esc(name)}</span><span class="mv">${v}</span></div>`;
+  }).join("");
+  setHTML(el, (subChips?`<div class="chips" style="margin:0 0 8px">${subChips}</div>`:"")+
+    (rows||'<p class="none">no meters yet — run Pull meters, or wait for the 60s periodic report (subs install at join)</p>'));
+}
+
+function renderGamePlay(el, s){
+  const gp=s.gamePlay||{};
+  const devs=Object.keys(gp).sort((a,b)=>Number(a)-Number(b));
+  if(!devs.length)
+    return setHTML(el,'<p class="none">no gamePlay data yet — run Game status / profile / denoms</p>');
+  setHTML(el, devs.map(d=>{
+    const g=gp[d]||{}, prof=g.profile||{};
+    let theo="";
+    const wc=(prof.wagerCategories||[])[0];
+    if(wc&&wc.theoPaybackPct){const p=Number(wc.theoPaybackPct)/100;if(isFinite(p))theo=p.toFixed(2)+"%";}
+    const denoms=(g.activeDenoms||[]).map(fmtDenom).join(" ");
+    const flags=[];
+    if(String(g.hostEnabled)==="false") flags.push(chip("hostDisabled","warn"));
+    if(String(g.egmEnabled)==="false") flags.push(chip("egmDisabled","warn"));
+    if(String(g.generalTilt)==="true") flags.push(chip("generalTilt","bad"));
+    if(String(g.reelTilt)==="true") flags.push(chip("reelTilt","bad"));
+    // setGamePlayState tracking (G2S-22): sent/acked pending, confirmed
+    // good, disagree/error:*/timeout bad — mirrors the cabinet-control chip.
+    const sc=g.stateChange||{};
+    if(sc.result) flags.push(chip(
+      (sc.enable==="false"?"disable ":"enable ")+sc.result,
+      sc.result==="confirmed"?"ok"
+      :sc.result==="sent"||sc.result==="acked"?"warn":"bad"));
+    const da=`data-egm="${esc(s.egmId)}" data-dev="${esc(d)}"`;
+    return `<div class="gpdev">
+      <div class="gphead"><span class="devno">dev ${esc(d)}</span> ${esc(g.themeId||"?")} · ${esc(g.paytableId||"?")}</div>
+      <div class="gpsub">${denoms?`denoms ${esc(denoms)}`:"denoms —"}${prof.maxWagerCredits?` · maxWager ${esc(prof.maxWagerCredits)}`:""}${theo?` · theo ${theo}`:""}${prof.winLevels?` · ${prof.winLevels.length} win levels`:""}</div>
+      ${flags.length?`<div class="chips">${flags.join("")}</div>`:""}
+      <div class="gpbtns">
+        <button class="cmd danger" ${da} data-en="0" onclick="gpFire(this)">
+          <span class="bl">Disable game</span><span class="ba">setGamePlayState</span></button>
+        <button class="cmd" ${da} data-en="1" onclick="gpFire(this)">
+          <span class="bl">Enable game</span><span class="ba">setGamePlayState</span></button>
+      </div>
+    </div>`;
+  }).join(""));
+}
+
+/* Tap a redemption row -> preload its validationId into the void input
+   (the Test Panel's voidValidationId bench unstick). */
+function fillVoid(vid){
+  const i=$("void-vid");
+  if(i&&vid){i.value=vid;i.focus();}
+}
+/* Outcome chip for a redemption record (G2S-26 tier 2): terminal outcome
+   from commitVoucher wins; before that, the authorization verdict. */
+function redemptionChip(r){
+  if(r.outcome==="redeemed") return chip("redeemed","ok");
+  if(r.outcome==="rejected") return chip("rejected · egmExc "+(r.egmException??"?"),"bad");
+  if(r.authAction==="authorized") return chip("authorized · awaiting commit","warn");
+  if(r.authAction==="rejected") return chip("refused · hostExc "+(r.hostException??"?"),"bad");
+  return chip(r.source||"pending","");
+}
+function renderVouchers(el, cntEl, s){
+  setHTML(cntEl, (s.voucherCount?`${s.voucherCount} out`:"")+
+    (s.redeemCount?(s.voucherCount?" · ":"")+`${s.redeemCount} in`:""));
+  const recent=(s.recentVouchers||[]).slice().reverse();
+  const rows=recent.map(v=>`
+    <div class="vrow"><span class="vk ${v.kind==="commit"?"commit":""}">${esc(v.kind||"?")}</span>
+      <span class="va">${esc(fmtAmt(v.voucherAmt))}</span>
+      <span class="vd">val ${esc(v.validationId||"—")} txn ${esc(v.transactionId||"—")}${v.egmException&&v.egmException!=="0"?" exc="+esc(v.egmException):""}</span>
+      <span class="tm">${clock(v.seenAt)}</span></div>`).join("");
+  const reds=(s.recentRedemptions||[]).slice().reverse();
+  const redRows=reds.map(r=>`
+    <div class="vrow" data-vid="${esc(r.validationId||"")}" onclick="fillVoid(this.dataset.vid)"
+         title="tap to preload the void input" style="cursor:pointer">
+      <span class="vk redeem">redeem</span>
+      <span class="va">${esc(fmtAmt(r.voucherAmt))}</span>
+      <span class="vd">val ${esc(r.validationId||"—")} txn ${esc(r.transactionId||"—")}${r.authAction==="rejected"&&r.reason?" · "+esc(r.reason):""}</span>
+      ${redemptionChip(r)}
+      <span class="tm">${clock(r.committedAt||r.authAt||r.requestedAt)}</span></div>`).join("");
+  setHTML(el, `
+    <div class="kv">
+      <div class="k">validation list</div><div class="v">#${esc(s.voucherListId??0)}</div>
+      <div class="k">ids sent</div><div class="v">${esc(s.voucherIdsSent??0)}${s.voucherListAt?" · "+clock(s.voucherListAt):""}</div>
+      <div class="k">vouchers issued</div><div class="v">${esc(s.voucherCount??0)}</div>
+      <div class="k">redemptions</div><div class="v">${esc(s.redeemCount??0)} · ${esc(s.redeemedCount??0)} redeemed / ${esc(s.redeemRejectedCount??0)} rejected</div>
+    </div>
+    ${redRows?`<div class="seclab" style="margin-top:10px">redemptions</div>${redRows}`:""}
+    ${rows?`<div class="seclab" style="margin-top:10px">tickets out</div>${rows}`
+         :'<p class="none" style="margin:8px 0 0">no tickets yet — print a voucher on the machine</p>'}`);
+}
+
+/* Enable-remote-handpay (G2S-25/27): purpose-built flip of the handpay
+   remote key-off-to-credits permissions — ONE multi-param setOptionChange
+   with an automatic read-back verify (watch the flip chip + the permission
+   lamp). RECONFIGURES the machine, so it keeps the two-step danger confirm;
+   the card is re-rendered by every poll, so the armed slot follows the
+   gpFire pattern (data- attributes + isConnected-guarded restore). */
+let HPARM=null;
+function hpEnableDisarm(){
+  if(!HPARM) return;
+  clearTimeout(HPARM.timer);
+  if(HPARM.btn.isConnected){
+    HPARM.btn.classList.remove("armed");
+    HPARM.btn.querySelector(".bl").textContent=HPARM.label;
+    HPARM.btn.querySelector(".ba").textContent=HPARM.sub;
+  }
+  HPARM=null;
+}
+async function hpEnableFire(btn){
+  if(!(HPARM&&HPARM.btn===btn)){         // two-step guarded switch: arm first…
+    hpEnableDisarm();
+    HPARM={btn,label:btn.querySelector(".bl").textContent,
+           sub:btn.querySelector(".ba").textContent,
+           timer:setTimeout(hpEnableDisarm,6000)};
+    btn.classList.add("armed");
+    btn.querySelector(".bl").textContent="CONFIRM: reconfigure EGM";
+    btn.querySelector(".ba").textContent="no rollback once applied · tap again to send";
+    return;
+  }
+  hpEnableDisarm();                      // …second tap sends
+  const body={action:"enableRemoteHandpay"};
+  if(btn.dataset.egm) body.egmId=btn.dataset.egm;
+  let ok=false, text="";
+  try{
+    const r=await fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    text=await r.text();
+    try{ok=JSON.parse(text).ok===true;}catch(e){ok=r.ok;}
+  }catch(e){text=String(e);}
+  tape("enableRemoteHandpay", body.egmId||"", ok, text);
+  btn.classList.add(ok?"flash-ok":"flash-err");
+  setTimeout(()=>btn.classList.remove("flash-ok","flash-err"),900);
+}
+function renderHandpay(el, cntEl, s){
+  const pend=s.pendingHandpays||[];
+  const recent=(s.recentHandpays||[]).slice().reverse().slice(0,6);
+  setHTML(cntEl, (pend.length?pend.length+" PENDING":"")+
+    (s.handpayCount?(pend.length?" · ":"")+s.handpayCount+" total":""));
+  // permission lamp from the config-sync (G2S_enabledRemoteCredit) — shows a
+  // disabled reset-to-credits path BEFORE anyone hits a jackpot; live-fed by
+  // handpayRemoteCreditAllowed (re-read automatically after a change applies)
+  // case-folded like the host's option_values_equal — an EGM may legally
+  // spell the xs:boolean True/TRUE
+  const rc=(s.handpayRemoteCreditAllowed||"").toLowerCase();
+  const perm = rc==="true" ? chip("remote→credits enabled","ok")
+             : rc==="false" ? chip("remote→credits DISABLED on EGM","bad")
+             : chip("remote→credits unknown — awaiting config-sync","");
+  // enableRemoteHandpay cycle chip: rides along while the flip is in
+  // flight / verifying (the change record targets G2S_handpayOptions)
+  const hoc=s.optionChange||{};
+  const flip=(hoc.optionId==="G2S_handpayOptions"&&hoc.result)
+    ? chip("flip "+hoc.result,
+        hoc.result==="verified"?"ok"
+        :(hoc.result==="applied"||hoc.result==="sent"||hoc.result==="acked"
+          ||hoc.result==="pending"||hoc.result==="authorized")?"warn":"bad")
+    : "";
+  const enableBtn = rc==="true" ? "" :
+    `<button class="cmd danger" data-egm="${esc(s.egmId)}" onclick="hpEnableFire(this)">
+       <span class="bl">🔓 Enable remote handpay</span>
+       <span class="ba">enableRemoteHandpay · setOptionChange + auto verify</span></button>
+     <p class="none" style="margin:4px 0 8px">flips G2S_enabledRemoteCredit (+ disabledRemoteCredit) to true on handpay/1 — key off a FRESH lockup after it verifies (an old lockup still carries remoteCredit=false)</p>`;
+  const pendRows=pend.map(h=>{
+    const amt=(h.pendingCashableAmt||0)+(h.pendingPromoAmt||0)+(h.pendingNonCashAmt||0);
+    const st=h.state||"pending";
+    const stCls=st==="pending"?"warn":(st.startsWith("error")||st==="keyOffTimeout")?"bad":"info";
+    const d=`data-egm="${esc(s.egmId)}" data-hp="${esc(h.transactionId)}"`;
+    return `<div class="hprow">
+      <div class="amt">${esc(fmtAmt(amt))}</div>
+      <div class="hpsub"><span>${esc((h.handpayType||"?").replace("G2S_",""))}
+        · txn ${esc(h.transactionId)} · ${clock(h.seenAt)}</span>
+        ${chip(st,stCls)}${h.remoteCredit==="false"?chip("EGM did not offer remoteCredit","warn"):""}</div>
+      <button class="cmd hpclear" ${d} onclick="hpFire(this)">
+        <span class="bl">💰 CLEAR TO CREDITS</span>
+        <span class="ba">setRemoteKeyOff G2S_remoteCredit</span></button>
+      <details><summary>other key-off types…</summary><div class="alt">
+        <button class="cmd" ${d} data-kot="G2S_remoteVoucher" onclick="hpFire(this)">
+          <span class="bl">To voucher</span><span class="ba">G2S_remoteVoucher</span></button>
+        <button class="cmd" ${d} data-kot="G2S_remoteHandpay" onclick="hpFire(this)">
+          <span class="bl">Paid by hand</span><span class="ba">G2S_remoteHandpay</span></button>
+      </div></details>
+    </div>`;
+  }).join("");
+  const recRows=recent.map(h=>{
+    const amt=(h.keyOffCashableAmt||0)+(h.keyOffPromoAmt||0)+(h.keyOffNonCashAmt||0);
+    return `<div class="vrow"><span class="vk">${esc((h.keyOffType||"?").replace("G2S_",""))}</span>
+      <span class="va">${esc(fmtAmt(amt))}</span>
+      <span class="vd">txn ${esc(h.transactionId||"—")}${h.handpayType?" · "+esc(h.handpayType.replace("G2S_","")):""}</span>
+      <span class="tm">${clock(h.keyedOffAt||h.seenAt)}</span></div>`;
+  }).join("");
+  setHTML(el, `<div class="chips" style="margin:0 0 8px">${perm}${flip}</div>`+
+    enableBtn+
+    (pendRows||'<p class="none">no pending handpays — the 💰 lands here when a lockup needs a key-off</p>')+
+    (recRows?`<div class="seclab" style="margin-top:10px">keyed off</div>${recRows}`:""));
+}
+
+/* Bill acceptor card (G2S-23): status lamps from noteAcceptorStatus /
+   the eventReport ride-along, the enabled-notes table promoted from the
+   config-sync (or the profile readback), and the session bill-in tape
+   (typed from G2S_NAE114 — recentBillIns / billInSessionAmt). */
+function renderNoteAcceptor(el, cntEl, s){
+  const na=s.noteAcceptor||{}, st=na.status||{};
+  setHTML(cntEl, s.billInCount?`${s.billInCount} bills · ${fmtAmt(s.billInSessionAmt||0)}`:"");
+  const chipsArr=[];
+  chipsArr.push(na.noteEnabled==="true"?chip("notes enabled","ok")
+    :na.noteEnabled==="false"?chip("notes DISABLED","bad")
+    :chip("notes ? — awaiting config-sync/profile",""));
+  if(na.voucherEnabled==="true") chipsArr.push(chip("takes vouchers","info"));
+  if(st.hostEnabled==="false") chipsArr.push(chip("hostDisabled","warn"));
+  if(st.egmEnabled==="false") chipsArr.push(chip("egmDisabled","warn"));
+  const FLAGS=["doorOpen","stackerRemoved","stackerNearlyFull","stackerFull",
+    "stackerJam","stackerFault","acceptorJam","acceptorFault","disconnected",
+    "firmwareFault","mechanicalFault","opticalFault","componentFault",
+    "nvMemoryFault","illegalActivity"];
+  for(const f of FLAGS) if(String(st[f])==="true")
+    chipsArr.push(chip(f, f==="stackerNearlyFull"?"warn":"bad"));
+  if(Number(st.noteValueInEscrow)>0)
+    chipsArr.push(chip("in escrow "+fmtAmt(st.noteValueInEscrow),"info"));
+  const notes=(na.notes||[]).map(n=>{
+    const on=String(n.noteActive)==="true";
+    return chip((n.denom||fmtAmt(n.baseCashableAmt))+(on?"":" off"), on?"ok":"");
+  }).join("");
+  const bills=(s.recentBillIns||[]).slice().reverse().map(b=>`
+    <div class="vrow"><span class="vk">💵</span>
+      <span class="va">${esc(b.denom||(b.amt?fmtAmt(b.amt):"?"))}</span>
+      <span class="vd">${esc(b.currencyId||"")} txn ${esc(b.transactionId||"—")}</span>
+      <span class="tm">${clock(b.seenAt)}</span></div>`).join("");
+  setHTML(el, `<div class="chips" style="margin:0 0 8px">${chipsArr.join("")}</div>
+    <div class="kv">
+      <div class="k">session bills in</div>
+      <div class="v">${esc(s.billInCount||0)} · ${esc(fmtAmt(s.billInSessionAmt||0))}</div>
+    </div>
+    ${notes?`<div class="seclab" style="margin-top:10px">note table${na.notesSource?" · "+esc(na.notesSource):""}</div><div class="chips">${notes}</div>`
+          :'<p class="none" style="margin:8px 0 0">note table unknown — the config-sync or Bill acceptor profile fills it</p>'}
+    ${bills?`<div class="seclab" style="margin-top:10px">bills in</div>${bills}`:""}`);
+}
+
+/* Tap a config-option chip -> prefill the setOption fields in the Advanced
+   group (deviceClass/deviceId/group/optionId) so a change is one edit + fire.
+   Key form: deviceClass/deviceId/optionGroupId/optionId. */
+function fillOption(key){
+  const p=String(key||"").split("/"); if(p.length<4) return;
+  const set=(id,v)=>{const e=$(id);if(e)e.value=v;};
+  set("opt-class",p[0]); set("opt-dev",p[1]); set("opt-group",p[2]); set("opt-id",p[3]);
+  const pv=$("opt-value"); if(pv) pv.focus();
+}
+/* Option-change record chip (G2S-27): verified/applied good, pending/
+   authorized/setting/acked in-flight, cancelled/error/timeout/verifyFailed
+   bad — mirrors the cabinet-control chip. ("applied" means the EGM said so;
+   "verified" means the auto read-back agreed.) */
+function optionChangeChip(oc){
+  if(!oc||!oc.result) return "";
+  const r=oc.result;
+  const cls=(r==="applied"||r==="verified")?"ok"
+    :(r==="sent"||r==="acked"||r==="pending"||r==="authorized")?"warn"
+    :"bad";  // cancelled / error:* / timeout / verifyFailed
+  return chip(r, cls);
+}
+function renderOwnership(el, s){
+  const hi=s.hostItems||{};
+  const hostRows=Object.keys(hi).map(hid=>{
+    const hh=hi[hid]||{};
+    return `<div style="margin-bottom:6px"><span class="chip info">host ${esc(hid)} · idx ${esc(hh.hostIndex??"—")}</span>
+      <div class="chips" style="margin-top:5px">${(hh.owned||[]).map(d=>chip(d.replace(/G2S_/g,""),"ok")).join("")||'<span class="none">owns nothing</span>'}</div></div>`;
+  }).join("");
+  const claim=s.ownedClaim||[], cfg=s.configDevices||[];
+  // optionConfig change cycle (G2S-27): the tracked change + config-option
+  // inventory (tap a chip to prefill the Advanced setOption fields).
+  const oc=s.optionChange||{}, ocl=s.optionChangeLog||{};
+  const opts=s.configOptions||[];
+  // per-param edits: "params" carries {paramId:{old,new}} for BOTH the
+  // single-param setOption and the multi-param enableRemoteHandpay cycles
+  const edits=oc.params&&Object.keys(oc.params).length
+    ? Object.keys(oc.params).map(p=>{const e=oc.params[p]||{};
+        return `${esc(p.replace(/^G2S_/,""))}: ${esc(e.old??"?")} → ${esc(e["new"]??"?")}`;}).join(" · ")
+    : `${esc(oc.paramId||"?")}: ${esc(oc.oldValue??"?")} → ${esc(oc.newValue??"?")}`;
+  const ocDetail=oc.optionId
+    ? `<div class="gpsub" style="margin-top:5px">cfg ${esc(oc.configId??"—")}${oc.transactionId?" · txn "+esc(oc.transactionId):""}
+        · ${esc(oc.deviceClass||"?")}/${esc(oc.deviceId||"?")} · ${esc(oc.optionId||"?")}
+        · ${edits}${oc.changeException&&oc.changeException!=="0"?" · exc "+esc(oc.changeException):""}</div>`
+    : "";
+  setHTML(el, `
+    <div class="kv">
+      <div class="k">commConfig stage</div><div class="v">${esc(s.commConfigStage||"—")}</div>
+      <div class="k">descriptors</div><div class="v">${esc(s.descriptorCount??0)}</div>
+      <div class="k">config-sync devices</div><div class="v">${esc(s.configDeviceCount??0)}</div>
+      <div class="k">config-sync options</div><div class="v">${esc(s.configOptionCount??0)}</div>
+    </div>
+    <div class="seclab">host ownership map</div>
+    ${hostRows||'<span class="none">not read yet — run Read host list (getCommHostList answers straight from the join)</span>'}
+    ${claim.length?`<div class="seclab">last claim</div><div class="chips">${claim.map(d=>chip(d.replace(/G2S_/g,""))).join("")}</div>`:""}
+    ${cfg.length?`<div class="seclab">config-sync inventory</div><div class="chips">${cfg.map(d=>chip(d.replace(/G2S_/g,""))).join("")}</div>`:""}
+    <div class="seclab">optionConfig change ${optionChangeChip(oc)}${ocl.totalEntries!=null?` <span class="chip">log ${esc(ocl.totalEntries)} entries</span>`:""}</div>
+    ${ocDetail||'<span class="none">no change in flight — use Advanced · optionConfig change</span>'}
+    ${opts.length?`<div class="seclab">config-sync options · tap to load</div><div class="chips">${opts.map(k=>{
+        const short=String(k).split("/").slice(2).join("/").replace(/G2S_/g,"");
+        return `<span class="chip" style="cursor:pointer" title="${esc(k)}" onclick="fillOption('${esc(k)}')">${esc(short)}</span>`;
+      }).join("")}</div>`:""}`);
+}
+
+/* Live activity tape (G2S-13): the host's typed event hooks land at
+   /api/status "activity" (newest first, capped ~100). Human label, category
+   icon, relative timestamp; hook name + extras ride the sub-line. Entries
+   only exist for semantically-mapped codes, so the section stays hidden
+   until the first door swing / bill / game / handpay / ticket. */
+function renderActivity(list){
+  const wrap=$("actwrap");
+  if(!list.length){wrap.classList.remove("on");return;}
+  wrap.classList.add("on");
+  setHTML($("act-n"), list.length+(list.length>=100?"+":"")+" · newest first");
+  setHTML($("act-body"), list.map(a=>{
+    const ex=a.extras||{};
+    const bits=[a.hook, a.egmId];
+    if(ex.door) bits.push(ex.door+" door");
+    if(ex.denom) bits.push(ex.denom);
+    else if(ex.amt) bits.push(fmtAmt(ex.amt));
+    if(ex.transactionId) bits.push("txn "+ex.transactionId);
+    if(ex.text) bits.push(ex.text);
+    return `<div class="ev"><span class="ic">${esc(a.icon||"•")}</span>`+
+      `<span class="lb">${esc(a.label||a.code)}`+
+      `<small>${esc(bits.filter(Boolean).join(" · "))}</small></span>`+
+      `<span class="tm">${ago(a.seenAt)}</span></div>`;
+  }).join(""));
+}
+
+function renderEvents(el, cntEl, s){
+  setHTML(cntEl, s.eventCount?`${s.eventCount} total${s.ehBackfilledCount?` · ${s.ehBackfilledCount} backfilled`:""}`:"");
+  const sub=s.subscribed
+    ? chip("subscribed · "+(s.supportedEventCount||0)+" supported","ok")
+    : chip("not subscribed","warn");
+  const evs=(s.recentEvents||[]).slice().reverse();
+  const rows=evs.map(e=>`
+    <div class="ev"><span class="ic">${esc(e.icon||"•")}</span>
+      <span class="lb">${esc(e.label||e.eventCode)}
+        <small>${esc(e.eventCode)} · ${esc(e.deviceClass)}/${esc(e.deviceId)}${e.affectedMeters?` · ${esc(e.affectedMeters)} meters`:""}${e.eventText?` · ${esc(e.eventText)}`:""}</small></span>
+      <span class="tm">${clock(e.seenAt)}</span></div>`).join("");
+  setHTML(el, `<div class="chips" style="margin:0 0 8px">${sub}</div>`+
+    (rows||'<p class="none">no events yet — subscriptions auto-install at join; open a door to make one</p>'));
+}
+
+/* ---- skeleton + tick ------------------------------------------------------ */
+function machineSkeleton(egm){
+  const p=sid(egm);
+  return `<section class="egm" id="egm-${p}">
+    <div class="banner" id="${p}-ban"></div>
+    <div class="grid">
+      <div class="card"><h2>Cabinet</h2><div class="body" id="${p}-cab"></div></div>
+      <div class="card"><h2>Meters <span class="hn" id="${p}-mn"></span></h2><div class="body scroll" id="${p}-met"></div></div>
+      <div class="card"><h2>Game play</h2><div class="body" id="${p}-gp"></div></div>
+      <div class="card"><h2>Handpay <span class="hn" id="${p}-hn"></span></h2><div class="body scroll" id="${p}-hp"></div></div>
+      <div class="card"><h2>Bill acceptor <span class="hn" id="${p}-nan"></span></h2><div class="body scroll" id="${p}-na"></div></div>
+      <div class="card"><h2>Vouchers <span class="hn" id="${p}-vn"></span></h2><div class="body scroll" id="${p}-vou"></div></div>
+      <div class="card"><h2>Ownership &amp; config</h2><div class="body scroll" id="${p}-own"></div></div>
+      <div class="card wide"><h2>Events <span class="hn" id="${p}-en"></span></h2><div class="body scroll" id="${p}-ev"></div></div>
+    </div>
+  </section>`;
+}
+
+function renderTargets(egms){
+  const w=$("target-wrap");
+  if(egms.length<2){setHTML(w, egms.length?`<span class="tchip sel">${esc(egms[0])}</span>`:"");return;}
+  // rebuild only when the set or selection changes
+  const sig=egms.join(",")+"|"+TARGET;
+  if(HTML_SIG.get(w)===sig) return;
+  HTML_SIG.set(w,sig);
+  w.innerHTML="";
+  for(const id of egms){
+    const c=document.createElement("span");
+    c.className="tchip"+(id===TARGET?" sel":"");
+    c.textContent=id; c.tabIndex=0;
+    c.onclick=()=>{TARGET=id;renderTargets(egms);};
+    w.appendChild(c);
+  }
+}
+
+function render(data){
+  // "activity" (the G2S-13 tape) and "_engine" are meta keys, not EGMs
+  const egms=Object.keys(data).filter(k=>k!=="_engine"&&k!=="activity"&&k!=="sas"&&k!=="names"&&k!=="uiStamp").sort();
+  const eng=data._engine||{};
+  renderActivity(data.activity||[]);
+  setHTML($("engine"),
+    `keepalive ${eng.keepaliveMs?eng.keepaliveMs/1000+"s":"—"} · harvest ${eng.harvest?"on":"off"}`+
+    ` · subscribe ${eng.subscribe?"on":"off"} · autoclock ${eng.autoClock?"on":"off"}`+
+    `${eng.inline?" · INLINE":""}`);
+  const main=$("machines");
+  if(!egms.length){
+    TARGET=null; EGM_SIG="";
+    renderTargets([]);
+    setHTML(main, `<div class="empty-hero">
+      <span class="lamp warn" style="display:block"></span>
+      <h2>NO MACHINE ON THE BENCH</h2>
+      <p>Waiting for an EGM to join. Power the machine, check the slot VLAN,
+      or watch the host log for its commsOnLine.</p>
+      <p style="font:11px var(--mono);color:var(--faint)">host is up — /api/status is answering</p>
+    </div>`);
+    return;
+  }
+  TARGET = TARGET && egms.includes(TARGET) ? TARGET : egms[0];
+  renderTargets(egms);
+  const sig=egms.join(",");
+  if(sig!==EGM_SIG){EGM_SIG=sig;HTML_SIG.delete(main);setHTML(main,egms.map(machineSkeleton).join(""));}
+  for(const egm of egms){
+    const p=sid(egm), s=data[egm]||{};
+    renderBanner($(p+"-ban"), s);
+    renderCabinet($(p+"-cab"), s);
+    renderMeters($(p+"-met"), $(p+"-mn"), s);
+    renderGamePlay($(p+"-gp"), s);
+    renderHandpay($(p+"-hp"), $(p+"-hn"), s);
+    renderNoteAcceptor($(p+"-na"), $(p+"-nan"), s);
+    renderVouchers($(p+"-vou"), $(p+"-vn"), s);
+    renderOwnership($(p+"-own"), s);
+    renderEvents($(p+"-ev"), $(p+"-en"), s);
+  }
+}
+
+async function tick(){
+  try{
+    const r=await fetch("/api/status",{cache:"no-store"});
+    render(await r.json());
+    const el=$("poll"); el.className=""; el.textContent="updated "+hhmmss(new Date());
+  }catch(e){
+    const el=$("poll"); el.className="err"; el.textContent="HOST UNREACHABLE";
+  }
+}
+buildPanel();
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

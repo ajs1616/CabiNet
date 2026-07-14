@@ -1,0 +1,56 @@
+{
+  "g2s_features": {
+    "aft": {
+      "enabled": true,
+      "bonus_transfers": true,
+      "debit_transfers": true,
+      "in_house_transfers": true,
+      "max_transaction_amount": 100000,
+      "min_transaction_amount": 100,
+      "require_pin": false,
+      "timeout_seconds": 30,
+      "partial_transfers": true,
+      "lock_timeout": 30000,
+      "max_pending_transactions": 10
+    },
+    "wat": {
+      "enabled": false,
+      "require_player_card": true,
+      "max_balance": 1000000,
+      "allow_anonymous": false
+    },
+    "ssl": {
+      "enabled": false,
+      "port": 8081,
+      "require_client_cert": false,
+      "cert_path": "certs/server.crt",
+      "key_path": "certs/server.key",
+      "ca_path": "certs/ca-bundle.crt"
+    },
+    "commands": {
+      "keepAlive": true,
+      "eventReport": true,
+      "handpay": true,
+      "progressives": false,
+      "tournament": false
+    },
+    "handpay": {
+      "enabled": true,
+      "local_handpay": true,
+      "remote_handpay": true,
+      "min_handpay_amount": 120000,
+      "require_id_check": true,
+      "require_tax_form": true
+    },
+    "event_handling": {
+      "max_events": 10000,
+      "overflow_behavior": "disableAll",
+      "persist_events": true,
+      "event_file": "data/g2s_events.json"
+    }
+  },
+  "ssl_enabled": false,
+  "https_port": 8081,
+  "http_port": 8081,
+  "protocol": "http"
+}

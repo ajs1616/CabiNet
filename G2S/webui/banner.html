@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<!-- CasinoNet glass banner — the ALWAYS-UP strip (IGT_mediaDisplay dev 5,
+     Player Banner, 1280x32). AJ's glass UX model: this thin bar is the only
+     thing that lives on the game full-time; its MENU touch target asks the
+     hub (XHR path-A, live-proven 2026-07-10) to show the BIG panel on a
+     Service Window, and the big panel's Close asks the hub to hide it again.
+     Target browser: QtEmbedded QNX Qt/4.8.2 WebKit 534.34 (~Safari 5) —
+     ES5 only, no flexbox, absolute/table layout, no external assets. -->
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>{{GAMEROOM}}</title>
+<style type="text/css">
+  html, body { margin:0; padding:0; width:1280px; height:32px;
+               overflow:hidden; background:#0b0f14; }
+  #bar { position:absolute; left:0; top:0; width:1280px; height:32px;
+         background:#0b0f14; color:#e8c266; font-family:Arial,sans-serif; }
+  #brand { position:absolute; left:12px; top:0; height:32px;
+           line-height:32px; font-size:18px; font-weight:bold;
+           letter-spacing:2px; color:#e8c266; }
+  #msg { position:absolute; left:220px; top:0; height:32px; line-height:32px;
+         font-size:16px; color:#9fb2c8; }
+  #menu { position:absolute; right:0; top:0; width:220px; height:32px;
+          line-height:32px; text-align:center; font-size:18px;
+          font-weight:bold; color:#0b0f14; background:#e8c266;
+          cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div id="brand">{{GAMEROOM}}</div>
+  <div id="msg">Welcome — tap MENU for your player panel</div>
+  <div id="menu" onclick="menuTap()">&#9776; MENU</div>
+</div>
+<script type="text/javascript">
+  // ES5 on purpose (Qt 4.8 WebKit). The tap tells the HUB; the hub decides
+  // what "open the menu" means (show the big panel on a Service Window).
+  function menuTap() {
+    var m = document.getElementById('menu');
+    m.style.background = '#9fb2c8';
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/api/glass/ping?src=banner-menu', true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        m.style.background = '#e8c266';
+        var msg = document.getElementById('msg');
+        if (xhr.status === 200) { msg.innerHTML = 'menu requested ✓'; }
+        else { msg.innerHTML = 'hub unreachable'; }
+      }
+    };
+    xhr.send(null);
+  }
+</script>
+</body>
+</html>

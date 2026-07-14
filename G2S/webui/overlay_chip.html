@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<!-- FUNCINO overlay menu chip (#18 stage 2). Authored for a RESIZED
+     overlay window (200x76, bottom-right of the game screen — the
+     setOptionChange geometry write on dev 4's IGT_behaviorParams). The
+     overlay host paints an opaque base (transparency probe verdict
+     2026-07-10: all 5 modes opaque), so instead of a transparent page we
+     shrink the WINDOW to button size — the window IS the button.
+     Tap -> /api/glass/ping?src=overlay-chip for the touch proof; once
+     touch is proven this becomes the "open the player menu" trigger.
+     ES5 / Qt 4.8 WebKit, self-contained. -->
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>Funcino chip</title>
+<style type="text/css">
+  html, body { margin:0; padding:0; width:200px; height:76px;
+               overflow:hidden; background:#0b0f14; }
+  #chip { position:absolute; left:0; top:0; width:194px; height:70px;
+          margin:3px; background:#e8c266; color:#0b0f14;
+          font-family:Arial,sans-serif; font-size:24px; font-weight:bold;
+          text-align:center; line-height:70px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="chip" onclick="chipTap()">&#9776; MENU</div>
+<script type="text/javascript">
+  function chipTap() {
+    var c = document.getElementById('chip');
+    c.style.background = '#9fb2c8';
+    var x = new XMLHttpRequest();
+    x.open('GET', '/api/glass/ping?src=overlay-chip', true);
+    x.onreadystatechange = function () {
+      if (x.readyState === 4) {
+        c.style.background = '#e8c266';
+        c.innerHTML = (x.status === 200) ? 'TOUCH \u2713' : 'hub?';
+        window.setTimeout(function () {
+          c.innerHTML = '\u2630 MENU';
+        }, 1500);
+      }
+    };
+    x.send(null);
+  }
+</script>
+</body>
+</html>

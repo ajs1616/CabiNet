@@ -1,0 +1,16836 @@
+#!/usr/bin/env python3
+"""
+CabiNet G2S Host (formerly CasinoNet) — MVP "machine joins" server.
+
+Spec-correct two-channel architecture (G2S Message Protocol v1.0.3 + the real
+IGT AVP capture at debug-captures/igt_exchange_20250725_235016.txt):
+
+  INBOUND  — the EGM POSTs SOAP-wrapped G2S to us (default 0.0.0.0:8081 /G2S).
+             The synchronous HTTP reply carries ONLY the message-level g2sAck
+             (escaped, double-wrapped). Never the application response.
+  OUTBOUND — WE originate POSTs to the EGM's own endpoint (egmLocation from its
+             commsOnLine) for every application-level response and host request:
+             commsOnLineAck, commsDisabledAck, keepAliveAck, setCommsState...
+
+Join choreography (spec ch.2 state machine):
+  EGM: commsOnLine            -> us: sync g2sAck, then POST commsOnLineAck   (EGM -> sync)
+  EGM: commsDisabled (30s hb) -> us: sync g2sAck, then POST commsDisabledAck
+  us:  POST setCommsState enable=true
+  EGM: commsStatus G2S_onLine -> JOINED (durable)
+
+Framing rules that the July-2025 attempt got wrong (spec §1.18.3, §2.2):
+  * a response NEVER echoes the request's commandId — it uses the HOST's own
+    monotonic sequence starting at 1 (commsOnLineAck seeds that sequence);
+  * request/response pairing is via sessionId, echoed verbatim;
+  * the application response must NOT ride in the synchronous HTTP reply.
+
+Cert-less permanently: the transport ack is the bare byte-matched form from the
+capture. No <g2s:certificate> anywhere, ever.
+
+Run from G2S/:  python3 g2s_host.py            (NO sudo — see bench checklist)
+"""
+
+import argparse
+import collections
+import errno
+import html
+import itertools
+import http.client
+import json
+import logging
+import logging.handlers
+import os
+import queue
+import random
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hub_store import HubStore, MAX_TICKET_FIELD_LEN   # noqa: E402  (sibling module, stdlib sqlite3)
+try:
+    # RFID fobs registry (hub.db v8): the tier list, the row cap and the
+    # UID canonicalizer live with the table's owner (hub_store).
+    from hub_store import FOB_TIERS, MAX_FOBS, _norm_fob_uid  # noqa: E402
+except ImportError:
+    # Mid-rollout hub_store without the v8 fobs slice — mirror the contract
+    # values so the companion ingest stays importable (and behaves
+    # identically) either way.
+    FOB_TIERS = ("player", "attendant", "manager", "reset")
+    MAX_FOBS = 256
+
+    def _norm_fob_uid(uid):
+        """Canonical fob UID: separators stripped, uppercase hex, 2..32
+        chars (byte-for-byte the hub_store._norm_fob_uid rule). None =
+        unparseable — the caller must treat it as no UID at all."""
+        if not isinstance(uid, str):
+            return None
+        u = uid.replace(":", "").replace("-", "").replace(" ", "").upper()
+        return u if re.fullmatch(r"[0-9A-F]{2,32}", u) else None
+
+# ----------------------------------------------------------------------------
+# Namespaces / constants
+# ----------------------------------------------------------------------------
+
+WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
+SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
+SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+SOAPACTION_SEND = "http://G2S.gamingstandards.com/SendG2SMessage"
+SOAPACTION_TRANSPORT = "http://G2S.gamingstandards.com/getTransportOptions"
+
+# IGT/GTK EXTENSION class namespaces → the exact prefixes the AVP uses on the
+# wire (from the captured commsOnLine advertisement). A class-level error
+# response to an extension request (e.g. licensing.getSecurityData) MUST put the
+# class element in its OWN namespace with these prefixes; emitting <g2s:licensing>
+# makes the AVP's gSOAP fail to deserialize and answer MSX004 in a retry loop.
+EXT_NS_PREFIX = {
+    "http://g2s.igt.com/licensing/v1.0.0": "igtLicensing",
+    "http://g2s.igt.com/mediaDisplay/v1.0.0": "igtMediaDisplay",
+    "http://g2s.igt.com/tournament/v1.0.0": "igtTourn",
+    "http://g2s.igt.com/CBG/v1.0.0": "cg",
+    "http://g2s.igt.com/playerContext/v1.0.0": "igtPC",
+    "http://g2s.igt.com/smartCard/v1.0.0": "igtSC",
+    "http://www.gtech.com/g2s/schemas/storage": "gtkST",
+}
+
+# igtMediaDisplay (#18): the IGT mediaDisplay extension — the on-glass
+# browser windows this host already OWNS (live-verified: the AVP's host-1
+# owned list carries IGT_mediaDisplay/1..6, the BB2E's /1+/2). The probe
+# ladder speaks under this namespace ON DEMAND ONLY: nothing fires at join,
+# the class stays OUT of SPOKEN_CLASSES, and a host that never receives a
+# mediaDisplayProbe emits zero mediaDisplay bytes (the replay gate pins it).
+MD_NS = "http://g2s.igt.com/mediaDisplay/v1.0.0"
+
+# The rung names /api/command mediaDisplayProbe accepts — ordered by the
+# ladder's risk gradient. Verbs are the AUTHORITATIVE igtMediaDisplay.xsd v1.8
+# (found 2026-07-10; the recon's showContent/hideContent were FICTION — they do
+# not exist in the schema, which is exactly why the AVP answered MSX004). The
+# real display path is loadContent -> setActiveContent -> showMediaDisplay; the
+# EGM assigns a transactionId at load and the host echoes it into the
+# transaction verbs (setactive/release/contentstatus). logstatus/log are the
+# safe diagnostic reads (they reveal the EGM-assigned transactionId + the URI
+# it actually recorded).
+MD_PROBE_RUNGS = ("status", "profile", "enable", "disable", "load",
+                  "logstatus", "log", "setactive", "show", "hide",
+                  "release", "contentstatus")
+
+# The load rung's default content: the FUNCINO hello page this host serves
+# itself — the decisive later rung is the AVP's built-in browser GETting it
+# (the UA-stamped journal line in _serve_webui is the P9 proof).
+MD_DEFAULT_CONTENT_URI = "http://192.168.50.2:8081/webui/hello.html"
+
+# Glass navigation v1 (#18 P4): ONE resident SPA per glass window — the hub
+# pushes webui/glass.html onto the cabinet's Service Window ONCE (glassShow),
+# the page stays resident and polls /api/glass/state every ~1.5s, and RFID
+# taps flip hub-side session state so the NEXT poll flips the view. A poll
+# flip costs <=1.5s; a G2S content swap costs ~5-8s — which is why navigation
+# never re-pushes content. Same hardcoded host base as MD_DEFAULT_CONTENT_URI
+# (the hub IS 192.168.50.2:8081 on the slot VLAN).
+GLASS_PAGE = "glass.html"
+GLASS_CONTENT_URI_BASE = "http://192.168.50.2:8081/webui/"
+# Device 1 = the AVP's left Service Window (256x1024) — the wire-proven HTML
+# renderer (dev 5 does not render; 3/4 are RAM-gated overlays).
+GLASS_DEFAULT_DEVICE = "1"
+# Content-push sequencer stage timeout: a push stalled mid-lifecycle
+# (loading/activating/showing) longer than this is ⚠️-logged and cleared —
+# the manual mediaDisplayProbe rungs stay usable as the fallback.
+GLASS_PUSH_TIMEOUT_SEC = 25
+# Card-IN recovery pushes (the self-heal after a machine/hub reboot) fire at
+# most this often per EGM, so a tap storm can never flood the FIFO with
+# 5-8s content lifecycles.
+GLASS_RECOVERY_THROTTLE_SEC = 60
+# Operator (attendant/manager) glass tokens idle out after this long with no
+# ACTION (the state poll deliberately never refreshes the clock — the page
+# polls forever, so a poll-refreshed horizon could never trip). Player
+# sessions NEVER idle-expire: the session is the wallet link (AJ's rule —
+# the CARD_SESSION_MAX_SEC=0 design carried onto the glass).
+GLASS_OPERATOR_IDLE_SEC = 600
+# An ADMIN OVERLAY (a supervisor tapped OVER a carded friend) auto-hands back
+# after this long with no activity on it — a distinct, SHORTER horizon than the
+# operator token's, because an overlay sits on top of an innocent player's
+# session and a walked-away admin must not hold the friend's glass hostage. The
+# attendant/manager token's own 600s idle already reroutes to pop+restore, but
+# an admin whose fob is player-tier mints a NEVER-idling token, so this sweep is
+# the backstop that reclaims it. The friend underneath is untouched — the sweep
+# only POPS the overlay and re-mints the player's token.
+ADMIN_OVERLAY_IDLE_SEC = 120
+# A NEVER-JOINED association (contacted the hub but never completed commsOnLine)
+# is a JOIN IN PROGRESS while it keeps talking, and junk once it goes silent.
+# ASSOC_JOINING_WINDOW_SEC: /api/status marks it joining=true while its last
+# contact is within this window, so the floor renders a distinct "Connecting…"
+# tile (tester feedback: "your machine reached the hub, the join is still
+# working") instead of nothing — past it the tile drops. ASSOC_REAP_SEC: the
+# watchdog PRUNES a silent never-joined association from memory (a client that
+# hit :8081 once and vanished can't linger forever — associations are otherwise
+# removed only by the manual Remove button). REAP > WINDOW so the tile
+# disappears (UI) before the record is swept (memory). A join that is genuinely
+# retrying keeps refreshing last_seen, so it is NEVER reaped while working; a
+# JOINED machine that went offline is never touched (it has commsOnLineSeen).
+ASSOC_JOINING_WINDOW_SEC = 120
+ASSOC_REAP_SEC = 300
+# The collector's GAMEROOM NAME (player-facing brand): a hub-wide personalization
+# (CabiNet is the product; the collector names their gameroom, AJ 2026-07-13),
+# shown on the glass/kiosk attract + footer in place of the old fixed brand.
+# Bounded so it fits the 256px glass attract line — the client steps the font
+# down for long names (the credits-display idiom); "" = unset -> neutral fallback.
+MAX_GAMEROOM_NAME_LEN = 28
+# The action gate for POST /api/glass/action (glass destub v1). The v1
+# NAVIGATION-only tier allowlist is retired: buttons are now REAL, gated by
+# the LIVE-resolved backend access (_session_is_admin), never a client-
+# claimed tier. Three bands (see _handle_glass_action):
+#   * GLASS_BASE_ACTIONS  — any carded session (logout).
+#   * GLASS_WALLET_ACTIONS — any carded session WITH a linked player wallet
+#     (walletFund/cashOutToWallet: the player moves only their OWN money).
+#   * GLASS_ADMIN_ACTIONS — _session_is_admin only (clearHandpay/refreshGames).
+# Anything outside these answers an honest 403 — never a 500. The hub ALWAYS
+# forces the egmId from the token (a page can only ever act on its own
+# cabinet) and re-resolves access server-side (a stale glass never decides).
+GLASS_BASE_ACTIONS = ("logout",)
+GLASS_WALLET_ACTIONS = ("walletFund", "cashOutToWallet", "cashOutNow")
+GLASS_ADMIN_ACTIONS = ("clearHandpay", "refreshGames")
+# 0x74 "available transfers" bit for machine->host cash-out (real SAS 6.02
+# Table 8.2b; the from-EGM counterpart of AVAIL_XFER_TO_EGM 0x01). The
+# machine->wallet cash-out gate (sas_from_egm_ready) reads this off the
+# satellite's reported aft.availXfers: set == the BB2 is menu-configured for
+# "soft cash-out to host". Mirrors SAS/modules/aft/aft_handler.py.
+AVAIL_XFER_FROM_EGM = 0x02
+# Sequencer setActiveContent retry knobs (BENCH LESSON 2026-07-10: the EGM
+# rejects setActiveContent with IGT_MDX005 "Content not loaded." until its
+# browser has fetched the page, so the advance is poll-driven with spaced
+# retries instead of firing on contentStatus IGT_contentPending).
+GLASS_RETRY_SPACING_SEC = 2.5
+GLASS_RETRY_MAX = 5
+# SPA-liveness horizon: the resident page's poll self-identifies
+# (&src=spa&dev=N), giving the hub a residency signal that SURVIVES host
+# restarts (the in-memory media_txn does not — live-hit IGT_MDX003 "Must
+# release loaded content." 2026-07-10 when a restarted hub loadContent-ed
+# over its own still-resident SPA). A poll fresher than this means the page
+# is fetched + executing on that window: recovery pushes skip, and an
+# explicit glassShow short-circuits to a bare showMediaDisplay.
+GLASS_SPA_LIVE_SEC = 8
+# Service-button debounce: one physical press can chirp several CBE301
+# events (4 in 3s observed live 2026-07-10), and a toggle must not flap.
+GLASS_BUTTON_DEBOUNCE_SEC = 2.0
+# Glass follows the card (AJ 2026-07-10: "the game can play full screen
+# when the menu isn't needed"): the Service Window is a SCALE type — while
+# shown it carves its 256px out of the game — so the hub hides it whenever
+# nobody is carded in and shows it again at card-IN (the content stays
+# resident under a hide, so the show is instant, no reload). The true
+# no-carve answer is the overlay-window chip (dev 3/4) — bench-gated on
+# RAM + touch; this is the shipping behavior until that lands.
+GLASS_FOLLOW_CARD = True
+
+# Host-originated keepAlive cadence (seconds) while onLine. The real AVP was
+# observed to NEVER emit its own keepAlive pulse (lastKeepAlive=0), so with no
+# traffic the SOAP transport idled out at ~30-55s and the EGM ran its §2.3.9
+# lost-communications recovery — the observed re-handshake. We POST a keepAlive
+# this often to keep BOTH transport directions warm: comfortably under that
+# idle window, above the spec's discouraged 5s floor (§2.28).
+HOST_KEEPALIVE_SEC = 10
+
+# Outbound POST timeout (seconds) for host->EGM sends (GR-19). MUST stay BELOW
+# HOST_KEEPALIVE_SEC: with timeout == ping cadence, a black-holing endpoint
+# (firewall DROP) makes every doomed keepAlive cost a full interval, so the
+# FIFO drain rate equals the arrival rate — the backlog never shrinks and a
+# rejoin's commsOnLineAck can wait a whole timeout behind an in-flight stale
+# keepAlive. At 5s the worker fails fast and the queue drains ahead.
+EGM_POST_TIMEOUT_SEC = 5
+
+# Dead-link demotion (GR-01). The overnight 8h EGM power-off proved the host
+# had NO lost-comms state: it stayed 'onLine', POSTed a doomed keepAlive every
+# 10s (2,900 CRITICALs) and the watchdog wrote 1,449 identical WARNINGs — 84%
+# of the host log — while /api/status lied 'onLine' all night. When either
+# threshold below trips, comms_state demotes to 'offline': every spam source
+# (pinger cadence, watchdog warn branch, per-attempt CRITICALs, game sweep)
+# keys off comms_state=='onLine' and self-silences. Recovery needs NO special
+# host action — the AVP re-handshakes autonomously (live-proven 10:57:07) and
+# the commsOnLine handler has no state precondition. While offline the pinger
+# keeps a LOW-rate probe so an asymmetric heal (outbound path returns without
+# an EGM re-handshake) is also detected host-side.
+KEEPALIVE_FAIL_DEMOTE = 6         # consecutive keepAlive POST failures -> offline
+KEEPALIVE_SILENCE_DEMOTE_SEC = 75  # onLine but no keepAliveAck this long -> offline
+OFFLINE_PROBE_SEC = 60            # low-rate keepAlive probe cadence while offline
+OFFLINE_REMINDER_SEC = 600        # still-offline reminder interval (with counts)
+
+# Log growth control (GR-02). The overnight session measured the un-rotated
+# wire log growing ~15MB/h machine-on (~370MB/day) — dominated by the
+# 2,142-meter periodic meterInfo push at ~225KB verbatim every 60s — on the
+# Pi's SD card, with a fresh timestamped file pair minted per process start
+# and never pruned (134 files, 47 zero-byte crash-loop stubs). Rotation caps
+# any single run; the startup sweep (sweep_log_dir) reclaims stubs and
+# expired runs; meter-heavy wire bodies log as an INFO digest with the full
+# body kept at DEBUG (--wire-full / -v).
+WIRE_LOG_MAX_BYTES = 30 * 1024 * 1024   # per wire-log file before rollover
+WIRE_LOG_BACKUPS = 5                    # keep g2s_wire_*.log.1 .. .5
+HOST_LOG_MAX_BYTES = 10 * 1024 * 1024
+HOST_LOG_BACKUPS = 3
+LOG_RETENTION_DAYS = 14                 # startup sweep prunes older run files
+WIRE_DIGEST_MIN_BYTES = 16384           # meter-heavy bodies >= this -> digest
+MAX_POST_BYTES = 2 * 1024 * 1024        # request-body ceiling (SAS-bridge F2)
+
+# Classes this host actively speaks (GR-21) — inbound commands handled by
+# G2SHost.dispatch and/or host-originated requests it builds. Drives the
+# §1.18.3.3 split for unhandled requests: G2S_APX008 "command not supported"
+# when the class IS spoken, G2S_APX007 "class not supported" otherwise. The
+# old inline tuple (communications/voucher/handpay) predated seven handler
+# classes and silently drifted; dispatch is an if/elif chain (no literal
+# table to derive from), so this frozenset is the ONE named source — add
+# your class here when you add its first handler, and the replay gate pins
+# both sides (unknown cabinet command -> APX008; licensing stays APX007 —
+# the wire-proven stable getSecurityData loop. NEVER add licensing here).
+SPOKEN_CLASSES = frozenset((
+    "communications", "cabinet", "commConfig", "eventHandler", "gamePlay",
+    "meters", "noteAcceptor", "optionConfig", "voucher", "handpay", "wat",
+    "download",  # RB: reboot script (setDownloadState/setScript) + the
+    #              downloadStatus/scriptStatus response folds
+    "bonus",     # G2S-41: reads + setBonusAward/commitBonus money cycle
+))
+
+# Join-sequence gamePlay sweep pacing (G2S-21, un-gated 2026-07-02). The real
+# AVP's descriptorList reveals 119 gamePlay devices (first-light capture) =
+# 357 status/profile/denoms reads. The sweep runs on its own epoch-gated
+# thread: it enqueues GP_SWEEP_BATCH devices' reads (x3 each) at a time, then
+# waits for the per-assoc FIFO to drain plus GP_SWEEP_DELAY_SEC before the
+# next batch, so interactive /api/command sends queue behind at most ONE
+# batch — never the whole 357-read sweep.
+GP_SWEEP_BATCH = 8
+GP_SWEEP_DELAY_SEC = 0.5
+GP_SWEEP_DRAIN_WAIT_SEC = 15
+
+# On-demand gamePlay STATUS refresh (GR-30). The join sweep (G2S-21) reads
+# status/profile/denoms ONCE per epoch; absent a re-handshake the enabled-state
+# then freezes, because a game enabled/disabled at the EGM's OWN operator/e-key
+# menu fires no host-visible refresh (LIVE-observed 2026-07-09: Da Vinci
+# Diamonds played on the wire — GPE112/GPE113 for its device — while the games
+# list still showed it disabled from a 6-day-old sweep). Rather than poll on a
+# timer (a 119-device flood every few minutes for something that only changes
+# when the operator touches the machine), the games list carries a manual
+# "refresh" button that fires refresh_game_play_status: a one-shot re-read of
+# ONLY gamePlayStatus (hostEnabled/egmEnabled) for every device, paced in the
+# SAME batches as the join sweep. Profile (RTP/wagerCategories) and denoms are
+# static per theme+paytable and left alone — the status response merges IN
+# PLACE (gp.update, GR-28), so a status-only refresh never wipes them.
+
+# gamePlay inventory persistence debounce (GR-28). The sweep lands ~357
+# status/profile/denoms parses in bursts; persisting (tmp+fsync+rename+dir
+# fsync, the GR-03 pattern) on EVERY parse would fsync hundreds of times per
+# sweep. Instead each parse just stamps game_play_last_update_ts and a single
+# trailing-edge flusher thread writes once the updates have been quiet for
+# GP_PERSIST_QUIET_SEC (comfortably above the 0.5s inter-batch settle, so a
+# full sweep persists ~once at completion). GP_PERSIST_MAX_WAIT_SEC bounds a
+# never-quiet burst with periodic checkpoints so a mid-sweep crash doesn't
+# lose everything.
+GP_PERSIST_QUIET_SEC = 2.0
+GP_PERSIST_MAX_WAIT_SEC = 30.0
+
+# Join-time auto clock-sync threshold in seconds (G2S-20). The real AVP drifts
+# (observed ~19min behind wall-clock) and >30s of skew risks G2S_APX011
+# request expiry on timeToLive checks. When the skew measured from the EGM's
+# own dateTimeSent exceeds this at join, the host sends cabinet.setDateTime
+# once (--no-auto-clock disables). Spec §3.13 recommends host correction only
+# beyond 5s; 30s is our conservative "actually breaks things" line.
+CLOCK_SKEW_SYNC_SEC = 30
+
+# Standing meter-subscription cadence in ms (G2S-16). 60000 is the schema
+# MINIMUM periodicInterval (spec §5.21 Table 5.19, minIncl 60000; default
+# 900000) — the hobbyist live-leaderboard cadence. periodicBase/eodBase stay
+# 0 (ms after midnight), so the periodic trigger lands on minute boundaries
+# and the EOD snapshot fires at midnight.
+METER_SUB_PERIODIC_MS = 60000
+
+# (house-hold meter settlement REMOVED 2026-07-15 — collector de-cage. A home
+# game room's Bank is the settable bankroll minus what you hand out; machine
+# take-tracking/drift was casino cage accounting. The hub.db v7 hold tables
+# remain in the schema chain, dormant. Do not rebuild.)
+
+# Byte-matched to the only exchange the real AVP accepted (capture lines 134-139).
+# Bare ack, wsdl namespace, NO certificate element. Do not "improve" this.
+TRANSPORT_ACK = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" '
+    'xmlns:g2s="http://www.gamingstandards.com/wsdl/g2s/v1.0">\n'
+    "    <SOAP-ENV:Body>\n"
+    "        <g2s:g2sTransportAckVersion>1.0</g2s:g2sTransportAckVersion>\n"
+    "    </SOAP-ENV:Body>\n"
+    "</SOAP-ENV:Envelope>"
+)
+
+log = logging.getLogger("g2s_host")
+wire = logging.getLogger("g2s_wire")
+
+
+def now_iso():
+    """XML dateTime, UTC, millisecond precision (spec §1.12 requires ms)."""
+    dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def escape_g2s_string(s):
+    """Escape an inner g2sMessage for embedding as the TEXT CONTENT of a SOAP
+    g2sResponse/g2sRequest element, byte-mirroring the AVP's own emission:
+    only & < > are escaped (attribute quotes stay RAW), and newlines become
+    &#xA;. NOT html.escape — that also escapes quotes to &quot;, which does not
+    match the machine's wire format."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace("\n", "&#xA;"))
+
+
+def localname(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def attr(el, name):
+    """Read an attribute that may be g2s:-prefixed (IGT style) or bare."""
+    v = el.get(f"{{{SCHEMA_NS}}}{name}")
+    if v is None:
+        v = el.get(name)
+    return v
+
+
+def parse_g2s_datetime(value):
+    """Parse a spec §1.12 XML dateTime into an aware UTC datetime (or None).
+    Tolerates any number of fractional digits (recipients truncate >3 /
+    zero-pad <3 per §1.12), a 'Z' or ±HH:MM offset, or NO offset — which the
+    spec defines as already-UTC. Never raises: an unparseable clock yields
+    None (AVP-silence tolerance applies to garbage timestamps too)."""
+    if not value:
+        return None
+    m = re.match(
+        r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+        r"(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$", value.strip())
+    if not m:
+        return None
+    try:
+        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                      int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                      int((m.group(7) or "0")[:6].ljust(6, "0")),
+                      tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    tz = m.group(8)
+    if tz and tz != "Z":
+        sign = 1 if tz[0] == "+" else -1
+        dt -= sign * timedelta(hours=int(tz[1:3]), minutes=int(tz[4:6]))
+    return dt
+
+
+# ----------------------------------------------------------------------------
+# Event metadata — turn raw G2S event codes into human/UI-friendly labels
+# (G2S-12). A G2S event code is G2S_<2-char class><E><nnn>, e.g. G2S_CBE301.
+# The class prefix drives category + icon; specific codes get a friendly label.
+# Labels are BEST-EFFORT from the spec/common IGT usage — the real machine's
+# exact codes get confirmed from the wire and refined here. Cosmetic only.
+# ----------------------------------------------------------------------------
+
+# Prefixes verified against the v1.0.3 spec's per-class event tables
+# (G2S-12 hook audit, 2026-07-02): handpay is G2S_JPE* (§11.24 — "JP" as in
+# jackpot), hopper is G2S_HPE* (§14.12), printer is G2S_PTE* (§16.21),
+# player is G2S_PRE* (ch.20), WAT is G2S_WTE* (§22), GAT is G2S_GAE* (§23),
+# central is G2S_CLE* (§24.26). The old guesses HP=handpay / HO=hopper /
+# PR=printer / PL=player / WA=wat matched nothing in the spec.
+EVENT_CLASS_PREFIX = {
+    "CM": ("communications", "📶"), "CB": ("cabinet", "🖥️"),
+    "EH": ("eventHandler", "🔔"), "MT": ("meters", "📊"),
+    "GP": ("gamePlay", "🎰"), "CC": ("commConfig", "🔧"),
+    "OC": ("optionConfig", "⚙️"), "DL": ("download", "⬇️"),
+    "NA": ("noteAcceptor", "💵"), "ND": ("noteDispenser", "💸"),
+    "CA": ("coinAcceptor", "🪙"), "HP": ("hopper", "🪙"),
+    "PT": ("printer", "🎫"), "JP": ("handpay", "🎉"),
+    "VC": ("voucher", "🎟️"), "WT": ("wat", "🏦"),
+    "PG": ("progressive", "💰"), "BN": ("bonus", "✨"),
+    "PR": ("player", "👤"), "ID": ("idReader", "💳"),
+    "GA": ("gat", "🧪"), "CL": ("central", "🎲"),
+    "GM": ("gameDenomMeters", "📊"),
+}
+
+# Specific codes worth a friendly label. CBE301-308 corrected to the spec's
+# cabinet event table (GR-11, §3.24 "Events: Resulting from cabinetStatus
+# Changes"): 301/302 = Service Lamp (fires on the Service button too),
+# 303/304 = Logic Door, 305/306 = Auxiliary Door, 307/308 = Cabinet (main)
+# Door. Wire-proven on this AVP 2026-07-02: the CBE307 eventReport's own
+# meterList increments G2S_cabinetDoorOpenCnt, and the old "Stacker door"
+# guess collided with the real stacker events NAE112/113 below.
+EVENT_LABELS = {
+    # G2S_CBE101-106 are the host-enable/disable pushes (§3.22) — the old
+    # "config changed" guess for 101 matched nothing in the spec.
+    "G2S_CBE101": "Host disabled game play",
+    "G2S_CBE102": "Host enabled game play",
+    "G2S_CBE103": "Host disabled money in",
+    "G2S_CBE104": "Host enabled money in",
+    "G2S_CBE105": "Host disabled money out",
+    "G2S_CBE106": "Host enabled money out",
+    "G2S_CBE301": "💡 Service lamp ON (service button)",
+    "G2S_CBE302": "💡 Service lamp off",
+    "G2S_CBE303": "🚪 Logic door OPENED",
+    "G2S_CBE304": "🚪 Logic door closed",
+    "G2S_CBE305": "🚪 Auxiliary door OPENED",
+    "G2S_CBE306": "🚪 Auxiliary door closed",
+    "G2S_CBE307": "🚪 Cabinet (main) door OPENED",
+    "G2S_CBE308": "🚪 Cabinet (main) door closed",
+    "G2S_CBE309": "⚠️ General cabinet tilt",
+    "G2S_CBE310": "⚠️ Video display error",
+    "G2S_CBE311": "⚠️ NVRAM failure",
+    "G2S_CBE312": "⚠️ General memory failure",
+    "G2S_CBE313": "✅ Cabinet tilt cleared",
+    "G2S_CBE315": "🕒 Date/time changed",
+    "G2S_CBE316": "💳 Cash-out button pressed",
+    "G2S_CBE317": "🔌 Power off — logic door open",
+    "G2S_CBE318": "🔌 Power off — auxiliary door open",
+    "G2S_CBE319": "🔌 Power off — cabinet door open",
+    "G2S_CBE320": "🔧 Operator reset cabinet",
+    "G2S_CBE322": "🧹 NVM cleared",
+    "G2S_CBE323": "🔋 Backup battery LOW",
+    "G2S_CBE324": "🔌 EGM power LOST",
+    "G2S_CBE325": "🔌 EGM power UP",
+    "G2S_CBE326": "⚠️ Hard meters disconnected",
+    "G2S_CBE327": "Hard meters reconnected",
+    # gamePlay cycle events per the spec table §6.23 — the old labels put
+    # "game started" on GPE104, which is really Wager Changed (GPE103 is
+    # Primary Game Started).
+    "G2S_GPE101": "Primary game escrow",
+    "G2S_GPE102": "⚠️ Primary game FAILED",
+    "G2S_GPE103": "🎰 Primary game STARTED",
+    "G2S_GPE104": "Wager changed",
+    "G2S_GPE105": "🎰 Primary game ended",
+    "G2S_GPE106": "Secondary game choice",
+    "G2S_GPE107": "Secondary game escrow",
+    "G2S_GPE108": "⚠️ Secondary game FAILED",
+    "G2S_GPE109": "Secondary game started",
+    "G2S_GPE110": "Secondary game ended",
+    "G2S_GPE111": "Game result",
+    "G2S_GPE112": "🎰 Game ENDED (meters final)",
+    "G2S_GPE113": "Game idle",
+    "G2S_NAE114": "💵 Bill STACKED (money in)",
+    "G2S_NAE112": "🚪 Stacker door opened",
+    "G2S_NAE113": "🚪 Stacker door closed",
+    "G2S_NAE001": "💵 Bill acceptor disabled (EGM)",
+    "G2S_NAE002": "💵 Bill acceptor enabled (EGM)",
+    "G2S_NAE003": "💵 Bill acceptor disabled by host",
+    "G2S_NAE004": "💵 Bill acceptor enabled by host",
+    "G2S_NAE099": "💵 Bill acceptor faults cleared",
+    "G2S_NAE101": "⚠️ Bill acceptor jam",
+    "G2S_NAE102": "⚠️ Bill acceptor fault",
+    "G2S_NAE103": "⚠️ Stacker REMOVED",
+    "G2S_NAE104": "Stacker inserted",
+    "G2S_NAE105": "⚠️ Stacker FULL",
+    "G2S_NAE106": "⚠️ Stacker jam",
+    "G2S_NAE107": "⚠️ Stacker fault",
+    "G2S_NAE108": "💵 Note returned",
+    "G2S_NAE109": "🎟️ Voucher returned",
+    "G2S_NAE110": "💵 Note/voucher rejected",
+    "G2S_NAE111": "Validator totals reset",
+    "G2S_NAE115": "🎟️ Voucher stacked (metered in voucher class)",
+    "G2S_NAE116": "💵 Note in escrow",
+    "G2S_NAE117": "⚠️ Stacker nearly full",
+    "G2S_NAE901": "⚠️ Bill acceptor disconnected",
+    "G2S_NAE902": "Bill acceptor connected",
+    # Handpay is the G2S_JPE* family (§11.24) — the old G2S_HPE101/102
+    # "handpay" labels were actually the hopper class (§14.12: HPE101 =
+    # Hopper Empty, HPE102 = Hopper Full).
+    "G2S_HPE101": "🪙 Hopper empty",
+    "G2S_HPE102": "🪙 Hopper full",
+    "G2S_JPE101": "🎉 HANDPAY PENDING (jackpot lockup)",
+    "G2S_JPE102": "Handpay request acknowledged",
+    "G2S_JPE103": "🔑 Remote key-off initiated",
+    "G2S_JPE104": "🎉 Handpay KEYED OFF",
+    "G2S_JPE105": "Key-off acknowledged",
+    "G2S_JPE106": "Cancelled-credit request cancelled",
+    # Printer per §16.21 — PTE101 is Print TRANSFER FAILED, not "printed".
+    "G2S_PTE101": "⚠️ Print transfer failed",
+    "G2S_PTE102": "🎫 Print completed",
+    "G2S_PTE103": "⚠️ Print failed",
+    "G2S_PTE205": "⚠️ Printer paper jam",
+    "G2S_PTE206": "🎫 Printer paper low",
+    "G2S_PTE207": "⚠️ Printer paper EMPTY",
+    "G2S_VCE103": "🎟️ Ticket-OUT issued",
+    "G2S_VCE106": "🎟️ Voucher redemption requested",
+    "G2S_VCE107": "Voucher authorized",
+    "G2S_VCE108": "🎟️ Ticket-IN redeemed",
+    "G2S_VCE109": "⚠️ Voucher rejected",
+    "G2S_VCE111": "Voucher commit acknowledged",
+    # wat per the ch.22 event table (Table 22.42, G2S-39). Note the spec
+    # SKIPS WTE007/WTE008 — the numbering really is 001-006, 009, 010.
+    "G2S_WTE001": "🏦 WAT disabled by EGM",
+    "G2S_WTE002": "🏦 WAT enabled by EGM",
+    "G2S_WTE003": "🏦 WAT disabled by host",
+    "G2S_WTE004": "🏦 WAT enabled by host",
+    "G2S_WTE005": "WAT configuration changed by host",
+    "G2S_WTE006": "WAT configuration changed by operator",
+    "G2S_WTE009": "🔒 EGM locked by WAT host",
+    "G2S_WTE010": "EGM unlocked by WAT host",
+    "G2S_WTE101": "WAT cash-out to host disabled",
+    "G2S_WTE102": "🏦 WAT cash-out to host enabled",
+    "G2S_WTE103": "🏦 WAT transfer requested by host",
+    "G2S_WTE104": "WAT transfer cancel requested by host",
+    "G2S_WTE105": "🏦 WAT transfer initiated",
+    "G2S_WTE106": "🏦 WAT transfer authorized",
+    "G2S_WTE107": "💸 WAT TRANSFER COMPLETED (meters final)",
+    "G2S_WTE108": "WAT commit acknowledged",
+    "G2S_WTE109": "New WAT key pair established",
+    "G2S_WTE110": "⚠️ New WAT key pair failed (invalid key value)",
+    # bonus (G2S-41): labels are the recovered ch.19 TOC texts VERBATIM
+    # (dossier §5 — the event-code table survived in the TOC + the live
+    # supportedEvents capture); nothing here is a reconstructed guess.
+    "G2S_BNE001": "🎁 Bonus device disabled by EGM",
+    "G2S_BNE002": "🎁 Bonus device enabled by EGM",
+    "G2S_BNE003": "🎁 Bonus device disabled by host",
+    "G2S_BNE004": "🎁 Bonus device enabled by host",
+    "G2S_BNE005": "Bonus configuration changed by host",
+    "G2S_BNE006": "Bonus configuration changed by operator",
+    "G2S_BNE007": "🔒 EGM locked by bonus host",
+    "G2S_BNE008": "EGM unlocked by bonus host",
+    "G2S_BNE101": "🎁 Bonus period STARTED",
+    "G2S_BNE102": "🎁 Bonus period ended",
+    "G2S_BNE103": "🎁 BONUS AWARD PENDING",
+    "G2S_BNE104": "🎁💰 BONUS AWARD PAID (meters final)",
+    "G2S_BNE105": "🎁⚠️ BONUS AWARD FAILED",
+    "G2S_BNE106": "🎁 Bonus award canceled",
+    "G2S_BNE107": "Bonus award acknowledged",
+    "G2S_BNE108": "🎁⚠️ Bonus host communications LOST (§19.4 watchdog)",
+    "G2S_BNE109": "🎁 Bonus host communications restored",
+}
+
+
+def event_meta(code):
+    """Return {label, category, icon} for a G2S event code (best-effort)."""
+    category, icon = "other", "•"
+    if code and code.startswith("G2S_") and len(code) >= 6:
+        category, icon = EVENT_CLASS_PREFIX.get(code[4:6], ("other", "•"))
+    return {"label": EVENT_LABELS.get(code, code), "category": category,
+            "icon": icon}
+
+
+def denom_dollars(millicents):
+    """G2S millicents -> a human note/denom label: 2000000 -> '$20',
+    25000 -> '$0.25'. Best-effort — a garbage value echoes back verbatim
+    rather than raising (silence/garbage tolerance applies to money labels
+    too)."""
+    try:
+        mc = int(millicents)
+    except (TypeError, ValueError):
+        return str(millicents)
+    if mc % 100000 == 0:
+        return f"${mc // 100000:,}"
+    return f"${mc / 100000:,.2f}"
+
+
+# ----------------------------------------------------------------------------
+# Typed event hooks (G2S-12/13) — a small semantic-callback layer over the
+# LIVE eventReport path. Each entry maps a spec-verified event code onto a
+# named hook plus static extras; the dispatcher (G2SHost.fire_event_hooks)
+# builds a normalized dict and fires every callback registered for that hook
+# (or for "*"). Deliberately conservative: only codes verified against the
+# v1.0.3 event tables — and, where noted, on this AVP's own wire — are
+# mapped; everything else still lands in the recentEvents ring, just without
+# a semantic hook. Backfilled log entries and deduped retries NEVER fire
+# hooks: the tape is what happened live, not what we later learned about.
+# ----------------------------------------------------------------------------
+
+EVENT_HOOK_CODES = {
+    # doors — cabinet event table §3.24 (GR-11-corrected; CBE307 wire-proven
+    # on this AVP 2026-07-02) + the noteAcceptor stacker/drop door §13.19
+    "G2S_CBE303": ("door_open",  {"door": "logic"}),
+    "G2S_CBE304": ("door_close", {"door": "logic"}),
+    "G2S_CBE305": ("door_open",  {"door": "auxiliary"}),
+    "G2S_CBE306": ("door_close", {"door": "auxiliary"}),
+    "G2S_CBE307": ("door_open",  {"door": "cabinet"}),
+    "G2S_CBE308": ("door_close", {"door": "cabinet"}),
+    "G2S_NAE112": ("door_open",  {"door": "stacker"}),
+    "G2S_NAE113": ("door_close", {"door": "stacker"}),
+    # service button — §3.24 CBE301 Service Lamp On. Live-proven 2026-07-10:
+    # with the operator's "app controls service button" enabled the AVP does
+    # NOT toggle the media window itself — it narrates each press as CBE301
+    # (~300ms to the hub), so the HUB is the app that controls it: the
+    # service_button hook toggles the resident glass menu (AJ's design —
+    # the cabinet's own button opens the player panel).
+    "G2S_CBE301": ("service_button", {}),
+    # tilt — §3.24.9 General Cabinet Tilt (live-proven overnight 2026-07-02)
+    # and §3.24.13 Cabinet Tilt Cleared
+    "G2S_CBE309": ("tilt", {}),
+    "G2S_CBE313": ("tilt_clear", {}),
+    # power — §3.27; CBE324/325 both appeared in the overnight live stream
+    "G2S_CBE317": ("power_loss", {"door": "logic"}),
+    "G2S_CBE318": ("power_loss", {"door": "auxiliary"}),
+    "G2S_CBE319": ("power_loss", {"door": "cabinet"}),
+    "G2S_CBE324": ("power_loss", {}),
+    "G2S_CBE325": ("power_up", {}),
+    # money in — §13.19.22 Note Stacked; the dispatcher adds denomination
+    # extras from the typed bill record when the transaction rode along
+    "G2S_NAE114": ("bill_in", {}),
+    # handpay lockup lifecycle — §11.24 (the handpay class is G2S_JPE*)
+    "G2S_JPE101": ("handpay_pending", {}),
+    "G2S_JPE104": ("handpay_keyed_off", {}),
+    # game cycle — §6.23: GPE103 Primary Game Started; GPE112 Game Ended is
+    # the cycle-complete event that finalizes the meters (GPE105 only ends
+    # the PRIMARY game, so it stays label-only to avoid double game_end)
+    "G2S_GPE103": ("game_start", {}),
+    "G2S_GPE112": ("game_end", {}),
+    # vouchers — §21.29
+    "G2S_VCE103": ("voucher_issued", {}),
+    "G2S_VCE108": ("voucher_redeemed", {}),
+    # wat (G2S-39): wat_transfer_completed / wat_transfer_failed deliberately
+    # do NOT ride event codes. G2S_WTE107 fires only on success and carries
+    # none of the amounts, while a failed transfer has NO event code at all —
+    # so both hooks fire from the commitTransfer dispatch handler instead
+    # (the authoritative, §22.31-deduped moment, with the ACTUAL transferred
+    # amounts as extras). Mapping WTE107 here as well would double-tape every
+    # live success. See the commitTransfer handler.
+    # bonus (G2S-41): the award lifecycle the EGM narrates (dossier §2.2 —
+    # BNE103 pending / BNE104 paid / BNE105 failed, all three live-advertised
+    # by this AVP's supportedEvents). Tape entries only + a ring stamp via
+    # _bonus_award_event_stamp; MONEY NEVER MOVES on an event — the
+    # commitBonus dispatch handler is the single debit point.
+    "G2S_BNE103": ("bonus_award_pending", {}),
+    "G2S_BNE104": ("bonus_award_paid", {}),
+    "G2S_BNE105": ("bonus_award_failed", {}),
+}
+
+
+class EventHookRegistry:
+    """Named-callback registry for the semantic event hooks (G2S-12).
+
+    register(hook, fn) attaches fn to one hook name ("door_open", ...) or to
+    "*" for every hook; fire(hook, info) calls each matching callback with
+    the normalized info dict. Callbacks run on the HTTP handler thread that
+    parsed the eventReport, OUTSIDE assoc.lock — they may take their own
+    locks but must stay quick and must never raise (a failing callback is
+    logged and skipped; the wire path is silence/garbage tolerant, so it is
+    hook-failure tolerant too)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hooks = {}                 # hook name (or "*") -> [callbacks]
+
+    def register(self, hook, callback):
+        with self._lock:
+            self._hooks.setdefault(hook, []).append(callback)
+
+    def fire(self, hook, info):
+        with self._lock:
+            cbs = list(self._hooks.get(hook, ())) + \
+                list(self._hooks.get("*", ()))
+        for cb in cbs:
+            try:
+                cb(info)
+            except Exception:
+                log.exception("event hook %r callback failed (ignored)", hook)
+
+
+# The bounded engine-level activity tape the default "*" hook feeds —
+# newest-first, consumed by /api/status "activity" (Test Panel tape today,
+# product UI + SMIB screens later).
+ACTIVITY_CAP = 100
+
+
+# ----------------------------------------------------------------------------
+# optionConfig current-value helpers (G2S-27) — the change cycle needs to
+# faithfully round-trip an option's <optionCurrentValues>: capture the full
+# structured value set from the config-sync push, edit exactly ONE param, and
+# re-emit the COMPLETE set (§9.15 p.362 — "no single-param deltas": the EGM
+# rejects a partial set, so we copy the live values and change one).
+# ----------------------------------------------------------------------------
+
+# The scalar value element tags that carry a paramId-keyed current value
+# (§9.13.10 Table 9.24-9.25). complexValue is the grouping wrapper.
+OPTION_VALUE_TAGS = ("booleanValue", "integerValue", "decimalValue",
+                     "stringValue")
+
+
+def parse_option_current_values(cv_el):
+    """Parse an <optionCurrentValues> element into an ordered structured list
+    that build_option_current_values_xml() can faithfully re-emit. Each entry
+    is either {"kind":"value", tag, paramId, value} for a flat scalar, or
+    {"kind":"complex", paramId, children:[{tag,paramId,value}...]} for a
+    complexValue wrapper. Order + structure are preserved so a re-emitted set
+    is byte-faithful to what the EGM sent (a repeated complexValue paramId —
+    e.g. a data table — round-trips too).
+
+    Returns (entries, lossy). lossy=True flags any shape this parser CANNOT
+    round-trip — a complexValue nested inside a complexValue (legal G2S:
+    §9.13.9 allows complexParameter-within-complexParameter, and
+    c_complexValue mirrors it) or any unrecognized child — so the change
+    cycle can refuse the option instead of re-emitting a silently-pruned
+    'complete' set (§9.15 sends the WHOLE set; a pruned one is rejected
+    atomically by the EGM). Wire-proven unreachable on THIS AVP (0 nested
+    among 408 complexValue blocks in the live 2026-07-02 inventory) — the
+    guard is for future EGMs (e.g. the WMS BB2Es)."""
+    out = []
+    lossy = False
+    for child in cv_el:
+        tag = localname(child.tag)
+        pid = attr(child, "paramId")
+        if tag == "complexValue":
+            kids = []
+            for gc in child:
+                gtag = localname(gc.tag)
+                if gtag in OPTION_VALUE_TAGS:
+                    kids.append({"tag": gtag, "paramId": attr(gc, "paramId"),
+                                 "value": (gc.text or "").strip()})
+                else:
+                    lossy = True  # nested complexValue / unknown shape
+            out.append({"kind": "complex", "paramId": pid, "children": kids})
+        elif tag in OPTION_VALUE_TAGS:
+            out.append({"kind": "value", "tag": tag, "paramId": pid,
+                        "value": (child.text or "").strip()})
+        else:
+            lossy = True  # unrecognized top-level child — not re-emittable
+    return out, lossy
+
+
+def option_value_param_ids(cv):
+    """The set of paramIds addressable within a structured current-value list
+    (flat scalars + complexValue children)."""
+    ids = set()
+    for e in cv:
+        if e["kind"] == "value":
+            if e["paramId"] is not None:
+                ids.add(e["paramId"])
+        else:
+            for k in e["children"]:
+                if k["paramId"] is not None:
+                    ids.add(k["paramId"])
+    return ids
+
+
+def option_param_values(cv):
+    """Flatten ONE option's structured current-value list to a paramId ->
+    value map: flat scalars plus complexValue children, exactly the shapes
+    parse_option_current_values records. Defensive .get()s throughout —
+    the list may come from the persisted store, not just a live parse.
+    The read-side twin of edit_option_current_value; also the comparator
+    for the G2S-27 post-apply verification read-back."""
+    params = {}
+    for e in cv or []:
+        if e.get("kind") == "value":
+            if e.get("paramId") is not None:
+                params[e["paramId"]] = e.get("value") or ""
+        else:
+            for k in e.get("children") or []:
+                if k.get("paramId") is not None:
+                    params[k["paramId"]] = k.get("value") or ""
+    return params
+
+
+def option_values_equal(a, b):
+    """The ONE comparator for option values (post-review 2026-07-02): the
+    enableRemoteHandpay no-op guard and the post-apply verify read-back both
+    use it, so they can never disagree about 'at target' (the guard used to
+    case-fold while the verify compared strict — an EGM emitting 'True'
+    would read as already-enabled yet stamp verifyFailed). Whitespace is
+    stripped on both sides; boolean literals compare case-folded (an
+    xs:boolean read-back may legally spell True/TRUE); everything else stays
+    strict, so a stringValue case change still fails verification honestly."""
+    a = ("" if a is None else str(a)).strip()
+    b = ("" if b is None else str(b)).strip()
+    la, lb = a.lower(), b.lower()
+    if la in ("true", "false") and lb in ("true", "false"):
+        return la == lb
+    return a == b
+
+
+def derive_handpay_options(config_options):
+    """Rebuild the handpay paramId -> value map (assoc.handpay_options) from a
+    STRUCTURED config-options inventory — the same values the live optionList
+    parse extracts from the wire, but recoverable from the persisted store so
+    a warm host restart keeps handpayRemoteCreditAllowed visible (GR-10)."""
+    params = {}
+    for opt in config_options.values():
+        if opt.get("deviceClass") != "G2S_handpay":
+            continue
+        params.update(option_param_values(opt.get("currentValues")))
+    return params
+
+
+def edit_option_current_value(cv, param_id, new_value):
+    """Return (new_cv, matches, old_value): a DEEP copy of the structured
+    current-value list with every occurrence of param_id set to new_value.
+    matches is how many were changed (0 = paramId not present; >1 = ambiguous
+    — the caller refuses both). The original list is never mutated."""
+    new = [dict(e, children=[dict(k) for k in e["children"]])
+           if e["kind"] == "complex" else dict(e) for e in cv]
+    matches = 0
+    old = None
+    for e in new:
+        if e["kind"] == "value" and e["paramId"] == param_id:
+            old = e["value"]
+            e["value"] = new_value
+            matches += 1
+        elif e["kind"] == "complex":
+            for k in e["children"]:
+                if k["paramId"] == param_id:
+                    old = k["value"]
+                    k["value"] = new_value
+                    matches += 1
+    return new, matches, old
+
+
+def build_option_current_values_xml(cv):
+    """Re-emit a structured current-value list as g2s:-prefixed
+    <optionCurrentValues> XML (the inner block of a setOptionChange option)."""
+    parts = ["<g2s:optionCurrentValues>"]
+    for e in cv:
+        if e["kind"] == "value":
+            parts.append(
+                f'<g2s:{e["tag"]} g2s:paramId="{e["paramId"]}">'
+                f'{html.escape(e["value"] or "")}</g2s:{e["tag"]}>')
+        else:
+            parts.append(
+                f'<g2s:complexValue g2s:paramId="{e["paramId"]}">')
+            for k in e["children"]:
+                parts.append(
+                    f'<g2s:{k["tag"]} g2s:paramId="{k["paramId"]}">'
+                    f'{html.escape(k["value"] or "")}</g2s:{k["tag"]}>')
+            parts.append("</g2s:complexValue>")
+    parts.append("</g2s:optionCurrentValues>")
+    return "".join(parts)
+
+
+# optionConfigExceptions change-exception codes (§9.24.1 Table 9.46) — logged
+# as hints on a failed change cycle.
+OPTION_CHANGE_EXCEPTIONS = {
+    "0": "success",
+    "1": "apply window expired",
+    "2": "error applying option changes",
+    "3": "EGM must be disabled",
+    "4": "EGM must have zero credits",
+    "5": "EGM must be idle",
+    "6": "host authorization timeout",
+}
+
+# optionConfig class error codes (§9.25 Table 9.47) — logged as hints when the
+# EGM rejects a setOptionChange/authorize/cancel with a class-level errorCode.
+OPTION_CONFIG_ERRORS = {
+    "G2S_OCX001": "invalid device class / device id",
+    "G2S_OCX002": "EGM must be disabled",
+    "G2S_OCX003": "EGM must be idle",
+    "G2S_OCX004": "transaction id already in use",
+    "G2S_OCX005": "invalid transaction id",
+    "G2S_OCX006": "transaction is not pending",
+    "G2S_OCX007": "invalid apply condition",
+    "G2S_OCX008": "invalid disable condition",
+    "G2S_OCX009": "disable condition not specified",
+    "G2S_OCX010": "start/end time not specified",
+    "G2S_OCX011": "invalid option group for device class",
+    "G2S_OCX012": "invalid option for option group",
+    "G2S_OCX013": "invalid value selected for option",
+    "G2S_OCX014": "invalid paramId for option",
+    "G2S_OCX015": "non-modifiable parameter change requested by host "
+                  "(check the parameter's canModRemote)",
+}
+
+# G2S-27 post-review hardening (2026-07-02): a NON-TERMINAL change record
+# whose last progress is older than this is treated as ABANDONED — the EGM
+# went totally silent past 4x the 30s timeToLive. snapshot()'s lazy timeout
+# only ever stamps the /api/status COPY; without this bound a silent EGM
+# wedged assoc.optionconfig_stage at authorizing/cancelling forever (every
+# new cycle refused) until a host restart. A fresh cycle may now claim the
+# stage past this age, stamping the old record result=timeout — spec-clean,
+# since §9.3.4 says a new set from this host OVERWRITES the EGM's previous
+# validated set anyway.
+OPTION_CHANGE_ABANDON_SEC = 120
+
+# enableRemoteHandpay (G2S-25/27): the handpay params a remote reset-to-
+# credits needs flipped, per §11.26.4/Table 11.46 and the live 2026-07-02
+# inventory read (19 booleans under complexValue G2S_handpayParams,
+# securityLevel=G2S_administrator on this AVP). G2S_enabledRemoteCredit is
+# THE gate — it permits setRemoteKeyOff keyOffType=G2S_remoteCredit while
+# handpay.hostEnabled=true (our host never disables handpay, so this is the
+# operative flag). G2S_disabledRemoteCredit is belt-and-braces so a reset
+# still works if the device is ever host-disabled. The remoteHandpay/
+# remoteVoucher/remoteWat families are deliberately NOT touched: the EGM
+# validates the whole set atomically (a single refused param draws
+# OCX013/OCX015 for EVERYTHING, §9.15), so fewer changed params = less
+# surface for the critical flag to be rejected alongside a companion.
+REMOTE_CREDIT_ENABLE_PARAMS = {
+    "G2S_enabledRemoteCredit": "true",
+    "G2S_disabledRemoteCredit": "true",
+}
+
+
+# ----------------------------------------------------------------------------
+# Per-EGM association state
+# ----------------------------------------------------------------------------
+
+class EgmAssociation:
+    def __init__(self, egm_id):
+        self.egm_id = egm_id
+        self.egm_location = None        # from commsOnLine (required attr)
+        self.device_id = "1"
+        self.lock = threading.Lock()    # guards counters + epoch
+        self.epoch = 0                  # bumped on each commsOnLine; tags sends
+        self.send_queue = queue.Queue() # single FIFO worker drains this in order
+        self.worker_started = False
+        self.host_command_id = 0        # host's own sequence; commsOnLineAck = 1
+        self.host_session_id = 1000     # for host-originated requests
+        self.comms_state = "closed"     # our mirror of the EGM state machine
+        self.comms_online_seen = 0
+        self.last_comms_online = 0.0
+        self.set_comms_state_sent = 0.0
+        self.keepalive_sent = False     # setKeepAlive issued this epoch
+        self.keepalive_pinger_started = False  # host keepAlive pinger this epoch
+        self.harvest_sent = False       # getDescriptor issued this epoch
+        self.eventsub_sent = False      # eventHandler bring-up issued this epoch
+        self.metersub_sent = False      # setMeterSub re-arm issued this epoch
+        self.gamesweep_started = False  # staggered gamePlay sweep this epoch
+        self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
+        self.descriptors = []           # harvest: device inventory (getDescriptor)
+        # eventHandler: the AVP's real data stream. supported_events populated
+        # by supportedEvents; subscribed flips true on setEventSubAck; events is
+        # a bounded ring of the most recent eventReports for the status API /
+        # Test Panel; event_count is the lifetime total. Persist across warm
+        # re-handshakes (they are our accumulated knowledge), so NOT cleared in
+        # new_epoch — only eventsub_sent (the per-epoch "did we re-subscribe"
+        # guard) resets there.
+        self.supported_events = []
+        self.subscribed = False
+        self.events = []
+        self.event_count = 0
+        # G2S-14 log backfill: eh_log_last_sequence is the high-water
+        # logSequence merged from getEventHandlerLog sweeps (per-host log,
+        # §4.1.7); eh_backfill_count is the lifetime count of entries merged
+        # from backfill (dupes excluded). Accumulated knowledge — NOT cleared
+        # in new_epoch, so a reconnect sweep skips what we already have.
+        # logSequence is only unique per LOG lifetime (§4.1.7): an EGM RAM/
+        # NVRAM clear restarts it, so the eventHandlerLogList handler resets
+        # this high-water when a full sweep's maximum falls below it.
+        self.eh_log_last_sequence = 0
+        self.eh_backfill_count = 0
+        # IGT AVP is push-oriented: the REAL device inventory + config arrives
+        # unsolicited via the optionConfig.optionList config-sync, keyed
+        # "deviceClass/deviceId". Persists across warm re-handshakes (config-
+        # sync only re-fires on deviceReset), so it is NOT cleared in new_epoch.
+        self.config_devices = {}
+        # optionConfig change cycle (G2S-27): config_options is the per-option
+        # current-value inventory parsed from the SAME optionList config-sync,
+        # keyed "deviceClass/deviceId/optionGroupId/optionId" ->
+        # {deviceClass, deviceId, optionGroupId, optionId, securityLevel,
+        #  currentValues:[structured], paramIds:[...]}. It is the source of
+        # truth for setOption: the option MUST exist here (refuse unknowns) and
+        # the COMPLETE current-value set is copied+edited from it (§9.15). NOT
+        # cleared in new_epoch (config-sync only re-fires on deviceReset).
+        self.config_options = {}
+        # GR-10 follow-up: config_seeded marks an inventory repopulated from
+        # the persisted store at assoc creation (vs parsed LIVE from an
+        # optionList this process). A store seed is presentation truth, not
+        # ground truth — the EGM may have changed options while the host was
+        # down and config-sync only re-fires on deviceReset — so the join
+        # one-shot still issues the getOptionList readback; the live
+        # optionList parse clears this flag.
+        self.config_seeded = False
+        # The optionConfig change state machine (mirrors the commConfig
+        # ownership cycle below): setOptionChange -> optionChangeStatus
+        # (pending) -> authorizeOptionChange -> optionChangeStatus (authorized)
+        # -> applied terminal push. ONE transaction in flight at a time.
+        # option_change is the detailed record surfaced in /api/status
+        # (configId/txn/4-tuple/paramId/old+new value/result). optionconfig_
+        # stage is the coarse UI stage. option_change_log holds the last
+        # getOptionChangeLogStatus reply (lastSequence/totalEntries). All are
+        # API-triggered ONLY (nothing automatic ever changes an option) and
+        # persist across warm re-handshakes.
+        self.optionconfig_stage = None  # None|setting|authorizing|applied|failed|cancelling|cancelled
+        self.pending_option_config_id = None
+        self.pending_option_txn_id = None
+        self.option_change = {}
+        self.option_change_log = {}
+        # commConfig ownership: host_items is the parsed commHostList (hostId ->
+        # {index, location, registered, owned[], config[], guest[]}); the
+        # ownership state machine tracks the enterCommConfigMode -> setCommChange
+        # -> authorizeCommChange cycle. All persist across warm re-handshakes.
+        self.host_items = {}
+        self.commconfig_stage = None    # None|entering|changing|authorizing|applied|failed
+        self.pending_config_id = None
+        self.pending_txn_id = None
+        self.pending_owned = []         # (deviceClass, deviceId) tuples in flight
+        self.pending_guest = []         # guest (deviceClass, deviceId) to KEEP
+        self.owned_claim = []           # device list we asked host 1 to own (strings)
+        # cabinet read state (cabinetStatus/cabinetProfile/getDateTime) and the
+        # meters map ("class/id/meterName" -> value). Live telemetry surface.
+        self.cabinet = {}
+        self.meters = {}
+        # gamePlay read state (G2S-21): per-deviceId dict keyed by the string
+        # deviceId (a multi-game cabinet exposes several gamePlay devices, one
+        # per theme+paytable, §6.1). Each holds themeId/paytableId/enabled/
+        # tilt flags from gamePlayStatus plus nested "profile" (wager
+        # categories + win levels) and "denoms"/"denomRanges"/"activeDenoms"
+        # from gameDenomList, plus nested "stateChange" (G2S-22) recording
+        # the most recent setGamePlayState attempt for that device (enable/
+        # disableText/sessionId/sentAt/sentTs/result: sent -> acked ->
+        # confirmed / disagree / error:* — snapshot() derives a lazy
+        # timeout). API-triggered ONLY — nothing automatic ever sends
+        # setGamePlayState. Handlers REPLACE nested objects wholesale
+        # (never mutate in place) so snapshot()'s shallow per-device copies
+        # stay internally consistent; snapshot() takes self.lock for the
+        # copies themselves because handlers DO insert new per-device keys
+        # (setdefault) and a lock-free iteration would race that. Accumulated
+        # knowledge — NOT cleared in new_epoch.
+        self.game_play = {}
+        # GR-28: gamePlay inventory persistence bookkeeping. The inventory
+        # above was memory-only, so a host restart blanked the Test Panel
+        # games card until a manual re-sweep — it now persists in the
+        # ConfigInventoryStore's gamePlay section and reseeds at association
+        # creation (the GR-10 treatment). game_play_as_of is the ISO stamp of
+        # the last LIVE status/profile/denoms parse (or the store's stamp
+        # when seeded) surfaced as /api/status gamePlayAsOf — a seeded
+        # inventory is LAST-KNOWN presentation truth: hostEnabled/egmEnabled
+        # may be stale and the on-demand sweep is the refresh. The other two
+        # fields drive the trailing-edge persist debounce (one store write
+        # per burst, not per parse) — see _schedule_game_play_persist.
+        self.game_play_as_of = None
+        self.game_play_last_update_ts = 0.0
+        self.game_play_persist_pending = False
+        # meters subscriptions (G2S-16): meter_subs holds the per-subType
+        # record parsed from the EGM's meterSubList responses
+        # ("G2S_onPeriodic"/"G2S_onEOD" -> {active, selectors, ...});
+        # last_meter_report(+type) timestamp the most recent meterInfo
+        # delivery of ANY flavor (onDemand read, periodic notification, EOD
+        # push). NOT cleared in new_epoch, BUT the real AVP does NOT keep
+        # host subscriptions across a comms loss: it raises
+        # subscriptionLost="true" on every commsOnLine (capture 20250725 —
+        # Table 2.6: "a host should ... set meter and event subscriptions if
+        # necessary"), so the commsOnLine handler marks these records
+        # inactive and the join path re-arms setMeterSub whenever
+        # meter_subs_desired is set. meter_subs_desired is operator INTENT
+        # (flipped true by enqueue_set_meter_sub, false by
+        # enqueue_clear_meter_sub) — accumulated knowledge, NOT cleared in
+        # new_epoch, so a deliberate clearMeterSub stays cleared across
+        # re-handshakes while an installed sub survives EGM reboots.
+        # DEFAULT TRUE since 2026-07-02: the "ownership gate" was a mirage
+        # (the double-wrap ack bug — the live AVP honors setMeterSub straight
+        # from the join sequence), so the standing subs install on the FIRST
+        # join with no operator action; a deliberate clear still sticks.
+        self.meter_subs = {}
+        self.meter_subs_desired = True
+        self.last_meter_report = None
+        self.last_meter_report_type = None
+        # clock sync (G2S-20): egm_clock_skew_sec is the rolling skew between
+        # the EGM's clock and ours (seconds, negative = EGM behind), refreshed
+        # from dateTimeSent on EVERY inbound g2sBody. clock_sync records the
+        # most recent setDateTime attempt (sentTs/skewBefore/result:
+        # sent|acked|confirmed|error:*). Accumulated knowledge — NOT cleared
+        # in new_epoch (the join-time auto-sync is gated per-epoch by
+        # first_join, not by a flag here).
+        self.egm_clock_skew_sec = None
+        self.clock_sync = {}
+        # cabinet control (rest of G2S-20): cabinet_state_change records the
+        # most recent setCabinetState attempt (enable/disableText/sessionId/
+        # sentTs/result: sent|acked|confirmed|disagree|error:*). API-triggered
+        # ONLY — nothing automatic ever sends setCabinetState. The record's
+        # sessionId gives EXACT response/error attribution (unlike the
+        # best-effort clock_sync window). Accumulated knowledge — NOT cleared
+        # in new_epoch (a host-disable PERSISTS across an EGM restart per the
+        # profile's restartStatus, §3.11, so the last attempt stays relevant
+        # across re-handshakes); snapshot() derives a lazy 30s timeout.
+        self.cabinet_state_change = {}
+        # voucher tier-1 (G2S-26): the validation list we most recently sent
+        # this EGM (id/size/timestamp) + a bounded ring of issued/committed
+        # voucher records. Backed by the engine's durable VoucherStore.
+        # Accumulated knowledge like events/meters — NOT cleared in new_epoch
+        # (a warm re-handshake does not invalidate ids in the EGM's buffer).
+        self.voucher_list_id = 0
+        self.voucher_ids_sent = 0
+        self.voucher_list_at = None
+        self.vouchers = []
+        self.voucher_count = 0
+        # voucher redemption tier-2 (G2S-26): redemptions is a bounded ring
+        # of per-transaction redemption records keyed by the EGM's
+        # transactionId and UPDATED IN PLACE through the lifecycle
+        # (redeemVoucher -> authorized/rejected -> outcome at commitVoucher),
+        # so snapshot() must dict-copy each entry (the handpays_pending
+        # treatment), not just slice. redeem_count = lifetime redemption
+        # transactions seen; redeemed_count/redeem_rejected_count tally the
+        # commit outcomes. Accumulated knowledge — NOT cleared in new_epoch
+        # (same rationale as vouchers; the durable truth lives in the
+        # VoucherStore's issuedIds states).
+        self.redemptions = []
+        self.redeem_count = 0
+        self.redeemed_count = 0
+        self.redeem_rejected_count = 0
+        # handpay reset-to-credits (G2S-25): handpays_pending maps
+        # transactionId -> the parsed handpayRequest record + its key-off
+        # lifecycle (state: pending -> keyOffSent -> keyOffAcked ->
+        # closed-out via keyedOff; error:* on a class-level rejection). The
+        # transactionId IS the handpay identifier (§11.2) and dict insertion
+        # order gives "oldest pending" for the clearHandpay default.
+        # handpays is a bounded ring of closed-out records; handpay_count is
+        # the lifetime total. Accumulated knowledge — NOT cleared in
+        # new_epoch: an EGM lockup survives comms loss (the AVP re-sends
+        # handpayRequest only while unacked, §11.12).
+        self.handpays_pending = {}
+        self.handpays = []
+        self.handpay_count = 0
+        # handpay_options: paramId -> value strings parsed from the handpay
+        # device's optionConfig config-sync push (G2S_enabledRemoteCredit &
+        # friends, Table 11.46) — the permission gate for remote key-off,
+        # surfaced so a disabled reset-to-credits path is visible BEFORE
+        # bench day. Config-sync only re-fires on deviceReset, so like
+        # config_devices this is NOT cleared in new_epoch.
+        self.handpay_options = {}
+        # noteAcceptor (G2S-23): note_acceptor is the acceptor's live
+        # picture — nested "status" (doors/stacker/faults/enabled, wholesale-
+        # replaced by _fold_note_acceptor_status), "profile" (readback
+        # scalars, Table 13.4) and the enabled-notes table "notes"/
+        # "activeNotes" (denoms in dollars), promoted from the optionConfig
+        # config-sync (G2S_noteAcceptorDataTable, §13.21.6-7) or the
+        # noteAcceptorProfile readback — whichever arrived last (same table,
+        # two views). bill_ins is a bounded ring of typed 💵 bill-in entries
+        # built from G2S_NAE114 eventReports (denom + amount from the riding
+        # transaction record); bill_in_count / bill_in_session_amt
+        # (millicents) run for the host process lifetime — the "session".
+        # All accumulated knowledge — NOT cleared in new_epoch (config-sync
+        # only re-fires on deviceReset, and a re-handshake does not un-stack
+        # a bill).
+        self.note_acceptor = {}
+        self.bill_ins = []
+        self.bill_in_count = 0
+        self.bill_in_session_amt = 0
+        # wat (G2S-39): wat_devices is the per-deviceId merged status+profile
+        # picture keyed by the string deviceId (the live AVP exposes G2S_wat/1
+        # and /2) — handlers REPLACE the per-device dict wholesale (copy +
+        # update + reassign) so snapshot()'s shallow copies stay consistent.
+        # wat_transfers is a bounded ring of per-transfer records UPDATED IN
+        # PLACE through the §22.7 lifecycle (requested -> pending ->
+        # initiated -> authorized -> committed/denied/failed/cancelled), so
+        # snapshot() dict-copies each entry (the redemptions treatment). The
+        # DURABLE transfer truth lives in the engine's WatStore — this ring
+        # is the presentation mirror, rebuilt from live traffic after a host
+        # restart (the store still dedupes EGM commit retries for
+        # transactions the ring never saw). wat_to_egm_ok/wat_from_egm_ok
+        # are lifetime process totals (millicents) of SUCCESSFULLY
+        # transferred amounts per direction. wat_egm_log holds the last
+        # watLogStatus/watLogList read. Accumulated knowledge — NOT cleared
+        # in new_epoch (a re-handshake does not unwind a transfer).
+        self.wat_devices = {}
+        self.wat_transfers = []
+        self.wat_transfer_count = 0
+        self.wat_to_egm_ok = 0
+        self.wat_from_egm_ok = 0
+        self.wat_egm_log = {}
+        # bonus (G2S-41): bonus is the merged read picture — nested
+        # "status"/"profile"/"egmLog"/"activity" dicts REPLACED WHOLESALE by
+        # their handlers (attribute census captured verbatim, ch.19 body is
+        # lost) so snapshot()'s shallow copy stays consistent. bonus_awards
+        # is a bounded ring of award records UPDATED IN PLACE through the
+        # dossier §2.2 lifecycle (sent -> acked -> committed/failed), so
+        # snapshot dict-copies each entry (the wat_transfers treatment).
+        # Money truth is the AccountStore ledger (ref g2sbonus:<txn>,
+        # debit-on-confirm at commitBonus ONLY) — this ring is presentation.
+        # Accumulated knowledge — NOT cleared in new_epoch (a re-handshake
+        # does not unpay an award).
+        self.bonus = {}
+        self.bonus_awards = []
+        self.bonus_award_count = 0
+        # mediaDisplay probe ladder (#18 P3): media is the per-deviceId
+        # parsed picture of the LAST inbound response of each command name
+        # (attribute census verbatim, keyed by command, + lastCommand/
+        # lastSeen) — the recon vocabulary is unproven, so the fold captures
+        # evidence rather than trusting a schema. Per-device dicts are
+        # REPLACED WHOLESALE by the fold (copy + update + reassign) so
+        # snapshot()'s shallow copies stay consistent. media_content maps
+        # deviceId -> the last host-allocated contentId, so show/hide/
+        # release/contentStatus rungs can follow a load without the bench
+        # re-typing the id. Accumulated knowledge — NOT cleared in
+        # new_epoch (a re-handshake does not unload the EGM's content).
+        self.media = {}
+        self.media_content = {}
+        # deviceId -> the transactionId the EGM assigned to that device's
+        # loaded content (captured from the contentStatus / mediaDisplayAck
+        # fold). setActiveContent/releaseContent/getContentStatus echo it —
+        # required, >=1 (c_baseTransaction). Accumulated; not cleared in
+        # new_epoch.
+        self.media_txn = {}
+        # Glass navigation v1 (#18 P4): glass_push is the content-push
+        # sequencer's per-device stage record {stage, contentId, uri,
+        # startedTs} — stage walks loading -> activating -> showing -> shown,
+        # advanced by the mediaDisplay fold off the EGM's own contentStatus/
+        # mediaDisplayAck narration (⚠️+clear on the watchdog's stage
+        # timeout). Unlike media_txn this IS cleared in new_epoch: a
+        # re-handshake usually means a reboot wiped the cabinet browser, and
+        # 'shown' is exactly what gates the card-IN recovery push — stale
+        # 'shown' knowledge would block the self-heal. Per-dev dicts are
+        # REPLACED WHOLESALE (the assoc.media snapshot rule).
+        # glass_recovery_ts throttles the card-IN recovery push.
+        self.glass_push = {}
+        self.glass_recovery_ts = 0.0
+        # glass_visible = the hub's best-effort belief about the menu
+        # window's visible state (True after a show we sent / a completed
+        # push, False after a hide). The service-button toggle keys off it;
+        # a wrong belief self-corrects in one press (show/hide are
+        # idempotent). glass_button_ts debounces CBE301 bursts (a press
+        # can chirp several events).
+        self.glass_visible = False
+        self.glass_button_ts = 0.0
+        # voucher device picture (G2S-39 companion): nested "status"/
+        # "profile" replaced wholesale by the voucherStatus/voucherProfile
+        # response handlers — the device-level view beside the VoucherStore's
+        # transaction truth. NOT cleared in new_epoch.
+        self.voucher_device = {}
+        # remote reboot (RB): the most recent reboot attempt of EITHER path —
+        # cabinet.resetProcessor (plan A) or the download setScript(resetEgm)
+        # pair (plan B) — {kind, sessionId, scriptId?, sentAt, outcome,
+        # scriptStatus?, scriptException?}. outcome walks sent -> resetStarted/
+        # error:* (plan A) or sent -> inProgress/completed/error:* (plan B),
+        # attributed by the recorded sessionId (§1.18.9 responses pair via
+        # sessionId). Surfaced at /api/status.lastResetProbe so a reboot's
+        # verdict (honored / APX008-unsupported / CBX002-refused / idle-gated)
+        # is visible. Accumulated knowledge — NOT cleared in new_epoch (a
+        # reset causes the very re-handshake that would otherwise wipe it, so
+        # it must SURVIVE the reboot to show "we reset, machine came back").
+        self.last_reset_probe = {}
+        self.joined_at = None
+        self.joined_ts = 0.0            # monotonic-ish onLine timestamp (watchdog)
+        self.last_seen = 0.0
+        self.last_flags = {}
+        self.outbound_ok = 0
+        self.outbound_fail = 0
+        # GR-01 dead-link demotion state. keepalive_fail_streak counts
+        # CONSECUTIVE keepAlive POST failures (any completed keepAlive POST
+        # resets it); at KEEPALIVE_FAIL_DEMOTE the association demotes
+        # onLine -> offline. offline_since timestamps the demotion (surfaced
+        # in /api/status); offline_suppressed counts the outbound attempts
+        # that failed at DEBUG while offline; last_offline_reminder paces the
+        # ~10-min still-offline reminder line.
+        self.keepalive_fail_streak = 0
+        self.offline_since = 0.0
+        self.offline_suppressed = 0
+        self.last_offline_reminder = 0.0
+
+    def next_command_id(self):
+        self.host_command_id += 1
+        return self.host_command_id
+
+    def next_session_id(self):
+        self.host_session_id += 1
+        return self.host_session_id
+
+    def new_epoch(self):
+        """A (re-)commsOnLine implies our counters may reset (spec §2.2).
+        MUST be called holding self.lock. Bumping epoch invalidates any
+        still-queued sends from the previous epoch so a stale setCommsState
+        can't go out ahead of the new commsOnLineAck.
+
+        host_session_id is deliberately NOT reset (GR-09): sessionId is a
+        host-chosen pairing token the EGM echoes verbatim (§1.14) — only the
+        commandId sequence needs the §2.2 restart. Pending control records
+        (cabinet_state_change, gamePlay stateChange) survive re-handshakes
+        by design, so a per-epoch reset to 1000 let a fresh epoch's early
+        responses sid-collide with a stale pre-rejoin pending and falsely
+        confirm/disagree it in /api/status. Monotonic sids can never repeat,
+        so cross-epoch attribution is impossible."""
+        self.epoch += 1
+        self.host_command_id = 0
+        self.set_comms_state_sent = 0.0
+        self.keepalive_sent = False
+        self.keepalive_pinger_started = False
+        self.harvest_sent = False
+        self.eventsub_sent = False
+        self.metersub_sent = False
+        self.gamesweep_started = False
+        self.joined_at = None
+        self.joined_ts = 0.0
+        self.comms_state = "opening"
+        # GR-01: a fresh handshake supersedes any dead-link bookkeeping (the
+        # commsOnLine handler reads these BEFORE calling new_epoch, so the
+        # rejoin banner still sees the outage evidence).
+        self.keepalive_fail_streak = 0
+        self.offline_since = 0.0
+        self.offline_suppressed = 0
+        self.last_offline_reminder = 0.0
+        # The pre-outage ack stamp must not survive into the new epoch: the
+        # new pinger's first ping lands HOST_KEEPALIVE_SEC after the join, so
+        # for ~10-12s the watchdog would compute `quiet` from an hours-stale
+        # stamp and falsely demote the freshly rejoined link (a 20s watchdog
+        # cadence made that fire on ~half of all power-cycle rejoins). With
+        # 0.0 the watchdog's `online_for` branch still backstops a rejoin
+        # whose acks never start (joined_ts is per-epoch).
+        self.last_keepalive = 0.0
+        # Glass nav v1: a re-handshake means the cabinet may have rebooted —
+        # hub-side "the SPA is on the glass" knowledge is no longer
+        # trustworthy, so drop it (media_content/media_txn stay: releasing a
+        # SURVIVING content still needs them). The recovery throttle resets
+        # too, so a tap right after the rejoin re-pushes and self-heals the
+        # resident page without waiting out a pre-reboot throttle window.
+        self.glass_push = {}
+        self.glass_recovery_ts = 0.0
+        # visibility belief resets to unknown-hidden; the button toggle
+        # self-corrects in one press if the window survived visible
+        self.glass_visible = False
+        self.glass_button_ts = 0.0
+
+    def snapshot(self):
+        # Copies of the mutable containers are taken under self.lock:
+        # handlers replace NESTED objects wholesale, but they also INSERT
+        # keys in place (cabinet["egmDateTime"], game_play.setdefault(dev),
+        # meters[...]), and a key insert during a lock-free dict
+        # iteration — the gamePlay comprehension here, or json.dumps
+        # (indent=2 forces the pure-Python encoder) walking a live dict —
+        # raises RuntimeError('dictionary changed size during iteration')
+        # and 500s the /api/status poll. The lock is held only for the
+        # cheap copies; JSON serialization runs on the copies afterwards.
+        # (events/vouchers ring entries are never mutated after append, and
+        # host_items/clock_sync are replaced/updated wholesale-or-scalar,
+        # so shallow copies + slices are sufficient.)
+        with self.lock:
+            clock_sync = dict(self.clock_sync)
+            cabinet_state_change = dict(self.cabinet_state_change)
+            # remote reboot (RB) — mutated in place across the send/response
+            # lifecycle, so dict-copy it (the cabinet_state_change treatment).
+            last_reset_probe = dict(self.last_reset_probe)
+            # optionConfig change record (G2S-27) — mutated in place through
+            # the cycle, so dict-copy it (the cabinet_state_change treatment).
+            option_change = dict(self.option_change)
+            option_change_log = dict(self.option_change_log)
+            config_options = sorted(self.config_options.keys())
+            # GR-22: config_devices gains keys under assoc.lock from the
+            # optionList config-sync handler — read it under the lock like
+            # config_options above (lock-free dict iteration during a key
+            # insert is the exact RuntimeError/500 this lock exists for).
+            config_devices = sorted(self.config_devices.keys())
+            cabinet = dict(self.cabinet)
+            meters = dict(self.meters)
+            meter_subs = dict(self.meter_subs)
+            game_play = {k: dict(v) for k, v in self.game_play.items()}
+            recent_events = self.events[-25:]
+            recent_vouchers = self.vouchers[-25:]
+            # redemption records ARE mutated in place through their
+            # lifecycle (unlike the events/vouchers rings) — copy each one.
+            recent_redemptions = [dict(r) for r in self.redemptions[-25:]]
+            pending_handpays = [dict(v)
+                                for v in self.handpays_pending.values()]
+            recent_handpays = self.handpays[-25:]
+            handpay_options = dict(self.handpay_options)
+            # note_acceptor's nested status/profile/notes are replaced
+            # wholesale by their handlers, and bill_ins entries are never
+            # mutated after append — shallow copy + slice suffice.
+            note_acceptor = dict(self.note_acceptor)
+            recent_bill_ins = self.bill_ins[-25:]
+            # wat (G2S-39): per-device dicts are replaced wholesale (shallow
+            # copies suffice), but the transfer-ring records ARE mutated in
+            # place through their lifecycle — copy each one (the redemptions
+            # treatment) through wat_present(), which adds the presentation
+            # contract (normalized amount trio, direction, updatedAt, the
+            # lazy requested-timeout). pendingTransfers = still-live subset.
+            wat_devices = {k: dict(v) for k, v in self.wat_devices.items()}
+            recent_wat_transfers = [wat_present(r)
+                                    for r in self.wat_transfers[-25:]]
+            pending_wat_transfers = [wat_present(r)
+                                     for r in self.wat_transfers
+                                     if r.get("state") in WAT_ACTIVE_STATES]
+            wat_egm_log = dict(self.wat_egm_log)
+            voucher_device = dict(self.voucher_device)
+            # bonus (G2S-41): nested status/profile/egmLog/activity are
+            # replaced wholesale by their handlers (shallow copy suffices);
+            # award-ring records ARE mutated in place — copy each one.
+            bonus_view = dict(self.bonus)
+            recent_bonus_awards = [dict(r) for r in
+                                   self.bonus_awards[-BONUS_AWARD_RING_MAX:]]
+            bonus_award_count = self.bonus_award_count
+            # mediaDisplay (#18 P3): per-device dicts replaced wholesale by
+            # the fold, nested censuses never mutated after — dict-copy each
+            # device (the wat_devices treatment).
+            media = {k: dict(v) for k, v in self.media.items()}
+        # G2S-20: derive a clock-sync timeout LAZILY (no timer thread, no
+        # retry): a setDateTime still unanswered after its 30s timeToLive
+        # surfaces as result=timeout. The underlying record is untouched, so
+        # a late cabinetDateTime still flips it to confirmed.
+        if clock_sync.get("result") in ("sent", "acked") and \
+                time.time() - clock_sync.get("sentTs", 0) > 30:
+            clock_sync["result"] = "timeout"
+        # Same lazy-timeout treatment for an unanswered setCabinetState (30s
+        # timeToLive, no retry — the pre-ownership AVP acks-then-ignores
+        # owner ops). Only the COPY is stamped: the underlying record stays
+        # live so a late cabinetStatus still confirms via its sessionId.
+        if cabinet_state_change.get("result") in ("sent", "acked") and \
+                time.time() - cabinet_state_change.get("sentTs", 0) > 30:
+            cabinet_state_change["result"] = "timeout"
+        # G2S-27: same lazy-timeout treatment for a stalled optionConfig change
+        # cycle. A setOptionChange/authorizeOptionChange left unanswered past
+        # its 30s timeToLive (the pre-ownership AVP acks-then-ignores owner
+        # ops) surfaces as result=timeout. Only intermediate/awaiting states
+        # time out — never a terminal applied/cancelled/aborted/error. The COPY
+        # is stamped; a late optionChangeStatus still advances the live record.
+        if option_change.get("result") in ("sent", "acked", "pending",
+                                            "authorized") and \
+                time.time() - option_change.get("progressTs", 0) > 30:
+            option_change["result"] = "timeout"
+        # G2S-22: same lazy-timeout treatment for an unanswered
+        # setGamePlayState, per device. The per-device COPIES above are
+        # shallow, so the nested stateChange dict is SHARED with the live
+        # record — the stamp must replace it wholesale on the copy, never
+        # mutate in place (a late gamePlayStatus still confirms via its
+        # sessionId).
+        for gp_copy in game_play.values():
+            sc = gp_copy.get("stateChange")
+            if sc and sc.get("result") in ("sent", "acked") and \
+                    time.time() - sc.get("sentTs", 0) > 30:
+                gp_copy["stateChange"] = dict(sc, result="timeout")
+        # G2S-25: same lazy-timeout treatment for an unanswered setRemoteKeyOff
+        # (30s timeToLive, no retry). Only the COPY is stamped — the underlying
+        # record stays live so a late remoteKeyOffAck/keyedOff still lands.
+        for h in pending_handpays:
+            if h.get("state") in ("keyOffSent", "keyOffAcked") and \
+                    time.time() - h.get("keyOffSentTs", 0) > 30:
+                h["state"] = "keyOffTimeout"
+        return {
+            "egmId": self.egm_id,
+            "egmLocation": self.egm_location,
+            "commsState": self.comms_state,
+            # GR-01 dead-link truth: offline is an explicit demoted state (the
+            # pre-fix host reported 'onLine' through an entire 8h power-off).
+            "offline": self.comms_state == "offline",
+            "offlineSince": self.offline_since or None,
+            "offlineSuppressed": self.offline_suppressed,
+            "joinedAt": self.joined_at,
+            "commsOnLineSeen": self.comms_online_seen,
+            # never-joined + still actively talking = a join IN PROGRESS: the
+            # floor shows a distinct "Connecting…" tile while true (tester
+            # feedback — "your machine reached the hub, the join is working"),
+            # and it flips off once the machine either joins (commsOnLineSeen)
+            # or goes silent past the window. A machine that ALREADY joined
+            # (even if now offline) is never "joining".
+            "joining": bool(
+                not (self.comms_online_seen or self.joined_at
+                     or self.comms_state == "onLine")
+                and self.last_seen
+                and (time.time() - self.last_seen) < ASSOC_JOINING_WINDOW_SEC),
+            "lastSeen": self.last_seen,
+            "lastKeepAlive": self.last_keepalive,
+            "descriptorCount": len(self.descriptors),
+            "configDeviceCount": len(config_devices),
+            "configDevices": config_devices,
+            "subscribed": self.subscribed,
+            "supportedEventCount": len(self.supported_events),
+            "eventCount": self.event_count,
+            "recentEvents": recent_events,
+            "ehLogLastSequence": self.eh_log_last_sequence,
+            "ehBackfilledCount": self.eh_backfill_count,
+            "hostItems": self.host_items,
+            "commConfigStage": self.commconfig_stage,
+            "ownedClaim": self.owned_claim,
+            # optionConfig change cycle (G2S-27)
+            "optionConfigStage": self.optionconfig_stage,
+            "optionChange": option_change,
+            "optionChangeLog": option_change_log,
+            "configOptionCount": len(config_options),
+            "configOptions": config_options,
+            "cabinet": cabinet,
+            "cabinetStateChange": cabinet_state_change,
+            "egmClockSkewSec": self.egm_clock_skew_sec,
+            "clockSync": clock_sync,
+            "meterCount": len(meters),
+            "meters": meters,
+            "meterSubs": meter_subs,
+            "meterSubsDesired": self.meter_subs_desired,
+            "lastMeterReport": self.last_meter_report,
+            "lastMeterReportType": self.last_meter_report_type,
+            "gamePlay": game_play,
+            # GR-28: freshness stamp for the (possibly store-seeded)
+            # inventory above — last-known view, the sweep refreshes.
+            "gamePlayAsOf": self.game_play_as_of,
+            "voucherListId": self.voucher_list_id,
+            "voucherIdsSent": self.voucher_ids_sent,
+            "voucherListAt": self.voucher_list_at,
+            "voucherCount": self.voucher_count,
+            "recentVouchers": recent_vouchers,
+            "redeemCount": self.redeem_count,
+            "redeemedCount": self.redeemed_count,
+            "redeemRejectedCount": self.redeem_rejected_count,
+            "recentRedemptions": recent_redemptions,
+            "handpayCount": self.handpay_count,
+            "pendingHandpays": pending_handpays,
+            "recentHandpays": recent_handpays,
+            "handpayOptions": handpay_options,
+            # "true"/"false" from the config-sync, None = not yet revealed —
+            # the pre-bench visibility for the reset-to-credits path (G2S-25)
+            "handpayRemoteCreditAllowed":
+                handpay_options.get("G2S_enabledRemoteCredit"),
+            "noteAcceptor": note_acceptor,
+            "billInCount": self.bill_in_count,
+            "billInSessionAmt": self.bill_in_session_amt,
+            "recentBillIns": recent_bill_ins,
+            # wat (G2S-39) — the "add credits without paper" surface
+            "wat": {
+                "devices": wat_devices,
+                "pendingTransfers": pending_wat_transfers,
+                "recentTransfers": recent_wat_transfers,
+                "transferCount": self.wat_transfer_count,
+                "toEgmOkMillicents": self.wat_to_egm_ok,
+                "fromEgmOkMillicents": self.wat_from_egm_ok,
+                "egmLog": wat_egm_log,
+            },
+            # bonus (G2S-41) — raw read picture (status/profile/egmLog/
+            # activity attribute censuses verbatim) + the award ring.
+            "bonus": dict(bonus_view, awards=recent_bonus_awards,
+                          awardCount=bonus_award_count),
+            # mediaDisplay probe evidence (#18 P3) — {} until a probe drew a
+            # response; feature-detected downstream, no UI contract yet.
+            "mediaDisplay": media,
+            # voucher device status/profile (beside the VoucherStore truth)
+            "voucherDevice": voucher_device,
+            # remote reboot (RB) — last reboot attempt + its verdict
+            "lastResetProbe": last_reset_probe,
+            "hostCommandId": self.host_command_id,
+            "outboundOk": self.outbound_ok,
+            "outboundFail": self.outbound_fail,
+            "lastFlags": self.last_flags,
+        }
+
+
+# ----------------------------------------------------------------------------
+# Voucher persistence — G2S-26 tiers 1 (issuance) + 2 (redemption)
+# ----------------------------------------------------------------------------
+
+# egmVoucherExceptions (Table 21.36) — why the EGM's commitVoucher says what
+# it says. Logged as hints; 5-10 are EGM-side aborts where the ticket stays
+# valid (the store resets a matching redeemPending id back to issued).
+EGM_VOUCHER_EXCEPTIONS = {
+    "0": "success",
+    "1": "printer presentation error (issuance)",
+    "2": "host returned a command error",
+    "3": "host rejected the redemption (hostException set)",
+    "4": "host rejected but hostAction forced a stack",
+    "5": "EGM timeout — no authorizeVoucher within voucherHoldTime",
+    "6": "amount exceeds the EGM credit limit",
+    "7": "game state changed",
+    "8": "another transfer in process",
+    "9": "cannot mix nonCash expirations",
+    "10": "cannot mix nonCash credit types",
+    "99": "unknown failure",
+}
+
+# watHostExceptions (Table 22.37) — why the host's authorizeTransfer denied.
+WAT_HOST_EXCEPTIONS = {
+    "0": "transfer authorized",
+    "1": "unable to accept transfer at this time",
+    "2": "no account available",
+    "3": "insufficient funds available for withdrawal",
+    "4": "amount exceeds maximum deposit",
+    "99": "transfer denied — no reason given",
+}
+
+# watEgmExceptions (Table 22.38) — why the EGM's commitTransfer says what it
+# says. 0 = success; 2 = "cancelled by host" (the cancelRequest close-out).
+WAT_EGM_EXCEPTIONS = {
+    "0": "transfer successful",
+    "1": "transfer error from host",
+    "2": "transfer cancelled by host",
+    "3": "transfer timed out by EGM",
+    "4": "total amount exceeds credit limit",
+    "5": "total amount exceeds voucher limit",
+    "6": "multiple amounts specified for voucher",
+    "7": "unable to print voucher",
+    "8": "game state changed",
+    "9": "another transfer in process",
+    "10": "cannot mix non-cashable expirations — voucher rejected",
+    "11": "cannot mix non-cashable credits — voucher rejected",
+    "99": "transfer aborted — reason unknown",
+}
+
+# wat class error codes (Table 22.41) — logged as hints when the EGM rejects
+# one of our wat requests with a class-level errorCode.
+WAT_ERRORS = {
+    "G2S_WTX001": "invalid request id",
+    "G2S_WTX002": "invalid transaction id",
+    "G2S_WTX003": "duplicate transaction id",
+    "G2S_WTX004": "another WAT device is currently the cash-out device",
+    "G2S_WTX005": "invalid authorization code",
+    "G2S_WTX006": "invalid wagering account",
+    "G2S_WTX007": "invalid account action (withdrawal or deposit)",
+    "G2S_WTX008": "unacknowledged transaction in log",
+    "G2S_WTX009": "unable to cancel transfer",
+    "G2S_WTX010": "algorithm not supported",
+    "G2S_WTX011": "invalid key pair identifier",
+    "G2S_WTX012": "key pair identifier has expired",
+}
+
+# The wat transfer states a record can sit in while still live — everything
+# else (committed/denied/failed/cancelled/abandoned/error:*) is terminal.
+# Drives the /api/status "pendingTransfers" split.
+WAT_ACTIVE_STATES = ("requested", "pending", "initiated", "authorized")
+
+# A host push whose initiateRequest has drawn only silence (no requestPending,
+# no error — the AVP's normal refusal mode) presents as timed out after this
+# many seconds (lazy, the clock_sync treatment — no timer thread). The store
+# record stays live and is LOCALLY cancellable via watCancel.
+WAT_REQUEST_ABANDON_SEC = 120
+
+# ---------------------------------------------------------------------------
+# bonus class (G2S-41, spec ch.19 — dossier-reconstructed; the chapter body
+# is lost). Wire-facing constants only; anything the dossier marks
+# RECONSTRUCTED (bonusStates strings, bonusException meanings, error codes)
+# is deliberately NOT enumerated here — handlers capture those verbatim.
+# ---------------------------------------------------------------------------
+
+# bonusPayMethods (dossier §3, STRONGLY INFERRED from the intact ch.17
+# progPayMethods table whose description reads "Payment method for bonuses."
+# — the copy-paste artifact). The /api/command whitelist; P-5 probes for a
+# possible fourth member on the bench.
+BONUS_PAY_METHODS = ("G2S_payAny", "G2S_payHandpay", "G2S_payVoucher")
+
+# Presentation ring bound for assoc.bonus_awards (the wat_transfers
+# treatment, but bonus traffic is one-award-at-a-time hobbyist volume).
+BONUS_AWARD_RING_MAX = 16
+
+# setBonusAward.textMessage clamp (API-side; the spec type is an unbounded
+# textMessage string but 128 keeps the on-glass banner sane).
+BONUS_TEXT_MAX = 128
+
+# BNE lifecycle event -> award-ring stamp key (see _bonus_award_event_stamp).
+BONUS_EVENT_STAMPS = {"bonus_award_pending": "bne103At",
+                      "bonus_award_paid": "bne104At",
+                      "bonus_award_failed": "bne105At"}
+
+
+def wat_present(rec):
+    """/api/status WAT presentation contract — the g2s host EMITS these and
+    home.html/index.html READ them, so they must agree exactly. Every
+    pendingTransfers/recentTransfers entry carries:
+      * transactionId (string; "0" until requestPending arrives), requestId,
+        state, deviceId (string), direction (G2S_toEgm|G2S_fromEgm);
+      * the NORMALIZED best-known amount trio cashableMillicents/
+        promoMillicents/nonCashMillicents — the committed ACTUALS if state
+        committed, else the authorized amounts if authorized, else the
+        requested amounts;
+      * createdAt/updatedAt as ISO-8601 strings (never epoch floats) —
+        updatedAt is the newest lifecycle stamp (same format, so max()
+        sorts correctly).
+    Lazy timeout: a 'requested' record older than WAT_REQUEST_ABANDON_SEC
+    presents as state=requestTimeout (only the COPY is stamped — the store
+    record stays live so a late requestPending still lands, and watCancel
+    can still clear it locally)."""
+    out = dict(rec)
+    out["transactionId"] = str(rec.get("transactionId") or "0")
+    out["deviceId"] = str(rec.get("deviceId") or "1")
+    out["direction"] = rec.get("watDirection") or "G2S_toEgm"
+    state = rec.get("state") or ""
+    if state == "committed":
+        src = ("transCashableAmt", "transPromoAmt", "transNonCashAmt")
+    elif state == "authorized":
+        src = ("authCashableAmt", "authPromoAmt", "authNonCashAmt")
+    else:
+        src = ("reqCashableAmt", "reqPromoAmt", "reqNonCashAmt")
+    for dst, s in zip(("cashableMillicents", "promoMillicents",
+                       "nonCashMillicents"), src):
+        out[dst] = int(rec.get(s) or 0)
+    out["createdAt"] = rec.get("createdAt") or now_iso()
+    stamps = [rec.get(k) for k in
+              ("createdAt", "pendingAt", "initiatedAt", "authorizedAt",
+               "committedAt", "cancelRequestedAt", "cancelAckedAt",
+               "cancelRejectedAt", "abandonedAt")
+              if rec.get(k)]
+    out["updatedAt"] = max(stamps) if stamps else out["createdAt"]
+    if state == "requested":
+        try:
+            created = datetime.strptime(
+                out["createdAt"],
+                "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+        except ValueError:
+            age = 0
+        if age > WAT_REQUEST_ABANDON_SEC:
+            out["state"] = "requestTimeout"
+    return out
+
+
+class VoucherStore:
+    """Durable state behind the voucher class (spec ch.21, G2S-26 tiers 1+2).
+
+    One JSON file (default G2S/data/voucher_state.json, gitignored runtime
+    state) holding:
+      * validationListSeq — monotonic validationListId source, never reused;
+      * issuedIds         — EVERY validation id ever handed to an EGM, so a
+                            host restart can never re-issue an id that may
+                            still sit in a machine's buffer (§21.3);
+      * egms              — per-EGM most-recent listId (drives deleteCurrent);
+      * vouchers          — bounded ring of issued/committed voucher records.
+
+    Each issuedIds record walks a redemption state machine (tier 2):
+        unused -> issued -> redeemPending -> redeemed
+    with two escapes: a REJECTED commit resets redeemPending back to issued
+    (the ticket stays valid, §21.21 p.905), and void_id (bench unstick) parks
+    an id at 'void' so redemption always rejects it. The 'pending' marker on
+    a redeemPending id records WHICH (egmId, transactionId) holds it — the
+    host MUST NOT authorize a second redemption until commit/manual reset
+    (§21.20 p.903) and an EGM retry of the SAME transaction must re-draw the
+    identical authorization (§21.5). All transitions are atomic under
+    self.lock and idempotent, surviving host restarts mid-redemption.
+
+    Stdlib-only. Writes are atomic (tmp + os.replace); a failed write is
+    logged but never raised — a full disk must not corrupt in-memory state or
+    stall the dispatch path (AVP-silence tolerance applies to disk too)."""
+
+    KEEP_VOUCHERS = 500
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.state = {"validationListSeq": 0, "issuedIds": {},
+                      "egms": {}, "vouchers": []}
+        self._rng = random.SystemRandom()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in self.state:
+                if k in data:
+                    self.state[k] = data[k]
+            log.info("voucher store loaded: listSeq=%s idsIssued=%d "
+                     "vouchers=%d (%s)", self.state["validationListSeq"],
+                     len(self.state["issuedIds"]),
+                     len(self.state["vouchers"]), path)
+        except FileNotFoundError:
+            log.info("voucher store: fresh state at %s", path)
+        except (OSError, ValueError) as e:
+            # GR-03 residue: QUARANTINE the unreadable file before starting
+            # fresh — fsync durability can't help against SD/FTL corruption
+            # (a classic Pi failure), and silently saving a fresh store over
+            # the old path made every outstanding printed ticket's 18-digit
+            # validationId unrecoverable. One .corrupt copy is kept (newest
+            # wins) so a bench operator can hand-recover the ids from it.
+            quarantine = self.path + ".corrupt"
+            try:
+                os.replace(self.path, quarantine)
+                log.error("voucher store UNREADABLE (%s) — quarantined to %s "
+                          "and starting fresh; hand-recover outstanding "
+                          "validationIds from the quarantine copy: %s",
+                          path, quarantine, e)
+            except OSError as qe:
+                log.error("voucher store UNREADABLE (%s) — starting fresh "
+                          "(quarantine to %s also failed: %s): %s",
+                          path, quarantine, qe, e)
+
+    def _save_locked(self):
+        """Persist. MUST be called holding self.lock.
+
+        GR-03 power-fail durability: rename-atomic alone is not enough on
+        the Pi — fsync the tmp file's DATA before os.replace, then fsync the
+        containing DIRECTORY so the rename itself is on disk before we ack
+        the EGM. Without this, a wall-plug pull seconds after a ticket
+        prints could revert/zero the store and make the printed ticket
+        unredeemable (authorize_redemption rejects unknown validationIds).
+        Write rate is tiny (per voucher transaction), so the fsyncs cost
+        nothing measurable."""
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            log.error("voucher store save FAILED (%s) — continuing with "
+                      "in-memory state", e)
+
+    def last_list_id(self, egm_id):
+        """The validationListId we most recently sent this EGM (0 = never)."""
+        with self.lock:
+            return self.state["egms"].get(egm_id, {}).get("lastListId", 0)
+
+    def new_validation_list(self, egm_id, count):
+        """Allocate the next validationListId plus `count` fresh
+        (validationId, validationSeed) pairs. Ids are 18 random digits
+        (exactly 18 chars, deliberately non-sequential — §21.3), seeds 20
+        digits (maxLen 20, manual-auth only). Neither is ever reused."""
+        with self.lock:
+            self.state["validationListSeq"] += 1
+            list_id = self.state["validationListSeq"]
+            issued = self.state["issuedIds"]
+            items = []
+            while len(items) < count:
+                vid = "".join(self._rng.choice("0123456789")
+                              for _ in range(18))
+                if vid in issued:
+                    continue  # astronomically unlikely — but never reuse
+                seed = "".join(self._rng.choice("0123456789")
+                               for _ in range(20))
+                issued[vid] = {"egmId": egm_id, "listId": list_id,
+                               "seed": seed, "state": "unused",
+                               "at": now_iso()}
+                items.append((vid, seed))
+            self.state["egms"][egm_id] = {"lastListId": list_id,
+                                          "idsSent": count, "at": now_iso()}
+            self._save_locked()
+        return list_id, items
+
+    def record_voucher(self, egm_id, rec):
+        """Persist an issue/commit record. Returns True if this (egmId, kind,
+        transactionId) is already recorded — the EGM retrying an unacked
+        command (§21.5 duplicate detection) — so the caller re-acks WITHOUT
+        double-recording."""
+        with self.lock:
+            for v in self.state["vouchers"]:
+                if v.get("egmId") == egm_id and \
+                        v.get("kind") == rec.get("kind") and \
+                        v.get("transactionId") == rec.get("transactionId"):
+                    return True
+            stored = dict(rec)
+            stored["egmId"] = egm_id
+            self.state["vouchers"].append(stored)
+            if len(self.state["vouchers"]) > self.KEEP_VOUCHERS:
+                self.state["vouchers"] = \
+                    self.state["vouchers"][-self.KEEP_VOUCHERS:]
+            info = self.state["issuedIds"].get(rec.get("validationId"))
+            if info is not None and rec.get("kind") == "issue":
+                # Stash the ticket's value on the id record — this is what
+                # authorize_redemption pays out when the ticket comes back
+                # (§21.20 requires the ISSUED amount/creditType). Commits no
+                # longer stamp state here: close_redemption owns the
+                # redeemed/reset-to-issued transition (tier 2).
+                info["state"] = "issued"
+                info["voucherAmt"] = rec.get("voucherAmt")
+                info["creditType"] = rec.get("creditType")
+                # issuedAt/issueTxn (G2S-40): the ticket-browser facts for
+                # GET /api/vouchers — when the ticket PRINTED (the EGM's own
+                # transferDateTime beats our receive stamp) and the issue
+                # transactionId.
+                info["issuedAt"] = rec.get("transferDateTime") \
+                    or rec.get("seenAt") or now_iso()
+                info["issueTxn"] = rec.get("transactionId")
+                if rec.get("expireDateTime"):
+                    info["expireDateTime"] = rec.get("expireDateTime")
+            self._save_locked()
+        return False
+
+    @staticmethod
+    def _reject(exc, reason):
+        """A voucherAmt=0 'invalid ticket' authorization (§21.20): reject via
+        authorizeVoucher, NEVER a class error (that skews the EGM's metering
+        to egmException=2). creditType stays required — G2S_cashable."""
+        return {"exc": exc, "amt": "0", "creditType": "G2S_cashable",
+                "retry": False, "reason": reason}
+
+    def authorize_redemption(self, egm_id, txn_id, validation_id):
+        """The authorize-or-reject decision for a redeemVoucher (§21.19/20),
+        atomic under the store lock. Success moves the id issued ->
+        redeemPending and records WHICH (egmId, transactionId) holds it, so
+        no second redemption can be authorized until commit or manual reset
+        (hostException=1, Table 21.35). Idempotent: an EGM retry of the SAME
+        transaction re-draws the identical authorization without touching
+        state. Rejections (unknown/never-issued=4, already-redeemed=2,
+        expired=3, voided=99) change nothing and recompute identically on
+        retry. Returns {exc, amt, creditType, retry, reason}."""
+        with self.lock:
+            info = self.state["issuedIds"].get(validation_id)
+            if info is None:
+                return self._reject(4, "unknown validationId")
+            state = info.get("state")
+            pend = info.get("pending") or {}
+            if state == "redeemPending":
+                if pend.get("egmId") == egm_id and \
+                        pend.get("transactionId") == txn_id:
+                    return {"exc": 0, "amt": pend.get("voucherAmt", "0"),
+                            "creditType": pend.get("creditType",
+                                                   "G2S_cashable"),
+                            "retry": True,
+                            "reason": "EGM retry — same authorization"}
+                return self._reject(
+                    1, "redemption already in process (txn %s at %s)"
+                    % (pend.get("transactionId"), pend.get("egmId")))
+            if state in ("redeemed", "committed"):
+                # "committed" is the tier-1 legacy stamp for the same thing
+                return self._reject(2, "voucher already redeemed")
+            if state == "void":
+                return self._reject(99, "validationId voided on the bench")
+            if state != "issued":
+                # 'unused' — the id sat in the EGM's buffer but no ticket
+                # was ever printed against it: no voucher exists to pay.
+                return self._reject(
+                    4, f"no voucher issued against this id (state={state})")
+            amt, ctype = info.get("voucherAmt"), info.get("creditType")
+            if amt is None:
+                # legacy tier-1 issue records predate the stash — recover
+                # the value from the voucher ring
+                for v in self.state["vouchers"]:
+                    if v.get("kind") == "issue" and \
+                            v.get("validationId") == validation_id:
+                        amt, ctype = v.get("voucherAmt"), v.get("creditType")
+            if not amt or not str(amt).isdigit() or int(amt) <= 0:
+                return self._reject(
+                    99, f"issued amount unknown/invalid ({amt!r})")
+            exp = parse_g2s_datetime(info.get("expireDateTime"))
+            if exp is not None and exp.year > 2000 \
+                    and exp < datetime.now(timezone.utc):
+                # year<=2000 is the schema's no-expiration sentinel
+                # (2000-01-01..., Table 21.22)
+                return self._reject(
+                    3, f"voucher expired {info.get('expireDateTime')}")
+            info["state"] = "redeemPending"
+            info["pending"] = {"egmId": egm_id, "transactionId": txn_id,
+                               "voucherAmt": str(amt),
+                               "creditType": ctype or "G2S_cashable",
+                               "at": now_iso()}
+            self._save_locked()
+            return {"exc": 0, "amt": str(amt),
+                    "creditType": ctype or "G2S_cashable",
+                    "retry": False, "reason": "authorized"}
+
+    def close_redemption(self, egm_id, txn_id, validation_id, egm_action):
+        """commitVoucher closes a redemption (§21.21): G2S_redeemed consumes
+        the id; anything else (G2S_rejected, or the attribute missing on a
+        loose EGM) RESETS a matching redeemPending id back to issued so the
+        ticket can be redeemed again/elsewhere (p.905). BOTH paths require
+        the caller to HOLD the pending marker authorize_redemption recorded:
+        a commit whose (egmId, transactionId) does not hold it — the §21.20
+        hostException=1 second site giving up, a stray/foreign redeemed
+        claim, or a commit for an id since voided/reset on the bench —
+        never clobbers the live redemption (the consuming path needs the
+        holder rights just like the reset path; the SAS ticket-store
+        lesson). Idempotent for duplicate commits: after the close the
+        pending marker is gone, so a re-commit changes nothing. Returns the
+        id's resulting state, or None for an id we never issued."""
+        with self.lock:
+            info = self.state["issuedIds"].get(validation_id)
+            if info is None:
+                return None
+            pend = info.get("pending") or {}
+            if pend.get("egmId") != egm_id \
+                    or pend.get("transactionId") != txn_id:
+                # not the holder (or no hold exists) — nothing to close
+                return info.get("state")
+            if egm_action == "G2S_redeemed":
+                info["state"] = "redeemed"
+                info["redeemedTxn"] = txn_id
+                info["redeemedAt"] = now_iso()
+                info.pop("pending", None)
+            elif info.get("state") == "redeemPending":
+                info["state"] = "issued"
+                info.pop("pending", None)
+            else:
+                return info.get("state")
+            self._save_locked()
+            return info.get("state")
+
+    def void_id(self, validation_id):
+        """Bench unstick: park an id at 'void' so any future redeemVoucher
+        for it draws voucherAmt=0 + hostException=99. Clears a pending
+        marker (that is the unstick). Returns the prior state, or None if
+        the id was never issued to any EGM."""
+        with self.lock:
+            info = self.state["issuedIds"].get(validation_id)
+            if info is None:
+                return None
+            prior = info.get("state")
+            info["state"] = "void"
+            info["voidedAt"] = now_iso()
+            info.pop("pending", None)
+            self._save_locked()
+        return prior
+
+    def has_id(self, validation_id):
+        """True if this store ever issued the id — the TitoAuthority union
+        routes an incoming redemption to THIS store (G2S-issued voucher) or
+        the hub ticket ledger (SAS-minted ticket) on this membership."""
+        with self.lock:
+            return validation_id in self.state["issuedIds"]
+
+    # ------------------------------------------------ G2S-40: log reconcile
+
+    MERGE_MAX = 200          # per-merge bound: the EGM keeps >=35 entries
+    #                          (minLogEntries) but a hostile/looping list
+    #                          must never balloon the store in one call
+
+    def merge_egm_log(self, egm_id, entries):
+        """Reconcile the EGM's voucherLogList (§21.26, Table 21.28) into the
+        durable store — the 'host was down while tickets moved' repair.
+        Entries are voucherLog attribute dicts (localname keys).
+
+        Per entry, keyed like record_voucher on (egmId, kind, transactionId)
+        — redeem-side entries key as kind='commit', the SAME kind the live
+        commitVoucher handler records, so a live-completed redemption
+        dedupes on the first log fetch:
+          * an OPEN transaction (egmAction=G2S_pending, Table 21.34) is
+            skipped entirely — it is still in flight (§21.20's redemption
+            hold must survive a log fetch during the escrow window) and its
+            terminal entry will merge later;
+          * already recorded -> counted 'known', nothing changes (§21.5
+            dedupe — a re-merge is idempotent);
+          * unseen           -> appended to the voucher ring with
+            source='egmLog', and the issuedIds state machine is advanced:
+              - issue actions promote a known unused id to issued and stash
+                amount/creditType/expiry (the authorize_redemption facts);
+              - redeem actions with egmAction=G2S_redeemed consume a known
+                id (redeemed); a G2S_rejected close-out resets a matching
+                redeemPending back to issued — close_redemption's rules.
+        voucherLog validationIds are MASKED to the last 4 digits (§21.26,
+        unconditional — 'only the last 4 digits of the validation ID are
+        reported'; the fixed 18-char type means the pad is implementation-
+        defined and a digit pad is indistinguishable from a real id), so an
+        id the store did not mint must NEVER synthesize a money record:
+        unmatched entries land in the ring for history only. Entries are
+        merged in logSequence order so an issue precedes its redeem, and
+        terminal states never regress (redeemed/void stay put). Returns a
+        summary dict for the log line."""
+        def seq_key(e):
+            try:
+                return int(e.get("logSequence") or 0)
+            except (TypeError, ValueError):
+                return 0
+        entries = sorted(entries, key=seq_key)[-self.MERGE_MAX:]
+        summary = {"entries": len(entries), "known": 0, "merged": 0,
+                   "open": 0, "idsUpdated": 0, "masked": 0}
+        changed = False
+        with self.lock:
+            issued = self.state["issuedIds"]
+            ring = self.state["vouchers"]
+            # Normalize legacy merge records: earlier builds keyed redeem
+            # entries as kind='redeem' while the live commitVoucher path
+            # records 'commit' — treat them as the same kind so both dedupe.
+            seen = {(v.get("egmId"),
+                     "commit" if v.get("kind") == "redeem" else v.get("kind"),
+                     v.get("transactionId"))
+                    for v in ring}
+            for e in entries:
+                kind = "issue" if e.get("voucherAction") == "G2S_issue" \
+                    else "commit"
+                txn = e.get("transactionId")
+                if e.get("egmAction") == "G2S_pending":
+                    # in-flight transaction (Table 21.34) — nothing terminal
+                    # to reconcile, and resetting a live redeemPending hold
+                    # here would break §21.20. Skip; the terminal entry for
+                    # this txn merges on a later fetch.
+                    summary["open"] += 1
+                    continue
+                if (egm_id, kind, txn) in seen:
+                    summary["known"] += 1
+                    continue
+                summary["merged"] += 1
+                changed = True
+                vid = e.get("validationId") or ""
+                when = e.get("transferDateTime") or now_iso()
+                ring.append({
+                    "kind": kind, "egmId": egm_id, "transactionId": txn,
+                    "validationId": vid, "voucherAmt": e.get("voucherAmt"),
+                    "creditType": e.get("creditType"),
+                    "transferAmt": e.get("transferAmt"),
+                    "transferDateTime": e.get("transferDateTime"),
+                    "egmAction": e.get("egmAction"),
+                    "egmException": e.get("egmException") or "0",
+                    "voucherState": e.get("voucherState"),
+                    "logSequence": e.get("logSequence"),
+                    "expireDateTime": e.get("expireDateTime"),
+                    "source": "egmLog", "seenAt": now_iso(),
+                })
+                seen.add((egm_id, kind, txn))
+                if len(vid) != 18 or not vid.isdigit():
+                    # masked/garbled id — ring history only
+                    summary["masked"] += 1
+                    continue
+                info = issued.get(vid)
+                if info is None:
+                    # an id this store never minted: §21.26 masks every
+                    # logged validationId to its last 4 digits, and with the
+                    # fixed 18-char type a digit pad passes any length/digit
+                    # gate — so an unmatched id IS (indistinguishable from)
+                    # a mask. Minting an issued/redeemable money record here
+                    # would forge a ticket into the durable store and
+                    # GET /api/vouchers. Ring history only.
+                    summary["masked"] += 1
+                    continue
+                summary["idsUpdated"] += 1
+                if kind == "issue":
+                    if info.get("state") in (None, "unused", "issued"):
+                        info["state"] = "issued"
+                        info["voucherAmt"] = e.get("voucherAmt")
+                        info["creditType"] = e.get("creditType")
+                        info["issuedAt"] = when
+                        info["issueTxn"] = txn
+                        if e.get("expireDateTime"):
+                            info["expireDateTime"] = e.get("expireDateTime")
+                else:
+                    # stash the value even on a redeem-only sighting (a
+                    # legacy tier-1 issue record has nothing else to pay
+                    # from)
+                    if info.get("voucherAmt") is None:
+                        info["voucherAmt"] = e.get("voucherAmt")
+                        info["creditType"] = e.get("creditType")
+                    pend = info.get("pending") or {}
+                    if e.get("egmAction") == "G2S_redeemed":
+                        if info.get("state") not in ("redeemed", "void"):
+                            info["state"] = "redeemed"
+                            info["redeemedTxn"] = txn
+                            info["redeemedAt"] = when
+                            info.pop("pending", None)
+                    elif e.get("egmAction") == "G2S_rejected" \
+                            and info.get("state") == "redeemPending" \
+                            and pend.get("egmId") == egm_id \
+                            and pend.get("transactionId") == txn:
+                        # the EGM's log says that redemption closed REJECTED
+                        # while we were down — the ticket stays redeemable.
+                        # Only this explicit close-out releases the §21.20
+                        # hold; anything still open or garbled leaves
+                        # redeemPending intact (close_redemption's rules).
+                        info["state"] = "issued"
+                        info.pop("pending", None)
+            if len(ring) > self.KEEP_VOUCHERS:
+                self.state["vouchers"] = ring[-self.KEEP_VOUCHERS:]
+            if changed:
+                self._save_locked()
+        return summary
+
+    # ------------------------------------------------ G2S-40: ticket API
+
+    @staticmethod
+    def _api_record(vid, info):
+        """One issuedIds record -> the GET /api/vouchers contract shape.
+        'expired' is DERIVED presentation state: an issued ticket whose
+        expireDateTime passed (year>2000 — the schema's no-expiration
+        sentinel is 2000-01-01) reads expired without mutating the store
+        (authorize_redemption stays the enforcement point)."""
+        state = info.get("state") or "unused"
+        exp = info.get("expireDateTime")
+        if state == "committed":     # tier-1 legacy stamp for redeemed
+            state = "redeemed"
+        if state == "issued" and exp:
+            expdt = parse_g2s_datetime(exp)
+            if expdt is not None and expdt.year > 2000 \
+                    and expdt < datetime.now(timezone.utc):
+                state = "expired"
+        amt = info.get("voucherAmt")
+        try:
+            amt = int(amt)
+        except (TypeError, ValueError):
+            amt = None
+        pend = info.get("pending") or {}
+        return {
+            "validationId": vid,
+            "state": state,
+            "amountMillicents": amt,
+            "creditType": info.get("creditType"),
+            "egmId": info.get("egmId"),
+            "issuedAt": info.get("issuedAt"),
+            "redeemedAt": info.get("redeemedAt"),
+            "expireAt": exp,
+            "voidedAt": info.get("voidedAt"),
+            "transactionId": info.get("issueTxn")
+            or pend.get("transactionId") or info.get("redeemedTxn"),
+        }
+
+    def api_vouchers(self, limit=50, offset=0, state=None, egm_id=None,
+                     vid=None):
+        """The GET /api/vouchers payload (G2S-40 ticket browser). vid= is an
+        EXACT-match lookup (limit/offset/state ignored, total 0 or 1).
+        Otherwise: newest-first by latest activity, optional state= filter
+        on the DERIVED state (issued/redeemPending/redeemed/void/expired/
+        unused) and egmId= filter; `total` counts the filtered set, the
+        page is [offset:offset+limit]. Buffer ids nobody printed against
+        (state unused) are excluded from the unfiltered listing — they are
+        not tickets — but state=unused shows them deliberately."""
+        with self.lock:
+            if vid is not None:
+                info = self.state["issuedIds"].get(vid)
+                recs = [self._api_record(vid, dict(info))] if info else []
+                return {"total": len(recs), "vouchers": recs}
+            rows = []
+            for v, info in self.state["issuedIds"].items():
+                rec = self._api_record(v, info)
+                if state:
+                    if rec["state"] != state:
+                        continue
+                elif rec["state"] == "unused":
+                    continue
+                if egm_id and rec["egmId"] != egm_id:
+                    continue
+                sort_key = max(filter(None, (
+                    info.get("at"), rec["issuedAt"], rec["redeemedAt"],
+                    rec["voidedAt"])), default="")
+                rows.append((sort_key, rec))
+        rows.sort(key=lambda t: t[0], reverse=True)
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        return {"total": len(rows),
+                "vouchers": [r for _, r in rows[offset:offset + limit]]}
+
+
+class TitoAuthority:
+    """The ONE cross-machine redemption authority (hub.db phase 2).
+
+    Union of the two ticket ledgers on the floor:
+      * VoucherStore  — every validation id the G2S host handed an EGM
+        (AVP-printed vouchers). Untouched, still the hardened tier-2 state
+        machine; ids it knows are delegated to it BYTE-IDENTICALLY, so the
+        replay gate and all existing AVP-only behavior are unchanged.
+      * hub ticket ledger (HubStore.tito_*) — every SAS-minted ticket
+        (BB2 system-validation cash-outs land here via /api/tito/mint).
+
+    authorize()/close() speak the VoucherStore decision dialect
+    ({exc, amt, creditType, retry, reason} — amt is a MILLICENTS string)
+    because the redeemVoucher/commitVoucher handlers already consume it;
+    hub-ledger decisions are adapted into that shape (hostException 4 =
+    unknown, 2 = already redeemed, 1 = redemption in process — the same
+    Table 21.35 codes VoucherStore emits). A ticket unknown to BOTH ledgers
+    rejects exc=4 exactly like an unknown voucher today."""
+
+    def __init__(self, voucher_store, hub_store):
+        self.voucher_store = voucher_store
+        self.hub_store = hub_store
+
+    @staticmethod
+    def _adapt(dec):
+        """hub {authorized, amountMc, reason, retry} -> voucher dialect."""
+        if dec.get("authorized"):
+            return {"exc": 0, "amt": str(int(dec.get("amountMc", 0))),
+                    "creditType": "G2S_cashable",
+                    "retry": bool(dec.get("retry")),
+                    "reason": dec.get("reason", "authorized")}
+        reason = dec.get("reason", "rejected")
+        if "already redeemed" in reason:
+            exc = 2
+        elif "already in process" in reason:
+            exc = 1
+        elif "voided" in reason:
+            exc = 99
+        else:
+            exc = 4
+        return {"exc": exc, "amt": "0", "creditType": "G2S_cashable",
+                "retry": False, "reason": reason}
+
+    def authorize(self, machine, txn, validation_id, reported_mc=None):
+        if self.voucher_store.has_id(validation_id):
+            return self.voucher_store.authorize_redemption(
+                machine, txn, validation_id)
+        try:
+            dec = self.hub_store.tito_authorize(
+                machine, txn, validation_id, reported_mc)
+        except Exception as e:  # noqa: BLE001 — a db fault must reject,
+            log.error("tito authorize(%s) db fault: %s "  # never crash the
+                      "-> rejected", validation_id, e)    # dispatch path
+            dec = {"authorized": False,
+                   "reason": f"ledger unavailable ({e}) — ticket returned"}
+        return self._adapt(dec)
+
+    def close(self, machine, txn, validation_id, egm_action):
+        """Close in whichever ledger owns the id. Returns the resulting
+        state string (or None for an id neither ledger issued).
+
+        A hub-ledger db fault RAISES — swallowing it here answered ok:true
+        to the satellite, which then never journaled the close and the
+        redemption stayed pending forever (review 2026-07-08). Each call
+        site handles it: /api/tito answers ok:false (the satellite journals
+        and the sync replays), the commitVoucher handler logs and still
+        acks the EGM (its retransmit protocol is not ours to break)."""
+        if self.voucher_store.has_id(validation_id):
+            return self.voucher_store.close_redemption(
+                machine, txn, validation_id, egm_action)
+        redeemed = egm_action == "G2S_redeemed"
+        return self.hub_store.tito_close(machine, txn, validation_id,
+                                         redeemed)
+
+
+class ConfigInventoryStore:
+    """Durable optionConfig inventory (GR-10). The AVP pushes its device/
+    option inventory unsolicited via the optionList config-sync, which only
+    re-fires on a deviceReset — so a host restart used to lose config_devices/
+    config_options (and the handpay permission lamp) until the EGM's next
+    reboot. This store persists the parsed inventory per EGM in one JSON file
+    beside the voucher store and hands it back when the association is
+    re-created after a warm restart.
+
+    GR-28: the same per-EGM record also carries a "gamePlay" section — the
+    parsed status/profile/denoms inventory from the on-demand 119-device
+    sweep, which was memory-only and got wiped by every deploy restart
+    (blanking the Test Panel games card until a manual re-sweep). Sections
+    are saved read-modify-write independently (save/save_game_play), so a
+    config-sync never clobbers the games inventory and vice versa. The
+    "gamePlayAt" stamp records when that section was last refreshed from a
+    live parse — a reload hands back a LAST-KNOWN view (hostEnabled/
+    egmEnabled may be stale; the sweep refreshes on demand).
+
+    Deliberately STATELESS between calls: every get()/save() re-reads the
+    file, so an external reset (deleting the file — e.g. the replay gate's
+    deterministic-join preflight) takes effect at the next association
+    creation without a host restart. Call rate is tiny (per config-sync /
+    per assoc creation), so the re-reads cost nothing.
+
+    Stdlib-only. Writes follow the GR-03 power-fail pattern: tmp + fsync data
+    + os.replace + fsync the directory; a failed write is logged, never
+    raised (a full disk must not stall the dispatch path)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def _read_locked(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("egms"), dict):
+                return data
+            log.error("config inventory %s has an unexpected shape — "
+                      "treating as empty", self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            # GR-03 residue (mirrors VoucherStore): quarantine rather than
+            # let the next save() silently overwrite the corrupt file. Unlike
+            # vouchers this state is rebuildable from the EGM, but the copy
+            # is free and the rename also stops this error from re-logging
+            # on every subsequent read (next read: FileNotFoundError).
+            quarantine = self.path + ".corrupt"
+            try:
+                os.replace(self.path, quarantine)
+                log.error("config inventory UNREADABLE (%s) — quarantined to "
+                          "%s; treating as empty (the EGM's next config-sync "
+                          "or a getOptionList rebuilds it): %s",
+                          self.path, quarantine, e)
+            except OSError as qe:
+                log.error("config inventory UNREADABLE (%s) — treating as "
+                          "empty (quarantine to %s also failed: %s): %s",
+                          self.path, quarantine, qe, e)
+        return {"egms": {}}
+
+    def get(self, egm_id):
+        """The persisted {configDevices, configOptions, at, gamePlay,
+        gamePlayAt} record for one EGM, or None."""
+        with self.lock:
+            return self._read_locked()["egms"].get(egm_id)
+
+    def save(self, egm_id, config_devices, config_options):
+        """Read-modify-write the optionConfig section of this EGM's record
+        (other EGMs' records — and this EGM's gamePlay section — are
+        preserved)."""
+        with self.lock:
+            data = self._read_locked()
+            rec = data["egms"].setdefault(egm_id, {})
+            rec["configDevices"] = config_devices
+            rec["configOptions"] = config_options
+            rec["at"] = now_iso()
+            self._write_locked(data)
+
+    def save_game_play(self, egm_id, game_play, as_of=None):
+        """GR-28: read-modify-write the gamePlay section of this EGM's record
+        (the optionConfig section and other EGMs' records are preserved)."""
+        with self.lock:
+            data = self._read_locked()
+            rec = data["egms"].setdefault(egm_id, {})
+            rec["gamePlay"] = game_play
+            rec["gamePlayAt"] = as_of or now_iso()
+            self._write_locked(data)
+
+    def _write_locked(self, data):
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            log.error("config inventory save FAILED (%s) — continuing "
+                      "with in-memory state", e)
+
+
+class WatStore:
+    """Durable state behind the wat class (spec ch.22, G2S-39).
+
+    One JSON file (G2S/data/wat_state.json, gitignored runtime state)
+    holding:
+      * requestIdSeq — monotonic host requestId source (Table 22.16 requires
+                       a NON-ZERO requestId on every initiateRequest; never
+                       reused across restarts, so a stale EGM retry can never
+                       collide with a fresh push);
+      * transfers    — bounded ring of per-transfer records keyed by
+                       (egmId, transactionId) and, pre-transactionId, by
+                       (egmId, requestId).
+
+    Each record walks the §22.7 state machine:
+        requested -> pending -> initiated -> authorized
+                  -> committed / denied / failed / cancelled
+    commitSeen is the §22.31 dedupe latch — the EGM re-sends commitTransfer
+    until acked, so a duplicate re-acks WITHOUT re-applying the account
+    movement (the duplicate-issueVoucher treatment). All transitions are
+    atomic under self.lock and survive host restarts mid-transfer: the
+    assoc-level ring is just a presentation mirror of this store.
+
+    Stdlib-only. Writes follow the GR-03 power-fail pattern (tmp + fsync +
+    os.replace + dir fsync); an unreadable file is quarantined to .corrupt
+    (money state — same rationale as VoucherStore); a failed write is logged,
+    never raised."""
+
+    KEEP_TRANSFERS = 200
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.state = {"requestIdSeq": 0, "transfers": []}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in self.state:
+                if k in data:
+                    self.state[k] = data[k]
+            log.info("wat store loaded: requestIdSeq=%s transfers=%d (%s)",
+                     self.state["requestIdSeq"],
+                     len(self.state["transfers"]), path)
+        except FileNotFoundError:
+            log.info("wat store: fresh state at %s", path)
+        except (OSError, ValueError) as e:
+            quarantine = self.path + ".corrupt"
+            try:
+                os.replace(self.path, quarantine)
+                log.error("wat store UNREADABLE (%s) — quarantined to %s and "
+                          "starting fresh; in-flight transfer escrow (if any) "
+                          "is hand-recoverable from the quarantine copy: %s",
+                          path, quarantine, e)
+            except OSError as qe:
+                log.error("wat store UNREADABLE (%s) — starting fresh "
+                          "(quarantine to %s also failed: %s): %s",
+                          path, quarantine, qe, e)
+
+    def _save_locked(self):
+        """Persist (GR-03 pattern). MUST be called holding self.lock."""
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            log.error("wat store save FAILED (%s) — continuing with "
+                      "in-memory state", e)
+
+    def _find_locked(self, egm_id, txn_id=None, request_id=None):
+        """Newest-first scan. A transactionId match wins; requestId is the
+        pre-requestPending fallback (only non-zero ids are host requests)."""
+        for rec in reversed(self.state["transfers"]):
+            if rec.get("egmId") != egm_id:
+                continue
+            if txn_id is not None and txn_id != "0" and \
+                    str(rec.get("transactionId")) == str(txn_id):
+                return rec
+            if txn_id in (None, "0") and request_id is not None and \
+                    str(request_id) != "0" and \
+                    str(rec.get("requestId")) == str(request_id):
+                return rec
+        return None
+
+    def _append_locked(self, rec):
+        self.state["transfers"].append(rec)
+        if len(self.state["transfers"]) > self.KEEP_TRANSFERS:
+            self.state["transfers"] = \
+                self.state["transfers"][-self.KEEP_TRANSFERS:]
+
+    def find(self, egm_id, txn_id=None, request_id=None):
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id,
+                                    request_id=request_id)
+            return dict(rec) if rec else None
+
+    def new_request(self, egm_id, device_id, account_id, pay_method,
+                    cashable, promo, non_cash):
+        """Allocate the next non-zero requestId + a 'requested' record for a
+        host-initiated push (initiateRequest, §22.25)."""
+        with self.lock:
+            self.state["requestIdSeq"] += 1
+            rid = self.state["requestIdSeq"]
+            rec = {
+                "requestId": rid, "transactionId": "0",
+                "egmId": egm_id, "deviceId": str(device_id),
+                "state": "requested", "watDirection": "G2S_toEgm",
+                "payMethod": pay_method, "accountId": account_id,
+                "reqCashableAmt": int(cashable), "reqPromoAmt": int(promo),
+                "reqNonCashAmt": int(non_cash), "commitSeen": False,
+                "createdAt": now_iso(),
+            }
+            self._append_locked(rec)
+            self._save_locked()
+            return rid, dict(rec)
+
+    def on_request_pending(self, egm_id, request_id, txn_id):
+        """requestPending (§22.26): the EGM assigned a transactionId to our
+        requestId. requested -> pending; idempotent on retries."""
+        with self.lock:
+            rec = self._find_locked(egm_id, request_id=request_id)
+            if rec is None:
+                return None
+            if rec.get("state") == "requested":
+                rec["state"] = "pending"
+                rec["transactionId"] = str(txn_id)
+                rec["pendingAt"] = now_iso()
+                self._save_locked()
+            return dict(rec)
+
+    def on_initiate(self, egm_id, txn_id, request_id, device_id, direction,
+                    pay_method, egm_amounts, max_amt, account_id):
+        """initiateTransfer (§22.29). Matches the host record by txn (or the
+        echoed requestId when requestPending was lost); creates a fresh
+        record for an EGM-initiated transfer (requestId=0). Never downgrades
+        an already-authorized/denied record — an EGM retry re-draws the SAME
+        authorization from the stored amounts. Returns (record copy,
+        created)."""
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id)
+            if rec is None and request_id and str(request_id) != "0":
+                rec = self._find_locked(egm_id, request_id=request_id)
+            if rec is not None and \
+                    rec.get("state") not in WAT_ACTIVE_STATES:
+                # A TERMINAL record matched this transactionId. A §1.18
+                # ghost duplicate of the SAME transfer echoes the same
+                # requestId/direction/amounts (kept — the decision layer
+                # re-draws the stored verdict without touching money). ANY
+                # mismatch means the EGM's transactionId space restarted
+                # (RAM clear — records persist 200 deep across restarts)
+                # and REUSED this id: a stale verdict must never bind the
+                # new transfer, so treat it as unmatched and record fresh.
+                stored = (rec.get("egmCashableAmt"),
+                          rec.get("egmPromoAmt"), rec.get("egmNonCashAmt"))
+                amounts_same = None in stored or all(
+                    int(s) == int(n)
+                    for s, n in zip(stored, egm_amounts))
+                if str(rec.get("requestId") or 0) != str(request_id or 0) \
+                        or (rec.get("watDirection") or direction) \
+                        != direction or not amounts_same:
+                    rec = None
+            created = False
+            if rec is None:
+                rec = {
+                    "requestId": int(request_id or 0)
+                    if str(request_id or 0).isdigit() else 0,
+                    "transactionId": str(txn_id),
+                    "egmId": egm_id, "deviceId": str(device_id),
+                    "state": "initiated", "watDirection": direction,
+                    "payMethod": pay_method,
+                    "accountId": account_id or "",
+                    "reqCashableAmt": int(egm_amounts[0]),
+                    "reqPromoAmt": int(egm_amounts[1]),
+                    "reqNonCashAmt": int(egm_amounts[2]),
+                    "commitSeen": False, "createdAt": now_iso(),
+                }
+                self._append_locked(rec)
+                created = True
+            if rec.get("state") in ("requested", "pending"):
+                rec["state"] = "initiated"
+            rec["transactionId"] = str(txn_id)
+            rec["egmCashableAmt"] = int(egm_amounts[0])
+            rec["egmPromoAmt"] = int(egm_amounts[1])
+            rec["egmNonCashAmt"] = int(egm_amounts[2])
+            rec["maxAmt"] = int(max_amt)
+            rec["initiatedAt"] = now_iso()
+            self._save_locked()
+            return dict(rec), created
+
+    def on_authorize(self, egm_id, txn_id, account_id, amounts,
+                     host_exception, escrow):
+        """authorizeTransfer decision recorded (§22.30): authorized (with the
+        escrowed amounts) or denied (all-zero + hostException). A record the
+        commitTransfer close-out already latched is returned UNCHANGED — a
+        ghost/late authorize must never regress a terminal state (which
+        would resurrect it into pendingTransfers with commitSeen stuck)."""
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id)
+            if rec is None:
+                return None
+            if rec.get("commitSeen"):
+                return dict(rec)
+            rec["accountId"] = account_id
+            rec["authCashableAmt"] = int(amounts[0])
+            rec["authPromoAmt"] = int(amounts[1])
+            rec["authNonCashAmt"] = int(amounts[2])
+            rec["hostException"] = str(host_exception)
+            if escrow:
+                rec["escrowCashable"] = int(amounts[0])
+                rec["escrowPromo"] = int(amounts[1])
+                rec["escrowNonCash"] = int(amounts[2])
+            rec["state"] = ("authorized" if str(host_exception) == "0"
+                            else "denied")
+            rec["authorizedAt"] = now_iso()
+            self._save_locked()
+            return dict(rec)
+
+    def on_commit(self, egm_id, txn_id, request_id, device_id, direction,
+                  account_id, trans_amounts, egm_exception):
+        """commitTransfer close-out (§22.31), idempotent: commitSeen is the
+        dedupe latch, so an EGM retry returns dup=True and the caller re-acks
+        WITHOUT re-applying account movement. A commit for a transaction this
+        store never saw (host restarted AND the store was reset) synthesizes
+        a terminal record so history stays complete. Returns (dup, record
+        copy)."""
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id)
+            if rec is None and request_id and str(request_id) != "0":
+                rec = self._find_locked(egm_id, request_id=request_id)
+            if rec is not None and rec.get("commitSeen"):
+                # dup ONLY when the facts match: a §22.31 retry re-sends the
+                # identical command (same requestId/direction/amounts/
+                # exception). A mismatch means the EGM reused this
+                # transactionId after a RAM clear — records persist 200
+                # deep, so without this check the stale latch would swallow
+                # a REAL commit (cash-out never credited). Treat a reused
+                # id as a brand-new transaction and record it fresh.
+                same = (str(rec.get("requestId") or 0)
+                        == str(request_id or 0)
+                        and (rec.get("watDirection") or direction)
+                        == direction
+                        and str(rec.get("egmException"))
+                        == str(egm_exception)
+                        and all(int(rec.get(k) or 0) == int(v)
+                                for k, v in zip(
+                                    ("transCashableAmt", "transPromoAmt",
+                                     "transNonCashAmt"), trans_amounts)))
+                if same:
+                    return True, dict(rec)
+                rec = None
+            if rec is None:
+                rec = {
+                    "requestId": int(request_id or 0)
+                    if str(request_id or 0).isdigit() else 0,
+                    "transactionId": str(txn_id), "egmId": egm_id,
+                    "deviceId": str(device_id), "state": "initiated",
+                    "watDirection": direction, "accountId": account_id or "",
+                    "commitSeen": False, "createdAt": now_iso(),
+                    "source": "unsolicitedCommit",
+                }
+                self._append_locked(rec)
+            rec["commitSeen"] = True
+            rec["transactionId"] = str(txn_id)
+            rec["transCashableAmt"] = int(trans_amounts[0])
+            rec["transPromoAmt"] = int(trans_amounts[1])
+            rec["transNonCashAmt"] = int(trans_amounts[2])
+            rec["egmException"] = str(egm_exception)
+            rec["committedAt"] = now_iso()
+            if sum(int(a) for a in trans_amounts) > 0 and \
+                    str(egm_exception) == "0":
+                rec["state"] = "committed"
+            elif rec.get("state") == "denied":
+                pass  # the mandated close-out of a host-denied transfer
+            elif str(egm_exception) == "2":
+                rec["state"] = "cancelled"  # Table 22.38: cancelled by host
+            else:
+                rec["state"] = "failed"
+            self._save_locked()
+            return False, dict(rec)
+
+    def mark_cancel(self, egm_id, txn_id, stamp):
+        """Stamp cancelRequestedAt/cancelAckedAt (the state itself only moves
+        at the EGM's mandated all-zero egmException=2 commitTransfer)."""
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id)
+            if rec is None:
+                return None
+            rec[stamp] = now_iso()
+            self._save_locked()
+            return dict(rec)
+
+    def cancel_local(self, egm_id, request_id):
+        """LOCAL cancel of a push that has no transactionId yet — the EGM
+        never answered requestPending, so no wire cancelRequest is possible
+        (§22.27 needs the txn) and a silent EGM must not make the record
+        un-cancellable. Nothing to unwind: escrow only exists from
+        'authorized'. Returns the copy, or None if the record moved."""
+        with self.lock:
+            rec = self._find_locked(egm_id, request_id=request_id)
+            if rec is None or rec.get("state") != "requested" or \
+                    str(rec.get("transactionId") or "0") != "0":
+                return None
+            rec["state"] = "cancelled"
+            rec["cancelledLocally"] = True
+            rec["cancelRequestedAt"] = now_iso()
+            self._save_locked()
+            return dict(rec)
+
+    def newest_active(self, egm_id):
+        """The NEWEST still-live transfer — the watCancel blank-target
+        (/api/command watCancel with neither requestId nor transactionId
+        cancels the latest). Returns a copy, or None."""
+        with self.lock:
+            for rec in reversed(self.state["transfers"]):
+                if rec.get("egmId") == egm_id and \
+                        rec.get("state") in WAT_ACTIVE_STATES:
+                    return dict(rec)
+        return None
+
+    def abandon_open_requests(self, egm_id, reason):
+        """The EGM reset (commsOnLine deviceReset/metersReset flags): every
+        host push still waiting on that machine's RAM — 'requested' (no
+        answer at all) or 'pending' (txn assigned, initiateTransfer never
+        came) — died with it. No money to unwind (escrow only exists from
+        'authorized'). Park them terminal so they can't wedge
+        pendingTransfers forever or soak up the best-effort wat error
+        attribution. Returns the copies."""
+        out = []
+        with self.lock:
+            for rec in self.state["transfers"]:
+                if rec.get("egmId") == egm_id and \
+                        rec.get("state") in ("requested", "pending"):
+                    rec["state"] = "abandoned"
+                    rec["abandonedAt"] = now_iso()
+                    rec["abandonReason"] = reason
+                    out.append(dict(rec))
+            if out:
+                self._save_locked()
+        return out
+
+    def mark_error(self, egm_id, txn_id=None, request_id=None, code=""):
+        """A wat-class error rejected our request — park a still-live record
+        at error:* (terminal). Returns the copy, or None."""
+        with self.lock:
+            rec = self._find_locked(egm_id, txn_id=txn_id,
+                                    request_id=request_id)
+            if rec is None or rec.get("state") not in WAT_ACTIVE_STATES:
+                return None
+            rec["state"] = f"error:{code}"
+            self._save_locked()
+            return dict(rec)
+
+
+class AccountStore:
+    """Durable enthusiast WAT accounts (G2S-39) — the funding side of the
+    wat class. PIN-less by decision (hashType=G2S_none forever): these are
+    named house/player buckets for showing off cashless transfers in a home
+    game room, NOT casino cashless (see ROADMAP out-of-scope).
+
+    One JSON file (G2S/data/account_state.json) holding:
+      * accountSeq — monotonic player-account id source (p1, p2, ...);
+      * accounts   — id -> {id, name, kind house|player, cashableMillicents,
+                     promoMillicents, nonCashMillicents, createdAt,
+                     lastActivity};
+      * ledger     — append-only bounded ring (KEEP_LEDGER) of
+                     {ts, accountId, kind cashable|promo|nonCash,
+                     deltaMillicents, ref, note} — one entry per non-zero
+                     credit-type delta.
+
+    THE overdraft rule: the house account MAY go negative (it is the bank —
+    pushing credits to a machine from thin air is the hobbyist point);
+    player accounts may NOT (adjust/escrow rejects the whole movement
+    atomically). A default house account (id "house") is seeded on first
+    run. All mutations are atomic under self.lock; saves follow the GR-03
+    power-fail pattern; an unreadable file quarantines to .corrupt (money
+    state — the VoucherStore rationale)."""
+
+    # 500 -> 2000 (house-hold build): floor-hold entries settle up to
+    # ~6/min/machine and would churn a 500-ring past the once=True dedupe
+    # window; 2000 is a cheap JSON list and keeps every ref the crash-heal
+    # sweeps could ever replay.
+    KEEP_LEDGER = 2000
+    BUCKETS = (("cashableMillicents", "cashable"),
+               ("promoMillicents", "promo"),
+               ("nonCashMillicents", "nonCash"))
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.state = {"accountSeq": 0, "accounts": {}, "ledger": []}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in self.state:
+                if k in data:
+                    self.state[k] = data[k]
+            log.info("account store loaded: %d account(s), %d ledger "
+                     "entries (%s)", len(self.state["accounts"]),
+                     len(self.state["ledger"]), path)
+        except FileNotFoundError:
+            log.info("account store: fresh state at %s", path)
+        except (OSError, ValueError) as e:
+            quarantine = self.path + ".corrupt"
+            try:
+                os.replace(self.path, quarantine)
+                log.error("account store UNREADABLE (%s) — quarantined to %s "
+                          "and starting fresh; balances are hand-recoverable "
+                          "from the quarantine copy: %s", path, quarantine, e)
+            except OSError as qe:
+                log.error("account store UNREADABLE (%s) — starting fresh "
+                          "(quarantine to %s also failed: %s): %s",
+                          path, quarantine, qe, e)
+        if "house" not in self.state["accounts"]:
+            self.state["accounts"]["house"] = {
+                "id": "house", "name": "House", "kind": "house",
+                "cashableMillicents": 0, "promoMillicents": 0,
+                "nonCashMillicents": 0, "createdAt": now_iso(),
+                "lastActivity": None,
+            }
+            with self.lock:
+                self._save_locked()
+            log.info("account store: seeded the default house account "
+                     "(kind=house — MAY go negative; it is the bank)")
+
+    def _save_locked(self):
+        """Persist (GR-03 pattern). MUST be called holding self.lock."""
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            log.error("account store save FAILED (%s) — continuing with "
+                      "in-memory state", e)
+
+    def get(self, account_id):
+        with self.lock:
+            rec = self.state["accounts"].get(str(account_id or ""))
+            if rec is None:
+                return None
+            out = dict(rec)
+            # admin (glass-menu backend access) is a forward-only optional
+            # field — a record written before the flag existed reads False,
+            # defaulted at READ so load never mutates the store (§1).
+            out.setdefault("admin", False)
+            return out
+
+    def snapshot(self):
+        """The GET /api/accounts payload: every account (house first, then
+        players by creation) + the last 100 ledger entries."""
+        with self.lock:
+            accounts = sorted(
+                (dict(a) for a in self.state["accounts"].values()),
+                key=lambda a: (a.get("kind") != "house",
+                               a.get("createdAt") or "", a.get("id") or ""))
+            ledger = [dict(e) for e in self.state["ledger"][-100:]]
+        for a in accounts:
+            # forward-only admin default at read (legacy record → False),
+            # the same posture as get() — never mutate on load.
+            a.setdefault("admin", False)
+        return {"accounts": accounts, "ledger": ledger}
+
+    def create(self, name):
+        name = (name or "").strip()
+        if not name:
+            return None, "account name required"
+        with self.lock:
+            self.state["accountSeq"] += 1
+            aid = f"p{self.state['accountSeq']}"
+            rec = {"id": aid, "name": name, "kind": "player",
+                   "cashableMillicents": 0, "promoMillicents": 0,
+                   "nonCashMillicents": 0, "createdAt": now_iso(),
+                   "lastActivity": None, "admin": False}
+            self.state["accounts"][aid] = rec
+            self._save_locked()
+            return dict(rec), None
+
+    def rename(self, account_id, name):
+        name = (name or "").strip()
+        if not name:
+            return None, "account name required"
+        with self.lock:
+            rec = self.state["accounts"].get(str(account_id or ""))
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            rec["name"] = name
+            rec["lastActivity"] = now_iso()
+            self._save_locked()
+            return dict(rec), None
+
+    def delete(self, account_id):
+        with self.lock:
+            rec = self.state["accounts"].get(str(account_id or ""))
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            if rec.get("kind") == "house":
+                return None, "the house account cannot be deleted (it is " \
+                             "the default WAT funding account)"
+            if any(int(rec.get(field, 0) or 0) for field, _ in self.BUCKETS):
+                # Atomic under self.lock — the last line of the "credits
+                # are never vaporized" rule: a credit landing AFTER a
+                # caller's final balance read (a fund on another request
+                # thread, a WAT/AFT sweep) must not ride the delete out of
+                # the books with its house leg still standing. Callers
+                # fold and retry (player_action remove does).
+                return None, (f"{rec['id']!r} still holds credits — fold "
+                              "the balance first (Players ▸ Remove does)")
+            del self.state["accounts"][str(account_id)]
+            self._save_locked()
+            return dict(rec), None
+
+    def adjust(self, account_id, d_cash=0, d_promo=0, d_non=0, note="",
+               ref="", once=False):
+        """Atomically move funds on one account: all three deltas apply or
+        none. Overdraft rule: kind=house may go negative, players may not.
+        Appends one ledger entry per non-zero delta. Returns
+        (account copy | None, error | None).
+
+        once=True makes the movement IDEMPOTENT on ref (crash/duplicate
+        safety for the WAT money legs): if the ledger already holds an
+        entry with this exact non-empty ref, the whole movement was already
+        applied — return the CURRENT account unchanged. The check-and-apply
+        is atomic under self.lock, so two racing duplicates can never both
+        apply. The ledger is a bounded ring (KEEP_LEDGER=2000 movements) —
+        far wider than any §22.31 retry window."""
+        with self.lock:
+            rec = self.state["accounts"].get(str(account_id or ""))
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            if once and ref and any(e.get("ref") == ref
+                                    for e in self.state["ledger"]):
+                return dict(rec), None
+            deltas = (int(d_cash), int(d_promo), int(d_non))
+            if rec.get("kind") != "house":
+                for (field, _), d in zip(self.BUCKETS, deltas):
+                    if int(rec.get(field, 0)) + d < 0:
+                        return None, (
+                            f"insufficient {field} on {rec['id']!r} "
+                            f"(have {rec.get(field, 0)}, delta {d}) — "
+                            "player accounts may not go negative")
+            ts = now_iso()
+            for (field, kind), d in zip(self.BUCKETS, deltas):
+                if d == 0:
+                    continue
+                rec[field] = int(rec.get(field, 0)) + d
+                self.state["ledger"].append({
+                    "ts": ts, "accountId": rec["id"], "kind": kind,
+                    "deltaMillicents": d, "ref": ref, "note": note})
+            if len(self.state["ledger"]) > self.KEEP_LEDGER:
+                self.state["ledger"] = self.state["ledger"][-self.KEEP_LEDGER:]
+            rec["lastActivity"] = ts
+            self._save_locked()
+            return dict(rec), None
+
+    def ref_totals(self, ref):
+        """Summed ledger deltas per credit type under ONE ref — the
+        authoritative record of what a WAT leg actually moved. Used at
+        commitTransfer to recover an escrow debit whose WatStore-side
+        escrow fields were lost to a crash between the two store fsyncs
+        (the ledger entry is the one that moved money, so it is the one
+        that must be refunded). Returns (cashable, promo, nonCash)."""
+        totals = {"cashable": 0, "promo": 0, "nonCash": 0}
+        with self.lock:
+            for e in self.state["ledger"]:
+                if ref and e.get("ref") == ref:
+                    k = e.get("kind")
+                    totals[k] = totals.get(k, 0) + \
+                        int(e.get("deltaMillicents") or 0)
+        return (totals["cashable"], totals["promo"], totals["nonCash"])
+
+    def set_admin(self, account_id, admin):
+        """Set the ACCOUNT-level admin flag (§1) — the glass-menu backend-
+        access authority, NOT a money field, so it touches no bucket and
+        no ledger. Refuses an unknown id and the house (the bank is never
+        carded in, never admin-toggleable). Atomic under self.lock +
+        _save_locked; returns (updated copy, err) — the store idiom."""
+        aid = str(account_id or "")
+        with self.lock:
+            rec = self.state["accounts"].get(aid)
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            if aid == "house" or rec.get("kind") == "house":
+                return None, ("the house account is the bank — it is never "
+                              "carded in and never admin")
+            rec["admin"] = bool(admin)
+            rec["lastActivity"] = now_iso()
+            self._save_locked()
+            out = dict(rec)
+            out.setdefault("admin", False)
+            return out, None
+
+
+class GlassSessionStore:
+    """Glass navigation v1 (#18 P4): the hub-authoritative session map behind
+    the on-glass SPA. In-memory BY DESIGN — a hub restart revokes every
+    token, the resident page just repaints attract and the next tap
+    re-mints. Lock-guarded; ONE session per EGM (the card_sessions model:
+    one carded body per cabinet, a new mint supersedes the old token).
+
+    Tokens ("gs_" + secrets.token_hex) are unguessable, but the real
+    boundary is the slot VLAN (the /api/glass/ping posture): the token
+    exists so a page action can never act with a tier the hub didn't record
+    server-side — it is not internet-grade auth. Player sessions NEVER
+    idle-expire (AJ's rule: the carded session IS the wallet link — see
+    CARD_SESSION_MAX_SEC); attendant/manager tokens idle out after
+    GLASS_OPERATOR_IDLE_SEC. resolve() — the ACTION path — refreshes the
+    idle clock; peek_egm() — the 1.5s state poll — deliberately does NOT,
+    or a page that polls forever would keep an abandoned attendant token
+    alive and the horizon could never trip."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_tok = {}           # tok -> record
+        self._by_egm = {}           # egmId -> tok (one session per EGM)
+
+    @staticmethod
+    def _expired(rec, now):
+        return rec.get("tier") in ("attendant", "manager") and \
+            now - (rec.get("lastSeen") or 0) > GLASS_OPERATOR_IDLE_SEC
+
+    def mint(self, egm_id, tier, uid, name):
+        """Card-IN: mint a fresh token for this EGM. Any prior session for
+        the same EGM is superseded (revoked) — the reader is physical, so
+        whoever tapped last IS the session."""
+        tok = "gs_" + secrets.token_hex(12)
+        rec = {"egmId": egm_id, "tier": tier, "uid": uid, "name": name,
+               "mintedIso": now_iso(), "lastSeen": time.time()}
+        with self._lock:
+            old = self._by_egm.pop(egm_id, None)
+            if old:
+                self._by_tok.pop(old, None)
+            self._by_tok[tok] = rec
+            self._by_egm[egm_id] = tok
+        return tok
+
+    def revoke_egm(self, egm_id):
+        """Card-OUT: drop this EGM's session. Idempotent — revoking an
+        EGM with no session is a no-op (returns False)."""
+        with self._lock:
+            tok = self._by_egm.pop(egm_id, None)
+            return bool(tok) and self._by_tok.pop(tok, None) is not None
+
+    def revoke_if(self, egm_id, tok):
+        """Compare-and-revoke (the glass logout button's card-out): drop
+        this EGM's session ONLY while `tok` is still its live token. False
+        means the token was superseded (a card switch minted a new session
+        between the action's resolve and its act) or already revoked — the
+        caller must then NO-OP rather than card out whoever holds the
+        session NOW. Atomic under the store lock: the check and the pop
+        can never straddle a mint."""
+        with self._lock:
+            if not tok or self._by_egm.get(egm_id) != tok:
+                return False
+            self._by_egm.pop(egm_id, None)
+            self._by_tok.pop(tok, None)
+            return True
+
+    def still_live(self, egm_id, tok):
+        """Read half of revoke_if: True while `tok` is still this EGM's live
+        (unexpired) session token — for a compare-BEFORE-write that must not
+        act on a token a card switch already superseded. Does NOT refresh
+        the idle clock (like peek_egm)."""
+        now = time.time()
+        with self._lock:
+            if not tok or self._by_egm.get(egm_id) != tok:
+                return False
+            rec = self._by_tok.get(tok)
+            return rec is not None and not self._expired(rec, now)
+
+    def resolve(self, tok):
+        """Action-path lookup: tok -> a COPY of the record, refreshing the
+        operator idle clock. None for a missing/expired token — the
+        caller's 401 (an expired operator token is deleted here, so the
+        next state poll flips the page back honestly)."""
+        now = time.time()
+        with self._lock:
+            rec = self._by_tok.get(tok) if tok else None
+            if rec is None:
+                return None
+            if self._expired(rec, now):
+                self._by_tok.pop(tok, None)
+                self._by_egm.pop(rec.get("egmId"), None)
+                return None
+            rec["lastSeen"] = now
+            return dict(rec)
+
+    def peek_egm(self, egm_id):
+        """State-poll lookup: egmId -> (tok, record COPY), applying the
+        operator idle horizon WITHOUT refreshing it (see the class note).
+        (None, None) when this EGM has no live session."""
+        now = time.time()
+        with self._lock:
+            tok = self._by_egm.get(egm_id)
+            rec = self._by_tok.get(tok) if tok else None
+            if rec is None:
+                return None, None
+            if self._expired(rec, now):
+                self._by_egm.pop(egm_id, None)
+                self._by_tok.pop(tok, None)
+                return None, None
+            return tok, dict(rec)
+
+    def idle_sec(self, egm_id, tok, now=None):
+        """Seconds since `tok` last saw an ACTION (resolve() refreshes the
+        clock; the state poll's peek deliberately does not). None when tok is
+        not this EGM's live token — the admin-overlay sweep uses this so an
+        actively-used overlay (the admin pressing buttons / opening sub-views)
+        stays alive while a walked-away one (only the ~1.5s poll touching it)
+        ages out. Read-only: never mutates the clock. `now` is injectable for
+        deterministic sweep tests (defaults to wall-clock)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if not tok or self._by_egm.get(egm_id) != tok:
+                return None
+            rec = self._by_tok.get(tok)
+            if rec is None:
+                return None
+            return now - (rec.get("lastSeen") or now)
+
+    def summary(self):
+        """/api/status 'glassSessions': count + tier/name per machine — NO
+        token values ever (the status endpoint has a far wider audience
+        than the carded EGM's own state poll)."""
+        now = time.time()
+        with self._lock:
+            sess = {rec["egmId"]: {"tier": rec.get("tier"),
+                                   "name": rec.get("name"),
+                                   "mintedIso": rec.get("mintedIso"),
+                                   "idleSec": round(
+                                       now - (rec.get("lastSeen") or now), 1)}
+                    for rec in self._by_tok.values()
+                    if not self._expired(rec, now)}
+        return {"count": len(sess), "byEgm": sess}
+
+
+# ----------------------------------------------------------------------------
+# G2S host engine
+# ----------------------------------------------------------------------------
+
+class G2SHost:
+    def __init__(self, host_id="1", sync_timer=30000, inline=False,
+                 auto_enable=True, keepalive_ms=0, harvest=False,
+                 subscribe=True, host_uri="http://192.168.50.2:8081/G2S",
+                 auto_clock=True, game_sweep=False):
+        self.host_id = host_id
+        self.sync_timer = sync_timer
+        # Our own G2S host URL as the AVP has it configured — needed for
+        # commConfig.setCommChange's setHostItem.hostLocation (spec §8.15 Table
+        # 8.14, a REQUIRED attribute). getCommHostList is silent on this AVP so
+        # we can't read it back; this must match what's typed in the AVP's
+        # "Override DHCP Configured Host" URI.
+        self.host_uri = host_uri
+        # Host-assigned configurationId sequence for commConfig/optionConfig
+        # change sets (spec §8.3.1). Monotonic; seeded off wall-clock so it does
+        # not collide with a prior run's ids the EGM may still remember.
+        self._config_seq = int(time.time()) % 100000
+        self._config_lock = threading.Lock()
+        self.inline = inline            # last-resort fallback: app response in sync reply
+        self.auto_enable = auto_enable  # send setCommsState enable=true after sync
+        self.keepalive_ms = keepalive_ms  # >0: setKeepAlive after join (positive health pulse)
+        self.harvest = harvest          # send getDescriptor after join (device inventory)
+        # subscribe: after join, run the eventHandler bring-up (getEventHandler-
+        # Profile -> getSupportedEvents -> setEventSub wildcard) so the AVP
+        # actually STREAMS us eventReports. This is THE data path on the push-
+        # oriented IGT AVP: getDescriptor/getCommHostList are cleanly acked then
+        # silent (host 1 owns no application devices to enumerate), but host 1
+        # DOES own eventHandler device 1 by definition (spec §4.1), so setEventSub
+        # is honored. The AVP's subscriptionLost="true" on every commsOnLine is
+        # it telling us our subscription table is empty — re-subscribe.
+        self.subscribe = subscribe
+        # game_sweep (G2S-21): the full 119-device gamePlay status/profile/denom
+        # sweep = 357 reads that monopolize the single per-assoc FIFO worker and
+        # STARVE interactive/money commands (handpay clear, voucher) for many
+        # seconds. OFF by default — the cheap join probes (setMeterSub, cabinet,
+        # eventlog) still run; the sweep is on-demand only until it can be made a
+        # true low-priority background trickle. --game-sweep opts in.
+        self.game_sweep = game_sweep
+        # auto_clock (G2S-20): at join, when the EGM clock skew observed from
+        # its own dateTimeSent exceeds CLOCK_SKEW_SYNC_SEC, send a single
+        # cabinet.setDateTime to correct it. --no-auto-clock disables.
+        self.auto_clock = auto_clock
+        # voucher tier-1 (G2S-26): durable validation-id/list state. Script-
+        # relative (like webui/) so it works from any cwd; runtime state,
+        # gitignored. Own lock — never taken while holding assoc.lock.
+        self.voucher_store = VoucherStore(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data",
+            "voucher_state.json"))
+        # GR-10: durable optionConfig inventory beside the voucher store —
+        # config-sync only re-fires on deviceReset, so a warm host restart
+        # must reload config_devices/config_options rather than sit blind
+        # until the EGM's next reboot. Own lock — never taken while holding
+        # assoc.lock.
+        self.config_store = ConfigInventoryStore(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data",
+            "config_inventory.json"))
+        # wat (G2S-39): durable transfer ledger + enthusiast accounts beside
+        # the voucher store. Own locks — never taken while holding assoc.lock.
+        self.wat_store = WatStore(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data",
+            "wat_state.json"))
+        self.account_store = AccountStore(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data",
+            "account_state.json"))
+        # hub.db (SQLite spine): the cross-protocol machine registry +
+        # server-side nicknames — one source of truth so the DSI kiosk and a
+        # phone show the same names (localStorage-per-browser can't). Money
+        # tables migrate here in a later phase; this slice is names only.
+        self.hub_store = HubStore(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "hub.db"))
+        # hub.db phase 2: the ONE cross-machine redemption authority — the
+        # union of the VoucherStore (G2S-issued ids, delegated untouched)
+        # and the hub's SQLite tito ledger (SAS-minted tickets). Every
+        # redeemVoucher/commitVoucher AND every satellite /api/tito call
+        # adjudicates through this, so an AVP voucher redeems in the BB2
+        # and a BB2 ticket redeems in the AVP with no double-redeem window.
+        self.tito = TitoAuthority(self.voucher_store, self.hub_store)
+        # The active rotating host-log path (set by main(); None under the
+        # in-process test harness) — GET /api/debug/log tails it.
+        self.host_log_file = None
+        self.associations = {}
+        self.assoc_lock = threading.Lock()
+        # G2S-12/13 typed event hooks + the live activity tape. The default
+        # "*" registration turns every semantic hook into a structured INFO
+        # line (the activity feed) and a bounded newest-first entry exposed
+        # at /api/status as "activity". Own lock — never taken while holding
+        # assoc.lock (hooks fire outside it).
+        self.event_hooks = EventHookRegistry()
+        self.activity = []
+        self.activity_lock = threading.Lock()
+        self.event_hooks.register("*", self._activity_hook)
+        # bonus (G2S-41): BNE103/104/105 additionally stamp the matching
+        # award-ring record (tape entries ride the "*" registration above).
+        for _hook in BONUS_EVENT_STAMPS:
+            self.event_hooks.register(_hook, self._bonus_award_event_stamp)
+        # Glass nav: the cabinet's own service button toggles the menu
+        # window (CBE301 -> service_button, see EVENT_HOOK_CODES).
+        self.event_hooks.register("service_button",
+                                  self._glass_service_button)
+        # Host-assigned bonusId sequence tail (bonusId = <epoch><seq> —
+        # PURE NUMERIC: the "bonusId data type" is defined at spec p.789
+        # inside the missing chapter part, and the live AVP answered an
+        # alphanumeric "CNB<epoch><seq>" id with G2S_MSX005 "Invalid Data
+        # Type Encountered" (2026-07-09) — G2S ID scalars are xs:long-ish,
+        # so the id must be digits. 13-digit epoch-ms-free form: epoch
+        # seconds + 3-digit seq = 13 digits, comfortably inside xs:long.
+        # Unique across a same-second burst; epoch prefix keeps it unique
+        # across host restarts). itertools.count is atomic under the GIL.
+        self._bonus_seq = itertools.count(1)
+        # mediaDisplay (#18 P3): host-allocated contentId tail — same
+        # PURE-NUMERIC law as bonusId (MSX005: G2S ID scalars are
+        # xs:long-ish), same <epoch><seq> shape (2-digit seq — content
+        # loads are rare bench acts, never a burst).
+        self._md_content_seq = itertools.count(1)
+        # SAS floor registry (the shared-server layer's first slice): each
+        # sas_host.py — the Pi's own AND every Zero SMIB on the CasinoNet
+        # AP — POSTs periodic state snapshots to /api/sas/report; the hub
+        # holds the latest per machine and surfaces them in /api/status
+        # under "sas" so the ONE Home UI shows the whole mixed-protocol
+        # floor. Own lock — never taken while holding assoc/activity locks.
+        self.sas_machines = {}
+        self.sas_lock = threading.Lock()
+        # hub->satellite command queues (smibId -> deque), drained into the
+        # reply of that SMIB's next /api/sas/report (the report cycle IS the
+        # command channel — satellites sit behind the AP with no listener).
+        # Guarded by sas_lock like the registry.
+        self.sas_commands = {}
+        # Machine linking (task #20): {g2s egmId: SAS machine key} — a
+        # dual-protocol cabinet whose G2S card OWNS its SAS leg (the BB2
+        # speaks both; linked, it is ONE machine: SAS = meter/money
+        # authority, G2S keeps everything else). hub.db (machines.sas_link,
+        # v9) is the durable truth, loaded once here; the ONLY writer
+        # afterwards is /api/settings, so the hot readers (/api/status, the
+        # glass credit display, the wallet reroute) do GIL-atomic dict
+        # lookups with no lock — the other engine maps' idiom. Empty on an
+        # unlinked floor: every linked path stays dormant.
+        self.sas_links = self.hub_store.sas_links()
+        # Satellite assignments (v11, zero-config onboarding): {sat_id ->
+        # assignment row} — the HUB, not the unit's ExecStart flags, is now the
+        # authority for a satellite's machine binding. A Companion self-IDs by a
+        # stable id (default = Pi serial) and shows up unassigned; the operator
+        # binds it to a machine in the UI, which writes hub.db (satellites, v11)
+        # AND updates this map. companion_report resolves the assigned binding by
+        # companionId here (falling back to what the daemon reports when there's
+        # no row — legacy flagged units + not-yet-assigned units keep working),
+        # so a re-assign takes effect live with no restart. Same hot-reader idiom
+        # as sas_links: loaded once, the ONLY writer afterwards is /api/settings,
+        # readers do GIL-atomic dict lookups. Empty on a floor with no assigned
+        # satellites: the whole path stays dormant.
+        self.sat_bindings = self.hub_store.sat_bindings()
+        # Serializes the /api/settings satellite read-modify-write (assign +
+        # one-reader-per-machine exclusivity, and the SAS-link-clears-explicit-
+        # reader step). The HTTP server is threaded, so two concurrent assigns
+        # to the same machine could otherwise mutually clear each other and
+        # leave it reader-less; this lock makes the whole displace cycle atomic.
+        self._sat_write_lock = threading.Lock()
+        # Companion floor registry (RFID phase 1): each Companion daemon —
+        # a PN532 reader beside a satellite SMIB — POSTs tap reports to
+        # /api/companion/report; the hub holds the latest state per
+        # companionId and turns KNOWN-fob taps into G2S carded sessions
+        # (setIdValidation on the bound EGM) or SAS handpay resets (the
+        # reset-tier fob). card_sessions is the active carded-session map
+        # {egmId: {uid, name, sinceIso, ...}} that /api/status surfaces as
+        # "cardSessions" for the UI's tile badge. Own lock — never taken
+        # while holding assoc/sas/activity locks. COMPLETELY dormant until
+        # a companion posts: no companions, no sessions, no traffic.
+        self.companions = {}
+        self.companion_lock = threading.Lock()
+        self.card_sessions = {}
+        # Admin overlay tap (#?): a transient SUPERVISOR layer stacked OVER a
+        # carded player's session — an admin taps their fob on a machine a
+        # friend is playing, the admin menu supersedes on the glass, and when
+        # it's dismissed the friend is STILL carded (their card_sessions body
+        # is NEVER mutated; setIdValidation stays True the whole time). This
+        # parallel map {egmId: {uid,name,tier,tok,deviceId,companionId,sinceTs,
+        # sinceIso}} records the overlay; its `tok` is the admin's glass token
+        # (minted to supersede the player's on the one-token-per-EGM store).
+        # Guarded by companion_lock, exactly like card_sessions. Dormant until
+        # an admin taps over a friend.
+        self.admin_overlays = {}
+        # Glass navigation v1 (#18 P4): the on-glass SPA's session tokens —
+        # minted at card-IN, revoked at card-OUT, delivered ONLY in the
+        # carded EGM's own /api/glass/state poll. Own lock inside the store
+        # — never taken while holding companion_lock/assoc.lock (store calls
+        # sit OUTSIDE both, like the enqueue rule). _glass_peer_seen is the
+        # best-effort peer-IP sanity journal ({egmId: last peer}, GIL-atomic
+        # lookups — the sas_links idiom, no lock).
+        self.glass_sessions = GlassSessionStore()
+        self._glass_peer_seen = {}
+        # egm_id -> {"ts", "dev"}: stamped by the SPA's self-identifying
+        # poll (&src=spa) — the restart-surviving residency signal
+        # (GLASS_SPA_LIVE_SEC). Same unguarded-dict posture as peer_seen
+        # (whole-value replacement, readers tolerate races).
+        self._glass_spa_seen = {}
+        # Glass cashOutToWallet pin (glass destub v1): {egmId: accountId} — a
+        # carded player arming setWatCashOut from the glass records THEIR
+        # wallet here so the machine's own EGM-initiated cash-out (fromEgm,
+        # blank accountId) credits them (no pin ⇒ the cash-out is DENIED
+        # and the machine falls back to a ticket — NEVER the House; see
+        # _wat_decide_authorization). Set on the enable toggle, cleared on
+        # disable, at card-out (the pin never outlives the session), and by
+        # the proactive vanished-account sweep (_sweep_cash_out_pins).
+        # Whole-value writes and the card-out pop take _glass_pin_lock so a
+        # card switch that lands in the toggle's resolve->act window can't
+        # re-arm a departed player's pin AFTER the switch cleared it (the
+        # arm revalidates the token under this lock; the card-out pop runs
+        # under it AFTER the glass-token revoke). Reads (_wat_decide/state
+        # fold) stay lock-free — a nanosecond-stale pin read is harmless.
+        # This lock nests OVER the glass-session store lock (still_live) and
+        # is never taken while holding companion_lock/assoc.lock.
+        self._glass_cash_out_pin = {}
+        self._glass_pin_lock = threading.Lock()
+        # private id sequence for fob-triggered satellite commands (the
+        # _aft_seq dialect — the queue entry shape is _handle_sas_command's)
+        self._fob_seq = itertools.count(1)
+        # throttle map for register_g2s_machines (egmId -> last hub.db touch)
+        self._registry_touched = {}
+        # hub-side auto AFT-register state (the sas_report canonical trigger):
+        # machine_key -> (last_enqueue_ts, tries). Keeps a NOT_REGISTERED
+        # machine — which reports every ~1 s — from storming the command queue,
+        # and backs off exponentially so an old satellite that answers
+        # "unknown type" can't loop hot. Private id sequence for auto commands.
+        self._aft_autoreg = {}
+        self._aft_seq = itertools.count(1)
+        # House-funded AFT credit push (0x72) — refs already settled to House
+        # (debit-on-confirm), so the satellite's ~every-second re-report of the same
+        # commandResults debits exactly once. This is only a perf/log guard;
+        # AccountStore.adjust(once=True, ref=...) is the hard idempotency (it
+        # survives a hub restart, which clears this set). Bounded below.
+        self._aft_pushes_settled = set()
+        # Machine->wallet RETURN leg (glass destub v2): refs already CREDITED
+        # to the pinned/echoed wallet for a button-driven SAS AFT host-cashout
+        # (EGM_TO_HOST). Same posture as _aft_pushes_settled — a perf/log guard
+        # over the satellite's ~every-second re-report; AccountStore.adjust(
+        # once=True, ref="aftcashout:<txn>") is the hard cross-restart
+        # idempotency. Bounded below.
+        self._aft_cashouts_settled = set()
+        # Distinct dedupe for the "confirmed but amount UNCONFIRMED" loud HOLD
+        # (nit): a cash-out the machine confirmed but whose cashable BCD the
+        # satellite couldn't parse (it reports cents=0). We flag it ONCE per
+        # txn for meter reconciliation WITHOUT consuming the credit ref above,
+        # so a later re-report carrying a readable amount can still heal into a
+        # real wallet credit. Bounded below.
+        self._aft_cashout_unconfirmed = set()
+        # SAS legs already given their one-time post-(re)boot cash-out disarm
+        # (finding #2a): a satellite armed before a hub restart must be cleared
+        # on its first report so a later 0x6A goes unanswered → ticket, rather
+        # than pulling money the hub — having lost every in-memory pin — can no
+        # longer home. Fires once per machine per hub lifetime.
+        self._sas_cashout_boot_disarmed = set()
+        # glass walletFund escrow reservations (SAS leg only). The SAS AFT
+        # push debits the player LATE + asynchronously at settle, and that
+        # settle never refuses an overdraw (House covers a short player), so
+        # the up-front balance check alone is not atomic with the debit: two
+        # rapid glass walletFund taps could each read the still-full wallet
+        # and both land. Mirror the G2S escrow's atomicity with short-lived
+        # in-memory reservations — available = cashable − Σ(unexpired
+        # reservations). A reservation self-expires after the settle window
+        # (by then the real debit has landed and the reduced balance carries
+        # the guard forward) and is dropped at once if the enqueue fails.
+        # Reserve-only — the reused settle path stays the authoritative
+        # debit + ledger + idempotency. List of {"acct", "mc", "exp"}.
+        self._glass_fund_reserves = []
+        self._glass_fund_lock = threading.Lock()
+        # sysval_fallback host-option TTL cache (value, read_ts): the C2
+        # report reply carries it to EVERY satellite EVERY ~1 s — a hub.db
+        # read per report would be a needless per-second query, so the
+        # option is re-read at most every SYSVAL_CACHE_SEC. /api/settings
+        # refreshes the cache on write, so a toggle lands on the next
+        # report with no ~5 s limbo. Boots True (absent row = 'on').
+        self._sysval_cache = (True, 0.0)
+        # Ticket-header TTL cache (blob, read_ts) — the sysval pattern for
+        # the C2 reply's "ticketData": the header rides EVERY satellite
+        # reply every ~1 s, so the 5-tenant read is cached and re-read at
+        # most every TICKET_CACHE_SEC; /api/settings refreshes it on write
+        # so a save lands on the very next report. Boots unread (None).
+        self._ticket_cache = (None, 0.0)
+        # Admin-flag migration (one-time, idempotent): the fob-tier→
+        # account.admin switch must not lock today's operators out of the
+        # backend, so promote to admin any account currently linked by an
+        # attendant/manager-tier fob. Runs HERE — where both stores are
+        # live — because AccountStore can't see fobs. Re-run safe: an
+        # already-admin account is skipped (no write), unknown/house links
+        # bounce off set_admin's refusals.
+        self._migrate_operator_fob_admins()
+
+    def _migrate_operator_fob_admins(self):
+        """Promote operator-fob-linked accounts to admin — see __init__.
+        Best-effort (a fob-read fault skips it, never a boot failure);
+        logs one line only when it actually promotes something so a
+        re-run on a migrated store stays silent.
+
+        TRULY one-shot: a persisted sentinel makes this run exactly once
+        over the store's lifetime, not every boot. Without it the sweep
+        re-promotes on every restart and silently UNDOES a deliberate
+        demotion — an operator who revokes an attendant-fob-linked account
+        in Players ▸ ADMIN would find admin re-granted next boot, because
+        the fob is still linked. The marker fires the legacy bridge ONCE
+        (today's operators keep access); afterward the account flag is the
+        sole authority."""
+        marker = os.path.join(
+            os.path.dirname(self.account_store.path), ".admin_migration_done")
+        try:
+            if os.path.exists(marker):
+                return
+        except OSError:
+            pass    # can't stat — fall through and try the sweep
+        try:
+            fobs = self.hub_store.fobs()
+        except Exception as e:  # noqa: BLE001 — migration must not block boot
+            log.error("admin migration: fob read failed (%s) — skipped", e)
+            return              # no marker: retry next boot
+        promoted = 0
+        for f in fobs:
+            if str(f.get("tier") or "") not in ("attendant", "manager"):
+                continue
+            aid = str(f.get("accountId") or "").strip()
+            if not aid:
+                continue
+            acct = self.account_store.get(aid)
+            if acct is None or acct.get("admin"):
+                continue
+            rec, err = self.account_store.set_admin(aid, True)
+            if err is None and rec is not None:
+                promoted += 1
+        # Sweep completed — stamp the sentinel so a later deliberate
+        # demotion is never re-promoted, even for a store that promoted
+        # nothing this run. A write fault only means we retry next boot
+        # (still idempotent), so it is logged, not fatal.
+        try:
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(now_iso())
+        except OSError as e:
+            log.error("admin migration: one-shot marker write failed (%s) — "
+                      "the sweep will re-run next boot", e)
+        if promoted:
+            log.info("🔑 admin migration: %d account(s) promoted to admin "
+                     "from operator fobs", promoted)
+
+    def next_config_id(self):
+        with self._config_lock:
+            self._config_seq += 1
+            return str(self._config_seq)
+
+    def assoc(self, egm_id):
+        with self.assoc_lock:
+            a = self.associations.get(egm_id)
+            if a is None:
+                a = EgmAssociation(egm_id)
+                # GR-10 warm-restart seed: repopulate the optionConfig
+                # inventory from the persisted store BEFORE the association
+                # becomes visible (no lock needed on `a` yet). The handpay
+                # permission lamp is re-derived from the same structured
+                # values, so handpayRemoteCreditAllowed survives restarts
+                # too. Seeded OR empty, the join-time getOptionList one-shot
+                # still fires (config_seeded): the store is only as fresh as
+                # the last sync this host saw, and an option flipped on the
+                # EGM while the host was down would otherwise be presented
+                # indefinitely as current.
+                saved = self.config_store.get(egm_id)
+                if saved and (saved.get("configDevices")
+                              or saved.get("configOptions")):
+                    a.config_devices = dict(saved.get("configDevices") or {})
+                    a.config_options = dict(saved.get("configOptions") or {})
+                    a.config_seeded = bool(a.config_options)
+                    a.handpay_options = derive_handpay_options(
+                        a.config_options)
+                    log.info("[%s] config inventory RELOADED from %s — "
+                             "%d device(s), %d option(s), remote key-off "
+                             "to credits %s (saved %s)", egm_id,
+                             self.config_store.path,
+                             len(a.config_devices), len(a.config_options),
+                             a.handpay_options.get(
+                                 "G2S_enabledRemoteCredit") or "unknown",
+                             saved.get("at"))
+                # GR-28: reseed the gamePlay inventory the same way — the
+                # 119-device sweep is on-demand only (a3b19f8 starvation
+                # decision stands, nothing auto-fires here), so a restart
+                # used to blank the Test Panel games card until a manual
+                # re-sweep. Seeded state is LAST-KNOWN (hostEnabled/
+                # egmEnabled may be stale) — gamePlayAsOf carries the
+                # store's stamp so the UI can say how old it is.
+                if saved and saved.get("gamePlay"):
+                    a.game_play = {k: dict(v) for k, v
+                                   in saved["gamePlay"].items()}
+                    a.game_play_as_of = saved.get("gamePlayAt")
+                    log.info("[%s] gamePlay inventory RELOADED from %s — "
+                             "%d device(s), last refreshed %s (last-known "
+                             "view; the on-demand sweep refreshes)", egm_id,
+                             self.config_store.path, len(a.game_play),
+                             a.game_play_as_of or "unknown")
+                self.associations[egm_id] = a
+            return a
+
+    # ------------------------------------------------------- event hooks (G2S-12)
+
+    def fire_event_hooks(self, assoc, ev, bill=None):
+        """Map one LIVE, deduped eventReport onto its semantic hook (if the
+        code is in EVENT_HOOK_CODES) and fire the registered callbacks with a
+        normalized dict. Called OUTSIDE assoc.lock. `bill` is the typed
+        bill-in record the eventReport handler builds for G2S_NAE114 — its
+        denomination rides into the bill_in extras."""
+        mapping = EVENT_HOOK_CODES.get(ev.get("eventCode"))
+        if not mapping:
+            return
+        hook, static_extras = mapping
+        extras = dict(static_extras)
+        if ev.get("eventText"):
+            extras["text"] = ev["eventText"]
+        if ev.get("transactionId") not in (None, "", "0"):
+            extras["transactionId"] = ev["transactionId"]
+        if hook == "bill_in" and bill:
+            for k in ("denom", "amt", "currencyId"):
+                if bill.get(k) not in (None, ""):
+                    extras[k] = bill[k]
+        self.event_hooks.fire(hook, {
+            "hook": hook,
+            "egmId": assoc.egm_id,
+            "code": ev.get("eventCode"),
+            "label": ev.get("label"),
+            "category": ev.get("category"),
+            "icon": ev.get("icon"),
+            "dateTime": ev.get("eventDateTime"),
+            "device": f'{ev.get("deviceClass")}/{ev.get("deviceId")}',
+            "extras": extras,
+        })
+
+    def _activity_hook(self, info):
+        """Default "*" hook: one structured INFO line per semantic event (the
+        activity feed) + a bounded newest-first entry for /api/status
+        "activity". Entries are never mutated after insert, so snapshot reads
+        only need a shallow list copy."""
+        extras = info.get("extras") or {}
+        detail = " ".join(f"{k}={v}" for k, v in extras.items()
+                          if v not in (None, ""))
+        log.info("🎬 [%s] ACTIVITY %s — %s%s", info.get("egmId"),
+                 info.get("hook"), info.get("label"),
+                 f" ({detail})" if detail else "")
+        entry = dict(info, seenAt=now_iso())
+        with self.activity_lock:
+            self.activity.insert(0, entry)
+            del self.activity[ACTIVITY_CAP:]
+
+    def _reset_activity(self, assoc, label, outcome):
+        """Push a remote-reboot (RB) milestone onto the activity tape via the
+        'power' hook (FUN_HOOK in the UI) — resetStarted / script state
+        changes aren't eventReports, so they can't ride the normal event
+        path. Never raises (fire() swallows callback errors)."""
+        self.event_hooks.fire("power", {
+            "hook": "power", "egmId": assoc.egm_id, "code": None,
+            "label": label, "category": "power", "icon": "🔄",
+            "dateTime": now_iso(), "device": "G2S_cabinet/1",
+            "extras": {"outcome": outcome},
+        })
+
+    def _bonus_award_event_stamp(self, info):
+        """bonus (G2S-41): BNE103/104/105 ride the normal typed-hook path
+        onto the activity tape; this extra registration stamps the matching
+        award-ring record (paired by the transactionId the eventReport
+        carried) so /api/status shows the EGM-narrated lifecycle beside the
+        commitBonus truth. MONEY NEVER MOVES HERE — the commitBonus dispatch
+        handler is the single debit point — and the record's state field is
+        never changed by an event (commitBonus is authoritative)."""
+        txn = str((info.get("extras") or {}).get("transactionId") or "")
+        stamp = BONUS_EVENT_STAMPS.get(info.get("hook"))
+        if txn in ("", "0") or not stamp:
+            return
+        with self.assoc_lock:
+            assoc = self.associations.get(info.get("egmId"))
+        if assoc is None:
+            return
+        with assoc.lock:
+            for r in assoc.bonus_awards:
+                if str(r.get("transactionId")) == txn:
+                    r[stamp] = now_iso()
+                    r["lastEventCode"] = info.get("code")
+                    r["updatedAt"] = now_iso()
+                    break
+
+    def activity_snapshot(self):
+        with self.activity_lock:
+            return list(self.activity)
+
+    # ------------------------------------------ SAS floor registry (hub side)
+
+    SAS_STALE_SEC = 20          # 3 missed 5s reports + margin
+    SAS_MAX_MACHINES = 32       # defensive bound (hobby floor, not a casino)
+    #: hub-side auto AFT-register base cooldown. MUST exceed the 30 s command
+    #: expiry below (an expired-unanswered command must not instantly re-fire);
+    #: the per-machine backoff doubles it up to the ceiling so a satellite that
+    #: keeps rejecting can't loop hot.
+    AFT_AUTOREG_COOLDOWN_SEC = 60
+    AFT_AUTOREG_MAX_COOLDOWN_SEC = 3600
+    #: sysval_fallback re-read interval — satellites report every ~1 s each,
+    #: the option changes at Settings-click cadence; ~5 s staleness is fine
+    #: (and /api/settings refreshes the cache on write anyway).
+    SYSVAL_CACHE_SEC = 5.0
+    #: ticket-header re-read interval — same posture as SYSVAL_CACHE_SEC
+    #: (per-second report path, Settings-click write cadence, cache
+    #: refreshed on /api/settings write so a save never sits in limbo).
+    TICKET_CACHE_SEC = 5.0
+
+    def sysval_fallback(self):
+        """The 'sysval_fallback' host option as a bool (C2/C4): whether the
+        hub answers legacy system-validation cash-outs (0x57) when a machine
+        falls back to system mode. ABSENT row = on (the pre-v5 behavior);
+        only a stored 'off' disables. TTL-cached (SYSVAL_CACHE_SEC) so the
+        per-second report path adds zero hub.db reads per satellite."""
+        now = time.time()
+        val, ts = self._sysval_cache
+        if now - ts >= self.SYSVAL_CACHE_SEC:
+            val = self.hub_store.host_setting("sysval_fallback", "on") != "off"
+            self._sysval_cache = (val, now)
+        return val
+
+    def house_allow_negative(self):
+        """The 'house_allow_negative' host option as a bool (collector
+        economy, 2026-07-13). ABSENT = on: the bank always covers a friend
+        card (never refuses, shown neutrally). Stored 'off' floors the bank
+        at $0 so funding past the bankroll is refused with a friendly 'top up'
+        nudge. Read straight (only the low-rate Players ▸ Fund path uses it —
+        no per-second hot loop, so no cache needed)."""
+        return self.hub_store.host_setting("house_allow_negative", "on") != "off"
+
+    def ticket_header(self):
+        """The hub-wide ticket header (C1/C2/C4) — hub_store.ticket_header()
+        behind the sysval-style TTL cache: zero extra hub.db reads on the
+        per-second report path. Always returns the full dict shape (absent
+        fields None, rev int); callers gate pushes on propName being set."""
+        now = time.time()
+        val, ts = self._ticket_cache
+        if val is None or now - ts >= self.TICKET_CACHE_SEC:
+            val = self.hub_store.ticket_header()
+            self._ticket_cache = (val, now)
+        return val
+
+    def sas_report(self, payload, peer):
+        """Ingest one sas_host.py report (POST /api/sas/report). The
+        reporter owns the shape; the hub stores it verbatim (bounded) and
+        stamps receipt. Key = smibId/address so one SMIB polling several
+        multidrop addresses shows as several machines. Returns the reply
+        dict (reserved: a future 'commands' list makes the report cycle a
+        command channel for satellites behind the AP)."""
+        def _s(v, n=64):
+            # scalar string clamp — a satellite value is attacker-typed;
+            # keep only short strings/numbers, never nested junk (F2).
+            if isinstance(v, str):
+                return v[:n]
+            if isinstance(v, (int, float, bool)) or v is None:
+                return v
+            return str(v)[:n]
+
+        smib = _s(payload.get("smibId") or peer)
+        addr = _s(payload.get("address") or "1", 8)
+        key = f"{smib}/{addr}"
+        entry = {k: payload.get(k) for k in (
+            "smibId", "address", "port", "online", "lastSeenAgoSec",
+            "polls", "events", "meterChanges", "protocol",
+            "startedAt") if k in payload}
+        # scalars: clamp each (defends against a dict/list where a string is
+        # expected, and oversize strings)
+        for k in list(entry):
+            entry[k] = _s(entry[k], 128)
+        # meters: dict of short scalars, capped at 64 keys
+        m = payload.get("meters")
+        if isinstance(m, dict):
+            entry["meters"] = {str(k)[:16]: _s(v, 32)
+                               for k, v in list(m.items())[:64]}
+        # recentEvents: list of small dicts, capped at 20
+        re_ = payload.get("recentEvents")
+        if isinstance(re_, list):
+            entry["recentEvents"] = [
+                {kk: _s(vv, 48) for kk, vv in ev.items()}
+                if isinstance(ev, dict) else {"label": _s(ev, 48)}
+                for ev in re_[:20]]
+        # tickets: a small summary dict, capped (F2 — was uncapped)
+        tk = payload.get("tickets")
+        if isinstance(tk, dict):
+            entry["tickets"] = {str(k)[:24]: _s(v, 32)
+                                for k, v in list(tk.items())[:16]}
+        # aft: the satellite's canonical AFT-registration block. It is NOT in
+        # the field-copy list above, so add it here — and it is attacker-typed
+        # on this unauthenticated wire, so coerce to a small fixed shape and
+        # reject nested junk (mirrors the tickets/meters clamp). The full
+        # 20-byte key never rides this wire — only keyFp (a fingerprint).
+        af = payload.get("aft")
+        if isinstance(af, dict):
+            def _bi(v, lo, hi):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    return None
+                iv = int(v)
+                return iv if lo <= iv <= hi else None
+            asset = _bi(af.get("asset"), 1, 0xFFFFFFFF)   # 0/absent -> no asset
+            key_fp = af.get("keyFp")
+            # inHouseEnabled is a strict TRI-STATE: only a real bool passes
+            # (an old satellite that doesn't report it must read as
+            # unknown, never as False — the Wallet excludes machines on
+            # positive knowledge only).
+            in_house = af.get("inHouseEnabled")
+            entry["aft"] = {
+                "registered": bool(af.get("registered")),
+                "statusCode": _bi(af.get("statusCode"), 0, 0xFF),
+                "asset": asset,
+                "posId": _bi(af.get("posId"), 0, 0xFFFFFFFF),
+                "keyFp": _s(key_fp, 16) if isinstance(key_fp, str) else None,
+                "availXfers": _bi(af.get("availXfers"), 0, 0xFF),
+                "aftStatus": _bi(af.get("aftStatus"), 0, 0xFF),
+                "inHouseEnabled": in_house if isinstance(in_house, bool)
+                                  else None,
+            }
+        # pendingHandpay: the satellite's 0x51 handpay latch (C3) — rides
+        # the entry into /api/status verbatim so the UI can raise the
+        # HANDPAY banner (and clears to null on 0x52 / a keyed reset).
+        # Attacker-typed wire like everything here: a dict coerces to a
+        # small fixed shape of clamped strings; anything else reads as no
+        # pending handpay.
+        ph = payload.get("pendingHandpay")
+        if isinstance(ph, dict):
+            entry["pendingHandpay"] = {"since": _s(ph.get("since"), 32),
+                                       "code": _s(ph.get("code"), 8)}
+        else:
+            entry["pendingHandpay"] = None
+        # ticketData (C2/C4): the satellite's ticket-header applied-state —
+        # {"appliedRev": int|null, "detail": str}. Rides the entry into
+        # /api/status so the UI can flag "ticket header pending" when
+        # appliedRev < hostOptions.ticket.rev. Attacker-typed wire like the
+        # aft block: coerce to the small fixed shape (a junk appliedRev
+        # reads as null = "never applied", never a crash); absent means an
+        # old satellite — the key is simply not stamped.
+        td = payload.get("ticketData")
+        if isinstance(td, dict):
+            ar = td.get("appliedRev")
+            ar_ok = (isinstance(ar, (int, float))
+                     and not isinstance(ar, bool)
+                     and 0 <= int(ar) <= 10 ** 9)
+            entry["ticketData"] = {
+                "appliedRev": int(ar) if ar_ok else None,
+                "detail": _s(td.get("detail"), 96)}
+        # commandResults: the satellite's verdicts on hub commands (newest
+        # first, bounded like recentEvents) — the UI diffs [0].id to toast
+        # the async outcome of a queued command exactly once.
+        cr = payload.get("commandResults")
+        if isinstance(cr, list):
+            entry["commandResults"] = [
+                {str(kk)[:16]: _s(vv, 48) for kk, vv in r.items()}
+                if isinstance(r, dict) else {"result": _s(r, 48)}
+                for r in cr[:8]]
+        # Remembered lock face for the UI's single cabinet toggle. SAS
+        # machines never report an authoritative enabled/disabled state
+        # (0x01/0x02 are fire-and-forget), so the hub remembers the last
+        # COMMANDED state: harvest the newest sas_disable/sas_enable
+        # verdict from the RAW commandResults (newest-first; raw list
+        # like _settle_aft_credit_pushes — the entry copy is clamped to
+        # 8, the satellite deque holds 20). Attacker-typed wire: require
+        # a dict with a real boolean "locked" (the satellite's exception
+        # path omits it — an errored send is NOT a state change).
+        # Re-harvesting the same record each report is an idempotent
+        # re-assign — no seen-set needed, unlike the money-moving settle.
+        lock_seen = None
+        if isinstance(cr, list):
+            for r in cr[:20]:
+                if (isinstance(r, dict)
+                        and r.get("type") in ("sas_disable", "sas_enable")
+                        and isinstance(r.get("locked"), bool)):
+                    lock_seen = "locked" if r["locked"] else "enabled"
+                    break
+        entry["peer"] = peer
+        entry["receivedAt"] = time.time()
+        # Echo the operator prefs back so /api/status carries them (the UI
+        # prefers them over its local cache — kiosk and phone agree). ONE
+        # SELECT per report (same cost as the old get_nickname read),
+        # read-only and best-effort — safe before admission. denomCents is
+        # the SAS money-math scale (credits -> mc for the hold settlement
+        # and the P&L floor term; absent = 1¢ until BENCH #2 pins it) as
+        # well as the UI display scale; lockState reseeds the remembered
+        # face after a hub restart (R3).
+        prefs = self.hub_store.machine_prefs(key) or {}
+        entry["nickname"] = prefs.get("nickname")
+        entry["denomCents"] = prefs.get("denomCents")
+        # sasEnabled: hub.db is the truth (C4) — absent row/NULL = enabled,
+        # so pre-v5 machines stay live. Rides the entry for /api/status
+        # (the UI hides disabled tiles) AND the C2 reply below, which is
+        # how the satellite learns to park/resume its poll loop.
+        sas_enabled = prefs.get("sasEnabled")
+        sas_enabled = True if sas_enabled is None else bool(sas_enabled)
+        entry["sasEnabled"] = sas_enabled
+        # sasCashoutReady (the machine->wallet return-leg gate): SELF-DETERMINED
+        # from the wire (CONFIRMED 2026-07-12) — true iff this report's 0x74
+        # status advertises AVAIL_XFER_FROM_EGM (the machine is menu-set to
+        # "soft cash-out to host"). NO manual flag: the arm gate and this
+        # /api/status display both read the same live from-EGM bit, so the UI
+        # can never show a fake ON for a machine that isn't configured. Derived
+        # AFTER entry["aft"] is populated above.
+        entry["sasCashoutReady"] = self.sas_from_egm_ready(entry)
+        with self.sas_lock:
+            known = key in self.sas_machines
+            if not known and len(self.sas_machines) >= self.SAS_MAX_MACHINES:
+                # evict the stalest entry before rejecting — a full registry
+                # of dead satellites must not lock out a live one (F3).
+                oldest = min(self.sas_machines.items(),
+                             key=lambda kv: kv[1].get("receivedAt", 0))
+                if time.time() - oldest[1].get("receivedAt", 0) > \
+                        self.SAS_STALE_SEC:
+                    del self.sas_machines[oldest[0]]
+                    log.info("🔻 [sas] evicted stale %s to admit %s",
+                             oldest[0], key)
+                else:
+                    return {"ok": False, "error": "sas registry full "
+                            "(all slots active)"}
+            prev_online = (self.sas_machines.get(key) or {}).get("online")
+            prev_aft = (self.sas_machines.get(key) or {}).get("aft")
+            # lockState: this report's harvested verdict wins, else carry
+            # the remembered face forward (the prev_online read-before-
+            # replace pattern), else the persisted face, else default
+            # "enabled" — machines boot enabled. Persisted (R3): verdict
+            # flips write through to hub.db ON CHANGE only, and the
+            # persisted face reseeds the chain when neither a fresh
+            # verdict nor an in-memory prev exists — a hub restart no
+            # longer forgets a locked machine.
+            entry["lockState"] = lock_seen or \
+                (self.sas_machines.get(key) or {}).get("lockState") or \
+                prefs.get("lockState") or \
+                "enabled"
+            self.sas_machines[key] = entry
+            # Drain this SMIB's pending commands into the reply (AFTER the
+            # registry-full early return — a rejected report must never
+            # consume queued commands). Expire anything that sat >30s: a
+            # satellite that comes back from the dead must not fire a
+            # forgotten bonus as a surprise.
+            commands = []
+            q = self.sas_commands.get(smib)
+            while q:
+                cmd = q.popleft()
+                if time.time() - cmd.pop("_queuedAt", 0) > 30:
+                    log.warning("🎁 [sas:%s] expired stale queued command %s",
+                                key, cmd.get("id"))
+                    continue
+                commands.append(cmd)
+        # R3: persist the remembered lock face ON CHANGE only (verdict
+        # flips are rare — never hammer the SD card at the 1 s report
+        # cadence). Best-effort; runs outside sas_lock.
+        if lock_seen is not None and lock_seen != prefs.get("lockState"):
+            self.hub_store.set_lock_state(key, lock_seen)
+        # Register in hub.db only AFTER admission (a rejected report must
+        # never write a registry row) and throttled like the G2S side —
+        # satellites report every 1 s, one upsert a minute is plenty.
+        now = time.time()
+        if now - self._registry_touched.get(key, 0) >= self.REGISTRY_TOUCH_SEC:
+            self._registry_touched[key] = now
+            self.hub_store.touch_machine(key, "SAS", {
+                "smibId": entry.get("smibId"),
+                "address": entry.get("address"),
+                "port": entry.get("port")})
+        if not known:
+            log.info("🔌 [sas:%s] SMIB registered from %s (port=%s)",
+                     key, peer, entry.get("port"))
+        if prev_online is not None and prev_online != entry.get("online"):
+            log.info("%s [sas:%s] machine %s", "🎰" if entry.get("online")
+                     else "🔻", key,
+                     "ONLINE" if entry.get("online") else "offline")
+        if commands:
+            log.info("🎁 [sas:%s] delivering %d queued command(s)",
+                     key, len(commands))
+        # Debit-on-confirm for any AFT credit push this report confirmed —
+        # against the record's echoed funding account, House fallback. Runs
+        # after admission (a rejected report already returned) and OUTSIDE
+        # sas_lock (account_store has its own lock; idempotent on txnId).
+        # Uses the RAW commandResults, not the stringified entry copy.
+        self._settle_aft_credit_pushes(cr, key)
+        # Credit-on-confirm for any button-driven AFT host-cashout (EGM_TO_HOST)
+        # this report confirmed — the machine->wallet RETURN leg, crediting the
+        # echoed destination wallet (NO House fallback — an uncreditable home
+        # is a loud unhomed HOLD, see _flag_unhomed_cashout). Same posture as
+        # the push settle: after admission, outside sas_lock, idempotent on
+        # txnId, raw commandResults.
+        self._settle_aft_cashouts(cr, key)
+        # BOOT DISARM (finding #2a): the FIRST report from each machine after a
+        # hub (re)start clears any cash-out arm that outlived the restart — the
+        # hub lost every in-memory pin, so a still-armed satellite must be
+        # reverted to the ticket default before its next 0x6A pulls money the
+        # hub can't home. Skips a machine a player has already re-armed. Once
+        # per machine per hub lifetime; cheap thereafter.
+        self._boot_disarm_sas_once(key)
+        # PROACTIVE DISARM sweep (reject → ticket, AJ 2026-07-12): the ~1 s
+        # report cadence is the natural hook — any armed cash-out pin whose
+        # account no longer exists gets its machine-side routing disarmed
+        # BEFORE the next button press can pull money off the glass (SAS:
+        # the satellite stops answering 0x6A → the machine tickets; AVP:
+        # the WAT cash-out mirror turns off). Sweeps ALL pins, not just this
+        # leg's — any satellite's heartbeat closes the gap floor-wide.
+        # Cheap no-op on an unpinned floor; best-effort, never raises.
+        self._sweep_cash_out_pins()
+        # AFT auto-registration (the hub-side canonical trigger). Runs OUTSIDE
+        # the sas_lock block above — sas_enqueue_command re-acquires that same
+        # non-reentrant lock (deadlock trap) — and only after admission (the
+        # registry-full path already returned inside the lock). Persist the
+        # observed state on change, then enqueue an aft_register EXACTLY ONCE
+        # per NOT_REGISTERED machine (in-memory cooldown + backoff + a
+        # queue-dedup) so a machine that reports unregistered every ~1 s can't
+        # storm the queue, and a good registration is neither re-enqueued nor
+        # clobbered.
+        aft = entry.get("aft")
+        if isinstance(aft, dict):
+            registered = bool(aft.get("registered"))
+            asset = aft.get("asset")
+            status_code = aft.get("statusCode")
+            if status_code is None:      # keep the persisted status coherent
+                status_code = 0x01 if registered else 0x80
+            if aft != prev_aft:          # SD-friendly: persist only on change
+                addr_int = int(addr) if isinstance(addr, str) \
+                    and addr.isdigit() else None
+                self.hub_store.aft_upsert_observed(
+                    key, entry.get("smibId") or smib, addr_int, asset,
+                    status_code, reg_key_fp=aft.get("keyFp"),
+                    pos_id=aft.get("posId"))
+            if registered:
+                # A good registration: clear the dedup so it is neither
+                # re-enqueued nor (the upsert already handled) clobbered; a
+                # later RAM clear re-arms the trigger from scratch.
+                self._aft_autoreg.pop(key, None)
+            elif asset and sas_enabled:
+                # NOT registered but the operator asset is readable — the one
+                # case the hub can self-register. Enqueue once per (backed-off)
+                # cooldown, and only if no aft_register is already queued.
+                # (sasEnabled false skips the trigger entirely: a parked
+                # satellite would only answer with an honest sas_disabled
+                # rejection, so queueing is pure churn.)
+                last_ts, tries = self._aft_autoreg.get(key, (0, 0))
+                cooldown = min(
+                    self.AFT_AUTOREG_COOLDOWN_SEC * (2 ** min(tries, 6)),
+                    self.AFT_AUTOREG_MAX_COOLDOWN_SEC)
+                if now - last_ts >= cooldown \
+                        and not self._aft_command_queued(smib):
+                    self._aft_autoreg[key] = (now, tries + 1)
+                    r = self.sas_enqueue_command(smib, {
+                        "id": f"aft{next(self._aft_seq)}-{int(now)}",
+                        "type": "aft_register"})
+                    if r.get("ok"):
+                        self.hub_store.aft_mark_attempt(key)
+                        log.info("🎫 [sas:%s] auto AFT-register queued "
+                                 "(asset %s, %s)", key, asset, r.get("id"))
+                    else:
+                        log.info("🎫 [sas:%s] auto AFT-register not queued: "
+                                 "%s", key, r.get("error"))
+            # asset absent/zero (status 'asset_unknown') -> do NOTHING: the hub
+            # cannot register without the operator's asset (no pool, never
+            # fabricated); the UI prompts to assign one, which also kills the
+            # hot loop for an asset-less machine.
+        # C2: the reply carries this machine's kill-switch + the host's
+        # sysval_fallback option (TTL-cached — zero extra db reads at the
+        # 1 s report cadence). Old satellites ignore unknown reply keys.
+        reply = {"ok": True, "key": key, "commands": commands,
+                 "sasEnabled": sas_enabled,
+                 "sysvalFallback": self.sysval_fallback()}
+        # C2 ticket header: rides the reply ONLY when the operator has set
+        # a property name — an unset hub must never push blank headers over
+        # a machine's existing on-glass config (C1). line1/line2 are plain
+        # strings ("" when unset — the 0x7D frame carries every field
+        # anyway); titleCash stays null when unset so the satellite knows
+        # to leave the machine's title alone. TTL-cached like
+        # sysvalFallback; the satellite applies when rev differs from its
+        # last APPLIED rev, so a re-report of the same rev is free.
+        hdr = self.ticket_header()
+        if hdr.get("propName"):
+            reply["ticketData"] = {"propName": hdr["propName"],
+                                   "line1": hdr.get("line1") or "",
+                                   "line2": hdr.get("line2") or "",
+                                   "titleCash": hdr.get("titleCash"),
+                                   "rev": int(hdr.get("rev") or 0)}
+        return reply
+
+    #: per-SMIB command queue bound — an operator mashing the button must
+    #: not build a surprise backlog of money movements.
+    SAS_CMD_QUEUE_MAX = 4
+    #: single-award ceiling, mirrors core/sas_bonus.MAX_BONUS_CREDITS on the
+    #: satellite (which enforces it again at the protocol edge). The value is
+    #: the 4-byte-BCD wire max — protocol physics, not a spend policy
+    #: (collector de-cage 2026-07-15; was a 10,000-credit casino knob).
+    SAS_BONUS_MAX_CREDITS = 99_999_999
+    #: AFT amount ceiling, in CENTS. Mirrors sas_host.MAX_AFT_CENTS — the
+    #: 5-byte BCD wire maximum ($99,999,999.99), a PROTOCOL-CORRECTNESS bound
+    #: (an amount above this can't be BCD-encoded), NOT an artificial spend cap.
+    #: Applies to BOTH legs: the house->EGM push AND the machine->wallet
+    #: cash-out settlement (the reported cash-out is credited up to this). It is
+    #: deliberately not smaller — a cash-out must never be capped below what the
+    #: machine holds (the old $10,000 value dropped a full cash-out as "over
+    #: ceiling; NOT credited"). House is the bank and may go negative, so this is
+    #: not a funds check.
+    SAS_AFT_MAX_CENTS = 9_999_999_999   # 5-byte BCD max = $99,999,999.99
+
+    #: how long a glass walletFund escrow reservation is held before it
+    #: self-expires. Must comfortably exceed the satellite report/settle lag
+    #: (~1 s) so the real debit at _settle_aft_credit_pushes has landed — and
+    #: thus the reduced wallet balance carries the overdraw guard forward —
+    #: before the reservation is released.
+    GLASS_FUND_RESERVE_TTL = 30.0
+
+    def _glass_fund_reserved_mc(self, account_id, now=None):
+        """Σ unexpired escrow reservations for this account, in millicents.
+        Prunes expired rows as it scans. MUST hold self._glass_fund_lock."""
+        now = time.time() if now is None else now
+        live = [r for r in self._glass_fund_reserves if r["exp"] > now]
+        self._glass_fund_reserves[:] = live
+        return sum(r["mc"] for r in live if r["acct"] == account_id)
+
+    def sas_enqueue_command(self, smib_id, cmd):
+        """Queue one hub->satellite command (from POST /api/sas/command) for
+        delivery in that SMIB's next report reply. Refuses unknown SMIBs
+        (the queue would sit forever) and full queues. Returns the reply
+        dict for the HTTP layer."""
+        with self.sas_lock:
+            known = any((e.get("smibId") or k.split("/", 1)[0]) == smib_id
+                        for k, e in self.sas_machines.items())
+            if not known:
+                return {"ok": False,
+                        "error": f"unknown smibId {smib_id!r} — no satellite "
+                                 "by that name has reported"}
+            q = self.sas_commands.setdefault(smib_id, collections.deque())
+            if len(q) >= self.SAS_CMD_QUEUE_MAX:
+                return {"ok": False, "error": "command queue full for this "
+                        "smib — wait for the pending commands to deliver"}
+            cmd["_queuedAt"] = time.time()
+            q.append(cmd)
+            return {"ok": True, "id": cmd["id"], "queuedBehind": len(q) - 1}
+
+    def _aft_command_queued(self, smib_id):
+        """True if an aft_register is already queued for this SMIB — the
+        auto-trigger must not stack a second register behind an in-flight one
+        (the satellite's auto_register is idempotent regardless, but this keeps
+        the bounded queue clean). Takes sas_lock briefly; the caller must NOT
+        already hold it (non-reentrant)."""
+        with self.sas_lock:
+            q = self.sas_commands.get(smib_id)
+            return bool(q) and any(c.get("type") == "aft_register" for c in q)
+
+    def _settle_aft_credit_pushes(self, command_results, key):
+        """Debit-on-confirm against the ECHOED funding account (R1) for SAS
+        AFT credit pushes (the SAS peer of the G2S WAT escrow debit). The
+        satellite echoes the queued command's accountId into its verdict
+        record; absent (old satellite) = House, exactly the pre-parity
+        behavior. On a CONFIRMED success we debit that account by the amount
+        that actually LANDED on the machine. A player who can't cover it at
+        settle is skipped and HOUSE covers it with a note naming them —
+        money always lands somewhere logged. Idempotent two ways: a bounded
+        seen-set skips the satellite's ~every-second re-report, and
+        AccountStore.adjust(once=True, ref=txnId) is the HARD guarantee the
+        money moves exactly once even across a hub restart (which empties the
+        set). Never raises — a bad record is skipped, not fatal to a report."""
+        if not isinstance(command_results, list):
+            return
+        for r in command_results:
+            if not isinstance(r, dict) or r.get("type") != "aft_transfer":
+                continue
+            if not r.get("ok") or r.get("outcome") not in ("completed",
+                                                           "partial"):
+                continue
+            txn = r.get("txnId")
+            cents = r.get("amountCents")
+            if not isinstance(txn, str) or not txn:
+                continue
+            if (isinstance(cents, bool) or not isinstance(cents, int)
+                    or cents <= 0):
+                continue
+            if cents > self.SAS_AFT_MAX_CENTS:
+                log.warning("💵 [sas:%s] AFT push %r reports %d cents — over "
+                            "the %d ceiling; NOT debited", key, txn, cents,
+                            self.SAS_AFT_MAX_CENTS)
+                continue
+            ref = f"aftpush:{txn}"
+            if ref in self._aft_pushes_settled:
+                continue
+            # Funding account (R1): echoed by the satellite; absent or
+            # junk-typed (an old satellite that doesn't echo) -> House.
+            # cents -> millicents; DEBIT (negative cashable delta). House
+            # is kind=house so it MAY go negative (it is the bank).
+            acct_id = r.get("accountId")
+            acct_id = acct_id.strip()[:64] if isinstance(acct_id, str) \
+                and acct_id.strip() else "house"
+            note = f"AFT credit push to {key} ({r.get('outcome')})"
+            acct, err = self.account_store.adjust(
+                acct_id, d_cash=-cents * 1000, note=note, ref=ref, once=True)
+            if err and acct_id != "house":
+                # The player couldn't cover it at settle time (balance moved
+                # in the queue->confirm gap, or the account vanished). The
+                # credits ARE on the glass — the money must land somewhere
+                # LOGGED, never silently lost: debit House, note naming the
+                # short player. The refused player adjust wrote NO ledger
+                # row (insufficient/unknown returns before the append), so
+                # reusing ref keeps once=True airtight — exactly one debit
+                # ever lands for this txn.
+                log.warning("💵 [sas:%s] %s debit for AFT push %r failed "
+                            "(%s) — House covers it", key, acct_id, txn, err)
+                acct, err = self.account_store.adjust(
+                    "house", d_cash=-cents * 1000,
+                    note=note + f" — {acct_id} couldn't cover it, House "
+                                "covered", ref=ref, once=True)
+                acct_id = "house"
+            self._aft_pushes_settled.add(ref)
+            if len(self._aft_pushes_settled) > 2048:
+                # bound the memo — once=True on the ledger is the real guard, so
+                # dropping it can at worst re-run an idempotent (no-op) adjust,
+                # and the satellite only re-reports its last ~20 results anyway.
+                self._aft_pushes_settled = {ref}
+            if err:
+                log.warning("💵 [sas:%s] %s debit for AFT push %r FAILED: "
+                            "%s", key, acct_id, txn, err)
+            else:
+                bal = int((acct or {}).get("cashableMillicents", 0))
+                log.info("💵 [sas:%s] AFT push CONFIRMED — debited %s $%.2f "
+                         "(txn %s); cashable now $%.2f",
+                         key, acct_id, cents / 100, txn, bal / 100000)
+
+    def _sas_cashout_pin(self, key):
+        """The hub's OWN armed cash-out destination for a reporting SAS machine
+        (the credit authority for the RETURN leg), or None. Resolves the G2S
+        egm_id(s) LINKED to this SAS leg (sas_links value == key) plus the leg
+        key itself, and returns the first live _glass_cash_out_pin. NEVER
+        consults the wire's echoed accountId — the hub credits only what it
+        pinned (finding #4). Lock-free reads (the sas_links / pin snapshot
+        idiom — a nanosecond-stale pin is harmless; once=True is the hard
+        guarantee)."""
+        for owner in [m for m, sk in self.sas_links.items()
+                      if sk == key] + [key]:
+            acct = self._glass_cash_out_pin.get(owner)
+            if acct:
+                return acct
+        return None
+
+    def _disarm_sas_leg(self, key):
+        """Enqueue a hub-side cash-out disarm (aft_set_host_cashout
+        enable:False) for a SAS machine BY ITS LEG KEY — the satellite drops
+        its armed state so the next 0x6A goes unanswered and the machine
+        tickets. Used to stop a satellite answering cash-outs the hub can't
+        home (an arm that outlived its pin). Derives the smib the same way the
+        arm path does; idempotent + best-effort (unknown/queue-full just
+        no-ops — the settle re-fires it on the next such report); never
+        raises."""
+        try:
+            with self.sas_lock:
+                entry = self.sas_machines.get(key) or {}
+            smib = entry.get("smibId") or str(key).split("/", 1)[0]
+            if not smib:
+                return
+            self.sas_enqueue_command(smib, {
+                "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
+                "type": "aft_set_host_cashout", "enable": False})
+        except Exception:  # noqa: BLE001 — best-effort disarm, never fatal
+            log.exception("SAS cash-out disarm (%s) failed (ignored)", key)
+
+    def _boot_disarm_sas_once(self, key):
+        """One-time-per-satellite cash-out disarm after a hub (re)start
+        (finding #2a). A hub restart clears every in-memory arm/pin/session,
+        but a satellite armed BEFORE the restart stays armed and would answer
+        the next 0x6A — pulling money off a machine the hub can no longer home.
+        On the FIRST report from each machine after boot, if the hub holds NO
+        cash-out pin for it, disarm it (revert to the ticket default); if a
+        player has already re-armed post-restart (a live pin exists), leave that
+        fresh arm alone. Fires at most once per machine per hub lifetime.
+        Combined with credit-by-pin, the worst case in the boot-race window is
+        a loud unhomed HOLD, never a wrong/House credit. Never raises."""
+        try:
+            if key in self._sas_cashout_boot_disarmed:
+                return
+            self._sas_cashout_boot_disarmed.add(key)
+            if self._sas_cashout_pin(key):
+                return  # a fresh post-restart arm owns this machine
+            self._disarm_sas_leg(key)
+        except Exception:  # noqa: BLE001 — best-effort, never fatal
+            log.exception("boot cash-out disarm (%s) failed (ignored)", key)
+
+    def _settle_aft_cashouts(self, command_results, key):
+        """Credit-on-confirm the hub-pinned wallet for a button-driven SAS
+        AFT host-cashout (EGM_TO_HOST) — the machine->wallet RETURN leg, the
+        exact inverse of glass_wallet_fund's debit. The satellite reports a
+        satellite-originated 'aft_cashout' record (NOT a hub command — the
+        transfer is wire-triggered by the machine's cash-out button, exception
+        0x6A). On a CONFIRMED completion we CREDIT — by the amount that actually
+        LEFT the machine — the account THE HUB ITSELF pinned when it armed this
+        cash-out (_glass_cash_out_pin / _sas_cashout_pin), NEVER the accountId
+        the record echoes: the /api/sas/report channel is unauthenticated and
+        forgeable, so honoring a wire-named credit destination would let a
+        crafted POST mint credits to any wallet (finding #4). NEVER on the arm —
+        only on the machine's confirmed completion.
+
+        Money conservation: the fund leg debited the player's OWN wallet when
+        credits landed ON the machine, so this return leg is the pure inverse
+        — a wallet credit, no House entry (the House-hold P&L is driven by GAME
+        meters, not AFT cashable moves, so no double-count).
+
+        NO HOUSE FALLBACK — reject → ticket (AJ, CORRECTED 2026-07-12): a
+        vanished/refusing destination account is NEVER back-filled to House —
+        that would silently move a player's cash-out into the House books.
+        The architecture decides validity BEFORE the pull (the proactive
+        _sweep_cash_out_pins disarm means an invalid pin stops the satellite
+        answering 0x6A → the machine tickets), so reaching this settle with
+        no creditable home is a should-never-happen race: it becomes a LOUD
+        UNHOMED-cash-out HOLD (_flag_unhomed_cashout) with NO ledger row —
+        a meter-reconcile situation, surfaced, never a House credit. The
+        unwritten ref keeps once=True airtight: at most ONE movement can
+        ever land for this txn (a post-restart re-report retries the credit
+        and either heals into the restored wallet or re-flags the hold).
+        Idempotent two ways: a bounded seen-set skips the ~every-second
+        re-report, and AccountStore.adjust(once=True, ref=aftcashout:<txn>) is
+        the HARD guarantee across a hub restart. Never raises."""
+        if not isinstance(command_results, list):
+            return
+        for r in command_results:
+            if not isinstance(r, dict) or r.get("type") != "aft_cashout":
+                continue
+            if not r.get("ok") or r.get("outcome") not in ("completed",
+                                                           "partial"):
+                continue
+            txn = r.get("txnId")
+            cents = r.get("amountCents")
+            if not isinstance(txn, str) or not txn:
+                continue
+            ref = f"aftcashout:{txn}"
+            if ref in self._aft_cashouts_settled:
+                continue
+            if (isinstance(cents, bool) or not isinstance(cents, int)
+                    or cents <= 0):
+                # CONFIRMED completion (passed the ok+completed/partial gate)
+                # but the cashable amount is unreadable — the satellite reports
+                # cents=0 with an UNCONFIRMED marker when the completion BCD
+                # won't parse. Money verifiably LEFT the machine; never bank a
+                # guessed figure, but do NOT settle it silently: fire a distinct
+                # loud HOLD ONCE per txn (its own dedupe — the credit ref stays
+                # unconsumed so a re-report carrying a readable amount can still
+                # heal into a real wallet credit).
+                if txn not in self._aft_cashout_unconfirmed:
+                    self._aft_cashout_unconfirmed.add(txn)
+                    if len(self._aft_cashout_unconfirmed) > 2048:
+                        self._aft_cashout_unconfirmed = {txn}
+                    self._flag_unhomed_cashout(
+                        key, txn, 0, self._sas_cashout_pin(key),
+                        "amount UNCONFIRMED (completion BCD unreadable) — "
+                        "verify meters", path="SAS AFT (amount unconfirmed)")
+                continue
+            if cents > self.SAS_AFT_MAX_CENTS:
+                log.warning("💵 [sas:%s] AFT cash-out %r reports %d cents — "
+                            "over the %d ceiling; NOT credited", key, txn,
+                            cents, self.SAS_AFT_MAX_CENTS)
+                continue
+            # Destination wallet: THE HUB'S OWN ARM (_glass_cash_out_pin for
+            # this machine), NEVER the wire's echoed accountId. The
+            # /api/sas/report channel is unauthenticated and forgeable, so
+            # trusting the record to NAME a credit destination would let a
+            # crafted POST mint credits to any wallet — the hub credits only
+            # the account IT pinned when it armed this cash-out (finding #4).
+            # NO HOUSE FALLBACK (AJ, CORRECTED 2026-07-12): no valid hub-armed
+            # home => a LOUD hold, never House, never the wire's account.
+            wire_acct = r.get("accountId")
+            wire_acct = wire_acct.strip()[:64] if isinstance(wire_acct, str) \
+                and wire_acct.strip() else ""
+            acct_id = self._sas_cashout_pin(key)
+            note = f"AFT cash-out from {key} to wallet ({r.get('outcome')})"
+            acct = err = None
+            if acct_id:
+                acct, err = self.account_store.adjust(
+                    acct_id, d_cash=cents * 1000, note=note, ref=ref,
+                    once=True)
+            self._aft_cashouts_settled.add(ref)
+            if len(self._aft_cashouts_settled) > 2048:
+                self._aft_cashouts_settled = {ref}
+            if not acct_id or err:
+                # No hub-armed home (or the adjust refused): the ref stays
+                # unconsumed (once=True airtight — no money moved for this txn),
+                # surface it LOUDLY, and DISARM this satellite so its next 0x6A
+                # goes unanswered → the machine tickets (it is answering
+                # cash-outs the hub can't home — stop the bleeding).
+                self._flag_unhomed_cashout(
+                    key, txn, cents * 1000, acct_id or wire_acct, err,
+                    path="SAS AFT")
+                self._disarm_sas_leg(key)
+            else:
+                bal = int((acct or {}).get("cashableMillicents", 0))
+                log.info("💵 [sas:%s] AFT CASH-OUT CONFIRMED — credited %s "
+                         "$%.2f (txn %s); cashable now $%.2f",
+                         key, acct_id, cents / 100, txn, bal / 100000)
+
+    def _flag_unhomed_cashout(self, machine, txn, millicents, acct_id, err,
+                              path):
+        """THE unhomed-cash-out HOLD (AJ, CORRECTED 2026-07-12): credits
+        confirmed OFF a machine whose destination wallet can't be credited
+        (vanished/blank/refused). NO HOUSE FALLBACK — a player's cash-out is
+        NEVER silently banked to the House. This writes NO ledger row (so
+        the money leg's once=True ref stays unconsumed — at most one credit
+        can ever land for the txn) and instead surfaces the situation
+        LOUDLY: an ERROR log + a money_hold activity-tape event, to be
+        reconciled against the machine's meters. The proactive
+        _sweep_cash_out_pins disarm exists precisely so this stays a
+        should-never-happen race, not a path money rides. Never raises —
+        rides the settle/commit paths."""
+        why = (f"account {acct_id!r} could not be credited ({err})"
+               if acct_id else "no destination account on the record")
+        log.error("🚨 [%s] UNHOMED CASH-OUT HOLD — %s: $%.2f left the "
+                  "machine (txn %s) but %s. NO ledger row written (the "
+                  "House is never credited with a player's cash-out) — "
+                  "reconcile by meter; the credit self-heals only into the "
+                  "restored wallet.", machine, path,
+                  int(millicents) / 100000, txn, why)
+        try:
+            self.event_hooks.fire("money_hold", {
+                "hook": "money_hold", "egmId": machine, "code": None,
+                "label": (f"🚨 UNHOMED cash-out HOLD — "
+                          f"${int(millicents) / 100000:.2f} off {machine} "
+                          f"(txn {txn}): {why}"),
+                "category": "money", "icon": "🚨",
+                "dateTime": now_iso(), "device": path,
+                "extras": {"txnId": txn, "amountMc": int(millicents),
+                           "accountId": acct_id or "", "path": path,
+                           "error": str(err or "")}})
+        except Exception:  # noqa: BLE001 — the tape is decoration
+            log.exception("money_hold activity fire failed (ignored)")
+
+    REGISTRY_TOUCH_SEC = 60      # throttle: at most one hub.db upsert per
+    #                              machine per minute (the status poll is 2s)
+
+    def register_g2s_machines(self, assocs):
+        """Upsert each live G2S association into the hub.db registry, throttled
+        so the 2s status poll doesn't hammer the db. Runs OUTSIDE assoc.lock
+        (hub_store has its own lock — never nest). Pulls the make/model from
+        the cabinet identity when the config-sync has revealed it."""
+        now = time.time()
+        for a in assocs:
+            key = a.egm_id
+            if not key:
+                continue
+            last = self._registry_touched.get(key, 0)
+            if now - last < self.REGISTRY_TOUCH_SEC:
+                continue
+            self._registry_touched[key] = now
+            ident = {}
+            try:
+                cab = a.snapshot().get("cabinet") or {}
+                ident = cab.get("identity") or {}
+            except Exception:      # snapshot must never break registration
+                ident = {}
+            self.hub_store.touch_machine(key, "G2S", {
+                "vendor": ident.get("vendorName") or ident.get("vendorId"),
+                "product": ident.get("productName") or ident.get("productId"),
+                "serial": ident.get("serialNum")})
+
+    def sas_snapshot(self):
+        """The /api/status 'sas' section: every reported machine + hub-side
+        staleness (a satellite that stops reporting is presented as stale —
+        the GR-01 truthfulness rule applied to the floor)."""
+        now = time.time()
+        with self.sas_lock:
+            out = {}
+            for key, e in self.sas_machines.items():
+                d = dict(e)
+                age = now - d.pop("receivedAt", now)
+                d["reportAgeSec"] = round(age, 1)
+                d["stale"] = age > self.SAS_STALE_SEC
+                out[key] = d
+        return out
+
+    def sas_forget(self, key):
+        """Remove a SAS machine's LIVE floor entry (POST /api/sas/forget).
+        A satellite that was reconfigured (new smibId/address) or retired no
+        longer reports under this key, so its tile lingers forever —
+        sas_snapshot marks a non-reporting machine stale but NEVER prunes it
+        (once reported, it stays until a hub restart). This is the operator's
+        manual prune. Offline-but-present machines are deliberately KEPT (a
+        collector's cabinets aren't all powered on at once); this only removes
+        on demand. NON-DESTRUCTIVE: the hub.db ticket/AFT ledger and the
+        operator nickname are left intact, so a machine that returns keeps its
+        history and name. If the satellite is STILL reporting, the entry
+        re-appears on its next report — flagged `stillReporting` so the UI can
+        say 'stop its satellite to remove permanently'."""
+        now = time.time()
+        with self.sas_lock:
+            entry = self.sas_machines.pop(key, None)
+            if entry is None:
+                return {"removed": False, "stillReporting": False, "key": key}
+            still = (now - entry.get("receivedAt", 0)) <= self.SAS_STALE_SEC
+            smib_id = entry.get("smibId") or key.split("/", 1)[0]
+            # multidrop-safe: only drop this smibId's queued commands if NO
+            # other address of the same smib remains — a forgotten machine must
+            # not leave a queued bonus/reset to fire if it ever re-reports, but
+            # a sibling multidrop address must keep its queue.
+            if not any(k.startswith(f"{smib_id}/") for k in self.sas_machines):
+                self.sas_commands.pop(smib_id, None)
+        return {"removed": True, "stillReporting": bool(still), "key": key}
+
+    def g2s_forget(self, egm_id):
+        """Remove a G2S machine's live association (POST /api/g2s/forget) —
+        sas_forget mirrored onto the association registry: a dark/retired
+        cabinet's tile lingers forever (associations are never pruned), so
+        this is the operator's manual prune. NON-DESTRUCTIVE: hub.db
+        (nickname/denom/lock), the config inventory, vouchers, WAT and
+        accounts are untouched — a rejoining machine gets its state back
+        via the assoc() seed. Teardown order matters: pop under assoc_lock,
+        new_epoch under a.lock (kills the keepAlive pinger on its next tick
+        and invalidates every queued send via the worker's epoch check),
+        then the None sentinel LAST to reap the FIFO worker. A machine that
+        is still ONLINE re-handshakes on its own §2.3.9 timer (~30s-a few
+        min) and the tile returns — flagged stillLive so the UI says so."""
+        with self.assoc_lock:
+            a = self.associations.pop(egm_id, None)
+        if a is None:
+            return {"removed": False, "stillLive": False, "egmId": egm_id}
+        with a.lock:
+            still = a.comms_state == "onLine"
+            a.new_epoch()
+        a.send_queue.put(None)
+        self._registry_touched.pop(egm_id, None)
+        return {"removed": True, "stillLive": bool(still), "egmId": egm_id}
+
+    # -------------------------------- Companion RFID floor (RFID phase 1)
+    # A Companion daemon (PN532 reader on the Zero beside a satellite SMIB)
+    # POSTs {companionId, startedAt, readerOk, bindings, taps[]} reports;
+    # the hub dedupes taps on (companionId, tapId) with an ack watermark,
+    # resolves the UID in the hub.db fobs table, and acts by tier:
+    # player/attendant/manager drive a G2S carded session (setIdValidation)
+    # on the bound EGM, reset queues a SAS handpay_reset on the bound SMIB.
+    # Unknown fobs are RECORDED ONLY (the UI offers registration) — a
+    # credential is never auto-created from this unauthenticated wire.
+
+    #: registry bound (hobby floor — a couple of Zeros, never hundreds)
+    COMPANION_MAX = 16
+    #: staleness horizon for the /api/status snapshot + full-registry
+    #: eviction (the daemon heartbeats every ~5 s idle)
+    COMPANION_STALE_SEC = 20
+    #: max taps accepted per report — the daemon's deque holds 64; anything
+    #: beyond this cap stays queued daemon-side (unacked) and re-rides the
+    #: next report, so nothing is lost
+    COMPANION_MAX_TAPS = 32
+    #: carded-session auto-logout horizon (seconds) — DEFAULT 0 = DISABLED
+    #: (AJ's design rule): the carded session IS the wallet link — a future
+    #: cashout-to-host routes credits to the player's account only while
+    #: the session is live, so a timer that silently drops the card would
+    #: break cashout. Sessions persist until an EXPLICIT logout: same-uid
+    #: re-tap, a different-uid tap (switch), or /api/command cardOut (the
+    #: UI affordance). The knob + sweep remain as a bench-only override.
+    CARD_SESSION_MAX_SEC = 0
+
+    def companion_report(self, payload, peer):
+        """Ingest one Companion daemon report (POST /api/companion/report).
+        The sas_report defensive posture applies verbatim: this wire is
+        unauthenticated on the AP, so every field is attacker-typed —
+        scalars clamp, lists bound, unknown fields drop silently.
+
+        Dedupe contract: taps carry a daemon-monotonic tapId; the hub
+        processes only tapId > the stored ack watermark and answers
+        {"ok": True, "ackTapId": n} so the daemon drops what landed. A
+        daemon restart resets its counter to 0 AND mints a new startedAt —
+        a changed startedAt resets the watermark to -1 first, so the fresh
+        id space replays cleanly instead of being swallowed."""
+        def _s(v, n=64):
+            # scalar string clamp — sas_report's F2 idiom
+            if isinstance(v, str):
+                return v[:n]
+            if isinstance(v, (int, float, bool)) or v is None:
+                return v
+            return str(v)[:n]
+
+        comp_id = payload.get("companionId")
+        comp_id = comp_id.strip()[:64] if isinstance(comp_id, str) \
+            and comp_id.strip() else str(peer)[:64]
+        started = payload.get("startedAt")
+        started = started[:40] if isinstance(started, str) else ""
+        g2s_egm = payload.get("g2sEgmId")
+        g2s_egm = g2s_egm.strip()[:64] if isinstance(g2s_egm, str) \
+            and g2s_egm.strip() else None
+        sas_smib = payload.get("sasSmib")
+        sas_smib = sas_smib.strip()[:64] if isinstance(sas_smib, str) \
+            and sas_smib.strip() else None
+        sas_addr = payload.get("sasAddress")
+        sas_addr = _s(sas_addr, 8) if isinstance(sas_addr, (str, int)) \
+            and not isinstance(sas_addr, bool) else None
+        last_error = payload.get("lastError")
+        last_error = last_error[:96] if isinstance(last_error, str) \
+            and last_error else None
+        # taps: bounded list of {tapId:int, uid:str, at:iso}; junk entries
+        # drop silently (a skipped tap is unacked — the daemon re-sends it,
+        # and if it is junk again it drops again: no wedge, no crash).
+        taps = []
+        taps_in = payload.get("taps")
+        if isinstance(taps_in, list):
+            for t in taps_in[:self.COMPANION_MAX_TAPS]:
+                if not isinstance(t, dict):
+                    continue
+                tid = t.get("tapId")
+                if isinstance(tid, bool) or not isinstance(tid, int) \
+                        or tid < 0:
+                    continue
+                uid = t.get("uid")
+                if not isinstance(uid, str) or not uid.strip():
+                    continue
+                at = t.get("at")
+                taps.append({"tapId": tid, "uid": uid.strip()[:32],
+                             "at": at[:40] if isinstance(at, str) else ""})
+        taps.sort(key=lambda t: t["tapId"])   # FIFO by daemon id — a
+        #                                       card-out never leapfrogs its
+        #                                       card-in inside one report
+        with self.companion_lock:
+            comp = self.companions.get(comp_id)
+            if comp is None:
+                if len(self.companions) >= self.COMPANION_MAX:
+                    # evict the stalest DEAD entry before rejecting — a full
+                    # registry of dead daemons must not lock out a live one
+                    # (the sas_report F3 posture).
+                    oldest = min(self.companions.items(),
+                                 key=lambda kv: kv[1].get("lastSeen", 0))
+                    if time.time() - oldest[1].get("lastSeen", 0) > \
+                            self.COMPANION_STALE_SEC:
+                        del self.companions[oldest[0]]
+                        log.info("🔻 [companion] evicted stale %s to admit "
+                                 "%s", oldest[0], comp_id)
+                    else:
+                        return {"ok": False, "error": "companion registry "
+                                "full (all slots active)"}
+                comp = {"companionId": comp_id, "startedAt": None,
+                        "ackTapId": -1, "lastTap": None,
+                        # lastSeen stamped AT creation: the field updates
+                        # below run under procLock, and a fresh entry must
+                        # never look eviction-stale in the gap between
+                        # the two lock windows
+                        "lastSeen": time.time(),
+                        # per-companion report mutex — see below
+                        "procLock": threading.Lock()}
+                self.companions[comp_id] = comp
+                log.info("💳 [companion:%s] registered from %s",
+                         comp_id, peer)
+            proc_lock = comp["procLock"]
+        # SERIALIZE the rest PER COMPANION: the HTTP server is threaded, so
+        # a daemon-timeout retry (2.5 s) racing a stalled handler thread
+        # could otherwise interleave the watermark math and the tap loop —
+        # tap N+1 classified against session state tap N had not written
+        # yet (card-IN twice, or OUT before IN on the wire). A dedicated
+        # mutex keeps companion_lock's no-nesting rule: the lock order is
+        # ALWAYS procLock -> companion_lock, never the reverse (the
+        # registration block above holds companion_lock ALONE). Distinct
+        # companions still report fully in parallel.
+        with proc_lock:
+            with self.companion_lock:
+                if started != comp.get("startedAt"):
+                    if comp.get("startedAt") is not None:
+                        log.info("💳 [companion:%s] daemon restart "
+                                 "(startedAt %r -> %r) — ack watermark "
+                                 "reset", comp_id, comp.get("startedAt"),
+                                 started)
+                    comp["startedAt"] = started
+                    comp["ackTapId"] = -1
+                comp["lastSeen"] = time.time()
+                comp["peer"] = peer
+                comp["readerOk"] = bool(payload.get("readerOk"))
+                # Binding authority (v11): if the operator has ASSIGNED this
+                # device a machine in the UI, the hub's satellites row wins over
+                # whatever the daemon reports from its flags; otherwise we fall
+                # back to the reported binding (a flagless zero-config image
+                # reports all None = unassigned; a legacy flagged unit keeps its
+                # flags). A row that carries only a LABEL (a name, no machine) is
+                # NOT a binding — it must not zero out a reported one. Resolved
+                # every report, so a re-assign is live — the tap consumers below
+                # read comp["bindings"] unchanged. GIL-atomic lookup, no lock
+                # (the sas_links idiom).
+                assign = self.sat_bindings.get(comp_id) or {}
+                a_egm = assign.get("g2sEgmId")
+                a_smib = assign.get("sasSmib")
+                a_addr = assign.get("sasAddress")
+                auto = False
+                leg = None
+                # A reader that reports its OWN binding (a legacy --g2s-egm /
+                # --sas-smib flag) knows its machine — honor that; co-location
+                # never overrides it. So co-location applies ONLY to a FLAGLESS
+                # reader (the zero-config golden image), as a fallback below an
+                # explicit UI assignment and below a reported flag. (A bare
+                # sas_addr with no smib names no machine — it doesn't count.)
+                reported_binding = bool(g2s_egm or sas_smib)
+                if a_egm:
+                    # EXPLICIT operator assignment to a G2S machine — the
+                    # reset-fob leg follows that machine's live SAS link
+                    # (self.sas_links, keyed "smibId/address"), so re-linking
+                    # the machine re-routes the reader with no re-assign.
+                    leg = self.sas_links.get(a_egm)
+                elif not reported_binding:
+                    # CO-LOCATION AUTO-BIND (AJ): a FLAGLESS companion that
+                    # reports from the SAME source IP as a SAS SMIB IS that
+                    # SMIB's reader — the network already tells us which machine
+                    # it serves, so we don't make the operator pick it.
+                    # One dedicated SMIB per machine => one leg per peer IP; if a
+                    # peer maps to MORE than one leg (a multidrop bus polling
+                    # several machines from one Pi, or a stale un-pruned entry),
+                    # co-location is AMBIGUOUS — we can't tell which cabinet the
+                    # reader sits at, so we DON'T auto-bind (fall through to the
+                    # operator's explicit pick) rather than guess a cabinet.
+                    peer = comp.get("peer")
+                    if peer:
+                        matches = [lk for lk, entry
+                                   in list(self.sas_machines.items())
+                                   if (entry or {}).get("peer") == peer]
+                        if len(matches) == 1:
+                            leg = matches[0]
+                            auto = True
+                            # its machine = the G2S cabinet this leg is LINKED to
+                            # (taps card over G2S — the proven BB2 path); a
+                            # standalone leg binds reset fobs only. list() the
+                            # dict: it is mutated by /api/settings on another
+                            # thread (no shared lock — snapshot to iterate).
+                            a_egm = next((e for e, lg
+                                          in list(self.sas_links.items())
+                                          if lg == leg), None)
+                if leg:
+                    if "/" in leg:
+                        a_smib, a_addr = leg.rsplit("/", 1)
+                    else:
+                        a_smib, a_addr = leg, None
+                has_binding = bool(a_egm or a_smib or a_addr)
+                if has_binding:
+                    comp["bindings"] = {"g2sEgmId": a_egm, "sasSmib": a_smib,
+                                        "sasAddress": a_addr}
+                else:
+                    comp["bindings"] = {"g2sEgmId": g2s_egm,
+                                        "sasSmib": sas_smib,
+                                        "sasAddress": sas_addr}
+                comp["assigned"] = has_binding
+                # auto = bound by co-location (no operator pick); the UI shows
+                # it read-only. An explicit assignment clears this.
+                comp["auto"] = auto
+                comp["label"] = assign.get("label") or ""
+                # Keep what the daemon actually reported (for the UI's "flashed
+                # with flags" hint + debugging), distinct from the resolved
+                # binding above.
+                comp["reported"] = {"g2sEgmId": g2s_egm, "sasSmib": sas_smib,
+                                    "sasAddress": sas_addr}
+                comp["lastError"] = last_error
+                fresh = [t for t in taps if t["tapId"] > comp["ackTapId"]]
+                if fresh:
+                    # advance BEFORE processing: a tap whose handling
+                    # errors is logged and dropped, never redelivered
+                    # forever (the log is the operator's signal; the
+                    # daemon must not hot-loop it)
+                    comp["ackTapId"] = max(t["tapId"] for t in fresh)
+                ack = comp["ackTapId"]
+            # Process OUTSIDE companion_lock: tap handling touches
+            # hub_store / account_store / assoc send queues (each with its
+            # own lock) — none of those are ever nested under ours.
+            for t in fresh:
+                try:
+                    self._process_companion_tap(comp, t)
+                except Exception as e:  # noqa: BLE001 — one bad tap must
+                    #                     not wedge the report/ack cycle
+                    log.error("💳 [companion:%s] tap %s failed: %s",
+                              comp_id, t.get("tapId"), e)
+        return {"ok": True, "ackTapId": ack}
+
+    def _process_companion_tap(self, comp, tap):
+        """One deduped tap -> the fob action. Unknown fobs are recorded in
+        lastTap (known=False, the Settings card's registration prompt) and
+        NOTHING else — never auto-created. Known fobs dispatch by tier:
+        player/attendant/manager = carded session, reset = SAS handpay key-
+        off (the physical attendant-key moment)."""
+        raw_uid = tap.get("uid") or ""
+        uid = _norm_fob_uid(raw_uid)
+        if uid is None:
+            log.warning("💳 [companion:%s] unparseable fob uid %r — ignored",
+                        comp.get("companionId"), raw_uid[:32])
+            return
+        fob = self.hub_store.fob_get(uid)
+        self.hub_store.fob_touch(uid, now_iso())
+        with self.companion_lock:
+            comp["lastTap"] = {"uid": uid, "at": tap.get("at") or now_iso(),
+                               "known": fob is not None,
+                               "tier": (fob or {}).get("tier"),
+                               "label": (fob or {}).get("label")}
+        if fob is None:
+            log.info("💳 [companion:%s] unknown fob %s — register it in "
+                     "Settings ▸ Fobs & Companions",
+                     comp.get("companionId"), uid)
+            return
+        tier = fob.get("tier")
+        if tier == "reset":
+            self._fob_handpay_reset(comp, fob, uid)
+        elif tier in ("player", "attendant", "manager"):
+            self._card_session_tap(comp, fob, uid, tier)
+        else:
+            # a tier this build doesn't know (future schema) — refuse
+            # loudly rather than guess at a permission level
+            log.warning("💳 [companion:%s] fob %s has unhandled tier %r — "
+                        "no action", comp.get("companionId"), uid, tier)
+
+    def _card_session_tap(self, comp, fob, uid, tier):
+        """The carded-session state machine for one tap on a G2S-bound
+        companion. Tap with no active session = card-IN (setIdValidation,
+        host-sourced); same-uid tap = card-OUT; different-uid tap = card-
+        OUT then card-IN (two enqueues, in order — the per-assoc FIFO ring
+        preserves it). Skips honestly (log, lastTap already recorded) when
+        the binding/assoc/ownership preconditions fail — never a blind
+        send at a device we don't own."""
+        egm_id = (comp.get("bindings") or {}).get("g2sEgmId")
+        if not egm_id:
+            log.info("💳 [companion:%s] fob %s (tier=%s) but no --g2s-egm "
+                     "binding — no carded session",
+                     comp.get("companionId"), uid, tier)
+            return
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None or assoc.comms_state != "onLine":
+            log.info("💳 [companion:%s] fob %s but %s is %s — carded "
+                     "session skipped", comp.get("companionId"), uid, egm_id,
+                     assoc.comms_state if assoc else "unknown")
+            return
+        dev = self.default_id_reader_device(assoc)
+        if dev is None:
+            log.info("💳 [companion:%s] fob %s but no owned G2S_idReader "
+                     "device on %s — carded session skipped",
+                     comp.get("companionId"), uid, egm_id)
+            return
+        # prefer name: the linked account's name, else the fob label, else
+        # the neutral "Player" (idPreferName is what the glass greets with)
+        acct_id = str(fob.get("accountId") or "").strip()
+        name = ""
+        if acct_id:
+            acct = self.account_store.get(acct_id)
+            if acct:
+                name = str(acct.get("name") or "").strip()
+        if not name:
+            name = str(fob.get("label") or "").strip() or "Player"
+        id_type = "G2S_player" if tier == "player" else "G2S_employee"
+        with self.companion_lock:
+            prev = self.card_sessions.get(egm_id)
+            prev = dict(prev) if prev else None
+            overlay = self.admin_overlays.get(egm_id)
+            overlay = dict(overlay) if overlay else None
+        # Classification reads under the lock; the pop itself is
+        # _glass_card_out's (atomic under companion_lock) so the re-tap
+        # path and the glass logout button share ONE card-out. Taps on one
+        # companion are serialized by procLock, so this read->pop window
+        # can't interleave same-reader taps; a same-EGM tap from a SECOND
+        # companion in that window is a physical simultaneity nobody can
+        # order anyway.
+        #
+        # ADMIN OVERLAY tap (checked FIRST, before the re-tap/switch/card-in
+        # classification):
+        #  (a) an overlay is already up -> ANY tap DISMISSES it back to the
+        #      player (AJ: "pop only the overlay"). Admin re-tap = done, friend
+        #      re-tap = "my screen back", third card = same. NEVER a card-out —
+        #      the friend's body underneath is untouched.
+        #  (b) no overlay, but a NON-admin friend is carded and THIS tap is an
+        #      admin fob -> RAISE the transient supervisor overlay over them
+        #      (the friend stays carded; setIdValidation is never revoked).
+        # Everything else falls through to today's behavior.
+        if overlay is not None:
+            self._admin_overlay_pop(egm_id, restore=True)
+            log.info("🧑‍💼 [%s] admin overlay dismissed by tap %s — "
+                     "player %s stays carded", egm_id, uid,
+                     (prev or {}).get("name"))
+            return
+        if prev and not prev.get("admin") and self._session_is_admin(uid, tier):
+            self._admin_overlay_push(egm_id, comp, uid, tier, name, dev)
+            log.info("🧑‍💼 [%s] admin %s (%s) overlaid on player %s — "
+                     "friend stays carded", egm_id, name, uid,
+                     prev.get("name"))
+            return
+        if prev and prev.get("uid") == uid:
+            self._glass_card_out(egm_id)            # re-tap = card-out
+            log.info("💳 [%s] card OUT — %s (%s)", egm_id,
+                     prev.get("name"), uid)
+            return
+        if prev:
+            # a different card while a session is active: close the old
+            # session first, then open the new one (FIFO keeps the order);
+            # hide=False — the incoming card's follow-show is next, no
+            # full-screen blink between two players
+            self._glass_card_out(egm_id, hide=False)
+            log.info("💳 [%s] card OUT — %s (switching cards)", egm_id,
+                     prev.get("name"))
+        # Glass nav v1: mint the SPA's session token at card-IN — and mint
+        # it BEFORE publishing the card session. glass_state's expiry
+        # branch reads card-present-with-no-token as "the operator token
+        # idled out" and cards the session straight back out, so a state
+        # poll (its own ThreadingHTTPServer thread, ~1.5s cadence) landing
+        # in a publish->mint gap would logout the fresh tap and orphan the
+        # token. Token-first is race-free: a token with no card session is
+        # inert (glass_state answers attract before it ever peeks), and
+        # mint() supersedes any stale orphan. Delivery is unchanged — ONLY
+        # the next /api/glass/state poll carries it; the hub never pushes;
+        # the <=1.5s poll flip IS the navigation event.
+        self.glass_sessions.mint(egm_id, tier, uid, name)
+        with self.companion_lock:
+            # accountId is stamped INTO the session record: the remove-
+            # while-carded refusal and the status/name joins must survive
+            # a mid-session fob unlink (the fob link is how we got here,
+            # not the session's identity)
+            self.card_sessions[egm_id] = {
+                "uid": uid, "name": name, "accountId": acct_id,
+                # tier is LOAD-BEARING for the admin-overlay restore: popping
+                # an overlay re-mints the PLAYER token from this body, and the
+                # tier must be the player's own (a player token never idle-
+                # expires; re-minting with a wrong tier would idle the friend
+                # out at the operator horizon and card them off).
+                "tier": tier,
+                "admin": self._session_is_admin(uid, tier),
+                "sinceIso": now_iso(), "sinceTs": time.time(),
+                "deviceId": dev, "companionId": comp.get("companionId")}
+        # enqueue OUTSIDE companion_lock (_enqueue takes assoc.lock)
+        self.enqueue_set_id_validation(
+            assoc, dev, True, id_number=uid, id_type=id_type,
+            prefer_name=name, full_name=name, player_id=acct_id,
+            id_class=tier)
+        log.info("💳 [%s] card IN — %s (uid=%s tier=%s dev=%s)",
+                 egm_id, name, uid, tier, dev)
+        # Card-IN recovery (glass nav v1): if the resident SPA is not KNOWN
+        # to be on this cabinet's glass, re-push it — throttled, and the
+        # ONLY non-/api/command glassShow trigger (NOTHING mediaDisplay
+        # fires at join; the probe-ladder dormancy rule holds).
+        self._glass_recovery_push(assoc)
+        # GLASS_FOLLOW_CARD: the menu window comes back for the carded
+        # player (no-op unless the SPA is known resident — a fresh
+        # recovery push above ends in its own show).
+        self._glass_follow(assoc, True)
+
+    def _glass_service_button(self, info):
+        """service_button hook (G2S_CBE301): the cabinet's own SERVICE
+        button toggles the glass menu — AJ's design, live-adjudicated
+        2026-07-10: with the operator's 'app controls service button'
+        enabled the AVP does NOT drive the window itself, it narrates each
+        press as CBE301 (~300ms), so the hub IS the app. Toggle keys off
+        the glass_visible belief (self-correcting — the verbs are
+        idempotent); bursts debounce (one press chirps several CBE301s);
+        and a press with NO resident SPA runs the recovery push instead —
+        the button self-heals the page after a media-system wipe. Runs on
+        the eventReport handler thread OUTSIDE assoc.lock (the hook
+        contract): quick, never raises (fire() also guards)."""
+        egm_id = info.get("egmId") or ""
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None or assoc.comms_state != "onLine":
+            return
+        dev = GLASS_DEFAULT_DEVICE
+        now = time.time()
+        with assoc.lock:
+            if now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC:
+                return
+            assoc.glass_button_ts = now
+            push = assoc.glass_push.get(dev)
+            resident = bool(push and push.get("stage") == "shown"
+                            and GLASS_PAGE in str(push.get("uri") or ""))
+            visible = assoc.glass_visible
+        spa = self._glass_spa_seen.get(egm_id) or {}
+        spa_live = (spa.get("dev") == dev
+                    and now - (spa.get("ts") or 0) <= GLASS_SPA_LIVE_SEC)
+        if not resident and not spa_live:
+            # nothing (known) on the window — the press becomes the
+            # self-heal: full push, ends shown (throttled like any
+            # recovery; a second press after the throttle retries)
+            log.info("🛎️ [%s] service button: SPA not resident — "
+                     "recovery push", egm_id)
+            self._glass_recovery_push(assoc)
+            return
+        if visible:
+            self.enqueue_hide_media_display(assoc, dev)
+        else:
+            self.enqueue_show_media_display(assoc, dev)
+        assoc.glass_visible = not visible
+        log.info("🛎️ [%s] service button: %s the menu (dev=%s)",
+                 egm_id, "hide" if visible else "SHOW", dev)
+
+    def _glass_follow(self, assoc, visible):
+        """GLASS_FOLLOW_CARD: show the resident SPA's window at card-IN,
+        hide it at card-OUT — the game plays FULL SCREEN while nobody is
+        carded in (a scale window carves the game while shown; AJ's call
+        2026-07-10). Only touches the wire when the SPA is KNOWN resident
+        (completed push this epoch, or a fresh src=spa heartbeat) — a bare
+        show/hide at an empty window is noise. The verbs are the
+        live-proven empty-element builders; both are idempotent on the
+        cabinet (ack echoes the visible state)."""
+        if not GLASS_FOLLOW_CARD:
+            return
+        if assoc is None or assoc.comms_state != "onLine":
+            return
+        dev = GLASS_DEFAULT_DEVICE
+        now = time.time()
+        with assoc.lock:
+            push = assoc.glass_push.get(dev)
+            resident = bool(push and push.get("stage") == "shown"
+                            and GLASS_PAGE in str(push.get("uri") or ""))
+        spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+        if not resident and not (
+                spa.get("dev") == dev
+                and now - (spa.get("ts") or 0) <= GLASS_SPA_LIVE_SEC):
+            return
+        if visible:
+            self.enqueue_show_media_display(assoc, dev)
+        else:
+            self.enqueue_hide_media_display(assoc, dev)
+        assoc.glass_visible = visible
+        log.info("🪟 [%s] glass follows card: %s dev=%s (game %s)",
+                 assoc.egm_id, "show" if visible else "hide", dev,
+                 "shares the screen" if visible else "full screen")
+
+    def _glass_card_out(self, egm_id, expect_tok=None, hide=True):
+        """THE card-out — the ONE implementation every logout path shares
+        (re-tap, card switch, /api/command cardOut, the glass SPA's logout
+        button, the bench auto-logout sweep, the operator idle expiry):
+        pop the card session, revoke the glass session token, and — link
+        permitting — enqueue the card-OUT setIdValidation. Pops under
+        companion_lock, enqueues OUTSIDE it (_enqueue takes assoc.lock —
+        the no-nesting rule). Returns the popped session dict, or None when
+        nothing was carded in (the glass token is revoked regardless, so a
+        half-torn state self-heals).
+
+        expect_tok (the glass logout button): compare-and-revoke. The
+        action handler resolves the token on one HTTP thread and acts on
+        the SAME thread later — if a card SWITCH tap fully completes in
+        that resolve->act gap (A carded out, B's session published and
+        minted), an unconditional card-out here would log out B with A's
+        dead token. With expect_tok set, the card-out proceeds ONLY while
+        it is still this EGM's live token (revoke_if is atomic in the
+        store lock; the session pop stays under the same companion_lock
+        hold so a tap's read-then-pop can't slip between them)."""
+        with self.companion_lock:
+            if expect_tok is not None and \
+                    not self.glass_sessions.revoke_if(egm_id, expect_tok):
+                return None
+            sess = self.card_sessions.pop(egm_id, None)
+            # A genuine card-out ends the player underneath, so any admin
+            # overlay stacked on them is meaningless now — drop it in the SAME
+            # lock hold as the card pop (an overlay outliving its player would
+            # render an admin stack over an attract screen). The overlay's
+            # admin token, if still live, is revoked by the token revoke below
+            # (expect_tok path) or revoke_egm (the None path).
+            self.admin_overlays.pop(egm_id, None)
+        if expect_tok is None:
+            self.glass_sessions.revoke_egm(egm_id)
+        # Glass cashOutToWallet pin dies with the session (glass destub v1):
+        # a fresh card-IN re-arms it via the cashOutToWallet toggle, so a
+        # stale pin can never credit the next player's cash-out to whoever
+        # left. Runs on every real card-out (the superseded-token early
+        # return above never reaches here — that session still stands). Pop
+        # under _glass_pin_lock, AFTER the glass-token revoke above, so a
+        # concurrent toggle's arm either sees the revoked token (refuses) or
+        # gets swept here — its late write can't outlive the card-out.
+        with self._glass_pin_lock:
+            had_pin = self._glass_cash_out_pin.pop(egm_id, None)
+        # DISARM the cash-out routing so an un-carded machine reverts to its
+        # DEFAULT (a ticket): pair the pin pop with a protocol-correct disarm
+        # (AJ — keep it simple). Fired only when a pin was actually armed (never
+        # spam a quiet machine on every idle card-out); idempotent + best-effort.
+        # Runs OUTSIDE _glass_pin_lock so the SAS enqueue / WAT _enqueue can take
+        # their own locks (the no-nesting rule), like the setIdValidation
+        # enqueue below.
+        if had_pin is not None:
+            leg = self.sas_links.get(egm_id)
+            if leg:
+                # SAS leg: the disarm is a pure HUB-SIDE flag clear — the
+                # satellite drops cashout_state["armed"]/pending and writes
+                # NOTHING to the machine (an unanswered 0x6A already tickets).
+                with self.sas_lock:
+                    entry = self.sas_machines.get(leg) or {}
+                smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+                self.sas_enqueue_command(smib, {
+                    "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
+                    "type": "aft_set_host_cashout", "enable": False})
+            else:
+                with self.assoc_lock:
+                    a = self.associations.get(egm_id)
+                if a is not None and a.comms_state == "onLine":
+                    # The AVP WAT mirror was left armed after logout (the pin
+                    # pop alone did not disable it) — turn it off too.
+                    self.enqueue_set_wat_cash_out(
+                        a, enable=False, device_id=self.default_wat_device(a))
+        if sess is None:
+            return None
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is not None and assoc.comms_state == "onLine":
+            self.enqueue_set_id_validation(
+                assoc, sess.get("deviceId") or "1", False)
+            # GLASS_FOLLOW_CARD: nobody carded in -> game full screen.
+            # hide=False on the card-SWITCH path (the new card's IN is
+            # about to show — no hide/show blink between two players).
+            if hide:
+                self._glass_follow(assoc, False)
+        return sess
+
+    def _admin_overlay_push(self, egm_id, comp, uid, tier, name, dev):
+        """Raise a transient ADMIN overlay over the carded player on egm_id.
+
+        NON-DESTRUCTIVE by construction: the friend's card_sessions body is
+        left untouched and setIdValidation is NOT revoked — physically they
+        stay carded in. All we do is mint an admin glass token (which
+        supersedes the player's on the one-token-per-EGM store, so the next
+        ~1.5s /api/glass/state poll flips BOTH surfaces — the AVP glass and
+        the BB2 kiosk — to the admin stack) and record the overlay beside the
+        player. glass_state renders the admin stack from THIS record (not the
+        friend's body) and suppresses the friend's wallet/credits while it
+        stands; _handle_glass_action 403s wallet verbs on the admin token.
+
+        Mint FIRST, OUTSIDE companion_lock (the store has its own lock — the
+        no-nesting rule), then record under companion_lock. No wire traffic:
+        an overlay is a pure hub-side view swap, nothing is enqueued."""
+        tok = self.glass_sessions.mint(egm_id, tier, uid, name)
+        with self.companion_lock:
+            self.admin_overlays[egm_id] = {
+                "uid": uid, "name": name, "tier": tier, "tok": tok,
+                "deviceId": dev, "companionId": comp.get("companionId"),
+                "sinceIso": now_iso(), "sinceTs": time.time()}
+
+    def _admin_overlay_pop(self, egm_id, restore=True):
+        """Drop the admin overlay on egm_id and hand the glass back.
+
+        restore=True (a dismiss tap, or glass_state finding the admin token
+        idled/superseded): if the player body is still carded, re-mint the
+        PLAYER's token from that intact body — it supersedes the admin's, so
+        the next poll flips both surfaces back to the friend, who never lost
+        their session. The player's OWN tier (the load-bearing card_sessions
+        `tier`) is used so the re-minted token keeps a player's never-idle
+        horizon. If the body vanished while the overlay stood (the friend
+        carded out underneath), just revoke the admin token so the glass
+        falls to attract rather than a stranded admin stack.
+
+        restore=False (a defensive drop when there's no player to hand back
+        to): revoke the admin token, mint nothing. Pop under companion_lock;
+        the mint/revoke runs OUTSIDE it. Returns the popped overlay, or None
+        when there was none (idempotent — double-dismiss is a no-op)."""
+        with self.companion_lock:
+            overlay = self.admin_overlays.pop(egm_id, None)
+            card = self.card_sessions.get(egm_id)
+            card = dict(card) if card else None
+        if overlay is None:
+            return None
+        if restore and card is not None:
+            self.glass_sessions.mint(
+                egm_id, card.get("tier") or "player",
+                card.get("uid"), card.get("name") or "Player")
+        else:
+            # No player underneath (or a defensive drop): retire the admin
+            # token only if it's still the live one — a card switch may have
+            # already superseded it, in which case revoke_if no-ops and we
+            # leave the current session alone.
+            self.glass_sessions.revoke_if(egm_id, overlay.get("tok"))
+        return overlay
+
+    def _sweep_cash_out_pins(self):
+        """PROACTIVE DISARM (reject → ticket, AJ CORRECTED 2026-07-12):
+        destination-account validity is decided BEFORE the pull. The moment
+        a pinned cash-out-to-wallet account is no longer valid (deleted /
+        vanished from the AccountStore), disarm the machine-side routing so
+        the money never leaves the machine — the machine's own fail path
+        prints a ticket instead:
+
+          * SAS leg: aft_set_host_cashout enable:False — the satellite
+            stops answering exception 0x6A, so the cash-out button falls
+            back to paper (the machine is menu-set "soft cash-out to host,
+            fail to ticket").
+          * AVP (plain G2S): setWatCashOut disable — the WAT cash-out
+            mirror turns off, so the button prints as normal.
+
+        Pops the pin under _glass_pin_lock with a same-account re-check (a
+        fresh re-arm by a NEW carded player must survive the sweep — the
+        TOCTOU idiom of _glass_card_out), enqueues OUTSIDE it (the
+        no-nesting rule; sas_enqueue_command/_enqueue take their own
+        locks). Idempotent + best-effort — a re-fire is impossible (the pop
+        is the act). If the SAS disarm enqueue is LOST (queue full), the
+        sweep cannot re-fire it (the pin is already gone), BUT the money is
+        still never mis-homed: a still-armed satellite that later answers a
+        0x6A reports a cash-out whose settle finds NO hub pin, and
+        _settle_aft_cashouts both flags a loud unhomed HOLD and re-issues the
+        disarm (_disarm_sas_leg) — never crediting the wire's account, never
+        House. The WAT authorize deny is the same hard pre-pull backstop on
+        the AVP. Called from the SAS report ingest (~1 s cadence, floor-wide)
+        and from the account-remove lifecycle (immediate, covers a
+        satellite-less AVP floor). Never raises."""
+        try:
+            if not self._glass_cash_out_pin:
+                return
+            with self._glass_pin_lock:
+                pins = list(self._glass_cash_out_pin.items())
+            stale = []
+            for egm_id, acct_id in pins:
+                if self.account_store.get(acct_id) is not None:
+                    continue
+                with self._glass_pin_lock:
+                    # pop ONLY while the pin still names the SAME vanished
+                    # account — a concurrent card-in's fresh arm keeps its
+                    # pin, a concurrent card-out's pop makes this a no-op.
+                    if self._glass_cash_out_pin.get(egm_id) == acct_id:
+                        self._glass_cash_out_pin.pop(egm_id, None)
+                        stale.append((egm_id, acct_id))
+            for egm_id, acct_id in stale:
+                log.warning("🚨 [glass:%s] pinned cash-out account %r no "
+                            "longer exists — PROACTIVE DISARM: cash-out "
+                            "reverts to the ticket default (reject → "
+                            "ticket)", egm_id, acct_id)
+                leg = self.sas_links.get(egm_id)
+                if leg:
+                    # Same command shape as the card-out disarm above: a
+                    # pure hub-side flag clear on the satellite — the next
+                    # 0x6A goes unanswered and the machine tickets.
+                    with self.sas_lock:
+                        entry = self.sas_machines.get(leg) or {}
+                    smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+                    self.sas_enqueue_command(smib, {
+                        "id": f"codis{next(self._fob_seq)}-"
+                              f"{int(time.time())}",
+                        "type": "aft_set_host_cashout", "enable": False})
+                else:
+                    with self.assoc_lock:
+                        a = self.associations.get(egm_id)
+                    if a is not None and a.comms_state == "onLine":
+                        self.enqueue_set_wat_cash_out(
+                            a, enable=False,
+                            device_id=self.default_wat_device(a))
+        except Exception:  # noqa: BLE001 — rides report ingest, never fatal
+            log.exception("cash-out pin sweep failed (ignored)")
+
+    def _fob_handpay_reset(self, comp, fob, uid):
+        """Reset-tier fob: queue a handpay_reset for the BOUND SAS
+        satellite EXACTLY the way POST /api/sas/command does (same dict
+        shape — {id, type} only, a reset never carries an amount; same
+        id dialect as the auto aft_register). The satellite keys the
+        latched win off to the credit meter; no win latched = its honest
+        no-op verdict rides back in commandResults."""
+        smib = (comp.get("bindings") or {}).get("sasSmib")
+        if not smib:
+            log.info("💳 [companion:%s] reset fob %s but no --sas-smib "
+                     "binding — nothing to reset",
+                     comp.get("companionId"), uid)
+            return
+        r = self.sas_enqueue_command(smib, {
+            "id": f"fob{next(self._fob_seq)}-{int(time.time())}",
+            "type": "handpay_reset"})
+        if r.get("ok"):
+            log.info("🔑 [sas:%s] handpay_reset queued by reset fob %s "
+                     "(%s, label=%r)", smib, uid, r.get("id"),
+                     fob.get("label"))
+        else:
+            log.info("🔑 [sas:%s] reset fob %s: %s", smib, uid,
+                     r.get("error"))
+
+    def sweep_card_sessions(self, now=None):
+        """Auto-logout sweep (called from the watchdog loop, 20 s cadence)
+        — a BENCH KNOB, dormant by default: CARD_SESSION_MAX_SEC ships 0
+        (disabled) because the carded session is the wallet link and must
+        persist until an EXPLICIT logout (re-tap / card switch / cardOut).
+        With a nonzero instance override, a session older than the horizon
+        is carded OUT and cleared. COMPLETELY dormant while card_sessions
+        is empty — zero cost (and zero wire traffic) on a fob-less floor."""
+        max_sec = self.CARD_SESSION_MAX_SEC
+        if not max_sec:
+            return
+        now = time.time() if now is None else now
+        with self.companion_lock:
+            expired = [(egm, s) for egm, s in self.card_sessions.items()
+                       if now - (s.get("sinceTs") or 0) > max_sec]
+        for egm_id, sess in expired:
+            # the shared card-out pops + revokes the glass token + enqueues
+            self._glass_card_out(egm_id)
+            log.info("💳 [%s] card session auto-logout (%ds) — %s", egm_id,
+                     max_sec, sess.get("name"))
+
+    def sweep_admin_overlays(self, now=None):
+        """Reclaim ABANDONED admin overlays (called from the watchdog loop).
+
+        An admin who taps OVER a carded friend and then walks away must not
+        hold the friend's glass hostage: an overlay whose admin token has seen
+        no ACTION for ADMIN_OVERLAY_IDLE_SEC is popped and the friend restored
+        (the same pop+restore a dismiss tap or Done runs — the friend never
+        lost their session). Unlike sweep_card_sessions this is ALWAYS armed
+        (no bench knob): an overlay is a supervisor override, not a wallet
+        link, so a bounded lifetime is always correct. Dormant/zero-cost while
+        admin_overlays is empty. The idle clock is the admin TOKEN's (actions
+        refresh it, the poll doesn't) so an actively-used overlay never trips.
+
+        An overlay whose token already vanished (idled/superseded) is popped
+        too — glass_state normally reroutes that on the next poll, but a
+        machine whose glass stopped polling (browser gone) would otherwise
+        strand it; here idle_sec returns None and we reclaim immediately."""
+        now = time.time() if now is None else now
+        with self.companion_lock:
+            overlays = list(self.admin_overlays.items())
+        for egm_id, ov in overlays:
+            idle = self.glass_sessions.idle_sec(egm_id, ov.get("tok"), now=now)
+            if idle is None or idle > ADMIN_OVERLAY_IDLE_SEC:
+                self._admin_overlay_pop(egm_id, restore=True)
+                log.info("🧑‍💼 [%s] admin overlay reclaimed (%s) — player "
+                         "restored", egm_id,
+                         "token gone" if idle is None
+                         else f"idle {int(idle)}s")
+
+    def _is_registered(self, egm_id):
+        """A cabinet the hub has a PERSISTED identity for — config-inventory
+        record (written only after a real join reads optionConfig/gamePlay) or
+        an operator-set nickname (names() = WHERE nickname IS NOT NULL). Both
+        are phantom-proof: an anonymous association that only hit :8081 without
+        joining or being named matches NEITHER. Mirrors the /api/status 'known'
+        flag; the reaper uses it to spare registered machines (AJ)."""
+        try:
+            if self.config_store.get(egm_id):
+                return True
+            return bool(self.hub_store.names().get(egm_id))
+        except Exception:  # noqa: BLE001 — a store fault FAILS SAFE (registered)
+            return True
+
+    def reap_stale_associations(self, now=None):
+        """Prune ANONYMOUS never-joined associations that have gone silent —
+        a cabinet (or stray client) that hit :8081 once and never completed
+        commsOnLine leaves an association that the manual Remove is otherwise
+        the only way to clear. GUARDS (all must hold to reap):
+          * never joined this session (no commsOnLineSeen, no joinedAt) — a
+            JOINED machine that later went offline is NEVER touched; its tile
+            stays 'dark since X' until Remove;
+          * NOT registered (_is_registered) — a known/named cabinet is spared
+            even while offline or mid-failed-join (AJ: "make sure it wont hit
+            registered machines — sometimes registered machines will be
+            offline"). Its tile persists; a rejoin re-seeds from the store;
+          * has actually contacted (last_seen>0) and gone silent past
+            ASSOC_REAP_SEC — a join that is genuinely retrying keeps refreshing
+            last_seen, so it is never reaped WHILE working.
+        Teardown mirrors g2s_forget (pop under assoc_lock, new_epoch under
+        a.lock to kill the pinger + invalidate queued sends, then the None
+        sentinel to reap the FIFO worker). Non-destructive: hub.db / config /
+        vouchers are untouched, so even a mistaken reap self-heals on rejoin."""
+        now = time.time() if now is None else now
+        with self.assoc_lock:
+            candidates = [egm for egm, a in self.associations.items()
+                          if not a.comms_online_seen and not a.joined_at
+                          and a.last_seen
+                          and (now - a.last_seen) > ASSOC_REAP_SEC]
+        for egm_id in candidates:
+            if self._is_registered(egm_id):
+                continue                       # a known cabinet — never reap
+            with self.assoc_lock:
+                a = self.associations.pop(egm_id, None)
+            if a is None:
+                continue
+            with a.lock:
+                a.new_epoch()
+            a.send_queue.put(None)
+            self._registry_touched.pop(egm_id, None)
+            log.info("🧹 reaped anonymous never-joined association %s (silent "
+                     "%ds, never reached commsOnLine, unregistered)",
+                     egm_id, int(now - (a.last_seen or now)))
+
+    def seed_registered_machines(self):
+        """Boot the floor with every REGISTERED G2S cabinet already present as
+        an OFFLINE tile, so a registered machine is NEVER absent from the UI
+        across a hub restart — it shows dark, not missing (AJ: "registered
+        machines should have never disappeared in the first place"). Each known
+        cabinet becomes a placeholder association, built THROUGH assoc() so it
+        inherits the persisted optionConfig/gamePlay seed, and left in an
+        offline, never-contacted state: it sends NOTHING (no worker, no
+        keepalive) until the real cabinet re-handshakes, at which point assoc()
+        returns THIS same placeholder and the join proceeds in place. Safe with
+        the rest of the lifecycle: the reaper spares it (registered + no stamped
+        contact), the join-gate shows it (known=true), the watchdog skips it
+        (not onLine). Best-effort — a store fault just means no pre-seed (the
+        machine still appears the moment it contacts). Run ONCE at startup."""
+        try:
+            rows = self.hub_store.machines()
+        except Exception:   # noqa: BLE001 — seeding is best-effort, never fatal
+            return
+        seeded = 0
+        for r in rows:
+            key = r.get("machine_key")
+            if not key or str(r.get("protocol") or "").upper() != "G2S":
+                continue                       # SAS legs tile via the sas registry
+            with self.assoc_lock:
+                if key in self.associations:
+                    continue
+            a = self.assoc(key)                # creates + config-seeds + registers
+            with a.lock:
+                if not a.comms_online_seen:    # a fresh placeholder, not a live join
+                    a.comms_state = "offline"  # a dark tile, not "waiting to join"
+            seeded += 1
+        if seeded:
+            log.info("🪑 seeded %d registered G2S cabinet(s) as OFFLINE on the "
+                     "boot floor (present-but-dark until they re-handshake)",
+                     seeded)
+
+    def card_out(self, assoc):
+        """/api/command cardOut {egmId} — the UI's explicit logout (the
+        machine-tile 💳 badge's "Log out <name>"). With auto-logout
+        disabled by default (see CARD_SESSION_MAX_SEC), the logout paths
+        are re-tap, card switch, the glass SPA's logout button, and THIS —
+        ending a session from the Floor UI without walking to the reader.
+        All of them run the shared _glass_card_out (pop + glass-token
+        revoke + card-OUT setIdValidation, correct lock order). Honest
+        {"ok": false} when nothing is carded in (a stale tile is not worth
+        a 4xx). Returns a dict merged into the /api/command reply."""
+        sess = self._glass_card_out(assoc.egm_id)
+        if sess is None:
+            return {"ok": False, "error": "no active card session"}
+        log.info("💳 [%s] card OUT — %s (explicit logout via /api/command)",
+                 assoc.egm_id, sess.get("name"))
+        return {"name": sess.get("name"), "uid": sess.get("uid")}
+
+    def companion_snapshot(self):
+        """The /api/status 'companions' section — sas_snapshot's posture:
+        every reported daemon + hub-side staleness (a companion that stops
+        reporting is presented stale, never silently dropped)."""
+        now = time.time()
+        with self.companion_lock:
+            out = {}
+            for cid, c in self.companions.items():
+                age = now - (c.get("lastSeen") or now)
+                out[cid] = {"companionId": cid,
+                            "lastSeen": c.get("lastSeen"),
+                            "reportAgeSec": round(age, 1),
+                            "stale": age > self.COMPANION_STALE_SEC,
+                            "startedAt": c.get("startedAt"),
+                            "readerOk": c.get("readerOk"),
+                            # resolved binding (assignment wins over reported)
+                            "bindings": dict(c.get("bindings") or {}),
+                            # v11 zero-config: is there an operator assignment,
+                            # its friendly label, what the daemon reported, and
+                            # the source IP so the UI can show it + let a
+                            # collector SSH to the right card (identical images
+                            # share a hostname).
+                            "assigned": bool(c.get("assigned")),
+                            # auto = bound by co-location (reader on a SAS SMIB
+                            # serves that SMIB's machine); UI shows it read-only.
+                            "auto": bool(c.get("auto")),
+                            "label": c.get("label") or "",
+                            "reported": dict(c.get("reported") or {}),
+                            "peer": c.get("peer"),
+                            "lastError": c.get("lastError"),
+                            "ackTapId": c.get("ackTapId"),
+                            "lastTap": dict(c["lastTap"])
+                            if c.get("lastTap") else None}
+        return out
+
+    def card_sessions_snapshot(self):
+        """The /api/status 'cardSessions' section — {egmId: {uid, name,
+        since}} so the UI can badge a machine tile with who is carded in.
+        The name resolves LIVE through the session's linked account (in-
+        memory get) so a mid-session rename reaches the badges; the frozen
+        card-in name is the fallback."""
+        with self.companion_lock:
+            cards = {egm: dict(s) for egm, s in self.card_sessions.items()}
+        out = {}
+        for egm, s in cards.items():
+            name = s.get("name")
+            aid = str(s.get("accountId") or "").strip()
+            if aid:
+                acct = self.account_store.get(aid)
+                if acct is not None and acct.get("kind") == "player" \
+                        and str(acct.get("name") or "").strip():
+                    name = acct.get("name")
+            out[egm] = {"uid": s.get("uid"), "name": name,
+                        "since": s.get("sinceIso")}
+        return out
+
+    def _player_carded_map(self):
+        """{accountId: egmId} for every live carded session — the
+        /api/players 'cardedAt' join AND the remove-while-carded refusal
+        share this one resolver. The session record's OWN accountId
+        (stamped at card-in) wins, so an unlink-then-remove cannot blind
+        the refusal; the fob link is the fallback for a pre-stamp legacy
+        session. Best-effort: an unreadable fob row just drops that
+        session from the map (fob_get never raises); first session wins
+        if one account is somehow carded in twice."""
+        with self.companion_lock:
+            cards = {egm: (str(s.get("accountId") or "").strip(),
+                           s.get("uid"))
+                     for egm, s in self.card_sessions.items()}
+        out = {}
+        for egm, (aid, uid) in cards.items():
+            if not aid:
+                fob = self.hub_store.fob_get(uid or "")
+                aid = str((fob or {}).get("accountId") or "").strip()
+            if aid and aid not in out:
+                out[aid] = egm
+        return out
+
+    def build_players(self):
+        """GET /api/players — the Player Maintenance composite: every
+        kind=player account joined with its linked fobs, live carded
+        location, and active glass-session tier, plus the House row under
+        its OWN key (the bank is NOT a player) and the unassigned player-
+        fob pool (the "link me" list for the Add Player flow). Read-only
+        aggregation over AccountStore + hub.db fobs + card/glass sessions
+        — no new state. Never raises (the HTTP edge also guards); each
+        source degrades independently rather than failing the whole reply."""
+        out = {"ok": True, "at": now_iso()}
+        try:
+            accounts = self.account_store.snapshot().get("accounts", [])
+        except Exception:  # noqa: BLE001 — never-500 endpoint
+            accounts = []
+            out["ok"] = False
+            out["error"] = "account store read failed"
+        fobs = self.hub_store.fobs()    # degrades to [] on a db fault
+        player_ids = {a.get("id") for a in accounts
+                      if a.get("kind") != "house"}
+        by_acct, unassigned = {}, []
+        for f in fobs:
+            row = {"uid": f.get("uid"), "label": f.get("label"),
+                   "tier": f.get("tier"), "lastSeen": f.get("lastSeen")}
+            aid = str(f.get("accountId") or "").strip()
+            is_player = f.get("tier") == "player"
+            if aid and (aid in player_ids or not out["ok"]):
+                # only PLAYER fobs render as wallet chips — a linked non-
+                # player tier is a legacy row (fob_set now clears/refuses
+                # the combination) and must never present a reset key as
+                # a wallet card; it stays visible in Settings ▸ Fobs
+                if is_player:
+                    by_acct.setdefault(aid, []).append(row)
+            elif is_player:
+                if aid:
+                    # linked to an account that no longer exists (raw
+                    # /api/accounts delete, or a mid-remove fault) —
+                    # surface it in the link-me pool instead of rendering
+                    # it NOWHERE, so it can be re-linked from the UI
+                    row["orphanAccountId"] = aid
+                unassigned.append(row)
+        carded = self._player_carded_map()
+        try:
+            glass = self.glass_sessions.summary().get("byEgm", {})
+        except Exception:  # noqa: BLE001 — tier is decoration, not truth
+            glass = {}
+        players, house = [], None
+        for a in accounts:
+            if a.get("kind") == "house":
+                house = dict(a)
+                continue
+            aid = a.get("id")
+            egm = carded.get(aid)
+            players.append({
+                "id": aid, "name": a.get("name"),
+                "admin": bool(a.get("admin")),
+                "cashableMillicents": int(a.get("cashableMillicents") or 0),
+                "promoMillicents": int(a.get("promoMillicents") or 0),
+                "nonCashMillicents": int(a.get("nonCashMillicents") or 0),
+                "createdAt": a.get("createdAt"),
+                "lastActivity": a.get("lastActivity"),
+                "fobs": by_acct.get(aid, []),
+                "cardedAt": egm,
+                "tier": (glass.get(egm) or {}).get("tier") if egm else None})
+        out.update(players=players, house=house, unassignedFobs=unassigned)
+        return out
+
+    _FUND_REF_SEQ = itertools.count(1)
+
+    def player_action(self, req):
+        """POST /api/players — Player Maintenance actions, each a THIN
+        composite over the EXISTING primitives (AccountStore +
+        hub_store.fob_set): create/remove/linkFob/unlinkFob/fund/rename.
+        Money moves are PAIRED adjust() calls under ONE shared ref so both
+        legs pair up in the ledger; the player leg always runs FIRST —
+        adjust()'s atomic player-overdraft refusal gates the pair before
+        the house leg (which cannot refuse: the bank may overdraft) ever
+        writes. No pre-check-then-write anywhere: remove's final delete is
+        the store's OWN atomic nonzero-balance refusal (a credit landing
+        mid-remove bounces back into the fold loop, never vanishes).
+        Returns the JSON reply dict; every refusal is an honest
+        ok:false."""
+        action = req.get("action")
+        store, hs = self.account_store, self.hub_store
+        if action == "create":
+            account, err = store.create(req.get("name"))
+            if err:
+                return {"ok": False, "error": err}
+            reply = {"ok": True, "player": account}
+            fob_uid = req.get("fobUid")
+            if isinstance(fob_uid, str) and fob_uid.strip():
+                # link only a KNOWN player-tier fob at create time; the
+                # account itself stands either way, the link verdict rides
+                # back honestly beside it.
+                fob = hs.fob_get(fob_uid)
+                if fob is None:
+                    reply["linkError"] = (f"unknown fob {fob_uid.strip()!r}"
+                                          " — register it first (or use "
+                                          "linkFob, which registers too)")
+                elif fob.get("tier") != "player":
+                    reply["linkError"] = (
+                        f"fob {fob['uid']} is tier {fob['tier']!r} — only "
+                        "player fobs link to accounts")
+                else:
+                    fob, ferr = hs.fob_set(fob_uid,
+                                           account_id=account["id"])
+                    if ferr:
+                        reply["linkError"] = ferr
+                    else:
+                        reply["fob"] = fob
+            log.info("🧑 player create %s (%s)%s", account["id"],
+                     account["name"],
+                     " + fob " + reply["fob"]["uid"]
+                     if reply.get("fob") else "")
+            return reply
+        if action == "remove":
+            aid = str(req.get("accountId") or "").strip()
+            acct = store.get(aid)
+            if acct is None:
+                return {"ok": False, "error": f"unknown account {aid!r}"}
+            if aid == "house" or acct.get("kind") == "house":
+                return {"ok": False, "error": "the house account cannot "
+                        "be removed — it is the bank"}
+            egm = self._player_carded_map().get(aid)
+            if egm:
+                try:
+                    nick = hs.names().get(egm) or ""
+                except Exception:  # noqa: BLE001 — refusal text only
+                    nick = ""
+                where = f"{nick} ({egm})" if nick else egm
+                return {"ok": False, "error":
+                        f"{acct.get('name')} is carded in at {where} — "
+                        "card out first"}
+            # Fold any balance back to the House FIRST — credits are never
+            # vaporized. Player debit leg first (adjust refuses atomically
+            # if a concurrent spend beat this snapshot — then nothing
+            # moved), house credit second (cannot refuse). The delete is
+            # the ATOMIC backstop: store.delete refuses a nonzero balance
+            # under its own lock, so a credit landing after the last fold
+            # read (a second browser's fund, a wallet sweep) bounces the
+            # delete back into this loop instead of vanishing with its
+            # house leg already committed.
+            ref = f"player-remove:{aid}"
+            folded = 0
+            unlinked = []
+            account = None
+            for attempt in range(3):
+                cash = int(acct.get("cashableMillicents") or 0)
+                promo = int(acct.get("promoMillicents") or 0)
+                non = int(acct.get("nonCashMillicents") or 0)
+                if cash or promo or non:
+                    _, err = store.adjust(
+                        aid, -cash, -promo, -non,
+                        note=f"remove {acct.get('name')} — fold to house",
+                        ref=ref)
+                    if err:
+                        return {"ok": False, "error": err}
+                    _, err = store.adjust(
+                        "house", cash, promo, non,
+                        note=f"folded from removed {aid}", ref=ref)
+                    if err:
+                        # should-never-happen ('house' always exists) —
+                        # the player leg already moved; the ledger ref is
+                        # the recovery record, say so, don't pretend.
+                        log.error("🧑 player remove %s: house fold leg "
+                                  "FAILED (%s) — see ledger ref %s",
+                                  aid, err, ref)
+                        return {"ok": False, "error":
+                                f"house fold leg failed after the player "
+                                f"debit: {err} — see ledger ref {ref}"}
+                    folded += cash + promo + non
+                if attempt == 0:
+                    # unlink once, between fold and delete; a fob_set
+                    # fault is non-fatal — an orphan link surfaces in
+                    # unassignedFobs (orphanAccountId), never invisible
+                    for f in hs.fobs():
+                        if str(f.get("accountId") or "").strip() == aid:
+                            _, ferr = hs.fob_set(f.get("uid"),
+                                                 account_id="")
+                            if not ferr:
+                                unlinked.append(f.get("uid"))
+                # Re-check carded IMMEDIATELY before the delete — a tap
+                # can land after the check at the top of this action. The
+                # map resolves the session record's OWN accountId, so the
+                # fob unlink above cannot blind this refusal.
+                egm = self._player_carded_map().get(aid)
+                if egm:
+                    return {"ok": False, "error":
+                            f"{acct.get('name')} carded in at {egm} "
+                            "mid-remove — card out first" + (
+                                f" (balance already folded to the house, "
+                                f"ledger ref {ref})" if folded else "")}
+                account, err = store.delete(aid)
+                if err is None:
+                    break
+                acct = store.get(aid)
+                if acct is None or not any(
+                        int(acct.get(k) or 0)
+                        for k in ("cashableMillicents", "promoMillicents",
+                                  "nonCashMillicents")):
+                    # not the credits backstop (unknown/house/db) — honest
+                    return {"ok": False, "error": err}
+                # credits landed between the fold and the delete — loop
+                # back, re-fold them (ledger-visible), try again
+            else:
+                return {"ok": False, "error":
+                        f"{aid} keeps receiving credits mid-remove — "
+                        "try again"}
+            # PROACTIVE DISARM (reject → ticket): the account is GONE — any
+            # machine still armed to route its cash-out button here must be
+            # disarmed NOW, so the credits never leave the machine (its own
+            # fail path prints a ticket). The carded-in refusals above make
+            # a live pin here unlikely, but this closes the gap for BOTH
+            # protocols the instant the account vanishes — no waiting on
+            # the ~1 s satellite-report sweep (which a satellite-less AVP
+            # floor never gets). Best-effort + idempotent, never raises.
+            self._sweep_cash_out_pins()
+            log.info("🧑 player remove %s (%s): folded %s mc to house, "
+                     "unlinked %s", aid, account.get("name"), folded,
+                     unlinked or "no fobs")
+            return {"ok": True, "removed": aid,
+                    "foldedMillicents": folded, "unlinkedFobs": unlinked}
+        if action == "linkFob":
+            aid = str(req.get("accountId") or "").strip()
+            acct = store.get(aid)
+            if acct is None:
+                return {"ok": False, "error": f"unknown account {aid!r}"}
+            if acct.get("kind") == "house":
+                return {"ok": False, "error":
+                        "fobs link to players, not the house"}
+            uid = req.get("uid")
+            uid = uid.strip() if isinstance(uid, str) else ""
+            if not uid:
+                return {"ok": False, "error": "uid required (string)"}
+            fob = hs.fob_get(uid)
+            if fob is not None and fob.get("tier") != "player":
+                return {"ok": False, "error":
+                        f"fob {fob['uid']} is tier {fob['tier']!r} — only "
+                        "player fobs link to accounts"}
+            # unknown uid: fob_set registers it as a player fob AND links
+            # it in one upsert — the tap-to-link path needs no second call.
+            fob, err = hs.fob_set(uid, account_id=aid)
+            if err or fob is None:
+                return {"ok": False, "error": err or "fob write failed"}
+            log.info("🧑 fob %s linked to %s (%s)", fob["uid"], aid,
+                     acct.get("name"))
+            return {"ok": True, "fob": fob}
+        if action == "unlinkFob":
+            uid = req.get("uid")
+            uid = uid.strip() if isinstance(uid, str) else ""
+            if not uid:
+                return {"ok": False, "error": "uid required (string)"}
+            prior = hs.fob_get(uid)
+            if prior is None:
+                return {"ok": False, "error": f"unknown fob {uid!r}"}
+            # account_id="" clears the link (fob_set's COALESCE only skips
+            # None — the empty string writes through); the fob row stays.
+            fob, err = hs.fob_set(uid, account_id="")
+            if err or fob is None:
+                return {"ok": False, "error": err or "fob write failed"}
+            # Footgun surface: admin is an ACCOUNT property, revoked ONLY via
+            # setAdmin (the settled design) — NEVER on unlink. So pulling an
+            # operator-tier fob off an admin account does NOT lock the
+            # backend; a plain player fob later linked to that account still
+            # cards in as admin. We deliberately do NOT auto-revoke here (it
+            # would contradict the account-is-the-truth model), but we WARN
+            # so an operator who expects "remove the attendant fob = lock
+            # out" sees the account flag is still hot (clear it in
+            # Players ▸ ADMIN).
+            prior_aid = str(prior.get("accountId") or "").strip()
+            if prior_aid and str(prior.get("tier") or "") in (
+                    "attendant", "manager"):
+                pacct = store.get(prior_aid)
+                if pacct is not None and pacct.get("admin"):
+                    log.warning("🔑 operator fob %s unlinked from %s (%s) "
+                                "which STAYS admin — unlink does NOT revoke "
+                                "backend access; clear it in Players ▸ ADMIN",
+                                fob["uid"], prior_aid, pacct.get("name"))
+            log.info("🧑 fob %s unlinked", fob["uid"])
+            return {"ok": True, "fob": fob}
+        if action == "fund":
+            aid = str(req.get("accountId") or "").strip()
+            acct = store.get(aid)
+            if acct is None:
+                return {"ok": False, "error": f"unknown account {aid!r}"}
+            if acct.get("kind") == "house":
+                return {"ok": False, "error":
+                        "the house is the bank — fund a player account"}
+            cents = req.get("cents")
+            if isinstance(cents, bool):
+                return {"ok": False, "error":
+                        "cents must be an integer, not a boolean"}
+            if not isinstance(cents, int):
+                try:
+                    if isinstance(cents, float) and not cents.is_integer():
+                        # 25.5 must REFUSE, not silently truncate to 25 —
+                        # every neighboring money edge refuses, none round
+                        raise ValueError(cents)
+                    cents = int(cents)
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError: json.loads accepts Infinity;
+                    # int(inf) raises it past the usual pair
+                    return {"ok": False, "error":
+                            "cents must be an integer (whole cents; "
+                            "negative pulls back to the house)"}
+            if cents == 0:
+                return {"ok": False, "error":
+                        "cents must be non-zero (negative pulls back "
+                        "to the house)"}
+            mc = cents * 1000
+            # Floor mode (Options ▸ "let the bank go negative" = OFF): giving
+            # a friend money that would take the bank below $0 is refused up
+            # front, BEFORE any ledger write, with a friendly nudge — the
+            # bankroll can run dry but never overdraws. ON (default) skips
+            # this so the bank always covers a friend. Only gates giving money
+            # (mc > 0); a pull-back to the house is always allowed. (Bench TOCTOU:
+            # two funds racing a near-empty bank could each pass and dip it
+            # slightly negative — harmless, money is still conserved, and a
+            # home floor never has concurrent funders.)
+            if mc > 0 and not self.house_allow_negative():
+                house = store.get("house") or {}
+                if int(house.get("cashableMillicents", 0) or 0) < mc:
+                    return {"ok": False, "error":
+                            "The Bank's running low — top up your bankroll "
+                            "in Options ▸ House Bankroll."}
+            # ms timestamp + process-lifetime counter (the _SAS_CMD_SEQ
+            # idiom): two funds in the same millisecond must not merge
+            # their four ledger legs under one ref
+            ref = (f"player-fund:{aid}:{int(time.time() * 1000)}"
+                   f"-{next(self._FUND_REF_SEQ)}")
+            # player leg FIRST: a pull-back that would take the player
+            # negative refuses HERE, atomically inside adjust, before the
+            # house leg ever writes.
+            account, err = store.adjust(
+                aid, d_cash=mc,
+                note=("house fund" if mc > 0 else "pull back to house"),
+                ref=ref)
+            if err:
+                return {"ok": False, "error": err}
+            _, err = store.adjust(
+                "house", d_cash=-mc,
+                note=f"{'fund' if mc > 0 else 'pull back'} {aid}", ref=ref)
+            if err:
+                log.error("🧑 player fund %s: house leg FAILED (%s) — see "
+                          "ledger ref %s", aid, err, ref)
+                return {"ok": False, "error":
+                        f"house leg failed after the player credit: {err}"
+                        f" — see ledger ref {ref}"}
+            log.info("🏦 player fund %s (%s): %+d cents (ref %s) — "
+                     "cashable now %s mc", aid, account.get("name"), cents,
+                     ref, account.get("cashableMillicents"))
+            return {"ok": True, "player": account, "ref": ref,
+                    "movedMillicents": mc}
+        if action == "rename":
+            account, err = store.rename(req.get("accountId"),
+                                        req.get("name"))
+            if err:
+                return {"ok": False, "error": err}
+            log.info("🧑 player rename %s -> %s", account.get("id"),
+                     account.get("name"))
+            return {"ok": True, "player": account}
+        if action == "setAdmin":
+            # Backend-access toggle (§6): AccountStore.set_admin owns the
+            # unknown-id and house refusals atomically. admin must be a
+            # real boolean — no truthy coercion, the money-edge posture.
+            admin = req.get("admin")
+            if not isinstance(admin, bool):
+                return {"ok": False, "error": "admin must be a boolean"}
+            account, err = store.set_admin(req.get("accountId"), admin)
+            if err:
+                return {"ok": False, "error": err}
+            log.info("🔑 player setAdmin %s -> %s (%s)", account.get("id"),
+                     admin, account.get("name"))
+            return {"ok": True, "player": account}
+        return {"ok": False, "error": f"unknown action {action!r} — "
+                "create/remove/linkFob/unlinkFob/fund/rename/setAdmin"}
+
+    def _glass_ui_build(self):
+        """Glass nav v1 uiBuild: int mtime of webui/glass.html — the
+        resident SPA reloads itself when it changes (the home.html uiStamp
+        idiom), so a webui deploy reaches every glass page without touching
+        a cabinet. 0 while the page doesn't exist yet (mid-rollout)."""
+        try:
+            return int(os.path.getmtime(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "webui", GLASS_PAGE)))
+        except OSError:
+            return 0
+
+    def _session_is_admin(self, uid, tier):
+        """Resolve a carded session's BACKEND (admin) access — the glass-
+        menu authority (§2), NOT the fob tier. Admin when the fob links to
+        an existing account flagged admin (the account is the truth, even
+        if its value is False); else the legacy bridge — an attendant/
+        manager-tier fob with NO linked account (today's raw operators, so
+        nothing regresses before the migration/toggle sets the flag).
+        Cheap: one fob_get + one in-memory account get, NO db writes — it
+        runs on the 1.5s glass poll and at card-in. Tiers still drive
+        hardware/G2S semantics (id_type, reset); they just stop being the
+        menu authority."""
+        try:
+            fob = self.hub_store.fob_get(uid or "")
+        except Exception:  # noqa: BLE001 — a db fault FAILS CLOSED, see below
+            return False
+        if fob is None:
+            # The fob did not RESOLVE — either a transient hub_store fault
+            # (fob_get swallows sqlite errors to None) or a fob deleted
+            # mid-session. This is the access-control resolver: fall CLOSED
+            # to non-admin, NOT through to the legacy tier bridge. A
+            # fail-open here would stamp admin=true at card-in for an
+            # operator-tier fob whose account was DELIBERATELY kept out of
+            # the backend (admin=False), and that stamp would stick for the
+            # whole session. The legacy bridge below fires ONLY when the fob
+            # resolves with no linked account (a raw operator pre-migration).
+            return False
+        aid = str(fob.get("accountId") or "").strip()
+        acct = self.account_store.get(aid) if aid else None
+        if acct is not None:
+            return bool(acct.get("admin"))
+        return str(tier or "") in ("attendant", "manager")
+
+    def glass_state(self, egm_id, peer=None, src=None, dev=None):
+        """GET /api/glass/state?egm= — the resident SPA's ~1.5s poll: the
+        carded/attract flip plus the session token for THIS egm (token
+        delivery is the poll response by design — the hub never pushes;
+        the VLAN is the trust boundary, same posture as /api/glass/ping).
+        Best-effort throughout (the caller wraps for the never-500 rule);
+        unknown egm answers ok:false at 200, never an HTTP error the
+        page's poll loop would have to special-case."""
+        egm_id = str(egm_id or "").strip()
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None:
+            return {"ok": False, "error": "unknown egm"}
+        # Best-effort peer sanity journal: one line per peer CHANGE (not per
+        # 1.5s poll) saying who polls this egm's state, checkable against
+        # the egmLocation the cabinet itself announced.
+        if peer and self._glass_peer_seen.get(egm_id) != peer:
+            self._glass_peer_seen[egm_id] = peer
+            loc = assoc.egm_location or ""
+            log.info("🪟 [%s] glass state polled by %s%s", egm_id, peer,
+                     "" if peer and peer in loc
+                     else f" (egmLocation={loc or 'unset'})")
+        # SPA liveness + sequencer trigger, gated on the page's OWN
+        # self-identifying poll (&src=spa&dev=N): only the resident SPA's
+        # poll proves the cabinet browser fetched our page — a hub-UI or
+        # bench poll proves nothing. The stamp is the restart-surviving
+        # residency signal (MDX003 lesson); the advance is the fetch-proof
+        # setActiveContent trigger (MDX005 lesson) — see
+        # _glass_poll_advance. Guarded so an advance fault can never
+        # break token delivery to the page.
+        if src == "spa":
+            self._glass_spa_seen[egm_id] = {
+                "ts": time.time(),
+                "dev": str(dev or GLASS_DEFAULT_DEVICE)}
+            try:
+                self._glass_poll_advance(assoc)
+            except Exception as e:  # noqa: BLE001 — poll keeps answering
+                log.error("glass poll-advance failed: %s", e)
+        try:
+            nick = self.hub_store.names().get(egm_id) or ""
+        except Exception:   # noqa: BLE001 — a db fault must not kill the poll
+            nick = ""
+        try:
+            gameroom = self.hub_store.host_setting("gameroom_name", "") or ""
+        except Exception:   # noqa: BLE001 — a db fault must not kill the poll
+            gameroom = ""
+        out = {"ok": True, "egmId": egm_id, "nick": nick, "carded": False,
+               "gameroom": gameroom, "uiBuild": self._glass_ui_build()}
+        with self.companion_lock:
+            card = self.card_sessions.get(egm_id)
+            card = dict(card) if card else None
+            overlay = self.admin_overlays.get(egm_id)
+            overlay = dict(overlay) if overlay else None
+        if card is None:
+            # No carded body. A lingering overlay with no player under it is
+            # incoherent (a genuine card-out drops it in the same lock hold);
+            # this is belt — drop it and retire its token so the glass paints
+            # attract, not an admin stack floating over nobody.
+            if overlay is not None:
+                self._admin_overlay_pop(egm_id, restore=False)
+            return out
+        tok, rec = self.glass_sessions.peek_egm(egm_id)
+        # ADMIN OVERLAY branch: a supervisor is layered over the carded
+        # friend. The EGM's live token should be the admin's. While it holds
+        # (present, matches, still admin) render the admin stack FROM THE
+        # OVERLAY record — identity is the admin's, credits are SUPPRESSED
+        # (the friend's wallet must never paint under the admin's token — the
+        # money-leak fix), and overlay:true tells both surfaces to hide the
+        # wallet/cash-out controls and show admin + Done only. If the admin
+        # token idled out, was superseded, OR the admin lost their rights
+        # mid-overlay, that is NEVER a friend logout: pop+restore the player
+        # and fall through to render THEM (this reroutes the dangerous
+        # idle-expiry card-out below away from the innocent friend).
+        if overlay is not None:
+            still_admin = (rec is not None and tok == overlay.get("tok")
+                           and bool(self._session_is_admin(
+                               overlay.get("uid"), rec.get("tier"))))
+            if still_admin:
+                out.update(carded=True, sess=tok, tier=rec.get("tier"),
+                           admin=True, overlay=True,
+                           name=overlay.get("name") or "Admin",
+                           # WHOSE session is being supervised — context for
+                           # the admin (no money risk; the friend's NAME, never
+                           # their wallet, which stays suppressed). The card
+                           # body is the friend's; overlay is the admin's.
+                           supervising=card.get("name") or "Player",
+                           sinceIso=overlay.get("sinceIso"))
+                return out
+            self._admin_overlay_pop(egm_id, restore=True)
+            log.info("🧑‍💼 [%s] admin overlay ended (token gone/rights "
+                     "revoked) — player %s restored", egm_id,
+                     card.get("name"))
+            tok, rec = self.glass_sessions.peek_egm(egm_id)
+        if rec is None:
+            # The glass token idled out (the operator 10-min horizon) with
+            # the card session still standing — that expiry IS the logout:
+            # run the shared card-out so the EGM drops its carded state too
+            # and this very response already paints attract.
+            self._glass_card_out(egm_id)
+            log.info("💳 [%s] glass session idle-expired — carded out (%s)",
+                     egm_id, card.get("name"))
+            return out
+        # admin drives the STACKED menu (§3); tier is KEPT (it still means
+        # the fob tier / employee-ness for hardware semantics). Resolve it
+        # LIVE every poll — NOT the frozen card-in stamp — so a mid-session
+        # setAdmin (grant OR revoke) reaches the glass on the next ~1.5s
+        # poll instead of waiting for a physical card-out/in. Player
+        # sessions never idle-expire (the carded session IS the wallet
+        # link), so a stamp would freeze a revoked operator's backend stack
+        # on the glass indefinitely. Same cheap cadence the credits/name
+        # resolve below already uses (fob_get + in-memory account get, NO
+        # writes); the card-in stamp remains only as the /api/status join
+        # source. Fall back to the stamp on the off chance the live resolve
+        # can't run (it always returns a bool today, so this is belt-only).
+        admin = self._session_is_admin(card.get("uid"), rec.get("tier"))
+        if admin is None:
+            admin = card.get("admin")
+        out.update(carded=True, sess=tok, tier=rec.get("tier"),
+                   admin=bool(admin),
+                   name=rec.get("name") or card.get("name") or "Player",
+                   sinceIso=card.get("sinceIso"))
+        # Player Maintenance: the carded player's credit balance — the
+        # first REAL glass feature. Resolved fob -> account per poll
+        # (fob_get is the tap-ingest-grade read, account get is in-memory;
+        # NO writes on this 1.5s path). Both fields are OMITTED when the
+        # fob has no linked account — the page hides its credits line.
+        # kind=player only (defense-in-depth: the bank's ledger position
+        # must never paint as a wallet, even if a raw write linked a fob
+        # to "house"). The same resolve refreshes the display NAME, so a
+        # rename mid-session reaches the glass — the frozen card-in name
+        # is the fallback. Guarded: a credits fault must never break
+        # token delivery.
+        try:
+            fob = self.hub_store.fob_get(card.get("uid") or "")
+            aid = str((fob or {}).get("accountId") or "").strip()
+            acct = self.account_store.get(aid) if aid else None
+            if acct is not None and acct.get("kind") == "player":
+                mc = int(acct.get("cashableMillicents") or 0)
+                out["creditsMc"] = mc
+                out["credits"] = f"${mc / 100000:,.2f}"
+                if str(acct.get("name") or "").strip():
+                    out["name"] = acct.get("name")
+        except Exception as e:  # noqa: BLE001 — poll keeps answering
+            log.error("glass credits resolve failed: %s", e)
+        return out
+
+    # -------------------------------------------------- glass destub v1 (#18)
+    # The on-glass SPA's REAL feature reads + writes: every button now maps to
+    # an already-live-proven backend class, gated server-side by the LIVE
+    # admin flag, with the egmId ALWAYS forced from the session token. The
+    # data reads reuse the same sources the Home UI does; the money writes
+    # reuse the EXACT engine methods sendCredits/clearHandpay drive — this
+    # build adds NO new debit/credit primitive.
+
+    def glass_data(self, tok, view):
+        """GET /api/glass/data backend — the panel's compact, token-resolved
+        reads. Returns (httpStatus, dict); the HTTP edge wraps this for the
+        never-500 rule. 401 for an unknown/expired token; the admin views
+        (tickets/handpay/games/settings) require _session_is_admin (403 for
+        a plain player); `cashout` is open to any carded session but its
+        wallet fields need a linked player account. egmId is ALWAYS the
+        token's — a query/body egm is never trusted."""
+        rec = self.glass_sessions.resolve(tok) \
+            if isinstance(tok, str) and tok else None
+        if rec is None:
+            return 401, {"ok": False, "error": "unknown session"}
+        egm_id = rec.get("egmId")
+        admin = self._session_is_admin(rec.get("uid"), rec.get("tier"))
+        view = str(view or "")
+        if view in ("tickets", "handpay", "games", "settings") and not admin:
+            return 403, {"ok": False, "error": "not authorized", "view": view,
+                         "egmId": egm_id}
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if view == "cashout":
+            return 200, self._glass_data_cashout(egm_id, assoc, rec.get("uid"))
+        if view == "tickets":
+            return 200, self._glass_data_tickets(egm_id)
+        if view == "handpay":
+            return 200, self._glass_data_handpay(egm_id, assoc)
+        if view == "games":
+            return 200, self._glass_data_games(egm_id, assoc)
+        if view == "settings":
+            return 200, self._glass_data_settings(egm_id, assoc, rec)
+        return 400, {"ok": False, "error": "unknown view", "egmId": egm_id}
+
+    def _machine_credits_mc(self, assoc):
+        """The cabinet's current cashable credits (millicents). 0 when
+        unmetered/disconnected. Never raises (best-effort read).
+
+        For a SAS-LINKED cabinet the SAS leg's LIVE 0x1A×denom is the
+        AUTHORITY, mirroring the Floor P&L rule (~L4600: "0x1A × denom — the
+        meter authority while linked; the G2S credit meters are the
+        suppressed feed"). On these BB2s money moves over SAS AFT, and the
+        machine only re-reports its G2S_cabinet playerCashableAmt meter
+        periodically — so a $10k AFT push latches into that G2S meter and the
+        SAS-side decrement never lands there. Reading G2S directly made "ON
+        THIS MACHINE" over-read by exactly one transfer (the $10k display
+        bug). The SAS leg polls ~every 0.4s and is current. Falls back to the
+        G2S meter only when there is no SAS leg or it can't answer (plain G2S
+        cabinet / dark / parked / no 0x1A)."""
+        if assoc is None:
+            return 0
+        # 1) SAS leg = credit authority for a linked cabinet (live 0x1A×denom).
+        try:
+            egm_id = getattr(assoc, "egm_id", None)
+            leg = self.sas_links.get(egm_id) if egm_id else None
+            if leg:
+                with self.sas_lock:
+                    entry = dict(self.sas_machines.get(leg) or {})
+                if entry.get("sasEnabled") is not False:
+                    m = entry.get("meters")
+                    m = m if isinstance(m, dict) else {}
+                    credits = m.get("0x1A", m.get("credits"))
+                    if not isinstance(credits, bool):  # bool is int — not a meter
+                        try:
+                            credits = int(credits)
+                        except (TypeError, ValueError):
+                            credits = -1
+                        if credits >= 0:
+                            denom = entry.get("denomCents")
+                            if isinstance(denom, bool) \
+                                    or not isinstance(denom, int) or denom < 1:
+                                denom = 1
+                            return credits * denom * 1000
+        except Exception:  # noqa: BLE001 — never-500; fall back to the G2S meter
+            pass
+        # 2) Plain G2S cabinet (or SAS leg dark): the G2S_cabinet meter fold.
+        try:
+            with assoc.lock:
+                meters = dict(assoc.meters)
+            for key, val in meters.items():
+                if key.endswith("playerCashableAmt"):
+                    try:
+                        return int(val)
+                    except (TypeError, ValueError):
+                        return 0
+        except Exception:  # noqa: BLE001 — never-500 read
+            pass
+        return 0
+
+    def _glass_data_cashout(self, egm_id, assoc, uid):
+        """cashout view: machine credits + the carded player's wallet + the
+        armed-cash-out flag. canFund is True only with a linked player
+        wallet. Every field best-effort."""
+        out = {"ok": True, "view": "cashout", "egmId": egm_id,
+               "machineCreditsMc": self._machine_credits_mc(assoc),
+               "walletMc": None, "walletCredits": None, "canFund": False,
+               "cashOutToWat": False}
+        try:
+            fob = self.hub_store.fob_get(uid or "")
+            aid = str((fob or {}).get("accountId") or "").strip()
+            acct = self.account_store.get(aid) if aid else None
+            if acct is not None and acct.get("kind") == "player":
+                mc = int(acct.get("cashableMillicents") or 0)
+                out["walletMc"] = mc
+                out["walletCredits"] = f"${mc / 100000:,.2f}"
+                out["canFund"] = True
+        except Exception:  # noqa: BLE001 — no wallet, not a fault
+            pass
+        # cashOutToWat: this session's own pin (armed here) OR the wat device
+        # state the machine reported — either proves cash-outs route to WAT.
+        try:
+            if egm_id in self._glass_cash_out_pin:
+                out["cashOutToWat"] = True
+            elif assoc is not None:
+                with assoc.lock:
+                    devs = [dict(v) for v in assoc.wat_devices.values()]
+                out["cashOutToWat"] = any(
+                    d.get("cashOutToWat") == "true" for d in devs)
+        except Exception:  # noqa: BLE001 — decorative flag
+            pass
+        return out
+
+    def _glass_data_tickets(self, egm_id):
+        """tickets view: this machine's recent vouchers (the durable
+        VoucherStore, egmId-filtered) + — when the cabinet has a linked SAS
+        money leg — that leg's tito tickets, newest first, capped ~12.
+        Read-only; every source degrades to nothing on a fault."""
+        tickets = []
+        try:
+            vs = self.voucher_store.api_vouchers(limit=12, egm_id=egm_id)
+            for v in vs.get("vouchers", []):
+                amt = v.get("amountMillicents")
+                tickets.append({
+                    "id": v.get("validationId"),
+                    "amount": f"${(amt or 0) / 100000:,.2f}"
+                    if amt is not None else "",
+                    "state": v.get("state"),
+                    "when": (v.get("redeemedAt") or v.get("issuedAt")
+                             or v.get("voidedAt"))})
+        except Exception:  # noqa: BLE001 — never-500 read
+            pass
+        try:
+            leg = self.sas_links.get(egm_id)
+            if leg:
+                smib, _, addr = str(leg).partition("/")
+                origin = f"sas:{smib}"
+                for t in self.hub_store.tito_list(limit=40).get("tickets", []):
+                    if t.get("origin") != origin:
+                        continue
+                    if addr and str(t.get("address")) != str(addr):
+                        continue
+                    mc = t.get("amountMc")
+                    tickets.append({
+                        "id": t.get("canonical") or t.get("vn16"),
+                        "amount": f"${(mc or 0) / 100000:,.2f}"
+                        if mc is not None else "",
+                        "state": t.get("state"),
+                        "when": (t.get("redeemedAt") or t.get("issuedAt")
+                                 or t.get("mintedAt"))})
+        except Exception:  # noqa: BLE001 — the linked-leg tickets are a bonus
+            pass
+        tickets.sort(key=lambda x: x.get("when") or "", reverse=True)
+        return {"ok": True, "view": "tickets", "egmId": egm_id,
+                "tickets": tickets[:12]}
+
+    def _glass_data_handpay(self, egm_id, assoc):
+        """handpay view: the machine's pending lockups + whether the reset
+        path is available (a pending one, machine onLine). Read from
+        assoc.handpays_pending (the same source the Home tile uses)."""
+        pending, can_clear = [], False
+        if assoc is not None:
+            try:
+                with assoc.lock:
+                    recs = [dict(v)
+                            for v in assoc.handpays_pending.values()]
+                    online = assoc.comms_state == "onLine"
+                for r in recs:
+                    amt = (int(r.get("pendingCashableAmt") or 0)
+                           + int(r.get("pendingPromoAmt") or 0)
+                           + int(r.get("pendingNonCashAmt") or 0))
+                    pending.append({
+                        "amount": f"${amt / 100000:,.2f}",
+                        "type": r.get("handpayType"),
+                        "when": r.get("handpayDateTime") or r.get("seenAt")})
+                can_clear = bool(recs) and online
+            except Exception:  # noqa: BLE001 — never-500 read
+                pass
+        return {"ok": True, "view": "handpay", "egmId": egm_id,
+                "pending": pending, "canClear": can_clear}
+
+    def _glass_data_games(self, egm_id, assoc):
+        """games view: MACHINE-ENABLED titles only, grouped one entry per
+        GAME (the AVP exposes one gamePlay device per theme+paytable — 119
+        devices is ~10 games on AJ's cabinet), each carrying its paytable
+        variants nested. The glass renders a button per game and drills into
+        the paytables. egmEnabled=false devices are filtered OUT entirely:
+        egmEnabled is the machine's own state (§6.2.2) and setGamePlayState
+        only drives hostEnabled, so the menu could never turn such a title
+        on — listing it would be a dead button. Name resolution = the same
+        igt_games catalog + hub.db overrides the Home games modal uses."""
+        games, as_of = [], None
+        if assoc is not None:
+            try:
+                with assoc.lock:
+                    gp = {k: dict(v) for k, v in assoc.game_play.items()}
+                    as_of = assoc.game_play_as_of
+                catalog = self._igt_games_catalog()
+                try:
+                    overrides = self.hub_store.game_names() or {}
+                except Exception:  # noqa: BLE001 — catalog titles still show
+                    overrides = {}
+                groups = {}
+                for dev in sorted(gp, key=lambda d: (
+                        not str(d).isdigit(),
+                        int(d) if str(d).isdigit() else str(d))):
+                    g = gp[dev]
+                    if not g.get("themeId"):
+                        continue  # stateChange-only stub, no title yet
+                    if g.get("egmEnabled", "true") != "true":
+                        continue  # machine-disabled: not ours to enable
+                    name = self._game_pretty(
+                        g.get("themeId"), overrides, catalog) or "(unnamed)"
+                    groups.setdefault(name, []).append({
+                        "id": dev,
+                        "label": re.sub(r"^[A-Z]{2,6}_", "",
+                                        str(g.get("paytableId") or "")) or "?",
+                        "on": g.get("hostEnabled", "true") == "true"})
+                games = [{"name": n, "count": len(p), "paytables": p}
+                         for n, p in sorted(groups.items(),
+                                            key=lambda kv: kv[0].lower())]
+            except Exception:  # noqa: BLE001 — never-500 read
+                pass
+        return {"ok": True, "view": "games", "egmId": egm_id,
+                "games": games, "asOf": as_of}
+
+    def _glass_data_settings(self, egm_id, assoc, rec):
+        """settings view: a compact READ-ONLY machine summary (no writes in
+        v1). Nick from hub.db, protocol/comms from the association, the
+        linked SAS leg, and who is carded in."""
+        try:
+            nick = self.hub_store.names().get(egm_id) or ""
+        except Exception:  # noqa: BLE001 — never-500 read
+            nick = ""
+        protocol = "G2S" if assoc is not None else "—"
+        comms = assoc.comms_state if assoc is not None else "disconnected"
+        sas_link = self.sas_links.get(egm_id)
+        rows = [{"label": "Nickname", "value": nick or "(unnamed)"},
+                {"label": "EGM ID", "value": egm_id},
+                {"label": "Protocol", "value": protocol},
+                {"label": "Comms", "value": comms},
+                {"label": "SAS leg", "value": sas_link or "none"},
+                {"label": "Carded", "value": rec.get("name") or "—"}]
+        return {"ok": True, "view": "settings", "egmId": egm_id, "nick": nick,
+                "protocol": protocol, "sasLink": sas_link, "comms": comms,
+                "rows": rows}
+
+    def _igt_games_catalog(self):
+        """The shipped igt_games.json catalog (family6+code3 -> title),
+        loaded once and cached. {} on any read/parse fault — the games view
+        then falls back to the raw themeId, never a 500."""
+        cat = getattr(self, "_igt_games_cache", None)
+        if cat is not None:
+            return cat
+        cat = {}
+        try:
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "webui", "igt_games.json")
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                cat = {str(k).upper(): v for k, v in data.items()}
+        except Exception:  # noqa: BLE001 — catalog optional
+            cat = {}
+        self._igt_games_cache = cat
+        return cat
+
+    @staticmethod
+    def _game_pretty(theme_id, overrides, catalog):
+        """themeId -> collector title, byte-mirroring the Home UI's
+        prettyTheme: the 6-digit family + 3-char code is the stable catalog
+        key (overrides win); an unknown game shows the vendor-prefix-stripped
+        raw id (which the editor can then name)."""
+        t = str(theme_id or "")
+        if not t:
+            return ""
+        m = re.search(r"(\d{6})([0-9A-Za-z]{3})", t)
+        key = (m.group(1) + m.group(2).upper()) if m else ""
+        if key and (overrides.get(key) or catalog.get(key)):
+            return overrides.get(key) or catalog.get(key)
+        return re.sub(r"^[A-Z]{2,6}_", "", t)
+
+    @staticmethod
+    def sas_from_egm_ready(entry):
+        """The machine->wallet SAS cash-out gate SELF-DETERMINES from the wire
+        (CONFIRMED 2026-07-12): the machine's last 0x74 status must advertise
+        AVAIL_XFER_FROM_EGM (0x02) — i.e. it is menu-set to "soft cash-out to
+        host, fail to ticket". NO manual operator flag — an un-configured
+        machine simply never reports the from-EGM bit, so the arm is refused
+        and its CASH OUT falls to a ticket. `entry` is a live sas_machines
+        record; its "aft" block carries availXfers straight off the
+        satellite's read-only 0x74/FF interrogate."""
+        aft = (entry or {}).get("aft") or {}
+        xf = aft.get("availXfers")
+        return (isinstance(xf, int) and not isinstance(xf, bool)
+                and bool(xf & AVAIL_XFER_FROM_EGM))
+
+    def glass_wallet_fund(self, egm_id, account_id, cents):
+        """walletFund — push the carded player's OWN wallet onto THIS machine,
+        reusing the EXACT money paths sendCredits drives: a SAS-linked cabinet
+        takes the satellite aft_transfer (sas_enqueue_command, CENTS); a plain
+        G2S cabinet takes the WAT addCredits push (start_wat_credit_push,
+        MILLICENTS). NO new primitive — the reused path's debit-on-confirm +
+        ledger + idempotency stay authoritative; this only forces the egmId
+        (from the token) + the funding account (from the session) and bounds
+        the amount. Returns (httpStatus, dict)."""
+        if isinstance(cents, bool) or not isinstance(cents, int) or cents < 1:
+            return 400, {"ok": False,
+                         "error": "cents must be a positive integer"}
+        if cents > self.SAS_AFT_MAX_CENTS:
+            return 400, {"ok": False,
+                         "error": f"cents over the {self.SAS_AFT_MAX_CENTS} "
+                                  "ceiling ($1 = 100)"}
+        acct = self.account_store.get(account_id)
+        if acct is None or acct.get("kind") != "player":
+            return 403, {"ok": False,
+                         "error": "no linked player wallet on this session"}
+        # Courtesy overdraft gate (players can never go negative). The reused
+        # money path re-checks at escrow/settle — this is the up-front refuse.
+        have = int(acct.get("cashableMillicents") or 0)
+        if have < cents * 1000:
+            return 400, {"ok": False,
+                         "error": f"{acct.get('name') or account_id} has "
+                                  f"${have / 100000:.2f} — can't fund a "
+                                  f"${cents / 100:.2f} push"}
+        # SAS-linked leg = the meter/money authority while linked (the
+        # sendCredits `sm` branch): route the push there in CENTS.
+        leg = self.sas_links.get(egm_id)
+        if leg:
+            with self.sas_lock:
+                entry = self.sas_machines.get(leg) or {}
+            smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+            # Atomic escrow reservation (mirrors the G2S authorizeTransfer
+            # escrow): the SAS settle debits LATE and never refuses an
+            # overdraw, so reserve against the LIVE balance minus any
+            # in-flight reservations under one lock. Two rapid taps can no
+            # longer both read the full wallet and both land.
+            need_mc = cents * 1000
+            resv = {"acct": account_id, "mc": need_mc,
+                    "exp": time.time() + self.GLASS_FUND_RESERVE_TTL}
+            with self._glass_fund_lock:
+                cur = self.account_store.get(account_id) or {}
+                live = int(cur.get("cashableMillicents") or 0)
+                avail = live - self._glass_fund_reserved_mc(account_id)
+                if avail < need_mc:
+                    return 400, {"ok": False,
+                                 "error": f"{acct.get('name') or account_id} "
+                                          f"has ${avail / 100000:.2f} "
+                                          "available (a fund is already in "
+                                          f"flight) — can't fund a "
+                                          f"${cents / 100:.2f} push"}
+                self._glass_fund_reserves.append(resv)
+            cmd = {"id": f"glass{next(self._fob_seq)}-{int(time.time())}",
+                   "type": "aft_transfer", "cents": cents,
+                   "accountId": account_id}
+            reply = self.sas_enqueue_command(smib, cmd)
+            ok = bool(reply.get("ok"))
+            if not ok:
+                # No push will land — release the reservation now (don't wait
+                # out the TTL) so the player can retry immediately.
+                with self._glass_fund_lock:
+                    try:
+                        self._glass_fund_reserves.remove(resv)
+                    except ValueError:
+                        pass
+            log.info("🪙 [glass:%s] walletFund $%.2f from %s -> SAS leg %s "
+                     "(%s)", egm_id, cents / 100, account_id, smib,
+                     reply.get("id") if ok else reply.get("error"))
+            return (200 if ok else 400,
+                    dict(reply, ok=ok, path="sas", cents=cents,
+                         accountId=account_id))
+        # Plain G2S cabinet = the WAT addCredits push (MILLICENTS).
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None:
+            return 404, {"ok": False, "error": "machine not connected"}
+        res = self.start_wat_credit_push(
+            assoc, device_id=self.default_wat_device(assoc),
+            account_id=account_id, cashable=cents * 1000)
+        ok = not (isinstance(res, dict) and res.get("ok") is False)
+        log.info("🪙 [glass:%s] walletFund $%.2f from %s -> WAT addCredits "
+                 "(%s)", egm_id, cents / 100, account_id,
+                 res if not ok else res.get("requestId"))
+        payload = {"ok": ok, "path": "g2s", "cents": cents,
+                   "accountId": account_id}
+        if isinstance(res, dict):
+            payload.update(res)
+        payload["ok"] = ok
+        return (200 if ok else 400), payload
+
+    def glass_cash_out_to_wallet(self, egm_id, account_id, enable,
+                                 expect_tok=None):
+        """cashOutToWallet — arm/disarm the machine's own CASH-OUT BUTTON so
+        that pressing it routes the machine's credits to the player's wallet
+        over the cabinet's NATIVE protocol. Moves NO money itself — the money
+        moves on the physical button press, credited on the machine's confirmed
+        completion. Per-protocol arm:
+
+          * AVP (plain G2S): the live-proven WAT cash-out mirror
+            (enqueue_set_wat_cash_out) — the fromEgm transfer credits the
+            pinned account at commitTransfer (_wat_decide_authorization).
+            KEPT VERBATIM.
+          * BB2 (SAS-linked, self.sas_links): the arm is a PURELY HUB-SIDE
+            flag pushed to the satellite (aft_set_host_cashout) — no game-lock,
+            no wire write to the machine. The machine is menu-set to "soft
+            cash-out to host, fail to ticket", so the CASH OUT button raises
+            SAS exception 0x6A; while armed the satellite answers it with a
+            0x72 EGM_TO_HOST transfer and the hub credits the pinned wallet on
+            the confirmed completion (_settle_aft_cashouts); unarmed, the 0x6A
+            goes unanswered and the machine tickets. The gate SELF-DETERMINES
+            from the wire (sas_from_egm_ready — the machine's 0x74 from-EGM
+            bit): arming a machine that isn't reporting from-EGM answers an
+            honest refusal, never a fake ON. Disarm is always allowed
+            (idempotent revert to the ticket default).
+
+        Both protocols share the _glass_cash_out_pin + expect_tok TOCTOU guard:
+        the pin is armed ONLY while the requester's token is STILL this EGM's
+        live session, so a card switch (A->B) landing in the gap can't re-arm
+        A's pin after B's card-in cleared it. Returns (httpStatus, dict)."""
+        def _arm_pin():
+            """The shared TOCTOU-guarded pin set/pop under _glass_pin_lock.
+            Returns None on success, else a (status, dict) refusal."""
+            with self._glass_pin_lock:
+                if expect_tok is not None and \
+                        not self.glass_sessions.still_live(egm_id, expect_tok):
+                    return 409, {"ok": False, "cashOutToWat": False,
+                                 "egmId": egm_id,
+                                 "error": "session superseded — re-tap your "
+                                          "card"}
+                if enable:
+                    self._glass_cash_out_pin[egm_id] = account_id
+                else:
+                    self._glass_cash_out_pin.pop(egm_id, None)
+            return None
+
+        # BB2 / SAS-linked cabinet: the AFT host-cashout arm.
+        leg = self.sas_links.get(egm_id)
+        if leg:
+            with self.sas_lock:
+                entry = self.sas_machines.get(leg) or {}
+            if enable and not self.sas_from_egm_ready(entry):
+                # GATE (self-determined from the wire, NOT a manual flag): the
+                # machine's last 0x74 status must advertise from-EGM cash-out
+                # (it is menu-set to "soft cash-out to host"). Un-configured ->
+                # refuse honestly (surfaced verbatim to the UI), never a fake
+                # ON. Disarm is never gated (idempotent revert to the ticket).
+                return 400, {"ok": False, "cashOutToWat": False,
+                             "egmId": egm_id, "path": "sas",
+                             "error": "cash-out to wallet isn't set up on this "
+                                      "machine yet (turn on soft cash-out to "
+                                      "host in its operator menu)"}
+            smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+            cmd = {"id": f"coarm{next(self._fob_seq)}-{int(time.time())}",
+                   "type": "aft_set_host_cashout", "enable": bool(enable),
+                   "accountId": account_id}
+            reply = self.sas_enqueue_command(smib, cmd)
+            if not reply.get("ok"):
+                # queue full / unknown smib — no arm will land; leave the pin
+                # untouched (mirror the AVP owner-guard refusal shape).
+                return 400, dict(reply, cashOutToWat=enable, egmId=egm_id,
+                                 path="sas")
+            refused = _arm_pin()
+            if refused is not None:
+                # A card switch (A->B) landed in the arm window: the pin guard
+                # refused, but the satellite is ALREADY armed with A's accountId
+                # baked in — and _settle_aft_cashouts credits that ECHOED
+                # accountId, not the (now-unset) pin. So without this, B's next
+                # cash-out button would credit departed A's wallet while B gets
+                # nothing. Undo the wire arm here; only an ENABLE needs undoing
+                # (a disarm already reverted to the ticket default). Same
+                # command shape as the card-out disarm (5131). Benign if it
+                # races a fresh arm — worst case B re-toggles; always money-safe.
+                if enable:
+                    self.sas_enqueue_command(smib, {
+                        "id": f"codis{next(self._fob_seq)}-{int(time.time())}",
+                        "type": "aft_set_host_cashout", "enable": False})
+                return refused
+            log.info("🏦 [glass:%s] cashOutToWallet=%s via SAS leg %s (%s)",
+                     egm_id, str(bool(enable)).lower(), smib,
+                     account_id if enable else "ticket default")
+            return 200, {"ok": True, "cashOutToWat": bool(enable),
+                         "path": "sas",
+                         "account": account_id if enable else None,
+                         "egmId": egm_id}
+        # AVP / plain G2S cabinet: the live-proven WAT cash-out arm (VERBATIM).
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None:
+            return 404, {"ok": False, "error": "machine not connected"}
+        res = self.enqueue_set_wat_cash_out(
+            assoc, enable=enable, device_id=self.default_wat_device(assoc))
+        if isinstance(res, dict) and res.get("ok") is False:
+            # owner-guard refusal — leave the pin untouched
+            return 400, dict(res, cashOutToWat=enable, egmId=egm_id)
+        refused = _arm_pin()
+        if refused is not None:
+            return refused
+        log.info("🏦 [glass:%s] cashOutToWallet=%s (mirror -> %s)", egm_id,
+                 str(bool(enable)).lower(),
+                 account_id if enable else "ticket default")
+        return 200, {"ok": True, "cashOutToWat": bool(enable), "path": "g2s",
+                     "account": account_id if enable else None,
+                     "egmId": egm_id}
+
+    def glass_cash_out_now(self, egm_id, account_id, expect_tok=None):
+        """cashOutNow — HOST-CONTROL cash-out to wallet (SAS/BB2 only): the
+        panel button pulls the machine's cashable credits machine->host->wallet
+        NOW, host-initiated, with NO physical CASH-OUT press — the symmetric
+        inverse of walletFund. Pins the carded account, then enqueues an
+        aft_cashout_pull to the satellite, which does a LOCK-FIRST EGM_TO_HOST
+        pull and reports an 'aft_cashout' completion; the hub credits the
+        PINNED wallet on the CONFIRMED amount (_settle_aft_cashouts), never the
+        wire's echoed account. Gated the SAME self-determined way as the arm
+        toggle — the machine's 0x74 from-EGM bit (soft-cash-out-to-host config).
+        AVP/plain-G2S cabinets are NOT host-control here (they keep the WAT
+        arm+button via cashOutToWallet) — this refuses on them. The credit is
+        ASYNC: the reply says pending; the wallet updates when the completion
+        settles. Returns (httpStatus, dict)."""
+        leg = self.sas_links.get(egm_id)
+        if not leg:
+            return 400, {"ok": False, "egmId": egm_id, "path": "g2s",
+                         "error": "instant cash-out to wallet isn't available "
+                                  "on this machine — use the cash-out button"}
+        with self.sas_lock:
+            entry = self.sas_machines.get(leg) or {}
+        if not self.sas_from_egm_ready(entry):
+            return 400, {"ok": False, "egmId": egm_id, "path": "sas",
+                         "error": "cash-out to wallet isn't set up on this "
+                                  "machine yet (turn on soft cash-out to host "
+                                  "in its operator menu)"}
+        smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+        # Pin the destination FIRST (TOCTOU-guarded) so the pull never fires
+        # without a wallet home; then enqueue. A card switch that superseded
+        # this token no-ops here (the departed player is never credited).
+        with self._glass_pin_lock:
+            if expect_tok is not None and \
+                    not self.glass_sessions.still_live(egm_id, expect_tok):
+                return 409, {"ok": False, "egmId": egm_id, "path": "sas",
+                             "error": "session superseded — re-tap your card"}
+            self._glass_cash_out_pin[egm_id] = account_id
+        cmd = {"id": f"copull{next(self._fob_seq)}-{int(time.time())}",
+               "type": "aft_cashout_pull", "accountId": account_id}
+        reply = self.sas_enqueue_command(smib, cmd)
+        if not reply.get("ok"):
+            # the pull won't fire — undo the pin we optimistically set (only if
+            # it is still ours; a concurrent card-out/arm may have moved it).
+            with self._glass_pin_lock:
+                if self._glass_cash_out_pin.get(egm_id) == account_id:
+                    self._glass_cash_out_pin.pop(egm_id, None)
+            return 400, dict(reply, egmId=egm_id, path="sas")
+        log.info("🏦 [glass:%s] cashOutNow (host-pull) enqueued to SAS leg %s "
+                 "(acct %s)", egm_id, smib, account_id)
+        return 200, {"ok": True, "path": "sas", "egmId": egm_id,
+                     "pending": True, "account": account_id,
+                     "note": "cashing out this machine's credits to your "
+                             "wallet — your balance updates when it completes"}
+
+    def engine_meta(self):
+        """The _engine block — shared verbatim by /api/status and
+        /api/debug/log (the contract says they must match)."""
+        return {"keepaliveMs": self.keepalive_ms,
+                "harvest": self.harvest,
+                "subscribe": self.subscribe,
+                "autoEnable": self.auto_enable,
+                "autoClock": self.auto_clock,
+                "gameSweep": self.game_sweep,
+                "inline": self.inline}
+
+    # ------------------------------------------------------------------ build
+
+    def build_inner_g2s_ack(self, egm_id, error_code=None, error_text=None):
+        err = ""
+        if error_code:
+            err = f' g2s:errorCode="{error_code}"'
+            if error_text:
+                err += f' g2s:errorText="{error_text}"'
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
+            f'   <g2s:g2sAck g2s:hostId="{self.host_id}" g2s:egmId="{egm_id}" '
+            f'g2s:dateTimeSent="{now_iso()}"{err}/>\n'
+            f"</g2s:g2sMessage>"
+        )
+
+    def build_inner_command(self, assoc, command_xml, session_type, session_id,
+                            time_to_live):
+        cid = assoc.next_command_id()
+        ts = now_iso()
+        return (
+            f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
+            f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
+            f'g2s:egmId="{assoc.egm_id}" g2s:dateTimeSent="{ts}">\n'
+            f'      <g2s:communications g2s:deviceId="{assoc.device_id}" '
+            f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
+            f'g2s:sessionType="{session_type}" g2s:sessionId="{session_id}" '
+            f'g2s:timeToLive="{time_to_live}">\n'
+            f"         {command_xml}\n"
+            f"      </g2s:communications>\n"
+            f"   </g2s:g2sBody>\n"
+            f"</g2s:g2sMessage>"
+        ), cid
+
+    def build_inner_request(self, assoc, cls, device_id, command_xml,
+                            session_id, time_to_live):
+        """Host-originated REQUEST under an ARBITRARY class wrapper (not just
+        <g2s:communications>). Needed for classes like commConfig/meters/cabinet
+        that the host queries directly. Mirrors build_inner_command's framing
+        exactly; only the class element and deviceId are parameterized."""
+        cid = assoc.next_command_id()
+        ts = now_iso()
+        return (
+            f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
+            f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
+            f'g2s:egmId="{assoc.egm_id}" g2s:dateTimeSent="{ts}">\n'
+            f'      <g2s:{cls} g2s:deviceId="{device_id}" '
+            f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
+            f'g2s:sessionType="G2S_request" g2s:sessionId="{session_id}" '
+            f'g2s:timeToLive="{time_to_live}">\n'
+            f"         {command_xml}\n"
+            f"      </g2s:{cls}>\n"
+            f"   </g2s:g2sBody>\n"
+            f"</g2s:g2sMessage>"
+        ), cid
+
+    def build_inner_request_ext(self, assoc, class_ns, class_local,
+                                device_id, command_xml, session_id,
+                                time_to_live):
+        """Host-originated REQUEST under an IGT/GTK EXTENSION class wrapper
+        (build_inner_request's sibling — that one stays g2s-only). Byte-
+        mirrors the sibling's framing under THE WIRE-SHAPE LAW, both halves
+        wire-proven the hard way:
+
+          1. The class element lives in its OWN namespace with the exact
+             prefix the AVP advertises (EXT_NS_PREFIX) — e.g.
+             <igtMediaDisplay:mediaDisplay>. NEVER <g2s:mediaDisplay> (a
+             wrong prefix = the MSX004 gSOAP deserialize-fail retry loop,
+             wire-proven 2026-07-02 on licensing.getSecurityData) and NEVER
+             <igtMediaDisplay:IGT_mediaDisplay> ("IGT_mediaDisplay" is only
+             the deviceClass ATTRIBUTE value elsewhere, not a tag).
+          2. The STRUCTURAL attributes (deviceId/dateTime/commandId/
+             sessionType/sessionId/timeToLive) keep the g2s: prefix —
+             exactly as the AVP emits them on its own extension traffic.
+          3. Command child elements and THEIR attributes carry the
+             extension prefix (the caller's command_xml is responsible).
+          4. All id values pure-numeric strings (the MSX005 lesson —
+             gSOAP's ID scalars are xs:long-ish).
+
+        Returns (inner_xml, cid) like the sibling."""
+        cid = assoc.next_command_id()
+        ts = now_iso()
+        pfx = EXT_NS_PREFIX.get(class_ns, "ext")
+        return (
+            f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}" '
+            f'xmlns:{pfx}="{class_ns}">\n'
+            f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
+            f'g2s:egmId="{assoc.egm_id}" g2s:dateTimeSent="{ts}">\n'
+            f'      <{pfx}:{class_local} g2s:deviceId="{device_id}" '
+            f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
+            f'g2s:sessionType="G2S_request" g2s:sessionId="{session_id}" '
+            f'g2s:timeToLive="{time_to_live}">\n'
+            f"         {command_xml}\n"
+            f"      </{pfx}:{class_local}>\n"
+            f"   </g2s:g2sBody>\n"
+            f"</g2s:g2sMessage>"
+        ), cid
+
+    @staticmethod
+    def wrap_sync_response(inner_xml):
+        """Synchronous HTTP reply, byte-mirroring the AVP's OWN sync-reply
+        emission: a SINGLE <g2s:g2sResponse> whose TEXT CONTENT is the escaped
+        inner g2sMessage.
+
+        The old capture-era shape double-nested <g2s:g2sResponse><g2s:g2sResponse>
+        — which handed the AVP's gSOAP a child ELEMENT where its WSDL declares an
+        xsd:string, so the deserialized g2sAck came back empty and the machine
+        NEVER registered a single ack. Per §1.18 it then resent every response
+        forever (wire-proven: 1,078 identical commsStatus resends, cadence
+        unchanged by clean-vs-error acks), head-of-line-blocking its whole
+        outbound queue → the operator-screen 'Overflow' and total response
+        silence. Fixed 2026-07-02 to match the machine's own bytes exactly."""
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<SOAP-ENV:Envelope xmlns:SOAP-ENV="{SOAP_NS}" '
+            'xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/" '
+            'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+            f'xmlns:g2s="{WSDL_NS}"><SOAP-ENV:Body>'
+            f'<g2s:g2sResponse>{escape_g2s_string(inner_xml)}</g2s:g2sResponse>'
+            '</SOAP-ENV:Body></SOAP-ENV:Envelope>'
+        )
+
+    def wrap_outbound_request(self, assoc, inner_xml):
+        """SendG2SMessage request wrapper, mirroring the AVP's own emission."""
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<SOAP-ENV:Envelope xmlns:SOAP-ENV="{SOAP_NS}" '
+            f'xmlns:g2s="{WSDL_NS}"><SOAP-ENV:Body><g2s:g2sRequest>'
+            f"<g2s:g2sRequest>{html.escape(inner_xml)}</g2s:g2sRequest>"
+            f"<g2s:g2sEgmId>{assoc.egm_id}</g2s:g2sEgmId>"
+            f"<g2s:g2sHostId>{self.host_id}</g2s:g2sHostId>"
+            f"</g2s:g2sRequest></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+        )
+
+    # ------------------------------------------------------------------ parse
+
+    @staticmethod
+    def extract_escaped_inner(soap_root):
+        """Pull the escaped inner g2sMessage + transport ids out of the SOAP body."""
+        outer = soap_root.find(f".//{{{WSDL_NS}}}g2sRequest")
+        if outer is None:
+            return None, None, None
+        inner_el = outer.find(f"{{{WSDL_NS}}}g2sRequest")
+        egm_id_el = outer.find(f"{{{WSDL_NS}}}g2sEgmId")
+        host_id_el = outer.find(f"{{{WSDL_NS}}}g2sHostId")
+        inner = inner_el.text if inner_el is not None else None
+        egm_id = egm_id_el.text if egm_id_el is not None else None
+        host_id = host_id_el.text if host_id_el is not None else None
+        return inner, egm_id, host_id
+
+    @staticmethod
+    def parse_inner(inner_xml):
+        """Parse an unescaped inner g2sMessage into a flat description."""
+        root = ET.fromstring(inner_xml)
+        msg = {"root": localname(root.tag)}
+        ack = root.find(f"{{{SCHEMA_NS}}}g2sAck")
+        if ack is not None:
+            msg["kind"] = "g2sAck"
+            msg["errorCode"] = attr(ack, "errorCode") or "G2S_none"
+            msg["egmId"] = attr(ack, "egmId")
+            return msg
+        body = root.find(f"{{{SCHEMA_NS}}}g2sBody")
+        if body is None:
+            msg["kind"] = "unknown"
+            return msg
+        msg["kind"] = "g2sBody"
+        msg["egmId"] = attr(body, "egmId")
+        msg["hostId"] = attr(body, "hostId")
+        msg["dateTimeSent"] = attr(body, "dateTimeSent")
+        msg["classes"] = []
+        for cls in body:
+            cls_desc = {
+                "class": localname(cls.tag),
+                "classNs": (cls.tag[1:cls.tag.index("}")]
+                            if cls.tag.startswith("{") else ""),
+                "deviceId": attr(cls, "deviceId") or "1",
+                "commandId": attr(cls, "commandId"),
+                "sessionType": attr(cls, "sessionType") or "G2S_request",
+                "sessionId": attr(cls, "sessionId") or "0",
+                "errorCode": attr(cls, "errorCode"),
+                # errorText rides beside errorCode on §1.18.9 error
+                # responses — the AVP puts real diagnostics there (RB:
+                # "EGM is not idle. There are 10 second(s) remaining until
+                # the EGM is idle." on an idle-gated setScript).
+                "errorText": attr(cls, "errorText"),
+                "command": None,
+                "commandEl": None,
+            }
+            for child in cls:
+                cls_desc["command"] = localname(child.tag)
+                cls_desc["commandEl"] = child
+                break
+            msg["classes"].append(cls_desc)
+        return msg
+
+    # --------------------------------------------------------------- outbound
+
+    def post_to_egm(self, assoc, inner_xml, label):
+        """POST a host-originated g2sMessage to the EGM's egmLocation."""
+        if not assoc.egm_location:
+            log.error("[%s] no egmLocation known — cannot send %s",
+                      assoc.egm_id, label)
+            return False
+        body = self.wrap_outbound_request(assoc, inner_xml)
+        url = urllib.parse.urlsplit(assoc.egm_location)
+        path = url.path or "/"
+        wire.info("OUT >>> %s to %s\n%s", label, assoc.egm_location, body)
+        conn = None
+        try:
+            # GR-19: timeout must stay below HOST_KEEPALIVE_SEC (see the
+            # EGM_POST_TIMEOUT_SEC comment) and the connection is closed in
+            # the finally below — the old success-path-only close leaked the
+            # socket to refcount GC on every failed POST.
+            conn = http.client.HTTPConnection(url.hostname, url.port or 80,
+                                              timeout=EGM_POST_TIMEOUT_SEC)
+            conn.request("POST", path, body=body.encode("utf-8"), headers={
+                "Content-Type": "text/xml; charset=utf-8",
+                "SOAPAction": f'"{SOAPACTION_SEND}"',
+                "User-Agent": "CasinoNet-G2S/1.0",
+            })
+            resp = conn.getresponse()
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            wire.info("OUT <<< HTTP %s for %s\n%s", resp.status, label, resp_body)
+            assoc.outbound_ok += 1
+            # GR-01: any COMPLETED keepAlive POST (regardless of ack verdict)
+            # proves the transport path is up — reset the demotion streak.
+            if label.startswith("keepAlive("):
+                assoc.keepalive_fail_streak = 0
+            # The EGM's message-level ack rides in this synchronous response.
+            clean_ack = False
+            if "g2sAck" in resp_body:
+                m = re.search(r'errorCode="(G2S_\w+)"', html.unescape(resp_body))
+                if m and m.group(1) != "G2S_none":
+                    log.warning("[%s] EGM g2sAck for %s carried errorCode=%s",
+                                assoc.egm_id, label, m.group(1))
+                else:
+                    clean_ack = True
+                    log.info("[%s] EGM acked %s", assoc.egm_id, label)
+            # A host->EGM keepAlive that the EGM cleanly g2sAck'd (HTTP 200, no
+            # error) proves the link is alive in BOTH directions. The real AVP
+            # may answer our keepAlive synchronously here rather than as a
+            # separate inbound keepAliveAck POST, in which case last_keepalive
+            # would otherwise stay 0 and the watchdog would false-warn "no
+            # keepAlive ever received". Refresh it on this success path. Label
+            # is the pinger's own "keepAlive(...)" (never "keepAliveAck(...)").
+            if clean_ack and resp.status == 200 and label.startswith("keepAlive("):
+                assoc.last_keepalive = time.time()
+                # GR-01 recovery path B: a low-rate OFFLINE probe got a clean
+                # ack — the outbound path healed without an EGM re-handshake
+                # (asymmetric outage). Promote back to onLine (the pinger is
+                # still alive in probe mode and resumes full cadence) and
+                # re-arm the meter subs the demotion marked inactive; the
+                # EGM-side sub state after an outage is unknown and re-arming
+                # is idempotent. Power-cycle recovery instead arrives as a
+                # commsOnLine (recovery path A — handled there).
+                restored_after = 0.0
+                with assoc.lock:
+                    if assoc.comms_state == "offline":
+                        restored_after = time.time() - (assoc.offline_since or
+                                                        time.time())
+                        suppressed = assoc.offline_suppressed
+                        assoc.comms_state = "onLine"
+                        assoc.offline_since = 0.0
+                        assoc.offline_suppressed = 0
+                if restored_after:
+                    log.info(
+                        "🔌 [%s] LINK RESTORED — keepAlive probe answered "
+                        "after %.0fs offline (%d suppressed sends); resuming "
+                        "%ds pings and re-arming meter subscriptions",
+                        assoc.egm_id, restored_after, suppressed,
+                        HOST_KEEPALIVE_SEC)
+                    if assoc.meter_subs_desired:
+                        self.enqueue_set_meter_sub(assoc)
+            # G2S-20: the message-level ack for a setDateTime upgrades the
+            # pending clock-sync record sent -> acked (transport proof; the
+            # application verdict is a later cabinetDateTime POST or a
+            # cabinet-class error). Check-and-set under the lock so a
+            # cabinetDateTime that already confirmed is never downgraded.
+            if clean_ack and resp.status == 200 and \
+                    label.startswith("setDateTime("):
+                with assoc.lock:
+                    if assoc.clock_sync.get("result") == "sent":
+                        assoc.clock_sync["result"] = "acked"
+            # Cabinet control (G2S-20 rest): same transport-proof upgrade for
+            # a setCabinetState — the application verdict is a later
+            # cabinetStatus POST (sessionId-matched) or a cabinet-class error.
+            if clean_ack and resp.status == 200 and \
+                    label.startswith("setCabinetState("):
+                with assoc.lock:
+                    if assoc.cabinet_state_change.get("result") == "sent":
+                        assoc.cabinet_state_change["result"] = "acked"
+            # gamePlay control (G2S-22): same transport-proof upgrade for a
+            # setGamePlayState. The label carries dev=<id> (we format it in
+            # the builder), so the upgrade lands on exactly that device's
+            # pending record. Wholesale replacement — snapshot()'s shallow
+            # per-device copies share the nested stateChange by reference.
+            if clean_ack and resp.status == 200 and \
+                    label.startswith("setGamePlayState("):
+                mdev = re.search(r"dev=([^,)]+)", label)
+                if mdev:
+                    with assoc.lock:
+                        gp = assoc.game_play.get(mdev.group(1))
+                        sc = (gp or {}).get("stateChange") or {}
+                        if gp is not None and sc.get("result") == "sent":
+                            gp["stateChange"] = dict(sc, result="acked")
+            # optionConfig change cycle (G2S-27): same transport-proof upgrade
+            # for a setOptionChange — the application verdict is a later
+            # optionChangeStatus POST or an optionConfig-class error.
+            if clean_ack and resp.status == 200 and \
+                    label.startswith("setOptionChange("):
+                with assoc.lock:
+                    oc = assoc.option_change
+                    if oc.get("result") == "sent":
+                        oc["result"] = "acked"
+                        oc["progressTs"] = time.time()
+            return True
+        except (OSError, http.client.HTTPException) as e:
+            assoc.outbound_fail += 1
+            # GR-01: while OFFLINE each failed attempt is expected — count it,
+            # log at DEBUG, and emit a paced reminder instead of the CRITICAL
+            # storm (2,900 of them across the overnight 8h power-off).
+            streak = 0
+            remind = False
+            with assoc.lock:
+                offline = assoc.comms_state == "offline"
+                if offline:
+                    assoc.offline_suppressed += 1
+                    suppressed = assoc.offline_suppressed
+                    down_for = time.time() - (assoc.offline_since or
+                                              time.time())
+                    if time.time() - assoc.last_offline_reminder >= \
+                            OFFLINE_REMINDER_SEC:
+                        assoc.last_offline_reminder = time.time()
+                        remind = True
+                elif label.startswith("keepAlive("):
+                    assoc.keepalive_fail_streak += 1
+                    streak = assoc.keepalive_fail_streak
+            if offline:
+                log.debug("[%s] offline — suppressed failed %s -> %s (%s)",
+                          assoc.egm_id, label, assoc.egm_location, e)
+                if remind:
+                    log.info(
+                        "🔌 [%s] still OFFLINE %.0fs — %d outbound attempts "
+                        "failed+suppressed since link down (probing every "
+                        "%ds; the AVP re-handshakes on its own when it "
+                        "returns)", assoc.egm_id, down_for, suppressed,
+                        OFFLINE_PROBE_SEC)
+                return False
+            log.critical(
+                "[%s] OUTBOUND POST FAILED for %s -> %s (%s). "
+                "If this persists the EGM endpoint is unreachable — check the "
+                "slot VLAN / firewall, or rerun with --inline as a last resort.",
+                assoc.egm_id, label, assoc.egm_location, e)
+            if streak >= KEEPALIVE_FAIL_DEMOTE:
+                self.mark_link_down(
+                    assoc, f"{streak} consecutive keepAlive POST failures "
+                           f"(last: {e})")
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def mark_link_down(self, assoc, reason):
+        """GR-01: demote a dead link onLine -> offline. Everything that was
+        spamming the log during the overnight outage gates on
+        comms_state=='onLine' (pinger full cadence, watchdog warn branch,
+        game sweep, per-attempt CRITICALs) so this single transition
+        self-silences all of them. The commsOnLine rejoin handler has NO
+        state precondition (live-proven: the AVP re-handshook autonomously
+        at 10:57:07 after the 8h power-off), so demotion can never block a
+        rejoin. Also marks the recorded meter subs inactive (GR-14): nothing
+        inbound can be trusted to report their loss."""
+        with assoc.lock:
+            if assoc.comms_state != "onLine":
+                return
+            assoc.comms_state = "offline"
+            assoc.offline_since = time.time()
+            assoc.offline_suppressed = 0
+            assoc.last_offline_reminder = time.time()
+            assoc.meter_subs = {
+                k: dict(v, active=False, lost=True)
+                for k, v in assoc.meter_subs.items()}
+        log.warning("=" * 64)
+        log.warning(
+            "🔌 [%s] LINK DOWN — %s. Demoting commsState onLine -> offline; "
+            "keepAlive drops to a %ds probe, further failures log at DEBUG "
+            "(reminder every %d min). Recovery is automatic: the AVP "
+            "re-handshakes on its own, or a probe success promotes us back.",
+            assoc.egm_id, reason, OFFLINE_PROBE_SEC,
+            OFFLINE_REMINDER_SEC // 60)
+        log.warning("=" * 64)
+
+    # --- outbound FIFO worker (one per association) -----------------------
+    #
+    # All host-originated sends go through a single per-association queue
+    # drained by one worker thread. This guarantees commandIds are allocated
+    # AND transmitted in strict order, and lets us drop sends whose epoch was
+    # superseded by a re-commsOnLine (so a stale setCommsState can never go
+    # out ahead of the new commsOnLineAck — the race the adversarial review
+    # reproduced). build() runs under assoc.lock (commandId allocation +
+    # epoch check are atomic vs new_epoch); the POST happens outside the lock.
+
+    def _ensure_worker(self, assoc):
+        # GR-17: check-and-set under assoc.lock. Two first-ever concurrent
+        # enqueues (inbound dispatch racing an /api/command thread) could
+        # both read False and spawn TWO workers on one queue — commandIds
+        # allocate under the lock but the POSTs race outside it, inverting
+        # wire order (the MSX007 wedge the single-worker design prevents).
+        # Neither call site holds assoc.lock (it is non-reentrant); the
+        # thread spawn stays outside the lock.
+        with assoc.lock:
+            if assoc.worker_started:
+                return
+            assoc.worker_started = True
+        threading.Thread(target=self._worker_loop, args=(assoc,),
+                         daemon=True).start()
+
+    def _enqueue(self, assoc, build, settle=0.0, epoch=None):
+        """Queue an outbound send. `build(assoc) -> (inner_xml, label)` is
+        called by the worker under assoc.lock; return None to skip.
+
+        epoch (GR-18): the epoch this job belongs to. Pass the value captured
+        under the SAME lock block that set a once-per-epoch guard — a fresh
+        read here could re-tag the job to a newer epoch if a re-commsOnLine
+        lands mid-handler, letting the stale job slip past the worker's
+        supersession drop while the new epoch enqueues its own copy. None
+        (the default, for jobs with no per-epoch guard) reads current."""
+        self._ensure_worker(assoc)
+        if epoch is None:
+            with assoc.lock:
+                epoch = assoc.epoch
+        assoc.send_queue.put({"epoch": epoch, "build": build, "settle": settle})
+
+    def _worker_loop(self, assoc):
+        while True:
+            job = assoc.send_queue.get()
+            if job is None:
+                return
+            if job["settle"]:
+                time.sleep(job["settle"])
+            with assoc.lock:
+                if job["epoch"] != assoc.epoch:
+                    continue  # superseded by a newer commsOnLine — drop it
+                built = job["build"](assoc)
+            if not built:
+                continue
+            inner, label = built
+            self.post_to_egm(assoc, inner, label)
+
+    def enqueue_comms_online_ack(self, assoc, req):
+        def build(a):
+            inner, cid = self.build_inner_command(
+                a, f'<g2s:commsOnLineAck g2s:syncTimer="{self.sync_timer}"/>',
+                "G2S_response", req["sessionId"], "0")
+            a.comms_state = "sync(expected)"
+            return inner, f"commsOnLineAck(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_comms_disabled_ack_then_enable(self, assoc, req):
+        def build_ack(a):
+            inner, cid = self.build_inner_command(
+                a, f'<g2s:commsDisabledAck g2s:syncTimer="{self.sync_timer}"/>',
+                "G2S_response", req["sessionId"], "0")
+            return inner, f"commsDisabledAck(cid={cid})"
+        self._enqueue(assoc, build_ack)
+        if not self.auto_enable:
+            return
+
+        def build_enable(a):
+            # Throttle: skip if we sent setCommsState recently (it either
+            # arrived and we're awaiting commsStatus, or was rejected).
+            if a.set_comms_state_sent and \
+                    time.time() - a.set_comms_state_sent < 10:
+                return None
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_command(
+                a, '<g2s:setCommsState g2s:enable="true"/>',
+                "G2S_request", str(sid), "30000")
+            a.set_comms_state_sent = time.time()
+            log.info("[%s] setCommsState enable=true queued — expecting "
+                     "commsStatus G2S_onLine back", a.egm_id)
+            return inner, f"setCommsState(cid={cid},sid={sid})"
+        # settle: let the EGM process the disabledAck first (outside the lock)
+        self._enqueue(assoc, build_enable, settle=0.5)
+
+    def enqueue_keep_alive_ack(self, assoc, req):
+        def build(a):
+            inner, cid = self.build_inner_command(
+                a, "<g2s:keepAliveAck/>", "G2S_response", req["sessionId"], "0")
+            return inner, f"keepAliveAck(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_comms_closing_ack(self, assoc, req):
+        def build(a):
+            inner, cid = self.build_inner_command(
+                a, "<g2s:commsClosingAck/>", "G2S_response",
+                req["sessionId"], "0")
+            return inner, f"commsClosingAck(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_keep_alive(self, assoc, epoch=None):
+        """Arm the EGM's keepAlive idle pulse. Defense-in-depth only (GR-27):
+        with our HOST_KEEPALIVE_SEC pinger active the EGM never goes idle
+        long enough to originate one (and this firmware was never observed
+        to) — real link health is the keepAliveAck flow to OUR pings."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_command(
+                a, f'<g2s:setKeepAlive g2s:interval="{self.keepalive_ms}"/>',
+                "G2S_request", str(sid), "30000")
+            return inner, f"setKeepAlive(cid={cid},interval={self.keepalive_ms}ms)"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_host_keep_alive(self, assoc):
+        """Host-originated keepAlive request (the durability pinger). Spec §2.30
+        (p.82): the host MAY send a keepAlive whenever it wants and the EGM MUST
+        answer keepAliveAck. That bidirectional traffic every interval keeps the
+        transport from idling out — which is what triggers the §2.3.9
+        re-handshake. Also allowed while OFFLINE (GR-01): the demoted state
+        keeps a low-rate probe so recovery of the outbound path is detected
+        host-side. Skipped in every other state."""
+        def build(a):
+            if a.comms_state not in ("onLine", "offline"):
+                return None
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_command(
+                a, "<g2s:keepAlive/>", "G2S_request", str(sid), "30000")
+            return inner, f"keepAlive(cid={cid},sid={sid})"
+        self._enqueue(assoc, build)
+
+    def _start_keepalive_pinger(self, assoc, epoch=None):
+        """One background thread per epoch that POSTs a keepAlive every
+        HOST_KEEPALIVE_SEC while onLine. Epoch-gated: a re-commsOnLine bumps the
+        epoch and this pinger exits, so there is exactly one live pinger per
+        epoch (no thread leak / stale-epoch ping across re-handshakes). We do
+        NOT rely on the EGM's own pulse — it was observed to never fire.
+        GR-01: when the link demotes to OFFLINE the pinger stays alive but
+        drops to OFFLINE_PROBE_SEC — a clean probe ack promotes the
+        association back to onLine (see post_to_egm), keeping the one-pinger-
+        per-epoch invariant across a same-epoch outage+heal. Any OTHER state
+        (a re-handshake in progress, closing, ...) still exits the thread.
+        GR-18: the caller passes the epoch captured under the same lock block
+        that set keepalive_pinger_started, so this pinger is always tagged
+        with the epoch its guard belonged to — a mid-handler re-commsOnLine
+        then kills it via the epoch check instead of leaving two same-epoch
+        pingers at double cadence."""
+        if epoch is None:
+            with assoc.lock:
+                epoch = assoc.epoch
+
+        def loop():
+            interval = HOST_KEEPALIVE_SEC
+            while True:
+                time.sleep(interval)
+                with assoc.lock:
+                    if epoch != assoc.epoch or \
+                            assoc.comms_state not in ("onLine", "offline"):
+                        return  # superseded / torn down — stop pinging
+                    interval = HOST_KEEPALIVE_SEC \
+                        if assoc.comms_state == "onLine" else OFFLINE_PROBE_SEC
+                self.enqueue_host_keep_alive(assoc)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def enqueue_class_response(self, assoc, req, command_xml, label):
+        """Class-level response carried under the REQUEST'S OWN class element
+        (echoed deviceId/sessionId, host's own next commandId, timeToLive=0).
+        Unlike build_inner_command this does NOT hardcode <g2s:communications>,
+        so it is correct for host-owned classes such as optionConfig where that
+        wrapper would produce a malformed reply."""
+        def build(a):
+            cid = a.next_command_id()
+            ts = now_iso()
+            cls = req.get("class", "communications")
+            inner = (
+                f'<g2s:g2sMessage xmlns:g2s="{SCHEMA_NS}">\n'
+                f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
+                f'g2s:egmId="{a.egm_id}" g2s:dateTimeSent="{ts}">\n'
+                f'      <g2s:{cls} g2s:deviceId="{req["deviceId"]}" '
+                f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
+                f'g2s:sessionType="G2S_response" g2s:sessionId="{req["sessionId"]}" '
+                f'g2s:timeToLive="0">\n'
+                f"         {command_xml}\n"
+                f"      </g2s:{cls}>\n"
+                f"   </g2s:g2sBody>\n"
+                f"</g2s:g2sMessage>"
+            )
+            return inner, f"{label}(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_descriptor(self, assoc, epoch=None):
+        """Harvest the device inventory. deviceClass and deviceId are BOTH
+        required with no defaults (spec §2.17 Table 2.10); the 'everything'
+        wildcard is the explicit literals G2S_all / -1. A bare <getDescriptor/>
+        fails EGM schema validation -> G2S_MSX005 (the observed descriptorCount=0)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_command(
+                a, '<g2s:getDescriptor g2s:deviceClass="G2S_all" '
+                'g2s:deviceId="-1"/>',
+                "G2S_request", str(sid), "30000")
+            return inner, f"getDescriptor(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_comm_host_list(self, assoc, epoch=None):
+        """commConfig.getCommHostList — ask the EGM for its host table. This is
+        the probe for the descriptorCount=0 mystery: getDescriptor returns only
+        devices the host owns/accesses, so an empty harvest means host 1 owns
+        nothing. commHostList reveals whether host 1 is registered, its role,
+        and (schema permitting) its owned/config/guest device lists."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1", "<g2s:getCommHostList/>",
+                str(sid), "30000")
+            return inner, f"getCommHostList(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_event_handler_profile(self, assoc, epoch=None):
+        """eventHandler.getEventHandlerProfile — step 1 of the subscription
+        bring-up. If the AVP answers with an eventHandlerProfile (vs. the silence
+        getDescriptor gave us) it confirms host 1 owns eventHandler device 1 and
+        exposes queueBehavior/timeToLive/forced-subscriptions (spec §4.6/§4.7)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "eventHandler", "1", "<g2s:getEventHandlerProfile/>",
+                str(sid), "30000")
+            return inner, f"getEventHandlerProfile(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_supported_events(self, assoc, epoch=None):
+        """eventHandler.getSupportedEvents(G2S_all,-1) — step 2. Ask the AVP for
+        the full catalog of events every device can raise (spec §4.8). deviceClass
+        and deviceId are both required; G2S_all / -1 is the 'everything' wildcard."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "eventHandler", "1",
+                '<g2s:getSupportedEvents g2s:deviceClass="G2S_all" '
+                'g2s:deviceId="-1"/>',
+                str(sid), "30000")
+            return inner, f"getSupportedEvents(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_event_sub(self, assoc, epoch=None):
+        """eventHandler.setEventSub — step 3, the payoff. Subscribe host 1 to the
+        wildcard firehose: EVERY event from EVERY device (deviceClass=G2S_all,
+        deviceId=-1, eventCode=G2S_all), with device-status + transaction records
+        riding along (spec §4.10, Table 4.12). eventPersist=true makes each event
+        a request/response pair the AVP persists until we eventAck it, so nothing
+        is lost. Owner-only command; host 1 owns eventHandler device 1 (§4.1)."""
+        def build(a):
+            sid = a.next_session_id()
+            sub = (
+                '<g2s:setEventSub>'
+                '<g2s:eventHostSubscription g2s:deviceClass="G2S_all" '
+                'g2s:deviceId="-1" g2s:eventCode="G2S_all" '
+                'g2s:sendDeviceStatus="true" g2s:sendTransaction="true" '
+                'g2s:sendClassMeters="false" g2s:sendDeviceMeters="true" '
+                'g2s:sendUpdatableMeters="true" g2s:eventPersist="true"/>'
+                '</g2s:setEventSub>')
+            inner, cid = self.build_inner_request(
+                a, "eventHandler", "1", sub, str(sid), "30000")
+            return inner, f"setEventSub(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_event_ack(self, assoc, req, event_id):
+        """Respond to an eventReport with an eventAck (spec §4.17). The AVP cannot
+        drain a persisted event from its outbound queue until this ack is received,
+        so acking promptly keeps the stream flowing. Carried under the request's
+        own eventHandler class, echoing its deviceId + sessionId."""
+        self.enqueue_class_response(
+            assoc, req, f'<g2s:eventAck g2s:eventId="{event_id}"/>',
+            f"eventAck(evt={event_id})")
+
+    def enqueue_get_event_handler_log(self, assoc, last_sequence=0,
+                                      total_entries=0, epoch=None):
+        """eventHandler.getEventHandlerLog (spec §4.20) — reconnect backfill
+        (G2S-14). The per-host log (deviceId == hostId, §4.1) holds every
+        event our eventPersist=true subscription captured, including anything
+        raised while we were away. Paging per §1.14.5: lastSequence=0 starts
+        at the NEWEST entry working backward, totalEntries=0 means every
+        entry <= start — so the 0/0 default is one full sweep of the
+        (recommended >=200-entry, §1.15) log. The eventHandlerLogList handler
+        merges with dedupe-by-eventId, so overlapping sweeps are safe. One
+        shot, response-driven: a pre-ownership AVP just g2sAcks then stays
+        silent — no retry."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "eventHandler", "1",
+                f'<g2s:getEventHandlerLog g2s:lastSequence="{last_sequence}" '
+                f'g2s:totalEntries="{total_entries}"/>',
+                str(sid), "30000")
+            return inner, f"getEventHandlerLog(last={last_sequence},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    # ------------------------------------------------- cabinet (read) — G2S-17
+
+    def enqueue_get_cabinet_status(self, assoc, epoch=None):
+        """cabinet.getCabinetStatus (spec §3.8) — egmState, door booleans,
+        service lamp, host enabled/locked, last-game ids. Guest-accessible."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1", "<g2s:getCabinetStatus/>", str(sid), "30000")
+            return inner, f"getCabinetStatus(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    # ------------------------------------------------- remote reboot — RB
+    # Ported 2026-07-07 from the Pi-only hotfix (bench: weak NVRAM battery
+    # trips a hard tilt on cold power-up; a software restart keeps VBAT fed).
+
+    def enqueue_reset_processor(self, assoc):
+        """cabinet.resetProcessor (spec §3.16, p.107-108) — remote WARM
+        REBOOT, plan A. Owner-only; sendable regardless of tilt/disable
+        state per spec ("the host may send the resetProcessor command"
+        regardless of disable outcome); NVRAM MUST survive per spec.
+        Expected when honored: resetStarted response + CBE401, then
+        commsClosing + reboot + fresh commsOnLine + CBE402.
+
+        BENCH-PROVEN 2026-07-07 on the real AVP (firmware AVP014 R2): THIS
+        machine answers G2S_APX008 — resetProcessor is an OPTIONAL command
+        and this firmware does not implement it. The action stays anyway:
+        other machines may honor it, and the APX008 refusal is harmless
+        (logged by the class-level error path; the association survives).
+        G2S_CBX002 = implemented but "cannot reset right now". ttl is a
+        GENEROUS 60000 (§3.16: "a reasonable timeToLive ... giving the EGM
+        enough time to perform a friendly shutdown")."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1", "<g2s:resetProcessor/>", str(sid), "60000")
+            # build() runs under assoc.lock (the worker holds it while
+            # allocating commandIds) — stamp the probe directly, like
+            # cabinet_state_change; NEVER re-acquire the non-reentrant lock.
+            a.last_reset_probe = {
+                "kind": "resetProcessor", "sessionId": str(sid),
+                "sentAt": now_iso(), "sentTs": time.time(),
+                "outcome": "sent"}
+            return inner, f"resetProcessor(cid={cid},sid={sid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_reboot_script(self, assoc, script_id=None):
+        """download.setScript w/ systemCmd G2S_resetEgm (spec §10.30
+        setScript p.422-423, §10.37 systemCmd p.424, Table 10.70 operSystem
+        p.441) — plan-B remote warm reboot, for the machines (this AVP014
+        R2 included) that APX008 cabinet.resetProcessor. A setDownloadState
+        enable rides ahead in the same FIFO (§10.7/§10.9: script execution
+        needs hostEnabled + egmEnabled). Reset-only commandList — NEVER add
+        package/module commands on this machine (flash-touching ops are the
+        only dangerous download commands).
+
+        BENCH-PROVEN 2026-07-07 on the real AVP (firmware AVP014 R2):
+        (1) setDownloadState enable=true -> clean downloadStatus (accepted);
+        (2) setScript(applyCondition=G2S_immediate, disableCondition=
+            G2S_none, commandList/systemCmd operation=G2S_resetEgm
+            cmdSequence=1) -> G2S_APX999 errorText "EGM is not idle. There
+            are 10 second(s) remaining until the EGM is idle." — a
+            HARD-TILTED machine never reaches idle, so the script path is
+            CONFIRMED SUPPORTED but idle-gated; retry once untilted.
+        Expected when it runs: scriptStatus response, DLE209/210 events,
+        EGM reboots, DLE211 + fresh commsOnLine after. Other refusals:
+        DLX006 scriptId already used — a FRESH default scriptId is minted
+        per attempt (epoch seconds) exactly to avoid that; {"scriptId": N}
+        overrides. DLX014/DLX015 malformed, APX007/APX008 unsupported.
+
+        Both sends are tagged with ONE epoch captured up front (GR-18): a
+        re-commsOnLine landing between the two enqueues must drop or keep
+        the PAIR, never send setScript without its setDownloadState."""
+        sid_script = str(script_id or int(time.time()))
+        def build_state(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "download", "1",
+                '<g2s:setDownloadState g2s:enable="true"/>',
+                str(sid), "30000")
+            return inner, f"setDownloadState(enable,cid={cid})"
+        def build_script(a):
+            sid = a.next_session_id()
+            body = ('<g2s:setScript g2s:scriptId="%s" '
+                    'g2s:applyCondition="G2S_immediate" '
+                    'g2s:disableCondition="G2S_none">'
+                    '<g2s:commandList>'
+                    '<g2s:systemCmd g2s:operation="G2S_resetEgm" '
+                    'g2s:cmdSequence="1"/>'
+                    '</g2s:commandList></g2s:setScript>' % sid_script)
+            inner, cid = self.build_inner_request(
+                a, "download", "1", body, str(sid), "30000")
+            # build() runs under assoc.lock — stamp the probe directly
+            # (the setScript is the one whose scriptStatus we fold).
+            a.last_reset_probe = {
+                "kind": "script", "sessionId": str(sid),
+                "scriptId": sid_script, "sentAt": now_iso(),
+                "sentTs": time.time(), "outcome": "sent"}
+            return inner, f"setScript(resetEgm,id={sid_script},cid={cid})"
+        with assoc.lock:
+            epoch = assoc.epoch
+        self._enqueue(assoc, build_state, epoch=epoch)
+        self._enqueue(assoc, build_script, epoch=epoch)
+
+    def enqueue_get_cabinet_profile(self, assoc):
+        """cabinet.getCabinetProfile (spec §3.10) — currency/locale/machine#/
+        limits/timeZone."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1", "<g2s:getCabinetProfile/>", str(sid), "30000")
+            return inner, f"getCabinetProfile(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_date_time(self, assoc):
+        """cabinet.getDateTime (spec §3.14) — read the EGM's current clock."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1", "<g2s:getDateTime/>", str(sid), "30000")
+            return inner, f"getDateTime(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_date_time(self, assoc, epoch=None):
+        """cabinet.setDateTime (spec §3.13) — push the host's CURRENT clock to
+        the EGM. cabinetDateTime is the single required attribute, §1.12 form
+        (UTC, exactly-3-digit milliseconds — what now_iso() emits). Owner-only.
+        There is NO setDateTimeAck: the application response to both set and
+        get is cabinetDateTime (§3.15), handled in dispatch. An NTP-disciplined
+        EGM answers G2S_CBX001 'Other Time Source In Use'; a pre-ownership AVP
+        just g2sAcks then stays silent — clock_sync records sent/acked/
+        confirmed/error:* and snapshot() derives a lazy timeout. Never retried
+        (no timer threads, no retry storms)."""
+        def build(a):
+            sid = a.next_session_id()
+            ts = now_iso()
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1",
+                f'<g2s:setDateTime g2s:cabinetDateTime="{ts}"/>',
+                str(sid), "30000")
+            a.clock_sync = {"cabinetDateTime": ts, "sentAt": ts,
+                            "sentTs": time.time(),
+                            "skewBefore": a.egm_clock_skew_sec,
+                            "result": "sent"}
+            return inner, f"setDateTime(cid={cid},sid={sid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_cabinet_state(self, assoc, enable=True, disable_text=""):
+        """cabinet.setCabinetState (spec §3.7, Table 3.2) — enable/disable the
+        WHOLE machine. Owner-only, API-triggered ONLY (never automatic). Every
+        attribute defaults TRUE, so a partial send implicitly resets omitted
+        flags — we therefore always send the FULL intended state: enable plus
+        explicit enableGamePlay/enableMoneyIn/enableMoneyOut="true" (this
+        surface never granularly disables), disableText only on a disable.
+        THE RESTORE PATH IS SACRED: enable=true with all flags true is the
+        clean full restore (§3.7 p.101 — a disable persists until exactly
+        that, and across an EGM restart via the profile's restartStatus).
+        The application response is cabinetStatus (§3.9) echoing hostEnabled;
+        the dispatch handler confirms via the sessionId recorded here (result:
+        sent -> acked -> confirmed / disagree / error:*). A getCabinetStatus
+        refresh rides the FIFO right behind the set so the full door/state
+        picture is current after any change. Pre-ownership the AVP just
+        g2sAcks then stays silent — record parks at sent/acked, snapshot()
+        derives a lazy 30s timeout, no retry storms. Events on the EGM:
+        G2S_CBE003/CBE004 (+ CBE204/CBE205 when play is affected)."""
+        def build(a):
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            cmd = (f'<g2s:setCabinetState g2s:enable="{on}" '
+                   'g2s:enableGamePlay="true" g2s:enableMoneyIn="true" '
+                   f'g2s:enableMoneyOut="true"{text}/>')
+            inner, cid = self.build_inner_request(
+                a, "cabinet", "1", cmd, str(sid), "30000")
+            a.cabinet_state_change = {
+                "enable": on, "disableText": disable_text if text else "",
+                "sessionId": str(sid), "sentAt": now_iso(),
+                "sentTs": time.time(), "result": "sent"}
+            log.info("🖥️ [%s] setCabinetState enable=%s%s — expecting "
+                     "cabinetStatus back (CBE00%s on the EGM)", a.egm_id, on,
+                     f' disableText="{disable_text}"' if text else "",
+                     "4" if enable else "3")
+            return inner, f"setCabinetState(enable={on},cid={cid},sid={sid})"
+        self._enqueue(assoc, build)
+        # Refresh the full cabinet picture right behind the set (same FIFO,
+        # so it hits the wire after the setCabinetState). Pre-ownership both
+        # are acked-then-ignored — harmless.
+        self.enqueue_get_cabinet_status(assoc)
+
+    # ------------------------------------------------ gamePlay (read) — G2S-21
+
+    def game_play_device_ids(self, assoc):
+        """The gamePlay deviceIds to probe, from REAL harvested data: the
+        getDescriptor descriptorList inventory (119 gamePlay devices on the
+        live AVP — one per theme+paytable on a multi-game cabinet, §6.1)
+        unioned with whatever the optionConfig config-sync has revealed,
+        else device 1. deviceId 0 is reserved for class-level meters/logs
+        and is never probed."""
+        with assoc.lock:
+            ids = {d["deviceId"] for d in assoc.descriptors
+                   if d.get("deviceClass") == "G2S_gamePlay"
+                   and d.get("deviceId") and d["deviceId"] != "0"}
+            ids |= {d["deviceId"] for d in assoc.config_devices.values()
+                    if d.get("deviceClass") == "G2S_gamePlay"
+                    and d.get("deviceId") and d["deviceId"] != "0"}
+        return sorted(ids, key=lambda i: (not i.isdigit(),
+                                          int(i) if i.isdigit() else i)) \
+            or ["1"]
+
+    def _start_game_play_sweep(self, assoc):
+        """Staggered join-sequence gamePlay sweep (G2S-21, un-gated
+        2026-07-02). One background thread per epoch that enqueues the
+        status/profile/denoms trio for GP_SWEEP_BATCH devices at a time,
+        then lets the per-assoc FIFO drain (+GP_SWEEP_DELAY_SEC) before the
+        next batch — so an interactive /api/command send queues behind at
+        most one batch, never all ~357 reads. Epoch-gated like the keepAlive
+        pinger: a re-commsOnLine bumps the epoch and the thread exits (the
+        FIFO worker drops any already-queued stale sends too). Reads are
+        silence-tolerant one-shots — a refusing EGM just acks-then-ignores,
+        no retries."""
+        with assoc.lock:
+            epoch = assoc.epoch
+        ids = self.game_play_device_ids(assoc)
+        log.info("[%s] 🎮 gamePlay sweep — %d device(s), batches of %d "
+                 "(status/profile/denoms each)", assoc.egm_id, len(ids),
+                 GP_SWEEP_BATCH)
+
+        def loop():
+            for i in range(0, len(ids), GP_SWEEP_BATCH):
+                if i:
+                    # Between batches: wait for the FIFO to drain (bounded)
+                    # plus a small settle, so the sweep trickles instead of
+                    # piling 300+ reads ahead of interactive sends.
+                    deadline = time.time() + GP_SWEEP_DRAIN_WAIT_SEC
+                    while assoc.send_queue.qsize() > 0 and \
+                            time.time() < deadline:
+                        time.sleep(0.1)
+                    time.sleep(GP_SWEEP_DELAY_SEC)
+                with assoc.lock:
+                    if epoch != assoc.epoch or assoc.comms_state != "onLine":
+                        return  # superseded / offline — abandon the sweep
+                for gp_id in ids[i:i + GP_SWEEP_BATCH]:
+                    self.enqueue_get_game_play_status(assoc, gp_id)
+                    self.enqueue_get_game_play_profile(assoc, gp_id)
+                    self.enqueue_get_game_denoms(assoc, gp_id)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def refresh_game_play_status(self, assoc):
+        """GR-30: ONE-SHOT gamePlayStatus re-read so the games list's
+        enabled-state can be refreshed ON DEMAND (the UI "refresh games"
+        button). The join sweep reads status once per epoch; a game
+        enabled/disabled at the EGM's own operator/e-key menu fires no
+        host-visible update, so the list can freeze at the last sweep
+        (LIVE-observed: Da Vinci played while the store showed it disabled
+        from a 6-day-old sweep). Re-reads ONLY status (profile/denoms are
+        static per theme+paytable; the status response merges in place so they
+        survive), paced in GP_SWEEP_BATCH batches like the join sweep and
+        yielding to interactive sends the same way — but a SINGLE pass, no
+        timer. Epoch-gated: a re-handshake/offline mid-refresh abandons it.
+        Returns {devices: N} so the caller can report the scope."""
+        with assoc.lock:
+            epoch = assoc.epoch
+            online = assoc.comms_state == "onLine"
+        ids = self.game_play_device_ids(assoc)
+        if not online:
+            return {"ok": False, "error": "machine offline", "devices": 0}
+
+        def pass_once():
+            for i in range(0, len(ids), GP_SWEEP_BATCH):
+                if i:
+                    # Same trickle discipline as the join sweep: wait for the
+                    # FIFO to drain (bounded) + settle so the refresh never
+                    # piles ahead of an interactive /api/command.
+                    deadline = time.time() + GP_SWEEP_DRAIN_WAIT_SEC
+                    while assoc.send_queue.qsize() > 0 and \
+                            time.time() < deadline:
+                        time.sleep(0.1)
+                    time.sleep(GP_SWEEP_DELAY_SEC)
+                with assoc.lock:
+                    if epoch != assoc.epoch or assoc.comms_state != "onLine":
+                        return  # superseded / offline — abandon the refresh
+                for gp_id in ids[i:i + GP_SWEEP_BATCH]:
+                    self.enqueue_get_game_play_status(assoc, gp_id)
+
+        log.info("[%s] 🔄 gamePlay status refresh — %d device(s) (on-demand)",
+                 assoc.egm_id, len(ids))
+        threading.Thread(target=pass_once, daemon=True).start()
+        return {"devices": len(ids)}
+
+    def enqueue_get_game_play_status(self, assoc, device_id="1"):
+        """gamePlay.getGamePlayStatus (spec §6.10) — empty request element;
+        the response is gamePlayStatus (§6.11): themeId/paytableId (required)
+        plus hostEnabled/egmEnabled/tilt booleans. NOTE: gamePlayStatus has NO
+        playState attribute — the playStates enum belongs to the recall-log
+        game-cycle model. Owner+guest; a pre-ownership AVP acks then stays
+        silent (expected, no retry)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "gamePlay", device_id, "<g2s:getGamePlayStatus/>",
+                str(sid), "30000")
+            return inner, f"getGamePlayStatus(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_game_play_profile(self, assoc, device_id="1"):
+        """gamePlay.getGamePlayProfile (spec §6.12) — empty request element;
+        the response is gamePlayProfile (§6.13): theme/paytable/maxWagerCredits
+        attrs plus wagerCategoryList (theoPaybackPct, 2 implied decimals) and
+        winLevelList children. Owner+guest."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "gamePlay", device_id, "<g2s:getGamePlayProfile/>",
+                str(sid), "30000")
+            return inner, f"getGamePlayProfile(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_game_denoms(self, assoc, device_id="1"):
+        """gamePlay.getGameDenoms (spec §6.14) — empty request element; the
+        response is gameDenomList (§6.16 — there is NO getGameDenomList
+        command): gameDenom singles + gameRange spans, denomIds in millicents
+        (25¢ = 25000). Owner+guest."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "gamePlay", device_id, "<g2s:getGameDenoms/>",
+                str(sid), "30000")
+            return inner, f"getGameDenoms(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def _schedule_game_play_persist(self, assoc):
+        """GR-28: debounced mirror of assoc.game_play into the store's
+        gamePlay section. Every gamePlayStatus/gamePlayProfile/gameDenomList
+        parse calls this AFTER stamping game_play_as_of; the actual write is
+        trailing-edge — one flusher thread per burst waits for
+        GP_PERSIST_QUIET_SEC of no further updates (a full 357-read sweep
+        persists ~once at completion, never 357 fsyncs), with
+        GP_PERSIST_MAX_WAIT_SEC checkpoints bounding a never-quiet burst."""
+        with assoc.lock:
+            assoc.game_play_last_update_ts = time.time()
+            if assoc.game_play_persist_pending:
+                return  # a flusher is already waiting on this burst
+            assoc.game_play_persist_pending = True
+        threading.Thread(target=self._game_play_persist_flusher,
+                         args=(assoc,), daemon=True).start()
+
+    def _game_play_persist_flusher(self, assoc):
+        """One-shot trailing-edge debounce worker (see the scheduler above).
+        Snapshot under assoc.lock (shallow per-device copies — handlers
+        replace nested objects wholesale, the snapshot() argument); the store
+        write happens outside it (config_store has its own lock, never
+        nested). pending is cleared under the lock BEFORE the write, so an
+        update racing the write simply schedules the next burst's flusher —
+        worst case one extra write, never a lost update."""
+        started = time.time()
+        while True:
+            time.sleep(GP_PERSIST_QUIET_SEC)
+            with assoc.lock:
+                quiet = (time.time() - assoc.game_play_last_update_ts
+                         >= GP_PERSIST_QUIET_SEC)
+                overdue = time.time() - started >= GP_PERSIST_MAX_WAIT_SEC
+                if not (quiet or overdue):
+                    continue
+                if quiet:
+                    assoc.game_play_persist_pending = False
+                else:
+                    started = time.time()  # checkpoint; keep waiting
+                game_play = {k: dict(v)
+                             for k, v in assoc.game_play.items()}
+                as_of = assoc.game_play_as_of
+            self.config_store.save_game_play(assoc.egm_id, game_play, as_of)
+            if quiet:
+                return
+
+    # ----------------------------------------------- gamePlay (control) — G2S-22
+
+    def enqueue_set_game_play_state(self, assoc, enable=True, disable_text="",
+                                    device_id="1"):
+        """gamePlay.setGamePlayState (spec §6.9, Table 6.4) — set hostEnabled
+        on ONE gamePlay device (theme+paytable combo). Owner-only,
+        API-triggered ONLY (never automatic). Table 6.4 carries exactly two
+        attributes: enable (optional, DEFAULT TRUE) + disableText (only sent
+        on a disable) — no granular flags, so a bare enable IS the full
+        restore. The application response is gamePlayStatus (§6.11) echoing
+        hostEnabled — sessionId pairing drives the per-device stateChange
+        record riding the G2S-21 game_play store (sent -> acked ->
+        confirmed / disagree / error:*; snapshot() derives a lazy 30s
+        timeout). NOTE §6.9 apply semantics: the EGM waits for credit meter
+        = 0 then cabinet idleTimePeriod idle, and ANY player activity
+        restarts the wait — a disable on a machine with credits sits
+        SILENTLY pending. egmEnabled stays independent (host-enabled may
+        still be unplayable, e.g. zero active denoms, §6.2.2). Pre-ownership
+        the AVP just g2sAcks then ignores — no retry storms, and NO
+        re-enable logic hangs off this: the restore is the same deliberate
+        enable=true. Events on the EGM: G2S_GPE003/GPE004."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "gamePlay", dev,
+                f'<g2s:setGamePlayState g2s:enable="{on}"{text}/>',
+                str(sid), "30000")
+            # Per-device tracking in the G2S-21 store. The nested record is
+            # REPLACED wholesale on every transition (never mutated in
+            # place): snapshot()'s per-device copies are shallow, so the
+            # stateChange dict is shared by reference with any in-flight
+            # /api/status serialization.
+            a.game_play.setdefault(dev, {})["stateChange"] = {
+                "enable": on, "disableText": disable_text if text else "",
+                "sessionId": str(sid), "sentAt": now_iso(),
+                "sentTs": time.time(), "result": "sent"}
+            log.info("🎰 [%s] setGamePlayState enable=%s dev=%s%s — expecting "
+                     "gamePlayStatus back (GPE00%s on the EGM; a disable "
+                     "applies only at 0 credits + idle)", a.egm_id, on, dev,
+                     f' disableText="{disable_text}"' if text else "",
+                     "4" if enable else "3")
+            return inner, (f"setGamePlayState(enable={on},dev={dev},"
+                           f"cid={cid},sid={sid})")
+        self._enqueue(assoc, build)
+
+    # --------------------------------------------------- noteAcceptor — G2S-23
+
+    # noteAcceptorStatus fault/door/stacker booleans (spec §13.10 Table 13.3)
+    # — ALL optional, default false. hostEnabled/egmEnabled (ABSENT = TRUE)
+    # and noteValueInEscrow (default 0) are handled separately in the fold.
+    NOTE_ACCEPTOR_FLAGS = (
+        "disconnected", "firmwareFault", "mechanicalFault", "opticalFault",
+        "componentFault", "nvMemoryFault", "illegalActivity", "doorOpen",
+        "stackerRemoved", "stackerNearlyFull", "stackerFull", "stackerJam",
+        "stackerFault", "acceptorJam", "acceptorFault")
+
+    @staticmethod
+    def _note_acceptor_dev(a, device_id):
+        """Resolve the noteAcceptor deviceId to address: explicit override,
+        else the first acceptor the optionConfig config-sync revealed, else
+        1 (typically one acceptor per EGM, §13.1). deviceId 0 is reserved
+        for class-level meters/logs and is never probed. MUST be called
+        holding a.lock (the build() context) — it reads config_devices."""
+        if device_id is not None:
+            return device_id
+        ids = sorted((d["deviceId"] for d in a.config_devices.values()
+                      if d.get("deviceClass") == "G2S_noteAcceptor"
+                      and d.get("deviceId") and d["deviceId"] != "0"),
+                     key=lambda i: (not i.isdigit(),
+                                    int(i) if i.isdigit() else i))
+        return ids[0] if ids else "1"
+
+    def enqueue_get_note_acceptor_status(self, assoc, device_id=None):
+        """noteAcceptor.getNoteAcceptorStatus (spec §13.9) — empty request
+        element; the response is noteAcceptorStatus (§13.10): doors/stacker/
+        fault booleans, hostEnabled/egmEnabled (ABSENT = TRUE — the repo
+        rule) and noteValueInEscrow. Owner+guest (Table 13.1) and always
+        point-to-point here, so a response is mandatory — but the
+        pre-ownership AVP acks-then-ignores anyway (silence-tolerant, no
+        retry). The EGM originates NO noteAcceptor commands (§13.7): bill-in
+        visibility rides eventHandler events + meters, this read is just the
+        on-demand device picture."""
+        def build(a):
+            dev = self._note_acceptor_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "noteAcceptor", dev, "<g2s:getNoteAcceptorStatus/>",
+                str(sid), "30000")
+            return inner, f"getNoteAcceptorStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_note_acceptor_profile(self, assoc, device_id=None):
+        """noteAcceptor.getNoteAcceptorProfile (spec §13.11) — empty request
+        element; the response is noteAcceptorProfile (§13.12, Table 13.4):
+        noteEnabled/voucherEnabled (the only REQUIRED attrs) plus
+        restartStatus/requiredForPlay/noMessageTimer/minLogEntries, with
+        noteAcceptorData children — the per-note table (currencyId/denomId/
+        baseCashableAmt/noteActive, all required, Table 13.6). It is the
+        READBACK VIEW of the same G2S_noteAcceptorDataTable the config-sync
+        pushes (§13.21.6-7). Owner+guest; silence-tolerant."""
+        def build(a):
+            dev = self._note_acceptor_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "noteAcceptor", dev, "<g2s:getNoteAcceptorProfile/>",
+                str(sid), "30000")
+            return inner, f"getNoteAcceptorProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_note_acceptor_state(self, assoc, enable=True,
+                                        disable_text="", device_id=None):
+        """noteAcceptor.setNoteAcceptorState (spec §13.8, Table 13.2) —
+        toggle bill acceptance: enable (optional, DEFAULT TRUE) +
+        disableText (shown on the EGM while disabled; only sent on a
+        disable). Owner-only; always point-to-point here so the EGM MUST
+        answer noteAcceptorStatus (§13.8 — a multicast delivery would draw
+        no response) and fires NAE003/NAE004. This is a DELIBERATE bench/
+        test-panel action: it changes machine behavior, the disable
+        PERSISTS across an EGM restart per the profile's restartStatus
+        (Table 13.4), and with requiredForPlay=true a disable takes the
+        WHOLE EGM down via evaluate(cabinet.egmState) (§13.19.1).
+        Pre-ownership the AVP just g2sAcks then stays silent — no pending
+        state machine, no timeout, no retry. hostEnabled absent = true
+        stays the rule and NO re-enable logic hangs off this: enabling is
+        the same deliberate operator action, never automatic."""
+        def build(a):
+            dev = self._note_acceptor_dev(a, device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "noteAcceptor", dev,
+                f'<g2s:setNoteAcceptorState g2s:enable="{on}"{text}/>',
+                str(sid), "30000")
+            log.info("💵 [%s] setNoteAcceptorState enable=%s dev=%s%s — "
+                     "expecting noteAcceptorStatus back (NAE00%s on the EGM)",
+                     a.egm_id, on, dev,
+                     f' disableText="{disable_text}"' if text else "",
+                     "4" if enable else "3")
+            return inner, f"setNoteAcceptorState(enable={on},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def _fold_note_acceptor_status(self, assoc, el, source):
+        """Fold ONE noteAcceptorStatus element (§13.10 Table 13.3 — every
+        attribute optional) into assoc.note_acceptor["status"]. Shared by
+        the getNoteAcceptorStatus/setNoteAcceptorState response handler and
+        the eventReport affected-status ride-along, so the doors/stacker/
+        escrow picture stays live with zero class reads. Defaults applied
+        here: hostEnabled/egmEnabled ABSENT = TRUE (never a fault, no
+        re-enable logic), booleans false, escrow 0. Wholesale replacement
+        of the nested dict — snapshot() shallow-copies note_acceptor.
+        Returns (data, raised-flag-names) for the caller's logging."""
+        data = {
+            "configurationId": attr(el, "configurationId") or "0",
+            "hostEnabled": attr(el, "hostEnabled") or "true",
+            "egmEnabled": attr(el, "egmEnabled") or "true",
+            "noteValueInEscrow": attr(el, "noteValueInEscrow") or "0",
+            "statusAt": now_iso(),
+            "statusSource": source,
+        }
+        for f in self.NOTE_ACCEPTOR_FLAGS:
+            data[f] = attr(el, f) or "false"
+        raised = [f for f in self.NOTE_ACCEPTOR_FLAGS if data[f] == "true"]
+        with assoc.lock:
+            assoc.note_acceptor["status"] = data
+        return data, raised
+
+    # ------------------------------------------------------------ wat — G2S-39
+    #
+    # The "add credits without paper" class (spec ch.22). Wire facts from the
+    # live AVP: two devices G2S_wat/1 and /2 (both deviceActive, ownerId=1),
+    # G2S_interfaceMode=G2S_hostControl, G2S_authRequired=false,
+    # G2S_mixCreditTypes=true, G2S_allowNonCash=true, G2S_cashOutMode=
+    # G2S_anyDevice, G2S_cashOutDelay=15000. Host-controlled means WE run the
+    # player interface: the host push is initiateRequest -> requestPending ->
+    # initiateTransfer -> authorizeTransfer -> commitTransfer ->
+    # commitTransferAck; the EGM cash-out leg starts at initiateTransfer with
+    # requestId=0 (gated by setWatCashOut). Funding is the AccountStore:
+    # escrow debits at authorizeTransfer, reconciles to ACTUAL amounts at
+    # commitTransfer (refund the difference), refunds fully on deny/abort/
+    # cancel — and never double-applies on §22.31 commit retries (the
+    # WatStore commitSeen latch).
+
+    def _wat_mirror(self, assoc, rec):
+        """Mirror a WatStore record COPY into the assoc presentation ring:
+        update-in-place by transactionId (or pre-txn requestId) match, else
+        append. snapshot() dict-copies each entry, so in-place update is
+        safe (the redemptions pattern)."""
+        if rec is None:
+            return
+        txn = rec.get("transactionId")
+        rid = str(rec.get("requestId") or 0)
+        with assoc.lock:
+            target = None
+            for r in assoc.wat_transfers:
+                if txn not in (None, "", "0") and \
+                        r.get("transactionId") == txn:
+                    target = r
+                    break
+                if rid != "0" and str(r.get("requestId") or 0) == rid:
+                    target = r
+                    break
+            if target is None:
+                assoc.wat_transfers.append(dict(rec))
+                assoc.wat_transfer_count += 1
+                if len(assoc.wat_transfers) > 200:
+                    assoc.wat_transfers = assoc.wat_transfers[-200:]
+            else:
+                target.update(rec)
+
+    @staticmethod
+    def _wat_ref(egm_id, rec, leg):
+        """Ledger idempotency ref for ONE account movement of ONE transfer
+        record: (egmId, transactionId, record createdAt, leg). Paired with
+        AccountStore.adjust(once=True) it makes every WAT money leg safely
+        re-appliable — a crash between the two store fsyncs (wat latch vs
+        account movement) is healed by the EGM's mandated retry, and a
+        transport-duplicate can never double-apply. createdAt scopes the
+        ref to THIS record instance, so a transactionId reused by the EGM
+        after a RAM clear can never dedupe against (or ride on) an older
+        transaction's ledger entries. Legs: escrow / commit / refund."""
+        return (f"wat:{egm_id}:txn{rec.get('transactionId')}"
+                f":{rec.get('createdAt')}:{leg}")
+
+    def _fold_wat_status(self, assoc, device_id, el, source):
+        """Fold ONE watStatus (§22.15 Table 22.5 — every attribute optional,
+        hostEnabled/egmEnabled ABSENT = TRUE per the repo rule) into the
+        merged per-device picture. Wholesale per-device replacement so
+        snapshot()'s shallow copies stay consistent."""
+        data = {
+            "configurationId": attr(el, "configurationId") or "0",
+            "egmEnabled": attr(el, "egmEnabled") or "true",
+            "hostEnabled": attr(el, "hostEnabled") or "true",
+            "hostLocked": attr(el, "hostLocked") or "false",
+            "cashOutToWat": attr(el, "cashOutToWat") or "false",
+            "keyPairId": attr(el, "keyPairId") or "1",
+            "statusAt": now_iso(), "statusSource": source,
+        }
+        if attr(el, "keyPairExpiry"):
+            data["keyPairExpiry"] = attr(el, "keyPairExpiry")
+        with assoc.lock:
+            merged = dict(assoc.wat_devices.get(device_id) or {})
+            merged.update(data)
+            assoc.wat_devices[device_id] = merged
+        return data
+
+    def owned_wat_devices(self, assoc):
+        """The set of wat deviceId strings WE OWN — the ownership truth the
+        owner-device guard (G2S-40) checks against. UNION of two sources so
+        either alone suffices:
+          * the optionConfig config-sync inventory (configDevices
+            G2S_wat/*) — the AVP's push-oriented ground truth; and
+          * the commHostList owned list for THIS host
+            (hostItems[host_id].owned, 'G2S_wat/<id>' entries), when a
+            getCommHostList has revealed it.
+        The guest device G2S_wat/3 (deviceGuest=true — the cabinet's
+        internal SAS 6.02 personality) is in NEITHER, so it never leaks in.
+        Empty before any config-sync/host-list (fresh bench): the guard is
+        then inert and defaults fall back to '1'. MUST NOT be called holding
+        assoc.lock (it takes it)."""
+        owned = set()
+        with assoc.lock:
+            for d in assoc.config_devices.values():
+                if d.get("deviceClass") == "G2S_wat" and d.get("deviceId"):
+                    owned.add(str(d["deviceId"]))
+            h = assoc.host_items.get(self.host_id) or {}
+            for dev in h.get("owned", []):
+                if str(dev).startswith("G2S_wat/"):
+                    owned.add(str(dev).split("/", 1)[1])
+        return owned
+
+    def default_wat_device(self, assoc):
+        """The default owner-action target: the LOWEST owned wat device
+        (numeric order), or '1' before any ownership is revealed. So on a
+        cabinet where we own only G2S_wat/2, an owner action with no explicit
+        deviceId addresses /2, never the guest /1."""
+        owned = self.owned_wat_devices(assoc)
+        if not owned:
+            return "1"
+        return sorted(owned, key=lambda i: (not i.isdigit(),
+                                             int(i) if i.isdigit() else i))[0]
+
+    def _wat_owner_guard(self, assoc, device_id, action):
+        """OWNER-type wat actions only address wat devices WE own (G2S-40
+        research delta, 2026-07-07): a THIRD wat device — G2S_wat/3,
+        deviceGuest=true — appeared on the live AVP; it is the cabinet's
+        internal SAS 6.02 personality surfacing, and we are merely its
+        guest. setWatState/setWatCashOut/initiateRequest/cancelRequest
+        against it draw errors (or worse, poke the cabinet's own transfer
+        leg). The owned set is owned_wat_devices() — the UNION of the
+        optionConfig config-sync inventory and the commHostList owned list;
+        wat/3 never appears in either, so once ownership has been revealed,
+        any deviceId outside it is refused here with a message naming the
+        guest device. Before any wat config-sync/host-list (fresh bench
+        host: the fixture syncs are partial) there is nothing to check
+        against, so the guard is inert. Guest-safe READS (watStatus/
+        watProfile/getWatLog/getWatLogStatus) never come through here — they
+        are owner+guest by spec. Returns None when allowed, else the
+        /api/command refusal dict."""
+        dev = str(device_id)
+        owned = self.owned_wat_devices(assoc)
+        if owned and dev not in owned:
+            log.warning("[%s] 🏦 %s REFUSED for G2S_wat/%s — not in the "
+                        "owned set %s (deviceGuest — e.g. the AVP's "
+                        "internal SAS personality wat device)",
+                        assoc.egm_id, action, dev, sorted(owned))
+            return {"ok": False,
+                    "error": f"G2S_wat/{dev} is a GUEST device (not in the "
+                             f"owned set {sorted(owned)}) — owner action "
+                             f"{action!r} refused; reads (watStatus/"
+                             "watProfile/getWatLog) still work"}
+        return None
+
+    def enqueue_get_wat_status(self, assoc, device_id="1", epoch=None):
+        """wat.getWatStatus (spec §22.14) — empty request element; the
+        response is watStatus (§22.15): hostEnabled/egmEnabled/hostLocked/
+        cashOutToWat + key-pair fields. Owner+guest; silence-tolerant
+        one-shot (join probe + on-demand)."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev, "<g2s:getWatStatus/>", str(sid), "30000")
+            return inner, f"getWatStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_wat_profile(self, assoc, device_id="1", epoch=None):
+        """wat.getWatProfile (spec §22.16) — empty request element; the
+        response is watProfile (§22.17, Table 22.6): interfaceMode/
+        cashOutMode/cashOutDelay/authRequired/mixCreditTypes/allowNonCash/
+        hashType. Owner+guest; silence-tolerant one-shot."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev, "<g2s:getWatProfile/>", str(sid), "30000")
+            return inner, f"getWatProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_wat_state(self, assoc, enable=True, disable_text="",
+                              device_id="1"):
+        """wat.setWatState (spec §22.12, Table 22.3) — enable/disable WAT
+        transfer functionality on ONE wat device: enable (optional, DEFAULT
+        TRUE) + disableText (only sent on a disable). Owner-only,
+        API-triggered ONLY (never automatic). The application response is
+        watStatus (§22.15) echoing hostEnabled; NO re-enable logic hangs off
+        this — the restore is the same deliberate enable=true. Events on the
+        EGM: G2S_WTE003/WTE004."""
+        refused = self._wat_owner_guard(assoc, device_id, "setWatState")
+        if refused:
+            return refused
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "wat", dev,
+                f'<g2s:setWatState g2s:enable="{on}"{text}/>',
+                str(sid), "30000")
+            log.info("🏦 [%s] setWatState enable=%s dev=%s%s — expecting "
+                     "watStatus back (WTE00%s on the EGM)", a.egm_id, on,
+                     dev, f' disableText="{disable_text}"' if text else "",
+                     "4" if enable else "3")
+            return inner, f"setWatState(enable={on},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def _enqueue_one_wat_cash_out(self, assoc, enable, device_id):
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev,
+                f'<g2s:setWatCashOut g2s:cashOutToWat="{on}"/>',
+                str(sid), "30000")
+            return inner, f"setWatCashOut(on={on},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_wat_cash_out(self, assoc, enable=True, device_id="1"):
+        """wat.setWatCashOut (spec §22.24) — route EGM-initiated cash-outs
+        (cash-out button, win over the credit limit) to the WAT host instead
+        of the printer. cashOutToWat may be true on at most ONE wat device
+        (G2S_WTX004 otherwise), so an enable first queues a disable to any
+        OTHER device we believe holds it — FIFO order puts the release on
+        the wire ahead of the claim. The response is watStatus (§22.15);
+        WTE101/WTE102 fire on the EGM. Owner-only, API-triggered ONLY."""
+        dev = str(device_id)
+        refused = self._wat_owner_guard(assoc, dev, "setWatCashOut")
+        if refused:
+            return refused
+        if enable:
+            # The auto-release is owner-guarded too (G2S-40): wat_devices
+            # holds ANY device the API ever read — including the guest
+            # G2S_wat/3 (guest-safe watStatus reads fold it) — and
+            # setWatCashOut is owner-only (Table 22.2), so a guest holder
+            # is skipped, never poked. Inert before ownership is revealed
+            # (empty owned set), like the primary guard.
+            owned = self.owned_wat_devices(assoc)
+            with assoc.lock:
+                others = [d for d, v in assoc.wat_devices.items()
+                          if d != dev and v.get("cashOutToWat") == "true"
+                          and (not owned or d in owned)]
+            for other in others:
+                log.info("🏦 [%s] setWatCashOut: releasing cash-out from wat "
+                         "dev=%s before claiming dev=%s (one device rule, "
+                         "G2S_WTX004)", assoc.egm_id, other, dev)
+                self._enqueue_one_wat_cash_out(assoc, False, other)
+        log.info("🏦 [%s] setWatCashOut cashOutToWat=%s dev=%s — expecting "
+                 "watStatus back (WTE10%s on the EGM)", assoc.egm_id,
+                 str(bool(enable)).lower(), dev, "2" if enable else "1")
+        self._enqueue_one_wat_cash_out(assoc, enable, dev)
+
+    def enqueue_initiate_request(self, assoc, rec):
+        """wat.initiateRequest (spec §22.25) for a WatStore 'requested'
+        record: non-zero requestId (Table 22.16 — the EGM echoes it in
+        requestPending, our pairing key), watDirection=G2S_toEgm,
+        payMethod=G2S_payCredit (credit meter or fail — no paper),
+        reduceAmts=true so the EGM may cap at its credit limit. The final
+        accountId/amounts land in authorizeTransfer, per the §22.10.2
+        suggested flow."""
+        def build(a):
+            sid = a.next_session_id()
+            acct = html.escape(str(rec.get("accountId") or ""), quote=True)
+            cmd = ('<g2s:initiateRequest '
+                   f'g2s:requestId="{rec["requestId"]}" '
+                   f'g2s:accountId="{acct}" '
+                   'g2s:watDirection="G2S_toEgm" '
+                   f'g2s:payMethod="{rec.get("payMethod") or "G2S_payCredit"}" '
+                   f'g2s:reqCashableAmt="{int(rec.get("reqCashableAmt") or 0)}" '
+                   f'g2s:reqPromoAmt="{int(rec.get("reqPromoAmt") or 0)}" '
+                   f'g2s:reqNonCashAmt="{int(rec.get("reqNonCashAmt") or 0)}" '
+                   'g2s:reduceAmts="true"/>')
+            inner, cid = self.build_inner_request(
+                a, "wat", str(rec.get("deviceId") or "1"), cmd,
+                str(sid), "30000")
+            return inner, (f'initiateRequest(req={rec["requestId"]},'
+                           f'cid={cid},sid={sid})')
+        self._enqueue(assoc, build)
+
+    def enqueue_cancel_request(self, assoc, txn_id, request_id,
+                               device_id="1"):
+        """wat.cancelRequest (spec §22.27) — abort a not-yet-authorized
+        transfer. The EGM answers cancelRequestAck, then MUST close the
+        transaction with an all-zero commitTransfer egmException=2 (that
+        commit is where the record flips to 'cancelled'). Not possible after
+        authorizeTransfer (G2S_WTX009). Addressed to the transfer record's
+        OWN wat device — a cancelRequest to any other device draws
+        G2S_WTX002 while the real transfer proceeds uncancelled."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev,
+                f'<g2s:cancelRequest g2s:transactionId="{txn_id}" '
+                f'g2s:requestId="{request_id}"/>',
+                str(sid), "30000")
+            return inner, f"cancelRequest(txn={txn_id},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_wat_log_status(self, assoc, device_id="1"):
+        """wat.getWatLogStatus (spec §22.33) — the EGM's transaction-log
+        high-water (lastSequence + totalEntries). Owner+guest."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev, "<g2s:getWatLogStatus/>", str(sid), "30000")
+            return inner, f"getWatLogStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_wat_log(self, assoc, device_id="1", last_sequence=0,
+                            total_entries=0):
+        """wat.getWatLog (spec §22.35) — page the EGM's WAT transaction log
+        (§1.14.5 paging: 0/0 = everything from the newest backward). The
+        answer is watLogList; note §22.36 masks accountId to the last four
+        characters for hosts. Owner+guest."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "wat", dev,
+                f'<g2s:getWatLog g2s:lastSequence="{last_sequence}" '
+                f'g2s:totalEntries="{total_entries}"/>',
+                str(sid), "30000")
+            return inner, f"getWatLog(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def start_wat_credit_push(self, assoc, device_id="1", account_id="house",
+                              cashable=0, promo=0, non_cash=0):
+        """THE killer feature (G2S-39): put credits on the machine with no
+        paper. Validates the funding account, allocates a durable non-zero
+        requestId, and queues wat.initiateRequest — the EGM answers
+        requestPending (assigning the transactionId), then initiateTransfer
+        (its max acceptable amounts), and the dispatch handler authorizes
+        with the escrowed account funds. Amounts are MILLICENTS ($1 =
+        100000). Player accounts get a courtesy funds pre-check here; the
+        AUTHORITATIVE check is the escrow debit at authorizeTransfer (the
+        balance may move in between). Returns a dict for the /api/command
+        reply."""
+        try:
+            cashable = int(cashable or 0)
+            promo = int(promo or 0)
+            non_cash = int(non_cash or 0)
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "error": "amounts must be integer millicents"}
+        if min(cashable, promo, non_cash) < 0 or \
+                cashable + promo + non_cash <= 0:
+            return {"ok": False,
+                    "error": "need a positive total — amounts are "
+                             "MILLICENTS ($1 = 100000)"}
+        refused = self._wat_owner_guard(assoc, device_id, "addCredits")
+        if refused:
+            return refused
+        account_id = str(account_id or "house")
+        account = self.account_store.get(account_id)
+        if account is None:
+            return {"ok": False, "error": f"unknown account {account_id!r}"}
+        if account.get("kind") != "house":
+            for (field, _), want in zip(AccountStore.BUCKETS,
+                                        (cashable, promo, non_cash)):
+                if int(account.get(field, 0)) < want:
+                    return {"ok": False,
+                            "error": f"insufficient {field} on "
+                                     f"{account_id!r} (have "
+                                     f"{account.get(field, 0)}, want {want})"}
+        rid, rec = self.wat_store.new_request(
+            assoc.egm_id, device_id, account_id, "G2S_payCredit",
+            cashable, promo, non_cash)
+        self._wat_mirror(assoc, rec)
+        self.enqueue_initiate_request(assoc, rec)
+        log.info("=" * 64)
+        log.info("🏦 [%s] ADD CREDITS — %s from account %r queued as "
+                 "requestId=%d dev=%s (cashable=%d promo=%d nonCash=%d mc)",
+                 assoc.egm_id,
+                 denom_dollars(cashable + promo + non_cash), account_id,
+                 rid, device_id, cashable, promo, non_cash)
+        log.info("   expecting requestPending -> initiateTransfer -> "
+                 "authorizeTransfer (escrow) -> commitTransfer")
+        log.info("=" * 64)
+        return {"requestId": rid, "accountId": account_id,
+                "transferState": "requested"}
+
+    def cancel_wat_request(self, assoc, request_id=None, txn_id=None):
+        """watCancel (/api/command): wat.cancelRequest for a still-pending
+        host push. Blank target (neither requestId nor transactionId) =
+        the NEWEST still-active transfer. §22.27: impossible after
+        authorizeTransfer — by then the credits are moving and the
+        commitTransfer close-out is authoritative either way. A record with
+        no transactionId yet (the EGM never answered requestPending — its
+        normal silent-refusal mode) is cancelled LOCALLY: no wire
+        cancelRequest is possible without a txn, and silence must not make
+        the record un-cancellable."""
+        if request_id is None and txn_id is None:
+            rec = self.wat_store.newest_active(assoc.egm_id)
+            if rec is None:
+                return {"ok": False,
+                        "error": "no active WAT transfer to cancel"}
+        else:
+            rec = self.wat_store.find(assoc.egm_id, txn_id=txn_id,
+                                      request_id=request_id)
+        if rec is None:
+            return {"ok": False, "error": "no matching WAT transfer "
+                                          "(requestId/transactionId?)"}
+        refused = self._wat_owner_guard(assoc, rec.get("deviceId") or "1",
+                                        "cancelRequest")
+        if refused:
+            return refused
+        state = rec.get("state")
+        if state == "authorized":
+            return {"ok": False,
+                    "error": "cannot cancel after authorizeTransfer "
+                             "(§22.27/G2S_WTX009) — await commitTransfer"}
+        if state not in ("requested", "pending", "initiated"):
+            return {"ok": False,
+                    "error": f"transfer already closed (state={state})"}
+        txn = rec.get("transactionId")
+        if txn in (None, "", "0"):
+            upd = self.wat_store.cancel_local(assoc.egm_id,
+                                              rec.get("requestId"))
+            if upd is None:
+                return {"ok": False,
+                        "error": "transfer moved while cancelling — retry"}
+            self._wat_mirror(assoc, upd)
+            log.info("🏦 [%s] watCancel req=%s cancelled LOCALLY — the EGM "
+                     "never answered requestPending, so there is no "
+                     "transactionId to cancelRequest on the wire",
+                     assoc.egm_id, rec.get("requestId"))
+            return {"ok": True, "requestId": rec.get("requestId"),
+                    "transactionId": None, "local": True}
+        self.enqueue_cancel_request(assoc, txn, rec.get("requestId"),
+                                    device_id=rec.get("deviceId") or "1")
+        upd = self.wat_store.mark_cancel(assoc.egm_id, txn,
+                                         "cancelRequestedAt")
+        self._wat_mirror(assoc, upd)
+        log.info("🏦 [%s] cancelRequest queued for txn=%s req=%s dev=%s — "
+                 "the EGM acks then closes with an all-zero commitTransfer "
+                 "(egmException=2)", assoc.egm_id, txn, rec.get("requestId"),
+                 rec.get("deviceId") or "1")
+        return {"ok": True, "requestId": rec.get("requestId"),
+                "transactionId": txn}
+
+    def _wat_decide_authorization(self, assoc, rec, egm_amounts, max_amt):
+        """The authorize-or-deny decision for an initiateTransfer (§22.30).
+        Returns (amounts 3-tuple, account_id, host_exception int, escrowed
+        bool, reason str). Escrow semantics: the funding account is debited
+        HERE for a toEgm transfer (held until commitTransfer reconciles);
+        a fromEgm cash-out credits the account only at commit. Idempotent:
+        ANY record that already left the fresh states (authorized/denied,
+        but also committed/cancelled/failed/abandoned/error:*) re-draws the
+        SAME stored verdict without touching the account — a fresh decision
+        for a closed transaction would escrow AGAIN, and the commitSeen
+        latch could never reconcile that second escrow. A record parked
+        terminal before any verdict existed (no hostException) denies with
+        99 (Table 22.37, no reason given)."""
+        state = rec.get("state")
+        if state not in ("requested", "pending", "initiated"):
+            exc = rec.get("hostException")
+            if exc in (None, ""):
+                exc = 0 if state == "authorized" else 99
+            return ((int(rec.get("authCashableAmt") or 0),
+                     int(rec.get("authPromoAmt") or 0),
+                     int(rec.get("authNonCashAmt") or 0)),
+                    rec.get("accountId") or "",
+                    int(exc), False,
+                    f"EGM retry of a {state} transfer — same verdict, "
+                    "account untouched")
+        # Glass cashOutToWallet pin (glass destub v1): an EGM-initiated
+        # cash-out whose accountId the machine left BLANK credits the carded
+        # player who armed setWatCashOut from the glass. A host-pushed
+        # transfer (toEgm) always carries a set accountId, so the pin never
+        # overrides it; the pin fires only for the blank fromEgm cash-out.
+        account_id = (str(rec.get("accountId") or "").strip()
+                      or self._glass_cash_out_pin.get(assoc.egm_id) or "")
+        if not account_id:
+            if rec.get("watDirection") == "G2S_fromEgm":
+                # NO HOUSE FALLBACK — reject → ticket (AJ, CORRECTED
+                # 2026-07-12): a cash-out with no armed wallet has no valid
+                # home, so DENY it (hostException=2, "no account available")
+                # BEFORE any money moves — the credits stay on the machine
+                # and its own cash-out falls back to paper. The House is
+                # NEVER the destination of a player's cash-out.
+                return (0, 0, 0), "", 2, False, \
+                    "fromEgm cash-out with no armed wallet — denied " \
+                    "(reject → ticket; the House is never the destination)"
+            # toEgm only: a blank funding account draws on the bank — a
+            # HOUSE DEBIT (funding the machine), never a cash-out credit.
+            account_id = "house"
+        account = self.account_store.get(account_id)
+        if account is None:
+            # Includes a pinned account that vanished before the button
+            # press settled — reject → ticket: deny here means the credits
+            # never leave the machine. (_sweep_cash_out_pins normally
+            # disarms the mirror before this can even be asked.)
+            return (0, 0, 0), account_id, 2, False, \
+                f"no such account {account_id!r} (hostException=2)"
+        if rec.get("watDirection") == "G2S_fromEgm":
+            # EGM cash-out to the account: accept the full stated amounts;
+            # the money lands at commitTransfer (actual amounts).
+            return tuple(int(a) for a in egm_amounts), account_id, 0, \
+                False, "cash-out accepted"
+        # toEgm: intersect our original ask with the EGM's stated maxima,
+        # then cap the total at maxAmt (§22.29: with reduceAmts the per-type
+        # amounts are independent maxima and may sum past maxAmt — trim
+        # nonCash first, then promo, keeping cashable whole longest).
+        want = [min(int(rec.get("reqCashableAmt") or 0), int(egm_amounts[0])),
+                min(int(rec.get("reqPromoAmt") or 0), int(egm_amounts[1])),
+                min(int(rec.get("reqNonCashAmt") or 0), int(egm_amounts[2]))]
+        if int(max_amt) > 0:
+            over = sum(want) - int(max_amt)
+            for i in (2, 1, 0):
+                if over <= 0:
+                    break
+                cut = min(want[i], over)
+                want[i] -= cut
+                over -= cut
+        if sum(want) <= 0:
+            return (0, 0, 0), account_id, 1, False, \
+                "nothing transferable (EGM maxima zero)"
+        # once=True (crash/duplicate safety): if this exact escrow leg is
+        # already in the ledger — a crash landed between this debit's fsync
+        # and on_authorize's, or a transport-duplicate initiateTransfer is
+        # racing this thread — the EGM's retry re-draws the authorization
+        # WITHOUT debiting a second time.
+        _, err = self.account_store.adjust(
+            account_id, -want[0], -want[1], -want[2],
+            note="WAT escrow (authorizeTransfer)",
+            ref=self._wat_ref(assoc.egm_id, rec, "escrow"), once=True)
+        if err:
+            return (0, 0, 0), account_id, 3, False, \
+                f"escrow refused: {err} (hostException=3)"
+        return tuple(want), account_id, 0, True, "authorized (escrowed)"
+
+    # ------------------------------------------- voucher device reads — G2S-39
+
+    @staticmethod
+    def _voucher_dev(a, device_id):
+        """Resolve the voucher deviceId to address: explicit override, else
+        the first voucher device the optionConfig config-sync revealed, else
+        1. MUST be called holding a.lock (the build() context)."""
+        if device_id is not None:
+            return device_id
+        ids = sorted((d["deviceId"] for d in a.config_devices.values()
+                      if d.get("deviceClass") == "G2S_voucher"
+                      and d.get("deviceId") and d["deviceId"] != "0"),
+                     key=lambda i: (not i.isdigit(),
+                                    int(i) if i.isdigit() else i))
+        return ids[0] if ids else "1"
+
+    def enqueue_get_voucher_status(self, assoc, device_id=None, epoch=None):
+        """voucher.getVoucherStatus (spec §21.11) — empty request element;
+        the response is voucherStatus (§21.12): hostEnabled/egmEnabled/
+        hostLocked + the EGM's current validationListId. Owner+guest.
+        epoch-capable: also rides the cheap join probes (G2S-40)."""
+        def build(a):
+            dev = self._voucher_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "voucher", dev, "<g2s:getVoucherStatus/>",
+                str(sid), "30000")
+            return inner, f"getVoucherStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_voucher_profile(self, assoc, device_id=None, epoch=None):
+        """voucher.getVoucherProfile (spec §21.13) — empty request element;
+        the response is voucherProfile (§21.14, Table 21.12): valId buffer
+        sizing/timers, voucherHoldTime, expirations, ticket title strings.
+        Owner+guest. epoch-capable: also rides the cheap join probes; the
+        parsed maxValIds becomes getValidationData's issuance cap (G2S-40)."""
+        def build(a):
+            dev = self._voucher_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "voucher", dev, "<g2s:getVoucherProfile/>",
+                str(sid), "30000")
+            return inner, f"getVoucherProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_voucher_state(self, assoc, enable=True, disable_text="",
+                                  device_id=None):
+        """voucher.setVoucherState (spec §21.9, Table 21.9) — enable/disable
+        ticket printing: enable (optional, DEFAULT TRUE) + disableText (only
+        sent on a disable). Owner-only, API-triggered ONLY. The response is
+        voucherStatus; a host-disable also expires the EGM's valIdListLife
+        timer (§21.9) so re-enabling restarts the validation-id dance."""
+        def build(a):
+            dev = self._voucher_dev(a, device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "voucher", dev,
+                f'<g2s:setVoucherState g2s:enable="{on}"{text}/>',
+                str(sid), "30000")
+            log.info("🎟️ [%s] setVoucherState enable=%s dev=%s%s — expecting "
+                     "voucherStatus back", a.egm_id, on, dev,
+                     f' disableText="{disable_text}"' if text else "")
+            return inner, f"setVoucherState(enable={on},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_voucher_log_status(self, assoc, device_id=None):
+        """voucher.getVoucherLogStatus (spec §21.23) — the EGM voucher-log
+        high-water. Owner+guest."""
+        def build(a):
+            dev = self._voucher_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "voucher", dev, "<g2s:getVoucherLogStatus/>",
+                str(sid), "30000")
+            return inner, f"getVoucherLogStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_voucher_log(self, assoc, device_id=None, last_sequence=0,
+                                total_entries=0):
+        """voucher.getVoucherLog (spec §21.25) — page the EGM's voucher
+        transaction log (§1.14.5 paging; 0/0 = full sweep). The answer is
+        voucherLogList. Owner+guest."""
+        def build(a):
+            dev = self._voucher_dev(a, device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "voucher", dev,
+                f'<g2s:getVoucherLog g2s:lastSequence="{last_sequence}" '
+                f'g2s:totalEntries="{total_entries}"/>',
+                str(sid), "30000")
+            return inner, f"getVoucherLog(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    # ------------------------------------------------------------ bonus — G2S-41
+    #
+    # Spec ch.19 — the chapter body is LOST (missing PDF split); the build
+    # follows the recovered wire dossier (scratchpad bonus_dossier.md):
+    # attribute censuses are index-backed, choreography mirrors the intact
+    # ch.17 progressive twin, and everything the dossier marks RECONSTRUCTED
+    # (bonusStates strings, bonusException codes, error codes) is handled
+    # DEFENSIVELY — captured/logged verbatim, never switched on. Live wire
+    # facts (first-light 2026-07-02): G2S_bonus/1 and /2 are ownerId=1 (ours,
+    # device 1 is the default target); G2S_bonus/3 is the EGM-internal SAS
+    # 6.02 bridge owned by hostIndex 0 "localhost" — we are guest there and
+    # owner actions must never target it. WATCHDOG RULE (§19.4): v1 touches
+    # NO bonus option config (no setOption, no bonusActivity loop, no
+    # keep-alive) — the build is inert until an operator explicitly probes
+    # or awards; the hostActive/noMessageTimer decision is FLAGGED FOR THE
+    # BENCH. Money: AccountStore debit-on-confirm ONLY — the House is
+    # debited at commitBonus by bonusPaidAmt (ref g2sbonus:<transactionId>,
+    # once=True — idempotent across §-retries), NEVER at award-send/ack.
+
+    @staticmethod
+    def _bonus_attrs(el, limit=200):
+        """EVERY attribute of a bonus-class element, localname -> clamped
+        string. The chapter body is lost, so handlers capture the wire
+        census VERBATIM instead of trusting a reconstructed schema — the
+        response itself is the attribute-census evidence (probe P-2/P-4)."""
+        return {k.rsplit('}', 1)[-1]: str(v)[:limit]
+                for k, v in el.attrib.items()}
+
+    def _bonus_award_update(self, assoc, bonus_id, txn=None, **fields):
+        """Update-in-place (matched by bonusId, falling back to
+        transactionId) or append into the bounded assoc.bonus_awards
+        presentation ring (the wat_transfers treatment). snapshot()
+        dict-copies each entry, so in-place update is safe. Returns a COPY
+        of the updated record."""
+        bid = str(bonus_id or "")
+        txn = str(txn or "")
+        with assoc.lock:
+            target = None
+            for r in assoc.bonus_awards:
+                if bid and str(r.get("bonusId")) == bid:
+                    target = r
+                    break
+                if txn not in ("", "0") and \
+                        str(r.get("transactionId")) == txn:
+                    target = r
+                    break
+            if target is None:
+                target = {"bonusId": bid, "createdAt": now_iso()}
+                assoc.bonus_awards.append(target)
+                assoc.bonus_award_count += 1
+                if len(assoc.bonus_awards) > BONUS_AWARD_RING_MAX:
+                    assoc.bonus_awards = \
+                        assoc.bonus_awards[-BONUS_AWARD_RING_MAX:]
+            target.update(fields)
+            target["updatedAt"] = now_iso()
+            return dict(target)
+
+    def owned_bonus_devices(self, assoc):
+        """The bonus deviceId strings WE OWN, from the commHostList owned
+        list ONLY. Unlike owned_wat_devices, the optionConfig config-sync is
+        deliberately NOT consulted: the live AVP's option inventory carries
+        G2S_bonusOptions for the GUEST SAS-bridge device (G2S_bonus/3, owned
+        by hostIndex 0 'localhost') too, so config-sync presence is not
+        ownership evidence for this class. Empty before a commHostList
+        reveal (fresh bench) — the guard is then inert. MUST NOT be called
+        holding assoc.lock (it takes it)."""
+        owned = set()
+        with assoc.lock:
+            h = assoc.host_items.get(self.host_id) or {}
+            for dev in h.get("owned", []):
+                if str(dev).startswith("G2S_bonus/"):
+                    owned.add(str(dev).split("/", 1)[1])
+        return owned
+
+    def _bonus_owner_guard(self, assoc, device_id, action):
+        """OWNER-type bonus actions (setBonusState, bonusAward) only address
+        bonus devices WE own. G2S_bonus/3 on the live AVP is the cabinet's
+        internal SAS 6.02 bonus bridge (deviceGuest=true) — awarding through
+        it would poke the EGM's own legacy-SAS bonus leg. Inert until the
+        commHostList has revealed a bonus ownership set (safe failure mode:
+        never a false refusal). Guest-safe READS (getBonusStatus/Profile/
+        Log) never come through here. Returns None when allowed, else the
+        /api/command refusal dict."""
+        dev = str(device_id)
+        owned = self.owned_bonus_devices(assoc)
+        if owned and dev not in owned:
+            log.warning("[%s] 🎁 %s REFUSED for G2S_bonus/%s — not in the "
+                        "owned set %s (e.g. G2S_bonus/3 = the EGM-internal "
+                        "SAS-bridge guest device)", assoc.egm_id, action,
+                        dev, sorted(owned))
+            return {"ok": False,
+                    "error": f"G2S_bonus/{dev} is not in the owned set "
+                             f"{sorted(owned)} — owner action {action!r} "
+                             "refused (the third bonus device is the EGM's "
+                             "internal SAS bridge); reads (getBonusStatus/"
+                             "getBonusProfile/getBonusLog) still work"}
+        return None
+
+    def enqueue_get_bonus_status(self, assoc, device_id="1", epoch=None):
+        """bonus.getBonusStatus (dossier §19.12) — empty request element;
+        the response is bonusStatus (§19.15): hostActive (the §19.4
+        watchdog evidence, unique to this class) + egmEnabled/hostEnabled/
+        hostLocked/bonusActive/delay*. Owner+guest read; on-demand only
+        (nothing auto-fires — the v1 inertness rule)."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev, "<g2s:getBonusStatus/>", str(sid), "30000")
+            return inner, f"getBonusStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_get_bonus_profile(self, assoc, device_id="1", epoch=None):
+        """bonus.getBonusProfile (dossier §19.16) — empty request element;
+        the response is bonusProfile (§19.17): noMessageTimer/noHostText
+        (the §19.4 watchdog arm), requiredForPlay, maxPendingBonus,
+        idReaderId, timeToLive. Owner+guest read; on-demand only."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev, "<g2s:getBonusProfile/>", str(sid), "30000")
+            return inner, f"getBonusProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_bonus_state(self, assoc, enable=True, disable_text="",
+                                device_id="1"):
+        """bonus.setBonusState (dossier §19.11 — enable + optional
+        disableText, the most stereotyped setXxxState in G2S). Owner-only,
+        API-triggered ONLY (never automatic); the response is bonusStatus
+        echoing hostEnabled (BNE003/004 on the EGM). NO re-enable logic
+        hangs off this — the restore is the same deliberate enable=true."""
+        refused = self._bonus_owner_guard(assoc, device_id, "setBonusState")
+        if refused:
+            return refused
+
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            on = str(bool(enable)).lower()
+            text = ""
+            if not enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev,
+                f'<g2s:setBonusState g2s:enable="{on}"{text}/>',
+                str(sid), "30000")
+            log.info("🎁 [%s] setBonusState enable=%s dev=%s%s — expecting "
+                     "bonusStatus back (BNE00%s on the EGM)", a.egm_id, on,
+                     dev, f' disableText="{disable_text}"' if text else "",
+                     "4" if enable else "3")
+            return inner, f"setBonusState(enable={on},dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_bonus_log_status(self, assoc, device_id="1"):
+        """bonus.getBonusLogStatus (dossier §19.27) — the EGM's bonus
+        transaction-log high-water (lastSequence + totalEntries).
+        Owner+guest read."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev, "<g2s:getBonusLogStatus/>",
+                str(sid), "30000")
+            return inner, f"getBonusLogStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_bonus_log(self, assoc, device_id="1", last_sequence=0,
+                              total_entries=0):
+        """bonus.getBonusLog (dossier §19.29, standard §1.14.5 paging —
+        0/0 = full sweep). The answer is bonusLogList, whose bonusLog
+        entries carry the bonusState strings VERBATIM — bench probe P-4's
+        payoff (the reconstructed enum gets retired by one read)."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev,
+                f'<g2s:getBonusLog g2s:lastSequence="{last_sequence}" '
+                f'g2s:totalEntries="{total_entries}"/>',
+                str(sid), "30000")
+            return inner, f"getBonusLog(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_bonus_award(self, assoc, bonus_id, amount_mc,
+                                device_id="1", pay_method="G2S_payAny",
+                                text_message=None):
+        """bonus.setBonusAward (dossier §19.19 census, exact attributes):
+        bonusId (host-assigned unique string), bonusAwardAmt (millicents),
+        creditType G2S_cashable (v1 rule — the intact Appendix A enum), and
+        payMethod, plus the FULL prose-"optional" tail at neutral values:
+        idReaderType=G2S_none idNumber="" playerId="" idRank="0" textMessage
+        msgDuration. LIVE LESSON (2026-07-09, first award attempt): the
+        minimal 4-attribute form drew errorCode=G2S_MSX005 on the sync
+        g2sAck — the AVP's gSOAP deserializer requires every attribute
+        present (the getDescriptor deviceClass/deviceId lesson, §MSX005
+        again). Deliberately NO transactionId (index-proven omission — the
+        EGM assigns it in bonusAwardAck) and NO idReader TARGETING in v1
+        (G2S_none/empty = uncarded award). The EGM pays when game state
+        allows (gameIdle/gameEnded per intact ch.6), then closes out with
+        an EGM-initiated commitBonus."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            msg = html.escape(
+                str(text_message or "")[:BONUS_TEXT_MAX], quote=True)
+            dur = "10000" if text_message else "0"
+            inner, cid = self.build_inner_request(
+                a, "bonus", dev,
+                f'<g2s:setBonusAward '
+                f'g2s:bonusId="{html.escape(str(bonus_id), quote=True)}" '
+                f'g2s:bonusAwardAmt="{int(amount_mc)}" '
+                f'g2s:creditType="G2S_cashable" '
+                f'g2s:payMethod="{pay_method}" '
+                f'g2s:idReaderType="G2S_none" '
+                f'g2s:idNumber="" '
+                f'g2s:playerId="" '
+                f'g2s:idRank="0" '
+                f'g2s:textMessage="{msg}" '
+                f'g2s:msgDuration="{dur}"/>',
+                str(sid), "30000")
+            return inner, (f"setBonusAward({bonus_id},"
+                           f"{int(amount_mc)}mc,dev={dev},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def start_bonus_award(self, assoc, amount_mc=0, device_id="1",
+                          pay_method="G2S_payAny", text_message=None):
+        """/api/command bonusAward — the host-initiated award entry point
+        (dossier §2.2). Allocates the bonusId, records the ring entry, and
+        queues setBonusAward; the EGM answers bonusAwardAck (assigning the
+        transactionId), narrates BNE103/104, then closes out with
+        commitBonus. MONEY RULE: nothing is debited here or at the ack —
+        the House debit happens ONLY in the commitBonus handler
+        (debit-on-confirm, idempotent on g2sbonus:<transactionId>).
+        Returns the /api/command reply dict."""
+        try:
+            amount_mc = int(amount_mc)
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "error": "amountMillicents must be an integer "
+                             "(millicents — $1 = 100000)"}
+        # Ceiling = the AFT ceiling's twin ($99,999,999.99 in mc) so every
+        # money button tells one story: the wire max is the only max
+        # (collector de-cage 2026-07-15; was an artificial $1,000 knob —
+        # G2S bonusAwardAmt is XML, there is no wire reason to cap lower).
+        if not 1 <= amount_mc <= 9_999_999_999_000:
+            return {"ok": False,
+                    "error": "amountMillicents out of range "
+                             "1..9999999999000 (millicents — $1 = 100000)"}
+        if pay_method not in BONUS_PAY_METHODS:
+            return {"ok": False,
+                    "error": f"payMethod must be one of "
+                             f"{sorted(BONUS_PAY_METHODS)}"}
+        refused = self._bonus_owner_guard(assoc, device_id, "bonusAward")
+        if refused:
+            return refused
+        state = assoc.comms_state
+        if state != "onLine":
+            return {"ok": False,
+                    "error": f"EGM is {state!r}, not onLine — refusing to "
+                             "queue a money award into a dead/handshaking "
+                             "link"}
+        text = str(text_message)[:BONUS_TEXT_MAX] if text_message else None
+        # pure digits — an alphanumeric id drew MSX005 live (see _bonus_seq)
+        bonus_id = f"{int(time.time())}{next(self._bonus_seq):03d}"
+        self._bonus_award_update(
+            assoc, bonus_id, state="sent", deviceId=str(device_id),
+            bonusAwardAmt=amount_mc, creditType="G2S_cashable",
+            payMethod=pay_method, textMessage=text or "",
+            transactionId="")
+        self.enqueue_set_bonus_award(assoc, bonus_id, amount_mc,
+                                     device_id=device_id,
+                                     pay_method=pay_method,
+                                     text_message=text)
+        log.info("=" * 64)
+        log.info("🎁 [%s] BONUS AWARD — %s queued as bonusId=%s dev=%s "
+                 "payMethod=%s%s", assoc.egm_id, denom_dollars(amount_mc),
+                 bonus_id, device_id, pay_method,
+                 f' text="{text}"' if text else "")
+        log.info("   expecting bonusAwardAck (EGM assigns transactionId) -> "
+                 "BNE103 pending -> BNE104 paid -> commitBonus; the House "
+                 "debit waits for commitBonus (debit-on-confirm)")
+        log.info("=" * 64)
+        return {"bonusId": bonus_id, "deviceId": str(device_id),
+                "amountMillicents": amount_mc, "payMethod": pay_method,
+                "state": "sent"}
+
+    # ---------------------------------------- idReader (ch.18, RFID phase 1)
+    # Phase-1 identification comes from the Companion PN532 — HOST-sourced
+    # (G2S_host), not the cabinet's own reader — so setIdValidation IS the
+    # carded-session mechanism: card-in paints the greeting on the machine's
+    # own glass, card-out returns it to idle. Both live cabinets carry an
+    # owned G2S_idReader/1 (live-verified 2026-07-10), and the EGM answers
+    # with idReaderStatus, which arrives via the normal inbound path — no
+    # new response parser needed for v1.
+
+    def owned_id_reader_devices(self, assoc):
+        """The set of idReader deviceId strings WE OWN — owned_wat_devices
+        mirrored onto G2S_idReader (same two sources, same union: the
+        optionConfig config-sync inventory + the commHostList owned list
+        for THIS host). MUST NOT be called holding assoc.lock (it takes
+        it)."""
+        owned = set()
+        with assoc.lock:
+            for d in assoc.config_devices.values():
+                if d.get("deviceClass") == "G2S_idReader" and \
+                        d.get("deviceId"):
+                    owned.add(str(d["deviceId"]))
+            h = assoc.host_items.get(self.host_id) or {}
+            for dev in h.get("owned", []):
+                if str(dev).startswith("G2S_idReader/"):
+                    owned.add(str(dev).split("/", 1)[1])
+        return owned
+
+    def default_id_reader_device(self, assoc):
+        """The carded-session target: the LOWEST owned idReader device, or
+        None when ownership has revealed none. Unlike default_wat_device
+        there is NO '1' fallback — a carded session must never address a
+        device we don't own (the AVP also exposes G2S_idReader/2), so a
+        tap on an ownership-blind association just skips."""
+        owned = self.owned_id_reader_devices(assoc)
+        if not owned:
+            return None
+        return sorted(owned, key=lambda i: (not i.isdigit(),
+                                            int(i) if i.isdigit() else i))[0]
+
+    @staticmethod
+    def set_id_validation_xml(present, id_number="", id_type="G2S_player",
+                              prefer_name="", full_name="", player_id="",
+                              locale_id="en_US", id_class="", rank=0):
+        """The <g2s:setIdValidation/> element (ch.18 §18.11, Table 18.9)
+        with ALL 21 attributes — THE MSX005 LAW (live-proven twice:
+        getDescriptor 2026-07-01, setBonusAward 2026-07-09): this gSOAP
+        generation rejects a command missing ANY attribute, so every one
+        of Table 18.9's attributes is always emitted.
+
+        present=True (card-in): host-sourced active identity —
+        idValidSource=G2S_host, idState=G2S_active, idValidExpired=false.
+        present=False (card-out): the spec's no-ID-present defaults —
+        idNumber="" idType=G2S_none idValidSource=G2S_none
+        idState=G2S_inactive, name/class/player empty,
+        idValidExpired=true. Both shapes share the neutral tail
+        (localeId REQUIRED, booleans false, idGender=G2S_Unknown,
+        idLossLimit/idAge 0, idTripEnd=now). Every string attribute is
+        html-escaped — it lands inside an XML attribute value."""
+        esc = lambda s, n: html.escape(  # noqa: E731 — local clamp+escape
+            str(s or "")[:n], quote=True)
+        ts = now_iso()
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError):
+            rank = 0
+        if present:
+            id_number = esc(id_number, 32)
+            id_type = esc(id_type, 32) or "G2S_player"
+            valid_source, state = "G2S_host", "G2S_active"
+            prefer_name = esc(prefer_name, 32)   # Table 18.9: ≤32
+            full_name = esc(full_name, 64)       # Table 18.9: ≤64
+            id_class = esc(id_class, 32)         # Table 18.9: ≤32
+            player_id = esc(player_id, 32)
+            expired = "false"
+        else:
+            id_number, id_type = "", "G2S_none"
+            valid_source, state = "G2S_none", "G2S_inactive"
+            prefer_name = full_name = id_class = player_id = ""
+            expired = "true"
+            rank = 0
+        return (f'<g2s:setIdValidation '
+                f'g2s:idNumber="{id_number}" '
+                f'g2s:idType="{id_type}" '
+                f'g2s:idValidDateTime="{ts}" '
+                f'g2s:idValidSource="{valid_source}" '
+                f'g2s:idState="{state}" '
+                f'g2s:idPreferName="{prefer_name}" '
+                f'g2s:idFullName="{full_name}" '
+                f'g2s:idClass="{id_class}" '
+                f'g2s:localeId="{esc(locale_id, 16) or "en_US"}" '
+                f'g2s:playerId="{player_id}" '
+                f'g2s:idLossLimit="0" '
+                f'g2s:idTripEnd="{ts}" '
+                f'g2s:idValidExpired="{expired}" '
+                f'g2s:idVIP="false" '
+                f'g2s:idBirthday="false" '
+                f'g2s:idAnniversary="false" '
+                f'g2s:idBanned="false" '
+                f'g2s:idPrivacy="false" '
+                f'g2s:idGender="G2S_Unknown" '
+                f'g2s:idRank="{rank}" '
+                f'g2s:idAge="0"/>')
+
+    def enqueue_set_id_validation(self, assoc, device_id, present,
+                                  id_number="", id_type="G2S_player",
+                                  prefer_name="", full_name="",
+                                  player_id="", locale_id="en_US",
+                                  id_class="", rank=0):
+        """idReader.setIdValidation (ch.18 §18.11) — the host TELLS the
+        EGM who is carded in (present=True) or that no ID is present
+        (present=False, the card-out). The full Table 18.9 attribute
+        census is built in set_id_validation_xml (the MSX005 regression
+        trap lives there). The EGM answers idReaderStatus + fires its
+        IDE-class events; both ride the existing inbound paths."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            xml = self.set_id_validation_xml(
+                present, id_number=id_number, id_type=id_type,
+                prefer_name=prefer_name, full_name=full_name,
+                player_id=player_id, locale_id=locale_id,
+                id_class=id_class, rank=rank)
+            inner, cid = self.build_inner_request(
+                a, "idReader", dev, xml, str(sid), "30000")
+            return inner, (f"setIdValidation(present={bool(present)},"
+                           f"dev={dev},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_get_id_reader_status(self, assoc, device_id="1"):
+        """idReader.getIdReaderStatus (ch.18) — empty request element; the
+        response is idReaderStatus (egmPhysicallyControls + the current
+        idNumber/idType/idState face). Owner+guest read; silence-tolerant
+        one-shot (bench probe)."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "idReader", dev, "<g2s:getIdReaderStatus/>",
+                str(sid), "30000")
+            return inner, f"getIdReaderStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_id_reader_profile(self, assoc, device_id="1"):
+        """idReader.getIdReaderProfile (ch.18) — empty request element;
+        the response is idReaderProfile (idReaderType/idValidMethod +
+        egmPhysicallyControls, the attribute that decides whether the EGM
+        or the host drives the reader UX). Owner+guest read."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "idReader", dev, "<g2s:getIdReaderProfile/>",
+                str(sid), "30000")
+            return inner, f"getIdReaderProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def id_reader_probe(self, assoc, device_id=None):
+        """/api/command idReaderProbe — on-demand bench read (the GR-30
+        refreshGameStatus posture: status-only, on a button, never a
+        timer): getIdReaderStatus + getIdReaderProfile for the owned
+        idReader device, so egmPhysicallyControls is visible BEFORE the
+        first live tap. Explicit deviceId overrides; the default is the
+        lowest owned device, else '1' (a probe is a read — the blind
+        fallback is safe here, unlike the carded-session sends)."""
+        dev = str(device_id) if device_id is not None else \
+            (self.default_id_reader_device(assoc) or "1")
+        self.enqueue_get_id_reader_status(assoc, dev)
+        self.enqueue_get_id_reader_profile(assoc, dev)
+        log.info("[%s] 💳 idReader probe queued (dev=%s)",
+                 assoc.egm_id, dev)
+        return {"deviceId": dev,
+                "ownedIdReaders": sorted(self.owned_id_reader_devices(assoc))}
+
+    # -------------------- mediaDisplay probe ladder (IGT extension, #18 P3)
+    # The scaffold that converts the RECONSTRUCTED igtMediaDisplay
+    # vocabulary into wire-proven fact, rung by rung, from the bench. The
+    # decisive later rung: loadContent(hello.html) -> the AVP's built-in
+    # browser GETs our page -> giant FUNCINO text on the glass. DORMANT BY
+    # DESIGN: nothing here fires at join, the class stays OUT of
+    # SPOKEN_CLASSES, and a host that never receives a mediaDisplayProbe
+    # emits ZERO mediaDisplay bytes (the replay gate pins that). Every
+    # child-element/attribute name below is the recon dossier's best
+    # reconstruction — NOT wire-proven; the status rung (an EMPTY read, the
+    # safest possible probe) adjudicates the vocabulary cheaply before
+    # anything that changes glass state. Where the attribute census is
+    # uncertain, reads stay EMPTY elements and writes carry the MINIMAL
+    # recon set — the bench answers, we never guess more here.
+
+    def owned_media_display_devices(self, assoc):
+        """The mediaDisplay deviceId strings WE OWN, from the commHostList
+        owned list ONLY (the owned_bonus_devices posture — the optionConfig
+        config-sync is not consulted; the wire deviceClass string is
+        "IGT_mediaDisplay"). Live-verified: the AVP's host-1 owned list
+        carries IGT_mediaDisplay/1..6, the BB2E's /1+/2. Empty before a
+        commHostList reveal (fresh bench) — the probe orchestrator then
+        answers an honest error instead of defaulting blindly. MUST NOT be
+        called holding assoc.lock (it takes it)."""
+        owned = set()
+        with assoc.lock:
+            h = assoc.host_items.get(self.host_id) or {}
+            for dev in h.get("owned", []):
+                if str(dev).startswith("IGT_mediaDisplay/"):
+                    owned.add(str(dev).split("/", 1)[1])
+        return owned
+
+    def enqueue_get_media_display_status(self, assoc, device_id):
+        """mediaDisplay.getMediaDisplayStatus — EMPTY element, THE
+        adjudicator rung: the safest possible read. A wrong verb name
+        draws an APX/MSX error at zero glass risk; a right one answers
+        mediaDisplayStatus (egmEnabled/hostEnabled/displayState expected
+        per the recon — egmEnabled=false is the known bring-up blocker).
+        RECONSTRUCTED verb — not wire-proven until the bench answers."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                "<igtMediaDisplay:getMediaDisplayStatus/>",
+                str(sid), "30000")
+            return inner, f"getMediaDisplayStatus(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_media_display_profile(self, assoc, device_id):
+        """mediaDisplay.getMediaDisplayProfile — EMPTY element, guest-safe
+        read; the recon expects the window geometry/capability census
+        (screen position, size, the content types the window accepts).
+        RECONSTRUCTED verb — see the ladder note above."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                "<igtMediaDisplay:getMediaDisplayProfile/>",
+                str(sid), "30000")
+            return inner, f"getMediaDisplayProfile(dev={dev},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_media_display_state(self, assoc, device_id, enable):
+        """mediaDisplay.setMediaDisplayState — the hostEnabled flip (the
+        recon's answer to egmEnabled=false at last recon: the ladder
+        enables before loading). One boolean attribute, extension-prefixed
+        per wire-shape law #3, lowercase literal. RECONSTRUCTED —
+        attribute census uncertain (a fuller census may be required per
+        the MSX005 all-attributes law; the bench adjudicates, this stays
+        minimal until it does)."""
+        def build(a):
+            dev = str(device_id)
+            flag = "true" if enable else "false"
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                f'<igtMediaDisplay:setMediaDisplayState '
+                f'igtMediaDisplay:enable="{flag}"/>',
+                str(sid), "30000")
+            return inner, (f"setMediaDisplayState(enable={flag},"
+                           f"dev={dev},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_load_content(self, assoc, device_id, content_id, media_uri,
+                             epoch=None):
+        """mediaDisplay.loadContent — THE payoff rung: the EGM's built-in
+        browser GETs media_uri (our own hello.html by default; the
+        UA-stamped _serve_webui journal line is the proof it landed) and
+        the EGM answers `contentStatus` carrying the transactionId it
+        assigned to this content instance.
+
+        ⚠️ The attribute is `mediaURI` (capital U-R-I), per igtMediaDisplay.
+        xsd v1.8 line 572 — and it is OPTIONAL with default
+        'http://www.example.com/example.swf'. Our first attempt sent
+        `mediaUri` (lowercase 'ri'); XML attributes are case-sensitive, so
+        the deserializer DROPPED it, defaulted the URI to example.swf, and
+        acked cleanly while never GETting our page — the whole "load acked
+        but no fetch" mystery. contentId is validated pure-numeric upstream
+        (the schema type is xs:long, minInclusive 1)."""
+        def build(a):
+            dev = str(device_id)
+            cnt = str(content_id)
+            uri = html.escape(str(media_uri), quote=True)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                f'<igtMediaDisplay:loadContent '
+                f'igtMediaDisplay:contentId="{cnt}" '
+                f'igtMediaDisplay:mediaURI="{uri}"/>',
+                str(sid), "30000")
+            return inner, (f"loadContent(content={cnt},dev={dev},"
+                           f"cid={cid})")
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def _enqueue_md_txn_verb(self, assoc, verb, device_id, content_id,
+                             transaction_id, epoch=None):
+        """Shared shape for the TRANSACTION content verbs (setActiveContent
+        / releaseContent / getContentStatus). Per igtMediaDisplay.xsd these
+        extend g2s:c_baseTransaction: a REQUIRED `g2s:transactionId`
+        (>=1, the EGM assigns it at load and reports it in contentStatus)
+        plus the igtMediaDisplay-qualified contentId. The g2s: prefix on
+        transactionId is mandatory (attributeFormDefault=qualified, and it
+        is inherited from the g2s namespace — matches how handpay/voucher/
+        bonus commands carry g2s:transactionId)."""
+        def build(a):
+            dev = str(device_id)
+            cnt = str(content_id)
+            txn = str(transaction_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                f'<igtMediaDisplay:{verb} '
+                f'g2s:transactionId="{txn}" '
+                f'igtMediaDisplay:contentId="{cnt}"/>',
+                str(sid), "30000")
+            return inner, (f"{verb}(txn={txn},content={cnt},dev={dev},"
+                           f"cid={cid})")
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def _enqueue_md_bare_verb(self, assoc, verb, device_id, epoch=None):
+        """Shared shape for the EMPTY-element device verbs (showMediaDisplay
+        / hideMediaDisplay / getContentLogStatus). These extend
+        g2s:c_baseCommand — NO transactionId, NO contentId: showMediaDisplay
+        makes the DEVICE's active content visible (set separately via
+        setActiveContent), so it needs no per-content reference."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                f'<igtMediaDisplay:{verb}/>',
+                str(sid), "30000")
+            return inner, f"{verb}(dev={dev},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    # The glass sequencer's verbs take an optional epoch (GR-18): its guard
+    # (assoc.glass_push, cleared by new_epoch) is written under assoc.lock,
+    # so the caller captures assoc.epoch in that SAME lock block and passes
+    # it here — a fresh read inside _enqueue could re-tag the job to a newer
+    # epoch if a re-commsOnLine lands in the release->enqueue window,
+    # letting a stale setActiveContent (dead pre-reboot transactionId) or an
+    # orphan loadContent slip past the worker's supersession drop and fire
+    # unprompted mediaDisplay traffic right at the rejoin — exactly what the
+    # sequencer's dormancy law forbids. The bench probe rungs (no per-epoch
+    # guard) keep the None default = current-epoch read.
+
+    def enqueue_set_active_content(self, assoc, device_id, content_id,
+                                   transaction_id, epoch=None):
+        """mediaDisplay.setActiveContent — make loaded content the device's
+        ACTIVE content (step 2 of load->setActive->show)."""
+        self._enqueue_md_txn_verb(assoc, "setActiveContent",
+                                  device_id, content_id, transaction_id,
+                                  epoch=epoch)
+
+    def enqueue_show_media_display(self, assoc, device_id, epoch=None):
+        """mediaDisplay.showMediaDisplay — make the device visible (step 3;
+        the real verb — 'showContent' never existed in the schema)."""
+        self._enqueue_md_bare_verb(assoc, "showMediaDisplay", device_id,
+                                   epoch=epoch)
+
+    def enqueue_hide_media_display(self, assoc, device_id):
+        """mediaDisplay.hideMediaDisplay — hide the device without releasing
+        its content."""
+        self._enqueue_md_bare_verb(assoc, "hideMediaDisplay", device_id)
+
+    def enqueue_release_content(self, assoc, device_id, content_id,
+                                transaction_id, epoch=None):
+        """mediaDisplay.releaseContent — unload; the clean-exit verb (needs
+        the transactionId + contentId, extends c_baseTransaction)."""
+        self._enqueue_md_txn_verb(assoc, "releaseContent",
+                                  device_id, content_id, transaction_id,
+                                  epoch=epoch)
+
+    def enqueue_get_content_status(self, assoc, device_id, content_id,
+                                   transaction_id):
+        """mediaDisplay.getContentStatus — per-content read (answer:
+        contentStatus with the content/visibility state)."""
+        self._enqueue_md_txn_verb(assoc, "getContentStatus",
+                                  device_id, content_id, transaction_id)
+
+    def enqueue_get_content_log_status(self, assoc, device_id):
+        """mediaDisplay.getContentLogStatus — empty-element read, THE safe
+        first probe: its contentLogStatus answer reveals how many content
+        log records exist (and the log itself carries the transactionId +
+        the mediaURI the EGM actually recorded)."""
+        self._enqueue_md_bare_verb(assoc, "getContentLogStatus", device_id)
+
+    def enqueue_get_content_log(self, assoc, device_id, last_sequence=0,
+                                total_entries=0):
+        """mediaDisplay.getContentLog — the diagnostic: contentLog records
+        carry transactionId, contentId, mediaURI (as recorded by the EGM),
+        contentState and contentException. Extends g2s:c_logRequest, so the
+        two attrs are g2s-qualified lastSequence/totalEntries (default 0/0 =
+        the whole log)."""
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request_ext(
+                a, MD_NS, "mediaDisplay", dev,
+                f'<igtMediaDisplay:getContentLog '
+                f'g2s:lastSequence="{int(last_sequence)}" '
+                f'g2s:totalEntries="{int(total_entries)}"/>',
+                str(sid), "30000")
+            return inner, (f"getContentLog(last={int(last_sequence)},"
+                           f"dev={dev},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def start_media_display_probe(self, assoc, rung=None, device_id=None,
+                                  uri=None, content_id=None,
+                                  transaction_id=None, last_sequence=None):
+        """/api/command mediaDisplayProbe — ONE action, rung-parameterized;
+        the climbing happens from the bench with observability between
+        rungs (the start_bonus_award posture: errors as dicts at HTTP 200,
+        never exceptions, the reply echoes what went on the wire).
+
+        Device pick: explicit deviceId wins (bench override); otherwise
+        the LOWEST owned IGT_mediaDisplay device, and an honest error when
+        ownership has revealed none — NEVER a blind "1" (the
+        default_id_reader_device rule: probes of a class this granular
+        must not address devices we don't own). load allocates a
+        pure-numeric contentId when none is given and remembers it per
+        device, so show/hide/release/contentStatus follow without
+        re-typing it."""
+        rung = str(rung or "")
+        if rung not in MD_PROBE_RUNGS:
+            return {"ok": False,
+                    "error": f"unknown rung {rung!r} — want one of "
+                             f"{list(MD_PROBE_RUNGS)}"}
+        owned = self.owned_media_display_devices(assoc)
+        if device_id is not None:
+            dev = str(device_id)
+        else:
+            if not owned:
+                return {"ok": False,
+                        "error": "no owned IGT_mediaDisplay device revealed "
+                                 "yet (commHostList) — pass deviceId to "
+                                 "override; never probing a blind default"}
+            dev = sorted(owned, key=lambda i: (not i.isdigit(),
+                                               int(i) if i.isdigit()
+                                               else i))[0]
+        reply = {"rung": rung, "deviceId": dev,
+                 "ownedMediaDisplays": sorted(owned),
+                 "commsState": assoc.comms_state}
+        if rung == "status":
+            self.enqueue_get_media_display_status(assoc, dev)
+        elif rung == "profile":
+            self.enqueue_get_media_display_profile(assoc, dev)
+        elif rung in ("enable", "disable"):
+            self.enqueue_set_media_display_state(assoc, dev,
+                                                 rung == "enable")
+        elif rung == "logstatus":
+            self.enqueue_get_content_log_status(assoc, dev)
+        elif rung == "log":
+            self.enqueue_get_content_log(
+                assoc, dev,
+                int(last_sequence) if last_sequence is not None else 0)
+        elif rung in ("show", "hide"):
+            # showMediaDisplay/hideMediaDisplay are EMPTY device verbs — the
+            # active content is chosen by setactive; show just reveals it.
+            (self.enqueue_show_media_display if rung == "show"
+             else self.enqueue_hide_media_display)(assoc, dev)
+        elif rung == "load":
+            target_uri = str(uri) if uri else MD_DEFAULT_CONTENT_URI
+            if content_id is not None:
+                cnt = str(content_id)
+            else:
+                # <epoch><2-digit seq> — the pure-numeric bonusId shape
+                cnt = (f"{int(time.time())}"
+                       f"{next(self._md_content_seq) % 100:02d}")
+            if not cnt.isdigit():
+                return {"ok": False,
+                        "error": "contentId must be pure-numeric (the "
+                                 "MSX005 id law — G2S ID scalars are "
+                                 "xs:long-ish)"}
+            with assoc.lock:
+                assoc.media_content[dev] = cnt
+            self.enqueue_load_content(assoc, dev, cnt, target_uri)
+            reply.update(contentId=cnt, uri=target_uri)
+        else:   # setactive / release / contentstatus (transaction verbs)
+            cnt = str(content_id) if content_id is not None else None
+            if cnt is None:
+                with assoc.lock:
+                    cnt = assoc.media_content.get(dev)
+            if not cnt:
+                return {"ok": False,
+                        "error": f"rung {rung!r} needs a contentId — load "
+                                 "first (the host remembers it per device) "
+                                 "or pass contentId explicitly"}
+            if not cnt.isdigit():
+                return {"ok": False,
+                        "error": "contentId must be pure-numeric (the "
+                                 "MSX005 id law)"}
+            # transactionId: explicit bench arg wins; else the one the EGM
+            # assigned at load (captured from the contentStatus fold). It is
+            # REQUIRED and must be >=1 (c_baseTransaction) — refuse rather
+            # than send a 0 that the deserializer rejects.
+            txn = str(transaction_id) if transaction_id is not None else None
+            if txn is None:
+                with assoc.lock:
+                    txn = assoc.media_txn.get(dev)
+            if not txn or not str(txn).isdigit() or int(txn) < 1:
+                return {"ok": False,
+                        "error": f"rung {rung!r} needs a transactionId >=1 "
+                                 "(the EGM assigns it at load and reports it "
+                                 "in contentStatus; none captured yet — load "
+                                 "first or pass transactionId explicitly)"}
+            {"setactive": self.enqueue_set_active_content,
+             "release": self.enqueue_release_content,
+             "contentstatus": self.enqueue_get_content_status}[rung](
+                assoc, dev, cnt, txn)
+            reply.update(contentId=cnt, transactionId=str(txn))
+            reply["contentId"] = cnt
+        log.info("🖥️ [%s] mediaDisplay probe rung=%s dev=%s%s%s queued — "
+                 "watch for the 🖥️ fold line (or an APX/MSX verdict: the "
+                 "vocabulary is recon, the bench adjudicates)",
+                 assoc.egm_id, rung, dev,
+                 f" content={reply['contentId']}"
+                 if reply.get("contentId") else "",
+                 f" uri={reply['uri']}" if reply.get("uri") else "")
+        return reply
+
+    # ------------------- glass navigation content-push sequencer (#18 P4)
+    # ONE command shows the resident SPA where the bench used to climb four
+    # manual probe rungs: glassShow enqueues [releaseContent old ->]
+    # loadContent, then the mediaDisplay FOLD advances the stages off the
+    # EGM's own narration — contentStatus pending/loaded => auto
+    # setActiveContent, contentStatus executing => auto showMediaDisplay,
+    # the show's mediaDisplayAck parks the stage at 'shown'. Stage truth
+    # lives in assoc.glass_push[dev]; the watchdog sweeps stalls. The same
+    # dormancy law as the probe ladder: NOTHING here fires at join —
+    # glassShow runs from /api/command or the throttled card-IN recovery.
+
+    def start_glass_show(self, assoc, device_id=None, page=None):
+        """/api/command glassShow {egmId, deviceId?=1, page?=glass.html} —
+        arm the sequencer and fire the load. The wire verbs are the
+        probe ladder's own builders VERBATIM (enqueue_load_content /
+        _enqueue_md_txn_verb / _enqueue_md_bare_verb — live-proven, never
+        re-derived). Release-before-load honors maxContentLoaded=1 (a load
+        over active content NO-OPs, live-hit 2026-07-10); the old content's
+        ids come from media_content/media_txn, best-effort — absent ids
+        skip the release and the stage timeout is the honest failure
+        surface. Errors as dicts at HTTP 200 (the probe posture)."""
+        owned = self.owned_media_display_devices(assoc)
+        dev = str(device_id) if device_id is not None \
+            else GLASS_DEFAULT_DEVICE
+        if owned and dev not in owned:
+            return {"ok": False,
+                    "error": f"device {dev} is not an owned "
+                             f"IGT_mediaDisplay device ({sorted(owned)})"}
+        page = str(page or GLASS_PAGE)
+        now = time.time()
+        # The SPA reads ?egm=&dev= off location.search — its state poll and
+        # any future EMDI-side logic key off them.
+        uri = (f"{GLASS_CONTENT_URI_BASE}{page}"
+               f"?egm={urllib.parse.quote(assoc.egm_id or '')}&dev={dev}")
+        # <epoch><2-digit seq> — the probe ladder's pure-numeric contentId
+        # shape (the MSX005 id law).
+        cnt = f"{int(now)}{next(self._md_content_seq) % 100:02d}"
+        with assoc.lock:
+            push = assoc.glass_push.get(dev)
+            if push and push.get("stage") != "shown":
+                age = now - (push.get("startedTs") or 0)
+                if age <= GLASS_PUSH_TIMEOUT_SEC:
+                    return {"ok": False,
+                            "error": f"glass push already in flight "
+                                     f"(stage={push.get('stage')}, "
+                                     f"{age:.0f}s in) — wait out the "
+                                     f"{GLASS_PUSH_TIMEOUT_SEC}s stage "
+                                     "timeout"}
+                # stale (the watchdog hasn't swept it yet) — supersede
+            # SPA-liveness short-circuit (the hub-restart MDX003 lesson):
+            # if the target IS the SPA and its own poll landed within
+            # GLASS_SPA_LIVE_SEC on this window, the page never left the
+            # glass — loadContent would smash into maxContentLoaded=1
+            # ("Must release loaded content.", live-hit 2026-07-10 after
+            # a restart emptied media_txn). A bare showMediaDisplay makes
+            # it visible again (idempotent if it already is).
+            spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+            spa_live = (page == GLASS_PAGE and spa.get("dev") == dev
+                        and now - (spa.get("ts") or 0)
+                        <= GLASS_SPA_LIVE_SEC)
+            if spa_live:
+                assoc.glass_push[dev] = {
+                    "stage": "showing",
+                    "contentId": assoc.media_content.get(dev)
+                    or "(resident)",
+                    "uri": uri, "startedTs": now}
+                epoch = assoc.epoch
+            else:
+                if spa.get("dev") == dev:
+                    # arming a real (re)load for this window replaces
+                    # whatever the SPA signal described — drop it so a
+                    # <8s-stale stamp can't short-circuit the NEXT show
+                    # over content that just displaced the SPA
+                    self._glass_spa_seen.pop(assoc.egm_id, None)
+                old_cnt = assoc.media_content.get(dev)
+                old_txn = assoc.media_txn.get(dev)
+                assoc.glass_push[dev] = {"stage": "loading",
+                                         "contentId": cnt,
+                                         "uri": uri, "startedTs": now}
+                assoc.media_content[dev] = cnt
+            # GR-18: glass_push is a per-epoch guard (new_epoch clears it),
+            # so capture the epoch in THIS lock block and tag both sends
+            # with it — a re-commsOnLine landing before the enqueues would
+            # otherwise retag them to the new epoch and POST a release/load
+            # the rejoined cabinet was never armed for (an orphan load no
+            # sequencer record can sweep).
+            epoch = assoc.epoch
+        if spa_live:
+            self.enqueue_show_media_display(assoc, dev, epoch=epoch)
+            assoc.glass_visible = True
+            log.info("🪟 [%s] glassShow dev=%s — SPA already RESIDENT "
+                     "(its own poll %0.1fs ago); show-only short-circuit, "
+                     "no load cycle", assoc.egm_id, dev,
+                     now - (spa.get("ts") or 0))
+            return {"deviceId": dev, "residentShowOnly": True, "uri": uri,
+                    "ownedMediaDisplays": sorted(owned)}
+        released = bool(old_cnt and str(old_cnt).isdigit() and old_txn
+                        and str(old_txn).isdigit() and int(old_txn) >= 1)
+        if released:
+            # FIFO order is the correctness here: the worker sends the
+            # release and only then the load, so the device is empty when
+            # the load lands.
+            self.enqueue_release_content(assoc, dev, old_cnt, old_txn,
+                                         epoch=epoch)
+        self.enqueue_load_content(assoc, dev, cnt, uri, epoch=epoch)
+        log.info("🪟 [%s] glassShow dev=%s content=%s uri=%s%s — sequencer "
+                 "armed (loading -> activating -> showing -> shown)",
+                 assoc.egm_id, dev, cnt, uri,
+                 f" (releasing old content={old_cnt} txn={old_txn} first)"
+                 if released else "")
+        return {"deviceId": dev, "contentId": cnt, "uri": uri,
+                "releasedOld": released,
+                "ownedMediaDisplays": sorted(owned)}
+
+    def start_glass_hide(self, assoc, device_id=None):
+        """/api/command glassHide {egmId, deviceId?=1} — hideMediaDisplay:
+        the window goes away, the content stays RESIDENT (glass_push keeps
+        its 'shown' stage — the page still polls underneath, so a bare
+        show probe rung brings it straight back without a 5-8s reload)."""
+        owned = self.owned_media_display_devices(assoc)
+        dev = str(device_id) if device_id is not None \
+            else GLASS_DEFAULT_DEVICE
+        if owned and dev not in owned:
+            return {"ok": False,
+                    "error": f"device {dev} is not an owned "
+                             f"IGT_mediaDisplay device ({sorted(owned)})"}
+        self.enqueue_hide_media_display(assoc, dev)
+        assoc.glass_visible = False
+        log.info("🪟 [%s] glassHide dev=%s queued (content stays resident)",
+                 assoc.egm_id, dev)
+        return {"deviceId": dev}
+
+    def _glass_recovery_push(self, assoc):
+        """Card-IN recovery: if the default glass window is not KNOWN to be
+        showing the resident SPA (hub-side truth = a completed 'shown'
+        push THIS epoch — new_epoch clears glass_push, so a rebooted
+        cabinet honestly reads not-shown), auto-run glassShow. Throttled
+        to one per GLASS_RECOVERY_THROTTLE_SEC per EGM; a push already in
+        flight is left alone. This is how a tap after a machine/hub
+        reboot self-heals the page — and the ONLY glassShow trigger
+        besides /api/command (nothing fires at join)."""
+        dev = GLASS_DEFAULT_DEVICE
+        now = time.time()
+        with assoc.lock:
+            push = assoc.glass_push.get(dev)
+            if push:
+                in_flight = push.get("stage") != "shown" and \
+                    now - (push.get("startedTs") or 0) <= \
+                    GLASS_PUSH_TIMEOUT_SEC
+                resident = push.get("stage") == "shown" and \
+                    GLASS_PAGE in str(push.get("uri") or "")
+                if in_flight or resident:
+                    return
+            # SPA-liveness skip (the hub-restart case): glass_push is
+            # empty after a restart, but if the page's own poll landed
+            # within GLASS_SPA_LIVE_SEC it never left the window — the
+            # tap flips its view via the next poll, no wire needed
+            # (loadContent here live-hit MDX003 2026-07-10).
+            spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+            if spa.get("dev") == dev and \
+                    now - (spa.get("ts") or 0) <= GLASS_SPA_LIVE_SEC:
+                return
+            if now - assoc.glass_recovery_ts < GLASS_RECOVERY_THROTTLE_SEC:
+                return
+            assoc.glass_recovery_ts = now
+        r = self.start_glass_show(assoc)
+        log.info("🪟 [%s] card-IN recovery push -> %s", assoc.egm_id,
+                 f"glassShow content={r.get('contentId')}"
+                 if r.get("contentId") else r.get("error"))
+
+    def _glass_poll_advance(self, assoc):
+        """The sequencer's fetch-proof trigger + retry heartbeat: the
+        resident SPA polls /api/glass/state every ~1.5s, and a poll can
+        only come from a page the cabinet browser ALREADY fetched — the
+        exact readiness signal setActiveContent needs (bench lesson
+        2026-07-10: firing on contentStatus IGT_contentPending draws
+        IGT_MDX005 "Content not loaded."). While a push for this EGM sits
+        at loading/activating with the EGM's txn recorded, each poll
+        (re)fires setActiveContent, spaced GLASS_RETRY_SPACING_SEC apart
+        and capped at GLASS_RETRY_MAX tries (a capped stall is left for
+        the stage-timeout sweep to clear and ⚠️-log). Decision under
+        assoc.lock, enqueue AFTER it (the tap path's no-nesting rule);
+        epoch captured under the same lock (GR-18: glass_push is a
+        per-epoch guard)."""
+        if assoc.comms_state != "onLine":
+            return
+        fire = []
+        now = time.time()
+        with assoc.lock:
+            epoch = assoc.epoch
+            for dev, push in list(assoc.glass_push.items()):
+                txn = push.get("txn")
+                if push.get("stage") not in ("loading", "activating") \
+                        or not txn:
+                    continue
+                if now - (push.get("lastTryTs") or 0) < \
+                        GLASS_RETRY_SPACING_SEC:
+                    continue
+                tries = int(push.get("tries") or 0)
+                if tries >= GLASS_RETRY_MAX:
+                    continue
+                assoc.glass_push[dev] = dict(
+                    push, stage="activating", lastTryTs=now,
+                    tries=tries + 1)
+                fire.append((dev, push["contentId"], txn, tries + 1))
+        for dev, cnt, txn, n in fire:
+            self.enqueue_set_active_content(assoc, dev, cnt, txn,
+                                            epoch=epoch)
+            log.info("🪟 [%s] glass sequencer dev=%s -> setActiveContent "
+                     "(poll-driven, try %d/%d)", assoc.egm_id, dev, n,
+                     GLASS_RETRY_MAX)
+
+    def sweep_glass_pushes(self, now=None):
+        """Sequencer stage timeout (watchdog cadence, so a stall clears in
+        25-45s): a push stuck mid-lifecycle past GLASS_PUSH_TIMEOUT_SEC is
+        ⚠️-logged and CLEARED — the manual mediaDisplayProbe rungs stay
+        usable as the fallback and the next glassShow/recovery starts
+        clean. 'shown' is the resting state, never swept. Dormant while
+        glass_push is empty — zero cost on a floor that never glassShows."""
+        now = time.time() if now is None else now
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        for assoc in assocs:
+            stale = []
+            with assoc.lock:
+                for dev, push in list(assoc.glass_push.items()):
+                    if push.get("stage") != "shown" and \
+                            now - (push.get("startedTs") or 0) > \
+                            GLASS_PUSH_TIMEOUT_SEC:
+                        del assoc.glass_push[dev]
+                        stale.append((dev, push))
+            for dev, push in stale:
+                log.warning("⚠️ 🪟 [%s] glass push dev=%s stalled at "
+                            "stage=%r (content=%s) — cleared after %ds; "
+                            "the manual probe rungs remain the fallback",
+                            assoc.egm_id, dev, push.get("stage"),
+                            push.get("contentId"), GLASS_PUSH_TIMEOUT_SEC)
+
+    # -------------------------------------------------- meters (read) — G2S-15
+
+    def enqueue_get_meter_info(self, assoc, device_class="G2S_all",
+                               device_id="-1", epoch=None):
+        """meters.getMeterInfo with a getDeviceMeters sub-command (spec §5.18).
+        Wildcard G2S_all/-1 pulls the COMPLETE device-meter set for every device
+        — credits, coin-in/out, games played/won, door counts, jackpot totals.
+        Values are millicents; percentages carry 2 implied decimals."""
+        def build(a):
+            sid = a.next_session_id()
+            cmd = ('<g2s:getMeterInfo>'
+                   f'<g2s:getDeviceMeters g2s:deviceClass="{device_class}" '
+                   f'g2s:deviceId="{device_id}" g2s:meterDefinitions="false"/>'
+                   '</g2s:getMeterInfo>')
+            inner, cid = self.build_inner_request(
+                a, "meters", "1", cmd, str(sid), "30000")
+            return inner, f"getMeterInfo(cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_meter_info_ack(self, assoc, req):
+        """Ack an EGM-pushed meterInfo (spec §5.20). An EOD subscription
+        meterInfo arrives as a G2S_request and MUST be acked or the EGM
+        re-collects and resends. A getMeterInfo response (G2S_response) and a
+        periodic push (G2S_notification — fire and forget, §5.4) need no ack."""
+        self.enqueue_class_response(
+            assoc, req, "<g2s:meterInfoAck/>", "meterInfoAck")
+
+    def _fold_meter_groups(self, assoc, container, changed=None):
+        """Fold every simpleMeter under `container`'s meter GROUP elements
+        (deviceMeters/currencyMeters/... — §5.19) into assoc.meters keyed
+        "deviceClass/deviceId/meterName". Device identity comes from the
+        GROUP element itself: simpleMeters carry only meterName/meterValue
+        (wire-proven — 0 of 64,282 overnight simpleMeters had their own
+        deviceClass). An element WITHOUT a deviceClass is descended into
+        (the eventReport ride-along nests meterList > meterInfo > groups),
+        never guessed at — GR-08: the old flat fold keyed ride-alongs by
+        the EVENT's device, so a cross-device group (e.g. a transaction
+        event carrying cabinet + noteAcceptor meters) folded under the
+        wrong key and collapsed same-named meters across devices. Shared by
+        the meterInfo handler and the eventReport meterList fold. Returns
+        the folded meter count; `changed` (optional list) collects up to a
+        handful of (key, old, new) actual value changes for the GR-02
+        digest log line."""
+        count = 0
+        for grp in container:
+            dc = attr(grp, "deviceClass")
+            if dc is None:
+                count += self._fold_meter_groups(assoc, grp, changed)
+                continue
+            di = attr(grp, "deviceId")
+            for m in grp.iter():
+                mn = attr(m, "meterName")
+                mv = attr(m, "meterValue")
+                if mn is not None and mv is not None:
+                    key = f"{dc}/{di}/{mn}"
+                    with assoc.lock:
+                        old = assoc.meters.get(key)
+                        assoc.meters[key] = mv
+                    if changed is not None and old != mv:
+                        changed.append((key, old, mv))
+                    count += 1
+        return count
+
+    # ------------------------------------------ meters subscriptions — G2S-16
+
+    # Subscription selector: the same wildcard device-meter sweep the on-demand
+    # getMeterInfo read uses (§5.21 Table 5.20 — setMeterSub carries the SAME
+    # get*Meters sub-elements; the EGM expands wildcards to full device form
+    # on acceptance and returns that expansion in meterSubList).
+    METER_SUB_SELECTORS = (
+        '<g2s:getDeviceMeters g2s:deviceClass="G2S_all" g2s:deviceId="-1" '
+        'g2s:meterDefinitions="false"/>')
+
+    def enqueue_set_meter_sub(self, assoc, epoch=None):
+        """meters.setMeterSub x2 (spec §5.21) — install host 1's standing
+        subscriptions: G2S_onPeriodic every METER_SUB_PERIODIC_MS (the schema
+        minimum — live-leaderboard cadence) and G2S_onEOD (eodBase=0 = the
+        midnight snapshot). One subscription of each type per host; a re-send
+        OVERWRITES (never additive, §5.2/§5.21), so this is idempotent.
+        Owner-only per §5.2 — and host 1 already IS the owner on the live AVP
+        (first-light 2026-07-02: honored straight from the join sequence; the
+        old "pre-ownership acks-then-ignores" reading was the double-wrap ack
+        bug). A refusing EGM just g2sAcks then stays silent — fine, no retry.
+        Each accepted sub answers meterSubList (expanded
+        form) then fires G2S_MTE100. The meters deviceId == our hostId (§5.2);
+        periodicInterval/periodicBase are INVALID on onEOD and eodBase on
+        onPeriodic, so each type carries only its own scheduling attrs.
+        Sets meter_subs_desired: the join path re-arms these subs every epoch
+        (the AVP drops them across any re-handshake, subscriptionLost=true)
+        until a clearMeterSub withdraws the intent."""
+        with assoc.lock:
+            assoc.meter_subs_desired = True
+
+        def build_periodic(a):
+            sid = a.next_session_id()
+            cmd = ('<g2s:setMeterSub g2s:meterSubType="G2S_onPeriodic" '
+                   f'g2s:periodicInterval="{METER_SUB_PERIODIC_MS}" '
+                   'g2s:periodicBase="0">'
+                   f'{self.METER_SUB_SELECTORS}</g2s:setMeterSub>')
+            inner, cid = self.build_inner_request(
+                a, "meters", self.host_id, cmd, str(sid), "30000")
+            return inner, (f"setMeterSub(onPeriodic,"
+                           f"interval={METER_SUB_PERIODIC_MS}ms,cid={cid})")
+
+        def build_eod(a):
+            sid = a.next_session_id()
+            cmd = ('<g2s:setMeterSub g2s:meterSubType="G2S_onEOD" '
+                   'g2s:eodBase="0">'
+                   f'{self.METER_SUB_SELECTORS}</g2s:setMeterSub>')
+            inner, cid = self.build_inner_request(
+                a, "meters", self.host_id, cmd, str(sid), "30000")
+            return inner, f"setMeterSub(onEOD,cid={cid})"
+        self._enqueue(assoc, build_periodic, epoch=epoch)
+        self._enqueue(assoc, build_eod, epoch=epoch)
+
+    def enqueue_get_meter_sub(self, assoc):
+        """meters.getMeterSub x2 (spec §5.23) — read back both standing subs.
+        Owner+guest; each answers meterSubList (empty = no subscription)."""
+        for sub_type in ("G2S_onPeriodic", "G2S_onEOD"):
+            def build(a, st=sub_type):
+                sid = a.next_session_id()
+                inner, cid = self.build_inner_request(
+                    a, "meters", self.host_id,
+                    f'<g2s:getMeterSub g2s:meterSubType="{st}"/>',
+                    str(sid), "30000")
+                return inner, f"getMeterSub({st},cid={cid})"
+            self._enqueue(assoc, build)
+
+    def enqueue_clear_meter_sub(self, assoc):
+        """meters.clearMeterSub x2 (spec §5.22) — drop both standing subs.
+        Owner-only; each answers an emptied meterSubList then fires
+        G2S_MTE101. Withdraws meter_subs_desired so the per-epoch join
+        re-arm does NOT resurrect a deliberately-cleared subscription."""
+        with assoc.lock:
+            assoc.meter_subs_desired = False
+        for sub_type in ("G2S_onPeriodic", "G2S_onEOD"):
+            def build(a, st=sub_type):
+                sid = a.next_session_id()
+                inner, cid = self.build_inner_request(
+                    a, "meters", self.host_id,
+                    f'<g2s:clearMeterSub g2s:meterSubType="{st}"/>',
+                    str(sid), "30000")
+                return inner, f"clearMeterSub({st},cid={cid})"
+            self._enqueue(assoc, build)
+
+    # ---------------------------------------- handpay reset-to-credits — G2S-25
+
+    def enqueue_set_remote_key_off(self, assoc, txn_id=None,
+                                   key_off_type="G2S_remoteCredit"):
+        """handpay.setRemoteKeyOff (spec §11.14, Table 11.10) — THE reset
+        command: authorize the EGM to key off a pending handpay lockup
+        remotely, defaulting to keyOffType=G2S_remoteCredit (Table 11.21 —
+        pay the win straight to the credit meter, no paper). txn_id defaults
+        to the OLDEST pending handpay; key_off_type may be overridden
+        (G2S_remoteVoucher/G2S_remoteHandpay) for completeness — the EGM is
+        the enforcer and answers G2S_JPX002 for a type it did not offer.
+        keyOff*Amt = request*Amt − egmPaid*Amt (the un-paid remainder; the
+        host MAY adjust per §11.14 — a shortfall makes the EGM issue a fresh
+        handpayRequest). Owner-only; pre-ownership the AVP just g2sAcks then
+        stays silent — the record parks at keyOffSent and snapshot() derives
+        a lazy 30s timeout (no timer threads, no retry storms). Success path:
+        remoteKeyOffAck (JPE103) then keyedOff -> our keyedOffAck."""
+        def build(a):
+            rec = None
+            if txn_id is not None:
+                rec = a.handpays_pending.get(str(txn_id))
+            elif a.handpays_pending:
+                # dict insertion order == arrival order -> oldest pending
+                rec = next(iter(a.handpays_pending.values()))
+            if rec is None:
+                log.warning("[%s] clearHandpay: no matching pending handpay "
+                            "(hpId=%s) — nothing sent", a.egm_id,
+                            txn_id if txn_id is not None else "oldest")
+                return None
+            sid = a.next_session_id()
+            cmd = (f'<g2s:setRemoteKeyOff '
+                   f'g2s:transactionId="{rec["transactionId"]}" '
+                   f'g2s:keyOffType="{key_off_type}" '
+                   f'g2s:keyOffCashableAmt="{rec["pendingCashableAmt"]}" '
+                   f'g2s:keyOffPromoAmt="{rec["pendingPromoAmt"]}" '
+                   f'g2s:keyOffNonCashAmt="{rec["pendingNonCashAmt"]}"/>')
+            inner, cid = self.build_inner_request(
+                a, "handpay", rec.get("deviceId", "1"), cmd, str(sid), "30000")
+            rec["state"] = "keyOffSent"
+            rec["keyOffType"] = key_off_type
+            rec["keyOffSentAt"] = now_iso()
+            rec["keyOffSentTs"] = time.time()
+            log.info("💰 [%s] setRemoteKeyOff txn=%s type=%s cash=%s promo=%s "
+                     "nonCash=%s — expecting remoteKeyOffAck then keyedOff",
+                     a.egm_id, rec["transactionId"], key_off_type,
+                     rec["pendingCashableAmt"], rec["pendingPromoAmt"],
+                     rec["pendingNonCashAmt"])
+            return inner, (f"setRemoteKeyOff(txn={rec['transactionId']},"
+                           f"type={key_off_type},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def reset_newest_handpay(self, assoc):
+        """/api/command resetHandpay — the Floor UI 🔑 button: key the
+        NEWEST pending lockup off to the credit meter (clearHandpay's
+        default is the OLDEST; the operator tapping the tile means the
+        lockup that just lit up). Unlike clearHandpay — whose empty-map
+        miss is log-only because the record lookup defers to build time —
+        this checks the pending map up front and answers an honest
+        {"ok": false} the UI can show. The reply also surfaces the per-
+        transaction remoteCredit permission (Table 11.6): a lockup raised
+        while G2S_enabledRemoteCredit was false carries remoteCredit=
+        "false" for life and will draw G2S_JPX002 — the fix is
+        enableRemoteHandpay then a FRESH handpay (flipping the option
+        cannot retro-permit this one, see enable_remote_handpay), so the
+        gate is reported, not auto-fired. The key-off is still sent either
+        way — the EGM is the enforcer. Returns a dict merged into the
+        /api/command reply."""
+        with assoc.lock:
+            if not assoc.handpays_pending:
+                return {"ok": False, "error": "no pending handpay"}
+            # dict insertion order == arrival order -> last key is newest
+            txn = next(reversed(assoc.handpays_pending))
+            remote_credit = (assoc.handpays_pending[txn]
+                             .get("remoteCredit") or "false")
+        self.enqueue_set_remote_key_off(assoc, txn_id=txn)
+        reply = {"hpId": txn, "keyOffType": "G2S_remoteCredit",
+                 "remoteCredit": remote_credit}
+        # Case-folded like option_values_equal — an EGM may legally spell
+        # the xs:boolean True/TRUE.
+        if remote_credit.strip().lower() != "true":
+            reply["gate"] = (
+                "this lockup was raised with remoteCredit=false — the EGM "
+                "will refuse (G2S_JPX002); run enableRemoteHandpay, then "
+                "raise a FRESH handpay")
+        return reply
+
+    # ------------------------------------- voucher redemption — G2S-26 tier 2
+
+    def void_validation_id(self, assoc, validation_id=""):
+        """/api/command voidValidationId — bench unstick. Marks the id void
+        in the durable store so any future redeemVoucher for it is rejected
+        (voucherAmt=0, hostException=99). Pure store operation: NOTHING is
+        sent to the EGM — G2S has no command to retract a single id from the
+        machine's buffer short of a deleteCurrent validation list, and this
+        must stay safe on a silent/pre-ownership AVP. Returns a dict merged
+        into the /api/command reply so the Test Panel tape shows the
+        outcome."""
+        vid = (validation_id or "").strip()
+        if not vid:
+            return {"ok": False, "error": "validationId required"}
+        prior = self.voucher_store.void_id(vid)
+        if prior is None:
+            log.warning("[%s] voidValidationId: %s is not in the store — "
+                        "nothing voided", assoc.egm_id, vid)
+            return {"ok": False, "error": "unknown validationId"}
+        log.info("🎟️ [%s] validationId %s VOIDED (was %s) — future "
+                 "redemption draws hostException=99", assoc.egm_id, vid,
+                 prior)
+        return {"validationId": vid, "priorState": prior, "state": "void"}
+
+    # -------------------------------------------- commConfig read/ack — G2S-18
+
+    def enqueue_get_comm_config_profile(self, assoc):
+        """commConfig.getCommConfigProfile (spec §8.10)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1", "<g2s:getCommConfigProfile/>",
+                str(sid), "30000")
+            return inner, f"getCommConfigProfile(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_comm_config_mode_status(self, assoc):
+        """commConfig.getCommConfigModeStatus (spec §8.8)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1", "<g2s:getCommConfigModeStatus/>",
+                str(sid), "30000")
+            return inner, f"getCommConfigModeStatus(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_comm_host_list_ack(self, assoc, req):
+        """Ack an UNSOLICITED commHostList push (spec §8.13/§8.14). The EGM sends
+        commHostList when the host list changes and expects commHostListAck (else
+        it raises CCE106 after noResponseTimer)."""
+        self.enqueue_class_response(
+            assoc, req, "<g2s:commHostListAck/>", "commHostListAck")
+
+    def enqueue_comm_change_status_ack(self, assoc, req, config_id, txn_id):
+        """Ack an EGM-pushed commChangeStatus (spec §8.19)."""
+        self.enqueue_class_response(
+            assoc, req,
+            f'<g2s:commChangeStatusAck g2s:configurationId="{config_id}" '
+            f'g2s:transactionId="{txn_id}"/>',
+            "commChangeStatusAck")
+
+    # ------------------------------------- commConfig ownership cycle — G2S-19
+
+    def enqueue_enter_comm_config_mode(self, assoc, enable=True):
+        """commConfig.enterCommConfigMode (spec §8.7). Owner-only. When enabled,
+        the EGM enters config mode and DISABLES game play (needs idle/0 credits)
+        — deliberate and disruptive. Responds with commConfigModeStatus."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1",
+                f'<g2s:enterCommConfigMode g2s:enable="{str(enable).lower()}"/>',
+                str(sid), "30000")
+            return inner, f"enterCommConfigMode(enable={enable},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_set_comm_change(self, assoc, config_id, owned, guest=()):
+        """commConfig.setCommChange (spec §8.15). Registers host 1 and assigns it
+        ownership of every (deviceClass, deviceId) in `owned`. applyCondition=
+        G2S_immediate + a self-only authorizeList (single-host home rig, no
+        multi-host quorum). NOTE §8.15: the setHostItem OVERWRITES host 1's prior
+        owned/config/guest lists, so the lists MUST be COMPLETE. Every claimed
+        device is emitted as ownedDevice AND configDevice — the live AVP
+        refuses a change whose result leaves a device without a config host
+        (CCX018 "DEVICES MUST HAVE OWNER AND CONFIG HOSTS", wire-proven
+        2026-07-07; an owned-only setHostItem wiped our config-host column).
+        `guest` = the guest relationships to KEEP (omitting them would
+        silently drop guest access). hostIndex comes from the live
+        commHostList when known (the AVP reports hostIndex=1 for host 1 —
+        wire-proven 2026-07-07), else the historical guess "1"; if wrong the
+        EGM returns a validation error we can read."""
+        def build(a):
+            sid = a.next_session_id()
+            # build() runs under assoc.lock (the FIFO worker holds it while
+            # allocating commandIds) — read host_items directly, never
+            # re-acquire the non-reentrant lock here.
+            host_index = (a.host_items.get(self.host_id) or {}).get(
+                "hostIndex") or "1"
+            owned_xml = "".join(
+                f'<g2s:ownedDevice g2s:deviceClass="{dc}" '
+                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
+                for dc, di in owned)
+            config_xml = "".join(
+                f'<g2s:configDevice g2s:deviceClass="{dc}" '
+                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
+                for dc, di in owned)
+            guest_xml = "".join(
+                f'<g2s:guestDevice g2s:deviceClass="{dc}" '
+                f'g2s:deviceId="{di}" g2s:deviceActive="true"/>'
+                for dc, di in guest)
+            cmd = (
+                f'<g2s:setCommChange g2s:configurationId="{config_id}" '
+                f'g2s:applyCondition="G2S_immediate" g2s:restartAfter="false">'
+                f'<g2s:setHostItem g2s:hostIndex="{host_index}" '
+                f'g2s:hostId="{self.host_id}" '
+                f'g2s:hostLocation="{self.host_uri}" g2s:hostRegistered="true" '
+                f'g2s:requiredForPlay="false">'
+                f'{owned_xml}{config_xml}{guest_xml}'
+                f'</g2s:setHostItem>'
+                f'<g2s:authorizeList>'
+                f'<g2s:authorizeItem g2s:hostId="{self.host_id}"/>'
+                f'</g2s:authorizeList>'
+                f'</g2s:setCommChange>')
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1", cmd, str(sid), "30000")
+            return inner, (f"setCommChange(cfg={config_id},cid={cid},"
+                           f"devs={len(owned)},guest={len(guest)})")
+        self._enqueue(assoc, build)
+
+    def enqueue_authorize_comm_change(self, assoc, config_id, txn_id):
+        """commConfig.authorizeCommChange (spec §8.17) — host authorizes the EGM
+        to apply the pending change set (identified by config_id + EGM txn_id)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "commConfig", "1",
+                f'<g2s:authorizeCommChange g2s:configurationId="{config_id}" '
+                f'g2s:transactionId="{txn_id}"/>',
+                str(sid), "30000")
+            return inner, (f"authorizeCommChange(cfg={config_id},txn={txn_id},"
+                           f"cid={cid})")
+        self._enqueue(assoc, build)
+
+    # Default device set to claim when no optionConfig.optionList config-sync has
+    # arrived to reveal the real inventory. Core devices every enthusiast AVP
+    # exposes; claiming a non-existent device fails validation (§8.15), so prefer
+    # the config-sync-derived list when available.
+    DEFAULT_OWN_CLAIM = [
+        ("G2S_cabinet", "1"), ("G2S_eventHandler", "1"), ("G2S_meters", "1"),
+        ("G2S_gamePlay", "1"), ("G2S_noteAcceptor", "1"), ("G2S_handpay", "1"),
+        ("G2S_printer", "1"), ("G2S_voucher", "1"), ("G2S_commConfig", "1"),
+        ("G2S_optionConfig", "1"),
+    ]
+
+    def start_ownership_cycle(self, assoc, owned=None):
+        """Kick off the commConfig ownership cycle (G2S-19). Builds the device
+        list to claim as the UNION of the live commHostList truth (host 1's
+        owned+guest devices) and the optionConfig.optionList config-sync
+        inventory (assoc.config_devices), else DEFAULT_OWN_CLAIM. The union
+        matters: §8.15 setHostItem OVERWRITES the prior owned list, and the
+        commHostList carries devices the config-sync never mentions
+        (G2S_communications/1, G2S_meters/1, GTK_storage/1 on the live AVP) —
+        a config-sync-only claim would ask the EGM to DROP them, including the
+        communications device carrying this very link. Guest devices are
+        claimed deliberately (flipping guest->owned IS the point of the
+        cycle). An explicit `owned` list (API body "devices") overrides. Sets
+        the stage machine to 'entering' and enqueues enterCommConfigMode; the
+        inbound commConfigModeStatus/commChangeStatus handlers advance it
+        through setCommChange -> authorizeCommChange -> applied."""
+        if owned is None:
+            devs = set()
+            with assoc.lock:
+                h = assoc.host_items.get(self.host_id) or {}
+                wire = list(h.get("owned") or []) + list(h.get("guest") or [])
+                cfg = [(d["deviceClass"], d["deviceId"])
+                       for d in assoc.config_devices.values()
+                       if d.get("deviceClass") and d.get("deviceId")]
+            for dev in wire:
+                dc, _, di = str(dev).partition("/")
+                if dc and di:
+                    devs.add((dc, di))
+            devs.update(cfg)
+            if devs:
+                owned = sorted(devs)
+                src = (f"commHostList owned+guest + config-sync union "
+                       f"({len(owned)} devices)")
+            else:
+                owned = list(self.DEFAULT_OWN_CLAIM)
+                src = (f"DEFAULT_OWN_CLAIM guess ({len(owned)} devices) — no "
+                       "commHostList or optionList config-sync received yet")
+        else:
+            src = f"explicit ({len(owned)} devices)"
+        config_id = self.next_config_id()
+        # Guest relationships to KEEP: every current guest device NOT being
+        # claimed as owned. §8.15 overwrite semantics — omitting them from
+        # the setHostItem would silently drop our guest access (e.g. the
+        # printer/hopper status reads on the EGM-owned devices).
+        claimed = set(owned)
+        with assoc.lock:
+            h = assoc.host_items.get(self.host_id) or {}
+            guest = []
+            for dev in h.get("guest") or []:
+                dc, _, di = str(dev).partition("/")
+                if dc and di and (dc, di) not in claimed:
+                    guest.append((dc, di))
+            guest.sort()
+            assoc.commconfig_stage = "entering"
+            assoc.pending_config_id = config_id
+            assoc.pending_txn_id = None
+            assoc.pending_owned = list(owned)
+            assoc.pending_guest = guest
+            assoc.owned_claim = [f"{dc}/{di}" for dc, di in owned]
+        log.info("=" * 64)
+        log.info("[%s] 🔑 OWNERSHIP CYCLE START cfg=%s — claiming from %s",
+                 assoc.egm_id, config_id, src)
+        for dc, di in owned:
+            log.info("    claim %s/%s (owner+config)", dc, di)
+        for dc, di in guest:
+            log.info("    keep  %s/%s (guest)", dc, di)
+        log.info("⚠️  enterCommConfigMode DISABLES play until the change applies "
+                 "or is cancelled.")
+        log.info("=" * 64)
+        self.enqueue_enter_comm_config_mode(assoc, enable=True)
+        return config_id, owned
+
+    # ------------------------------- optionConfig change cycle — G2S-27
+    #
+    # Flip ONE option value on the EGM remotely (the strategic use: enabling
+    # handpay remote-key-off-to-credits if the AVP ships it disabled). A
+    # guarded, staged, epoch-safe state machine modelled on the commConfig
+    # ownership cycle above — ONE transaction in flight at a time, with an
+    # abort path. Owner-only (post-claimOwnership on the AVP); the whole thing
+    # is silence-tolerant (a pre-ownership AVP acks-then-ignores, the record
+    # parks and snapshot() times it out). Nothing here fires automatically.
+
+    def enqueue_set_option_change(self, assoc, config_id, dc, di, gid, oid,
+                                  current_values_xml, apply_condition,
+                                  disable_condition=None):
+        """optionConfig.setOptionChange (§9.15, Tables 9.27-9.32). The command
+        rides under <g2s:optionConfig> at deviceId = the host's own hostId
+        (§9.1). Carries configurationId + applyCondition + restartAfter=false,
+        exactly one <g2s:option> (the addressing 4-tuple) wrapping the COMPLETE
+        <optionCurrentValues> (one param edited, the rest copied — §9.15), and
+        an <authorizeList> naming THIS host (the initiator MUST include itself,
+        p.362). disableCondition is emitted ONLY with applyCondition=
+        G2S_disable (Table 9.35). Response: optionChangeStatus (G2S_pending)."""
+        def build(a):
+            sid = a.next_session_id()
+            disable_xml = ""
+            if apply_condition == "G2S_disable":
+                disable_xml = (' g2s:disableCondition="'
+                               f'{disable_condition or "G2S_idle"}"')
+            cmd = (
+                f'<g2s:setOptionChange g2s:configurationId="{config_id}" '
+                f'g2s:applyCondition="{apply_condition}"{disable_xml} '
+                f'g2s:restartAfter="false">'
+                f'<g2s:option g2s:deviceClass="{dc}" g2s:deviceId="{di}" '
+                f'g2s:optionGroupId="{gid}" g2s:optionId="{oid}">'
+                f'{current_values_xml}'
+                f'</g2s:option>'
+                f'<g2s:authorizeList>'
+                f'<g2s:authorizeItem g2s:hostId="{self.host_id}"/>'
+                f'</g2s:authorizeList>'
+                f'</g2s:setOptionChange>')
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id, cmd, str(sid), "30000")
+            # build() already runs under assoc.lock (the worker holds it while
+            # allocating commandIds) — record the sessionId directly, NEVER
+            # re-acquire the non-reentrant lock here.
+            oc = a.option_change
+            if oc.get("configId") == config_id:
+                oc["sessionId"] = str(sid)
+            return inner, (f"setOptionChange(cfg={config_id},cond="
+                           f"{apply_condition},cid={cid},sid={sid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_authorize_option_change(self, assoc, config_id, txn_id):
+        """optionConfig.authorizeOptionChange (§9.17) — host authorizes the EGM
+        to apply the pending set (configId + EGM txn_id). Response:
+        optionChangeStatus (G2S_authorized), then the EGM applies per
+        applyCondition and pushes a terminal optionChangeStatus."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                f'<g2s:authorizeOptionChange g2s:configurationId="{config_id}" '
+                f'g2s:transactionId="{txn_id}"/>',
+                str(sid), "30000")
+            return inner, (f"authorizeOptionChange(cfg={config_id},"
+                           f"txn={txn_id},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_cancel_option_change(self, assoc, config_id, txn_id):
+        """optionConfig.cancelOptionChange (§9.16) — initiator-owner abort,
+        valid ONLY while the set is pending. Response: optionChangeStatus
+        (G2S_cancelled). Once applied there is NO rollback (§9.16 p.365)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                f'<g2s:cancelOptionChange g2s:configurationId="{config_id}" '
+                f'g2s:transactionId="{txn_id}"/>',
+                str(sid), "30000")
+            return inner, (f"cancelOptionChange(cfg={config_id},"
+                           f"txn={txn_id},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_get_option_list(self, assoc, epoch=None,
+                                device_class="G2S_all", device_id="-1"):
+        """optionConfig.getOptionList (§9.10 Table 9.6) — read the option
+        inventory back on demand (GR-10). All five attributes are REQUIRED:
+        deviceClass/deviceId default to the everything-wildcards G2S_all/-1
+        (the getDescriptor pattern) but may be scoped to one device;
+        optionGroupId/optionId take G2S_all; optionDetail=false asks for
+        current VALUES only — the same shape the unsolicited config-sync
+        push carries and all the optionList parser stores (optionDetail=true
+        would add optionParameters/defaults, which it skips). The EGM
+        answers with the same optionList command in RESPONSE form (§9.13
+        'sent in response to a getOptionList'), which the widened optionList
+        handler parses + persists; a response draws NO optionListAck. Wired
+        as (a) a join-time one-shot when the inventory is empty — pre-GR-10
+        a warm host restart had NO path to repopulate it until the EGM's
+        next deviceReset — (b) the /api/command getOptionList refresh, and
+        (c) the G2S-27 post-apply verification read-back, scoped to the
+        changed device — §9.3.4 (p.344) DOES mandate a post-apply optionList
+        push to hosts with config authority, but the host-initiated
+        read-back keeps verification independent of this AVP honoring it
+        (the optionList handler verifies against either arrival form)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                f'<g2s:getOptionList g2s:deviceClass="{device_class}" '
+                f'g2s:deviceId="{device_id}" g2s:optionGroupId="G2S_all" '
+                'g2s:optionId="G2S_all" g2s:optionDetail="false"/>',
+                str(sid), "30000")
+            return inner, f"getOptionList({device_class}/{device_id},cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def persist_config_inventory(self, assoc):
+        """GR-10: mirror the association's parsed optionConfig inventory into
+        the durable store so a warm host restart keeps it. Snapshot under
+        assoc.lock (handlers insert keys in place); the store write happens
+        outside it (config_store has its own lock, never nested)."""
+        with assoc.lock:
+            devices = {k: dict(v) for k, v in assoc.config_devices.items()}
+            options = {k: dict(v) for k, v in assoc.config_options.items()}
+        self.config_store.save(assoc.egm_id, devices, options)
+
+    def enqueue_get_option_change_log_status(self, assoc):
+        """optionConfig.getOptionChangeLogStatus (§9.20) — guest-OK read of the
+        change-log high-water (lastSequence + totalEntries). Response:
+        optionChangeLogStatus. Surfaced via /api/command getOptionChangeStatus
+        so an operator can poll how many option changes the EGM has logged."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                "<g2s:getOptionChangeLogStatus/>", str(sid), "30000")
+            return inner, f"getOptionChangeLogStatus(cid={cid})"
+        self._enqueue(assoc, build)
+
+    def start_option_change_cycle(self, assoc, device_class=None,
+                                  device_id=None, option_id=None, value=None,
+                                  param_id=None, option_group_id=None,
+                                  apply_condition="G2S_immediate",
+                                  disable_condition=None, values=None):
+        """Kick off the optionConfig change cycle (G2S-27). Validates the option
+        + paramId(s) against the stored config-sync inventory (assoc.config_
+        options) and REFUSES unknowns — a change is never sent for an option/
+        param the EGM never advertised. On success, copies the option's
+        COMPLETE current values, edits the target param(s), assigns a
+        configurationId, parks the tracking record, sets the stage to
+        'setting', and enqueues setOptionChange. The inbound optionChangeStatus
+        handlers advance it setting -> authorizing -> applied (or cancelled/
+        failed); on applied a scoped getOptionList read-back verifies the new
+        values (result -> verified/verifyFailed). Returns a dict (merged into
+        the /api/command reply) — ok:false with an error for any refusal,
+        WITHOUT touching the wire or the current stage. Refusals (post-review
+        2026-07-02): link not onLine, lossy option (a nested complexValue the
+        parser can't round-trip), and a genuinely in-flight cycle — checked
+        AND claimed under one assoc.lock hold, with a record silent past
+        OPTION_CHANGE_ABANDON_SEC treated as abandoned and replaced.
+
+        Two edit forms: param_id+value edits ONE param (the /api/command
+        setOption shape); `values` ({paramId: newValue}) edits SEVERAL params
+        of the SAME option in ONE transaction — spec-clean, since §9.15 sends
+        the complete parameter set either way, and it avoids N sequential
+        cycles (one silent EGM wedges the whole chain at 'setting')."""
+        if not all([device_class, device_id, option_id]):
+            return {"ok": False, "error": "setOption requires deviceClass, "
+                    "deviceId and optionId"}
+        if values:
+            values = {str(k): str(v) for k, v in values.items()}
+        elif value is None:
+            return {"ok": False, "error": "setOption requires a value"}
+        else:
+            value = str(value)
+        # Post-review hardening (2026-07-02): a change cycle needs a LIVE
+        # link. Fired pre-join/offline, the setOptionChange POST just dies on
+        # the dead link (or the epoch-tagged job is silently dropped at
+        # rejoin) and the record strands at stage=setting where it refuses
+        # every later cycle until a manual cancel — verified live on a
+        # throwaway host. Money-path enqueues tolerate a dead link (keepAlive
+        # and friends simply re-fire); the ONE-txn-at-a-time stage cannot,
+        # so refuse up front. (The in-flight refusal moved DOWN into the
+        # claim block, where it is atomic with the claim.)
+        with assoc.lock:
+            comms = assoc.comms_state
+        if comms != "onLine":
+            return {"ok": False, "error": "EGM link is not onLine "
+                    f"(commsState={comms}) — an optionConfig change started "
+                    "now would strand at stage=setting on a dead link; retry "
+                    "after the EGM (re)joins", "commsState": comms}
+        # Locate the option in the config-sync inventory. optionGroupId may be
+        # omitted (resolve it from the option) — but if the same optionId lives
+        # in >1 group, require the caller to disambiguate.
+        with assoc.lock:
+            if option_group_id:
+                okey = (f"{device_class}/{device_id}/{option_group_id}/"
+                        f"{option_id}")
+                opt = assoc.config_options.get(okey)
+                matches = [okey] if opt else []
+            else:
+                matches = [k for k, o in assoc.config_options.items()
+                           if o["deviceClass"] == device_class
+                           and o["deviceId"] == str(device_id)
+                           and o["optionId"] == option_id]
+                opt = assoc.config_options.get(matches[0]) if len(matches) == 1 \
+                    else None
+            opt = dict(opt) if opt else None
+            known = sorted(assoc.config_options.keys())
+        if not matches:
+            return {"ok": False, "error": f"unknown option {device_class}/"
+                    f"{device_id}/{option_id} — not in the config-sync "
+                    "inventory (refusing to send a change for an option the "
+                    "EGM never advertised)", "knownOptions": known}
+        if len(matches) > 1:
+            return {"ok": False, "error": f"option {option_id} exists in "
+                    f"multiple groups {sorted(matches)} — pass optionGroupId "
+                    "to disambiguate"}
+        if opt.get("lossy"):
+            # parse_option_current_values could not round-trip this option's
+            # value shapes — re-emitting its pruned copy as the §9.15-mandated
+            # COMPLETE set would silently drop the un-parsed parts (the EGM
+            # rejects the incomplete set atomically at best). Unreachable on
+            # this AVP; guards future EGMs with nested complex options.
+            return {"ok": False, "error": f"option {option_id} carries value "
+                    "shapes the round-trip parser cannot re-emit faithfully "
+                    "(nested complexValue, §9.13.9) — refusing to send a "
+                    "silently-pruned 'complete' set (§9.15)"}
+        gid = opt["optionGroupId"]
+        cur = opt["currentValues"]
+        param_ids = option_value_param_ids(cur)
+        if values:
+            # Multi-param form: every requested paramId must exist; edit each
+            # in turn (edit_option_current_value deep-copies, so chaining the
+            # results never mutates the inventory copy).
+            unknown = sorted(set(values) - param_ids)
+            if unknown:
+                return {"ok": False, "error": f"unknown paramId(s) "
+                        f"{unknown} for option {option_id} — available: "
+                        f"{sorted(param_ids)}"}
+            new_cv, edits = cur, {}
+            for pid, val in values.items():
+                new_cv, n, old = edit_option_current_value(new_cv, pid, val)
+                if n != 1:  # defensive: param_ids said it exists exactly once
+                    return {"ok": False, "error": f"paramId {pid} matched "
+                            f"{n} values in option {option_id} — cannot "
+                            "target one"}
+                edits[pid] = {"old": old, "new": val}
+            target_param = old_value = None
+        else:
+            # Single-param form: explicit paramId if given (and present), else
+            # the option's SINGLE param when unambiguous; otherwise refuse.
+            if param_id:
+                if param_id not in param_ids:
+                    return {"ok": False, "error": f"unknown paramId {param_id} "
+                            f"for option {option_id} — available: "
+                            f"{sorted(param_ids)}"}
+                target_param = param_id
+            elif len(param_ids) == 1:
+                target_param = next(iter(param_ids))
+            else:
+                return {"ok": False, "error": f"option {option_id} has multiple "
+                        f"params {sorted(param_ids)} — pass paramId to pick one"}
+            new_cv, n, old_value = edit_option_current_value(cur, target_param,
+                                                             value)
+            if n != 1:  # defensive: param_ids said it exists exactly once
+                return {"ok": False, "error": f"paramId {target_param} matched "
+                        f"{n} values in option {option_id} — cannot target one"}
+            edits = {target_param: {"old": old_value, "new": value}}
+        cur_xml = build_option_current_values_xml(new_cv)
+        config_id = self.next_config_id()
+        abandoned = None
+        with assoc.lock:
+            # Check-and-claim ATOMICALLY (post-review 2026-07-02): the old
+            # pre-validation check ran OUTSIDE the lock, so two near-
+            # simultaneous /api/command calls could both pass it — both
+            # setOptionChange transactions hit the wire but only the second
+            # configId was tracked, leaving an untracked pending set on the
+            # EGM with no cancel path. ONE txn at a time: a terminal/absent
+            # stage starts fresh; a non-terminal record silent past
+            # OPTION_CHANGE_ABANDON_SEC is stamped timeout and REPLACED
+            # (spec-clean per §9.3.4 — a new set from this host overwrites
+            # the EGM's previous validated set), so a totally-silent EGM can
+            # no longer wedge the stage at authorizing/cancelling until a
+            # host restart.
+            if assoc.optionconfig_stage in ("setting", "authorizing",
+                                            "cancelling"):
+                age = time.time() - (assoc.option_change.get("progressTs")
+                                     or 0)
+                if age <= OPTION_CHANGE_ABANDON_SEC:
+                    return {"ok": False, "error": "an optionConfig change is "
+                            "already in flight (stage="
+                            f"{assoc.optionconfig_stage}) — cancel or wait "
+                            "for it to settle",
+                            "stage": assoc.optionconfig_stage}
+                abandoned = {"configId": assoc.option_change.get("configId"),
+                             "stage": assoc.optionconfig_stage,
+                             "age": int(age)}
+                assoc.option_change["result"] = "timeout"
+                assoc.option_change["progressTs"] = time.time()
+            assoc.optionconfig_stage = "setting"
+            assoc.pending_option_config_id = config_id
+            assoc.pending_option_txn_id = None
+            # "params" carries the per-param edit map for BOTH forms (single
+            # keeps paramId/oldValue/newValue too); it is created here and
+            # never mutated in place afterwards, so snapshot()'s shallow
+            # dict-copy of option_change stays consistent.
+            assoc.option_change = {
+                "configId": config_id, "deviceClass": device_class,
+                "deviceId": str(device_id), "optionGroupId": gid,
+                "optionId": option_id, "paramId": target_param,
+                "oldValue": old_value,
+                "newValue": value if not values else None,
+                "params": edits,
+                "applyCondition": apply_condition,
+                "transactionId": None, "sessionId": None,
+                "sentAt": now_iso(), "sentTs": time.time(),
+                "progressTs": time.time(), "result": "sent",
+                "changeException": None,
+            }
+        if abandoned:
+            log.warning("[%s] ⚙️  OPTION CHANGE ABANDONED cfg=%s — the "
+                        "previous cycle sat at stage=%s unanswered for %ss "
+                        "(> %ss = 4x the 30s timeToLive); stamped timeout and "
+                        "replaced. If the EGM still holds that validated set, "
+                        "this new set overwrites it (§9.3.4).", assoc.egm_id,
+                        abandoned["configId"], abandoned["stage"],
+                        abandoned["age"], OPTION_CHANGE_ABANDON_SEC)
+        edit_str = ", ".join(f"{p}: {e['old']!r} -> {e['new']!r}"
+                             for p, e in edits.items())
+        log.info("=" * 64)
+        log.info("[%s] ⚙️  OPTION CHANGE START cfg=%s — %s/%s/%s/%s "
+                 "%s (applyCondition=%s)", assoc.egm_id,
+                 config_id, device_class, device_id, gid, option_id,
+                 edit_str, apply_condition)
+        log.info("⚠️  setOptionChange can RECONFIGURE the machine. Once applied "
+                 "there is NO rollback (§9.16) — restore by sending the old "
+                 "value. applyCondition=G2S_cancel is a validate-only dry run.")
+        log.info("=" * 64)
+        self.enqueue_set_option_change(
+            assoc, config_id, device_class, str(device_id), gid, option_id,
+            cur_xml, apply_condition, disable_condition)
+        return {"ok": True, "configId": config_id, "optionId": option_id,
+                "paramId": target_param, "oldValue": old_value,
+                "newValue": value if not values else None, "params": edits,
+                "applyCondition": apply_condition, "stage": "setting"}
+
+    def cancel_option_change(self, assoc):
+        """Abort the in-flight optionConfig change (§9.16) — initiator-owner,
+        valid only while pending. Sends cancelOptionChange for the tracked
+        configId+transactionId and moves the stage to 'cancelling' (the
+        resulting optionChangeStatus G2S_cancelled confirms). Refuses when no
+        cancellable change is in flight."""
+        with assoc.lock:
+            oc = dict(assoc.option_change)
+            stage = assoc.optionconfig_stage
+            cfg = assoc.pending_option_config_id
+            txn = assoc.pending_option_txn_id
+        if stage not in ("setting", "authorizing"):
+            return {"ok": False, "error": "no cancellable optionConfig change "
+                    f"in flight (stage={stage})", "stage": stage}
+        if not txn:
+            # setOptionChange not yet acknowledged with a transactionId — the
+            # EGM has no set to cancel. Mark the local record aborted so a
+            # silently-ignored (pre-ownership) attempt does not wedge the state.
+            with assoc.lock:
+                if assoc.pending_option_config_id == cfg:
+                    assoc.optionconfig_stage = "cancelled"
+                    if assoc.option_change.get("configId") == cfg:
+                        assoc.option_change["result"] = "cancelled"
+                        assoc.option_change["progressTs"] = time.time()
+            log.warning("[%s] optionConfig change cfg=%s cancelled LOCALLY — no "
+                        "transactionId yet (EGM never validated the set; likely "
+                        "pre-ownership silence)", assoc.egm_id, cfg)
+            return {"ok": True, "cancelled": "local", "configId": cfg,
+                    "stage": "cancelled"}
+        with assoc.lock:
+            assoc.optionconfig_stage = "cancelling"
+            if assoc.option_change.get("configId") == cfg:
+                assoc.option_change["progressTs"] = time.time()
+        log.info("[%s] ⚙️  OPTION CHANGE CANCEL cfg=%s txn=%s — sending "
+                 "cancelOptionChange", assoc.egm_id, cfg, txn)
+        self.enqueue_cancel_option_change(assoc, cfg, txn)
+        return {"ok": True, "configId": cfg, "transactionId": txn,
+                "stage": "cancelling"}
+
+    def enable_remote_handpay(self, assoc):
+        """Purpose-built bench action (G2S-25/27): enable remote handpay
+        key-off-to-credits on G2S_handpay/1 — the wire path that unblocks
+        clearHandpay/setRemoteKeyOff after the 2026-07-02 discovery that the
+        AVP ships handpayRemoteCreditAllowed=false. Flips every
+        REMOTE_CREDIT_ENABLE_PARAMS param that (a) the option actually
+        advertises and (b) is not already at its target — all in ONE
+        setOptionChange transaction (§9.15 carries the complete param set
+        anyway). Already-enabled is a clean no-op that never touches the
+        wire. Verification is automatic: the terminal applied status
+        triggers a scoped getOptionList read-back that stamps the change
+        record verified/verifyFailed and re-lights handpayRemoteCredit-
+        Allowed. NOTE for tonight's test: a lockup raised BEFORE the flip
+        carries its own remoteCredit=false (Table 11.6) — raise a FRESH
+        handpay after 'verified' lands."""
+        dc, di = "G2S_handpay", "1"
+        gid = oid = "G2S_handpayOptions"
+        with assoc.lock:
+            opt = assoc.config_options.get(f"{dc}/{di}/{gid}/{oid}")
+            opt = dict(opt) if opt else None
+        if not opt:
+            return {"ok": False, "error": "handpay options are not in the "
+                    "config-sync inventory yet — run getOptionList first, "
+                    "then retry"}
+        vals = option_param_values(opt.get("currentValues"))
+        # Only touch params the EGM advertises; the critical flag is a hard
+        # requirement, the belt-and-braces companion is best-effort.
+        targets = {pid: want for pid, want in
+                   REMOTE_CREDIT_ENABLE_PARAMS.items() if pid in vals}
+        if "G2S_enabledRemoteCredit" not in targets:
+            return {"ok": False, "error": "G2S_enabledRemoteCredit is not "
+                    "among the handpay option's params — cannot enable "
+                    "remote key-off", "params": sorted(vals)}
+        before = {pid: vals.get(pid) for pid in targets}
+        # option_values_equal is the SAME comparator the post-apply verify
+        # uses — the guard and the verify can never disagree about 'at
+        # target' (post-review 2026-07-02).
+        changes = {pid: want for pid, want in targets.items()
+                   if not option_values_equal(vals.get(pid), want)}
+        if not changes:
+            log.info("[%s] 💰 enableRemoteHandpay: nothing to do — %s already "
+                     "at target", assoc.egm_id, before)
+            return {"ok": True, "alreadyEnabled": True, "before": before,
+                    "target": dict(targets)}
+        result = self.start_option_change_cycle(
+            assoc, device_class=dc, device_id=di, option_id=oid,
+            option_group_id=gid, values=changes)
+        if result.get("ok"):
+            result["before"] = before
+            result["target"] = dict(targets)
+            result["verify"] = ("automatic — on the applied status the host "
+                                "re-reads the handpay options and stamps the "
+                                "change record verified/verifyFailed; watch "
+                                "optionChange + handpayRemoteCreditAllowed "
+                                "in /api/status")
+        return result
+
+    #: Ticket header (C3): hub tenant -> the G2S_voucherTextFields paramId
+    #: it edits (G2S_voucher/1, option group G2S_voucherOptions — live-
+    #: inventoried on the AVP, whose factory G2S_propName is "YOUR
+    #: ESTABLISHMENT": the whole reason this feature exists). Ordered so
+    #: verdict logs read naturally.
+    TICKET_PARAM_MAP = (("propName", "G2S_propName"),
+                        ("line1", "G2S_propLine1"),
+                        ("line2", "G2S_propLine2"),
+                        ("titleCash", "G2S_titleCash"))
+
+    def push_ticket_header_g2s(self):
+        """Fan the hub ticket header to every ONLINE G2S EGM's printed
+        tickets via the PROVEN option-change cycle (G2S-27 multi-param form,
+        applyCondition G2S_immediate — the start_option_change_cycle
+        default). Called from the /api/settings write path after a header
+        save bumped ticket_rev and refreshed the cache.
+
+        Per machine, the enable_remote_handpay discipline: only paramIds
+        the option ADVERTISES are touched, only hub fields that are SET are
+        pushed (an unset line never blanks a machine's existing text — C1),
+        and params already at target are skipped via option_values_equal
+        (the shared comparator) — all-at-target is a clean no-op that never
+        touches the wire. Verdicts are logged AND returned so the
+        /api/settings reply carries them. BENCH SAFETY: any refusal (option
+        not in inventory, a cycle already in flight, or the EGM refusing
+        G2S_immediate later in the cycle) is recorded and STOPPED at —
+        never auto-escalated to disable conditions; retry is the operator
+        re-saving. A machine that joins LATER is NOT auto-pushed (flagged
+        as skipped in the build notes) — re-save after it joins."""
+        hdr = self.ticket_header()
+        if not hdr.get("propName"):
+            return []
+        dc, di = "G2S_voucher", "1"
+        gid, oid = "G2S_voucherOptions", "G2S_voucherTextFields"
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        verdicts = []
+        for a in assocs:
+            with a.lock:
+                online = a.comms_state == "onLine"
+                opt = a.config_options.get(f"{dc}/{di}/{gid}/{oid}")
+                opt = dict(opt) if opt else None
+            if not online:
+                continue
+            v = {"egmId": a.egm_id, "ok": False}
+            if not opt:
+                v["error"] = ("voucher text fields not in the config-sync "
+                              "inventory — run getOptionList on "
+                              "G2S_voucher/1, then re-save the header")
+            else:
+                vals = option_param_values(opt.get("currentValues"))
+                targets = {pid: hdr[f] for f, pid in self.TICKET_PARAM_MAP
+                           if hdr.get(f) is not None and pid in vals}
+                if "G2S_propName" not in targets:
+                    v["error"] = ("option advertises no G2S_propName param "
+                                  "— refusing a header push that cannot set "
+                                  "the property name")
+                else:
+                    changes = {pid: want for pid, want in targets.items()
+                               if not option_values_equal(vals.get(pid),
+                                                          want)}
+                    if not changes:
+                        v.update(ok=True, alreadyApplied=True)
+                    else:
+                        res = self.start_option_change_cycle(
+                            a, device_class=dc, device_id=di,
+                            option_group_id=gid, option_id=oid,
+                            values=changes)
+                        v["ok"] = bool(res.get("ok"))
+                        if v["ok"]:
+                            v["configId"] = res.get("configId")
+                            v["params"] = sorted(changes)
+                        else:
+                            v["error"] = str(res.get("error"))[:200]
+            verdicts.append(v)
+            log.info("🎫 [ticket:%s] header push -> %s", a.egm_id, v)
+        return verdicts
+
+    def enqueue_app_error(self, assoc, req, error_code, error_text):
+        """Class-level error response: empty class element + errorCode (§1.18.9).
+
+        NAMESPACE-CRITICAL: for IGT/GTK EXTENSION classes the class element must
+        live in its OWN namespace (e.g. <igtLicensing:licensing>), with the
+        standard attributes still g2s-prefixed — exactly as the AVP emits them.
+        Emitting <g2s:licensing> for an extension class makes the AVP's gSOAP
+        deserializer fail and return MSX004, which loops forever (wire-proven
+        2026-07-02 on licensing.getSecurityData)."""
+        def build(a):
+            cid = a.next_command_id()
+            ts = now_iso()
+            cls = req.get("class", "communications")
+            ns = req.get("classNs") or SCHEMA_NS
+            if ns and ns != SCHEMA_NS:
+                pfx = EXT_NS_PREFIX.get(ns, "ext")
+                ns_decls = f'xmlns:g2s="{SCHEMA_NS}" xmlns:{pfx}="{ns}"'
+                open_tag = f"{pfx}:{cls}"
+            else:
+                ns_decls = f'xmlns:g2s="{SCHEMA_NS}"'
+                open_tag = f"g2s:{cls}"
+            inner = (
+                f'<g2s:g2sMessage {ns_decls}>\n'
+                f'   <g2s:g2sBody g2s:hostId="{self.host_id}" '
+                f'g2s:egmId="{a.egm_id}" g2s:dateTimeSent="{ts}">\n'
+                f'      <{open_tag} g2s:deviceId="{req["deviceId"]}" '
+                f'g2s:dateTime="{ts}" g2s:commandId="{cid}" '
+                f'g2s:sessionType="G2S_response" g2s:sessionId="{req["sessionId"]}" '
+                f'g2s:timeToLive="0" g2s:errorCode="{error_code}" '
+                f'g2s:errorText="{error_text}"/>\n'
+                f"   </g2s:g2sBody>\n"
+                f"</g2s:g2sMessage>"
+            )
+            return inner, f"{error_code}({req['command']})"
+        self._enqueue(assoc, build)
+
+    # ---------------------------------------------------------------- inbound
+
+    def handle_g2s_message(self, inner_xml, transport_egm_id):
+        """Process one inbound g2sMessage. Returns the inner XML for the
+        synchronous HTTP reply (a g2sAck unless --inline)."""
+        try:
+            msg = self.parse_inner(inner_xml)
+        except ET.ParseError as e:
+            log.error("inner XML parse error: %s", e)
+            return self.build_inner_g2s_ack(
+                transport_egm_id or "G2S_undecipherable",
+                "G2S_MSX004", "Incomplete or malformed XML.")
+
+        egm_id = transport_egm_id or msg.get("egmId") or "G2S_undecipherable"
+
+        if msg["kind"] == "g2sAck":
+            # EGM acked one of our messages on a fresh inbound connection.
+            log.info("[%s] inbound g2sAck errorCode=%s", egm_id, msg["errorCode"])
+            return self.build_inner_g2s_ack(egm_id)
+
+        if msg["kind"] != "g2sBody" or not msg.get("classes"):
+            return self.build_inner_g2s_ack(
+                egm_id, "G2S_MSX004", "Incomplete or malformed XML.")
+
+        assoc = self.assoc(egm_id)
+        assoc.last_seen = time.time()
+
+        # G2S-20: every inbound g2sBody timestamps the EGM's clock. Track the
+        # rolling skew vs ours (negative = EGM behind) — it feeds the join-time
+        # auto clock-sync and /api/status egmClockSkewSec.
+        egm_dt = parse_g2s_datetime(msg.get("dateTimeSent"))
+        if egm_dt is not None:
+            with assoc.lock:
+                assoc.egm_clock_skew_sec = round(
+                    (egm_dt - datetime.now(timezone.utc)).total_seconds(), 3)
+
+        commands = [c for c in msg["classes"]]
+        has_comms_online = any(c["command"] == "commsOnLine" for c in commands)
+
+        # MSX003 rule (spec p.18): before commsOnLine is processed, refuse to
+        # process anything except commsOnLine (strict §1.18.2 pre-join gate).
+        # The gate passes a commsOnLine batch straight through to dispatch, so
+        # a fresh handshake is served on first arrival (§2.3.3 allows app-
+        # processing a commsOnLine whose message-level ack said MSX003). The
+        # once-shipped "restart nudge" (G2S-38) that serviced pre-join
+        # commsClosing here was live-proven inert — the AVP re-handshakes on
+        # its own internal timer — and was retired (GR-12).
+        if assoc.comms_online_seen == 0 and not has_comms_online:
+            log.warning("[%s] %s before commsOnLine -> G2S_MSX003", egm_id,
+                        [c["command"] for c in commands])
+            return self.build_inner_g2s_ack(
+                egm_id, "G2S_MSX003", "Communications not online.")
+
+        inline_response = None
+        for c in commands:
+            inline_response = self.dispatch(assoc, c) or inline_response
+
+        if self.inline and inline_response is not None:
+            return inline_response
+        return self.build_inner_g2s_ack(egm_id)
+
+    def dispatch(self, assoc, req):
+        """Handle one class-level command. Outbound sends run on a worker
+        thread, serialized per association so commandIds hit the wire in
+        order. Returns inner XML only in --inline mode."""
+        cmd, stype = req["command"], req["sessionType"]
+        log.info("[%s] <- %s.%s commandId=%s sessionId=%s type=%s",
+                 assoc.egm_id, req["class"], cmd, req["commandId"],
+                 req["sessionId"], stype)
+
+        # A class-level errorCode on a RESPONSE means the EGM rejected one of our
+        # requests (e.g. setEventSub -> G2S_EHX003 if host 1 weren't the owner).
+        # Surface it loudly; there is usually no child command element to match
+        # below, so this is the only place it would otherwise be visible.
+        rerr = req.get("errorCode")
+        if rerr and rerr != "G2S_none":
+            rtext = req.get("errorText")
+            log.warning("[%s] %s.%s carried class-level errorCode=%s — the EGM "
+                        "REJECTED our request%s", assoc.egm_id, req["class"],
+                        cmd, rerr, f' (errorText="{rtext}")' if rtext else "")
+            # Glass sequencer fail-fast (live-hit 2026-07-10: MDX003 "Must
+            # release loaded content." rejected the load itself): a
+            # mediaDisplay-class rejection while a push still sits at
+            # 'loading' is that push's verdict — clear it NOW with an
+            # actionable line instead of parking the bench behind the 25s
+            # sweep. 'activating' is deliberately NOT cleared: MDX005
+            # ("Content not loaded.") there is the expected too-early
+            # verdict the poll heartbeat retries through.
+            if req["class"] == "mediaDisplay":
+                mdev = str(req.get("deviceId") or "")
+                cleared = []
+                with assoc.lock:
+                    for d, p in list(assoc.glass_push.items()):
+                        if p.get("stage") == "loading" and \
+                                (not mdev or mdev == d):
+                            del assoc.glass_push[d]
+                            cleared.append((d, p))
+                for d, p in cleared:
+                    log.warning("⚠️ 🪟 [%s] glass push dev=%s (content=%s) "
+                                "REJECTED at load (%s%s) — cleared now "
+                                "(fail-fast). If the window holds foreign "
+                                "content, the manual logstatus/log/release "
+                                "probe rungs recover it.",
+                                assoc.egm_id, d, p.get("contentId"), rerr,
+                                f' "{rtext}"' if rtext else "")
+            # G2S-19: a commConfig-class error while the ownership cycle is
+            # mid-flight is its verdict (error responses carry NO child
+            # command, so the commChangeStatus handler below can never fire).
+            # Fail the stage AND leave config mode — a rejected setCommChange
+            # otherwise strands the EGM in commConfig mode showing the
+            # config-mode screen until an operator intervenes (observed live
+            # on the AVP 2026-07-07: two CCX018 rejections left the cabinet
+            # sitting in config mode with no exit).
+            if req["class"] == "commConfig":
+                failed_mid_cycle = False
+                with assoc.lock:
+                    if assoc.commconfig_stage in ("entering", "changing",
+                                                  "authorizing"):
+                        assoc.commconfig_stage = "failed"
+                        failed_mid_cycle = True
+                if failed_mid_cycle:
+                    log.warning("[%s] ❌ OWNERSHIP CYCLE FAILED (%s) — exiting "
+                                "commConfig mode to release the EGM",
+                                assoc.egm_id, rerr)
+                    self.enqueue_enter_comm_config_mode(assoc, enable=False)
+            # G2S-20: a cabinet-class error while a setDateTime is pending is
+            # its verdict (error responses carry NO child command per §1.18.9,
+            # so nothing below can match). G2S_CBX001 = the EGM's clock is
+            # disciplined by another time source (e.g. our NTP) — setDateTime
+            # is ignored by design there, not a fault. Best-effort attribution:
+            # the pending window is seconds wide and cabinet traffic is sparse.
+            if req["class"] == "cabinet":
+                # RB: EXACT attribution FIRST — a resetProcessor rejection
+                # (the OPTIONAL command this AVP014 R2 refuses) echoes the
+                # probe's sessionId. G2S_APX008 = EGM does not support it;
+                # G2S_CBX002 = supported but cannot reset right now. Stamp
+                # the probe verdict so it never bleeds into the state-change
+                # or clock-sync records below.
+                reset_rejected = False
+                with assoc.lock:
+                    pr = assoc.last_reset_probe
+                    if pr.get("kind") == "resetProcessor" and \
+                            pr.get("outcome") == "sent" and \
+                            req["sessionId"] == pr.get("sessionId"):
+                        pr["outcome"] = f"error:{rerr}"
+                        pr["outcomeAt"] = now_iso()
+                        reset_rejected = True
+                if reset_rejected:
+                    hint = {
+                        "G2S_APX008": "EGM does NOT support resetProcessor "
+                                      "(optional command) — use "
+                                      "rebootEgmScript (plan B)",
+                        "G2S_CBX002": "supported but CANNOT RESET right now "
+                                      "(operational conditions) — retry",
+                    }.get(rerr, "")
+                    log.warning("[%s] 🔄 RESET PROCESSOR REFUSED — %s%s",
+                                assoc.egm_id, rerr,
+                                f" ({hint})" if hint else "")
+                    self._reset_activity(assoc, f"🔄 Cabinet reset refused "
+                                         f"({rerr})", f"error:{rerr}")
+                # Cabinet control (G2S-20 rest): EXACT attribution next —
+                # the pending setCabinetState recorded its sessionId and an
+                # error response echoes it (§1.18.9 responses pair via
+                # sessionId), so a state-change rejection never bleeds into
+                # the clock-sync record below (or vice versa).
+                state_rejected = False
+                with assoc.lock:
+                    csc = assoc.cabinet_state_change
+                    if not reset_rejected and \
+                            csc.get("result") in ("sent", "acked") and \
+                            req["sessionId"] == csc.get("sessionId"):
+                        csc["result"] = f"error:{rerr}"
+                        state_rejected = True
+                        want = csc.get("enable")
+                if state_rejected:
+                    log.warning("[%s] 🖥️ SET CABINET STATE REJECTED "
+                                "(enable=%s) — %s", assoc.egm_id, want, rerr)
+                rejected = False
+                with assoc.lock:
+                    if not state_rejected and not reset_rejected and \
+                            assoc.clock_sync.get("result") in ("sent", "acked"):
+                        assoc.clock_sync["result"] = f"error:{rerr}"
+                        rejected = True
+                if rejected:
+                    log.warning("[%s] 🕒 CLOCK SYNC REJECTED — %s%s",
+                                assoc.egm_id, rerr,
+                                " (EGM uses another time source, e.g. NTP — "
+                                "expected, not a fault)"
+                                if rerr == "G2S_CBX001" else "")
+            # G2S-25: a handpay-class error while a setRemoteKeyOff is in
+            # flight is its verdict (Table 11.22; no remoteKeyOffAck, no
+            # JPE103). Attribute it to the most recently sent key-off —
+            # best-effort like the cabinet case; the record stays PENDING
+            # because keyedOff is authoritative (§11.16): after G2S_JPX003
+            # an attendant's local key-off is likely already racing us and
+            # its keyedOff will close the entry out.
+            elif req["class"] == "handpay":
+                target = None
+                with assoc.lock:
+                    for rec in assoc.handpays_pending.values():
+                        if rec.get("state") in ("keyOffSent", "keyOffAcked") \
+                                and (target is None
+                                     or rec.get("keyOffSentTs", 0)
+                                     > target.get("keyOffSentTs", 0)):
+                            target = rec
+                    if target is not None:
+                        target["state"] = f"error:{rerr}"
+                        txn = target["transactionId"]
+                if target is not None:
+                    hint = {
+                        "G2S_JPX001": "invalid key-off type",
+                        "G2S_JPX002": "key-off type NOT ALLOWED — check "
+                                      "handpayOptions (G2S_enabledRemote*) "
+                                      "and the request's remote* flags",
+                        "G2S_JPX003": "transaction not pending — an "
+                                      "attendant may have keyed it off "
+                                      "locally; the keyedOff is "
+                                      "authoritative",
+                        "G2S_JPX004": "invalid key-off amount",
+                    }.get(rerr, "")
+                    log.warning("[%s] 💰 REMOTE KEY-OFF REJECTED txn=%s — "
+                                "%s%s", assoc.egm_id, txn, rerr,
+                                f" ({hint})" if hint else "")
+            # G2S-22: a gamePlay-class error while a setGamePlayState is
+            # pending is its verdict (error responses carry NO child command
+            # per §1.18.9, so the gamePlayStatus handler below can never
+            # match). EXACT attribution: BOTH the deviceId AND the recorded
+            # sessionId must echo — a rejected read on another device can
+            # never flip a pending state change.
+            elif req["class"] == "gamePlay":
+                gp_rejected = False
+                with assoc.lock:
+                    gp = assoc.game_play.get(req["deviceId"])
+                    sc = (gp or {}).get("stateChange") or {}
+                    if gp is not None and \
+                            sc.get("result") in ("sent", "acked") and \
+                            req["sessionId"] == sc.get("sessionId"):
+                        gp["stateChange"] = dict(sc, result=f"error:{rerr}")
+                        gp_rejected = True
+                        want = sc.get("enable")
+                if gp_rejected:
+                    hint = {
+                        "G2S_GPX001": "invalid denomination specified",
+                        "G2S_GPX002": "game-play-device collision — two "
+                                      "devices with the same theme + active "
+                                      "denom (§6.2.4)",
+                    }.get(rerr, "")
+                    log.warning("[%s] 🎰 SET GAME PLAY STATE REJECTED dev=%s "
+                                "(enable=%s) — %s%s", assoc.egm_id,
+                                req["deviceId"], want, rerr,
+                                f" ({hint})" if hint else "")
+            # G2S-27: an optionConfig-class error while a change cycle is in
+            # flight is its verdict (error responses carry NO child command per
+            # §1.18.9, so the optionChangeStatus handler can never match). The
+            # whole set is rejected atomically and never enters the change log
+            # (§9.15). Fail the tracked record loudly with the OCX hint.
+            elif req["class"] == "optionConfig":
+                oc_rejected = False
+                with assoc.lock:
+                    oc = assoc.option_change
+                    if assoc.optionconfig_stage in (
+                            "setting", "authorizing", "cancelling") and \
+                            oc.get("result") in ("sent", "acked", "pending",
+                                                 "authorized"):
+                        assoc.optionconfig_stage = "failed"
+                        oc["result"] = f"error:{rerr}"
+                        oc["progressTs"] = time.time()
+                        oc_rejected = True
+                        oid = oc.get("optionId")
+                if oc_rejected:
+                    hint = OPTION_CONFIG_ERRORS.get(rerr, "")
+                    log.warning("[%s] ⚙️ OPTION CHANGE REJECTED (option=%s) — "
+                                "%s%s", assoc.egm_id, oid, rerr,
+                                f" ({hint})" if hint else "")
+            # G2S-39: a wat-class error while a transfer request is in flight
+            # is its verdict (error responses carry NO child command per
+            # §1.18.9). Best-effort attribution to the newest still-live
+            # transfer record — wat traffic is sparse and the window is
+            # seconds wide (the cabinet clock-sync treatment). The durable
+            # store record parks at error:* so the escrow-free request can't
+            # wedge the pending list forever; a later commitTransfer (the
+            # §22.26 mandate once a transactionId exists) still closes it out.
+            elif req["class"] == "wat":
+                target = None
+                with assoc.lock:
+                    for r in assoc.wat_transfers:
+                        if r.get("state") in WAT_ACTIVE_STATES and \
+                                (target is None
+                                 or (r.get("createdAt") or "")
+                                 > (target.get("createdAt") or "")):
+                            target = r
+                if target is not None and \
+                        target.get("cancelRequestedAt") and \
+                        not target.get("cancelAckedAt"):
+                    # The in-flight command on this record is OUR OWN
+                    # cancelRequest — the error is ITS verdict (G2S_WTX009
+                    # "unable to cancel", ...): the CANCEL failed, not the
+                    # transfer. Never park the record at error:* here — the
+                    # transfer is still live on the EGM and its mandated
+                    # commitTransfer close-out stays authoritative (parking
+                    # it also mis-showed a proceeding transfer as dead).
+                    upd = self.wat_store.mark_cancel(
+                        assoc.egm_id, target.get("transactionId"),
+                        "cancelRejectedAt")
+                    self._wat_mirror(assoc, upd)
+                    hint = WAT_ERRORS.get(rerr, "")
+                    log.warning("[%s] 🏦 WAT CANCEL REJECTED req=%s txn=%s "
+                                "— %s%s; the transfer itself proceeds "
+                                "(commitTransfer will close it out)",
+                                assoc.egm_id, target.get("requestId"),
+                                target.get("transactionId"), rerr,
+                                f" ({hint})" if hint else "")
+                elif target is not None:
+                    upd = self.wat_store.mark_error(
+                        assoc.egm_id,
+                        txn_id=target.get("transactionId"),
+                        request_id=target.get("requestId"), code=rerr)
+                    self._wat_mirror(assoc, upd)
+                    hint = WAT_ERRORS.get(rerr, "")
+                    log.warning("[%s] 🏦 WAT REQUEST REJECTED req=%s txn=%s — "
+                                "%s%s", assoc.egm_id, target.get("requestId"),
+                                target.get("transactionId"), rerr,
+                                f" ({hint})" if hint else "")
+            # RB: a download-class error is the reboot script's verdict —
+            # the ONLY download traffic this host originates is the
+            # setDownloadState + setScript(resetEgm) pair. Wire-proven
+            # 2026-07-07 (AVP014 R2): G2S_APX999 with errorText "EGM is not
+            # idle. There are 10 second(s) remaining until the EGM is
+            # idle." — the machine idle-gates script execution, and a
+            # hard-tilted machine never reaches idle. No state to fail
+            # (fire-and-observe, like resetProcessor); just shout with the
+            # actionable hint. The generic warning above already carried
+            # the raw errorText.
+            elif req["class"] == "download":
+                hint = {
+                    "G2S_APX999": "EGM not idle — the script path IS "
+                                  "supported but idle-gated; clear the "
+                                  "tilt/finish the game and re-fire",
+                    "G2S_DLX006": "scriptId already used — re-fire (a "
+                                  "fresh default id is minted per attempt) "
+                                  "or override with {\"scriptId\": N}",
+                }.get(rerr, "")
+                # Stamp the probe verdict (the only download traffic we
+                # originate is the reboot pair) so the refusal surfaces in
+                # /api/status.lastResetProbe alongside the log shout.
+                with assoc.lock:
+                    pr = assoc.last_reset_probe
+                    if pr.get("kind") == "script" and \
+                            pr.get("outcome") in ("sent", "inProgress"):
+                        pr["outcome"] = f"error:{rerr}"
+                        pr["outcomeAt"] = now_iso()
+                log.warning("⬇️ [%s] REBOOT SCRIPT PATH REJECTED — %s%s",
+                            assoc.egm_id, rerr,
+                            f" ({hint})" if hint else "")
+                self._reset_activity(assoc, f"⬇️ Reset script refused "
+                                     f"({rerr})", f"error:{rerr}")
+
+        if cmd == "commsOnLine":
+            el = req["commandEl"]
+            loc = attr(el, "egmLocation")
+            flags = {f: attr(el, f) for f in
+                     ("deviceReset", "deviceChanged",
+                      "subscriptionLost", "metersReset")}
+            # Epoch reset + bookkeeping must be atomic vs the outbound worker
+            # (it checks epoch + allocates commandIds under the same lock), so
+            # a re-commsOnLine can't split an in-flight send across epochs
+            # (the race the adversarial review reproduced).
+            with assoc.lock:
+                gap = time.time() - assoc.last_comms_online
+                # GR-15/GR-01: capture the outage evidence BEFORE new_epoch
+                # wipes it — it drives the evidence-based rejoin banner below.
+                was_offline = assoc.comms_state == "offline"
+                offline_since = assoc.offline_since
+                suppressed = assoc.offline_suppressed
+                ka_fail_streak = assoc.keepalive_fail_streak
+                assoc.comms_online_seen += 1
+                assoc.last_comms_online = time.time()
+                assoc.device_id = req["deviceId"]
+                if loc:
+                    assoc.egm_location = loc
+                assoc.last_flags = flags
+                # G2S-16/GR-14: a commsOnLine means our record of the EGM's
+                # standing subscriptions can no longer be trusted, so mark the
+                # recorded meter subs inactive on EVERY commsOnLine. The
+                # spec's reset flags (subscriptionLost/deviceReset/...) are
+                # UNRELIABLE on this firmware: the pre-fix 20250725 capture
+                # carried all four ="true", but BOTH live joins post-d556ad2
+                # (2026-07-02, including the rejoin after an 8h power-off)
+                # carried NONE of them — flag-gating left /api/status showing
+                # stale-active subs through the whole outage. The join path
+                # must keep re-arming setMeterSub unconditionally (below,
+                # gated only on meter_subs_desired — wire-proven at both live
+                # joins). Wholesale replacement with fresh dicts: snapshot()
+                # may be serializing the old ones.
+                assoc.meter_subs = {
+                    k: dict(v, active=False, lost=True)
+                    for k, v in assoc.meter_subs.items()}
+                assoc.new_epoch()
+                seen = assoc.comms_online_seen
+            # G2S-39: the EGM says it reset (deviceReset/metersReset) — any
+            # host push still waiting on that machine's answer (requested/
+            # pending) died with its RAM, and the epoch bump above just
+            # dropped any still-queued initiateRequest too: abandon them so
+            # they can't wedge pendingTransfers forever. Full fencing of
+            # the transfer ring keyed on these flags is deliberately NOT
+            # done — this AVP raises all four flags on EVERY boot (capture
+            # 20250725), so they cannot discriminate a RAM clear from a
+            # plain reboot, and the §22.31 cross-reboot commitTransfer
+            # retry must keep deduping. transactionId reuse after a REAL
+            # RAM clear is handled where it bites instead: the field-match
+            # reuse checks in WatStore.on_initiate/on_commit.
+            if flags.get("deviceReset") == "true" or \
+                    flags.get("metersReset") == "true":
+                for r in self.wat_store.abandon_open_requests(
+                        assoc.egm_id, "egm reset (commsOnLine flags)"):
+                    self._wat_mirror(assoc, r)
+                    log.info("🏦 [%s] WAT push req=%s (txn=%s) ABANDONED — "
+                             "the EGM reported a reset before answering it",
+                             assoc.egm_id, r.get("requestId"),
+                             r.get("transactionId"))
+            if seen > 1:
+                # GR-15: diagnose the rejoin from evidence instead of
+                # hardcoding the pre-d556ad2 "ack was not accepted" theory
+                # onto every rejoin (it fired on a routine 8.5h power-cycle
+                # and pointed straight at the dead year-long-blocker).
+                if was_offline:
+                    down_for = time.time() - offline_since \
+                        if offline_since else gap
+                    log.info(
+                        "🔌 [%s] RE-HANDSHAKE #%d — LINK RESTORED: EGM "
+                        "returned after %.0fs offline (power cycle or "
+                        "network loss; %d suppressed sends while down); "
+                        "flags=%s", assoc.egm_id, seen, down_for,
+                        suppressed, flags)
+                elif gap >= 90 or ka_fail_streak:
+                    log.info(
+                        "[%s] RE-HANDSHAKE #%d (gap %.0fs since the last "
+                        "commsOnLine%s) — EGM returned after a quiet gap "
+                        "(power cycle or network loss); flags=%s",
+                        assoc.egm_id, seen, gap,
+                        f"; {ka_fail_streak} keepAlive POST failure(s) "
+                        f"pending" if ka_fail_streak else "", flags)
+                else:
+                    # Short-gap rapid rejoin with no outage evidence — the
+                    # signature that CAN mean our commsOnLineAck is being
+                    # rejected (the watchdog flags the loop at >=3 in 90s).
+                    log.warning(
+                        "[%s] RE-HANDSHAKE #%d only %.0fs after the "
+                        "previous one — rapid re-join; if this repeats the "
+                        "EGM may be rejecting our commsOnLineAck (watchdog "
+                        "flags the loop); flags=%s",
+                        assoc.egm_id, seen, gap, flags)
+            else:
+                log.info("[%s] commsOnLine #1 egmLocation=%s flags=%s",
+                         assoc.egm_id, assoc.egm_location, flags)
+            if self.inline:
+                return self._inline(
+                    assoc,
+                    f'<g2s:commsOnLineAck g2s:syncTimer="{self.sync_timer}"/>',
+                    req["sessionId"])
+            self.enqueue_comms_online_ack(assoc, req)
+
+        elif cmd == "commsDisabled":
+            if assoc.comms_state in ("sync(expected)", "opening"):
+                assoc.comms_state = "sync"
+                log.info("[%s] EGM is in SYNC state (commsDisabled heartbeat) "
+                         "— commsOnLineAck WAS ACCEPTED 🎉", assoc.egm_id)
+            if self.inline:
+                return self._inline(
+                    assoc,
+                    f'<g2s:commsDisabledAck g2s:syncTimer="{self.sync_timer}"/>',
+                    req["sessionId"])
+            self.enqueue_comms_disabled_ack_then_enable(assoc, req)
+
+        elif cmd == "keepAlive":
+            assoc.last_keepalive = time.time()
+            if self.inline:
+                return self._inline(assoc, "<g2s:keepAliveAck/>",
+                                    req["sessionId"])
+            self.enqueue_keep_alive_ack(assoc, req)
+
+        elif cmd == "keepAliveAck" and stype == "G2S_response":
+            # The EGM answered OUR host keepAlive ping (§2.30). This is the
+            # smoking-gun signal that was missing (lastKeepAlive=0): it proves
+            # the link is alive in both directions and resets the idle timer
+            # that would otherwise drive the §2.3.9 re-handshake. No reply.
+            assoc.last_keepalive = time.time()
+            log.debug("[%s] keepAliveAck — link confirmed alive", assoc.egm_id)
+
+        elif cmd == "commsStatus" and stype == "G2S_response":
+            el = req["commandEl"]
+            state = attr(el, "commsState")
+            log.info("[%s] commsStatus: commsState=%s transportState=%s "
+                     "hostEnabled=%s egmEnabled=%s", assoc.egm_id, state,
+                     attr(el, "transportState"), attr(el, "hostEnabled"),
+                     attr(el, "egmEnabled"))
+            if state == "G2S_onLine":
+                # GR-01 recovery path C: an inbound commsStatus refresh while
+                # we hold the link offline proves the EGM side is alive and
+                # still in-session (no re-handshake) — promote back with ONE
+                # INFO banner. The pinger is still running in probe mode and
+                # resumes full cadence on its next wake.
+                with assoc.lock:
+                    restored_after = 0.0
+                    if assoc.comms_state == "offline":
+                        restored_after = time.time() - (assoc.offline_since or
+                                                        time.time())
+                        rest_suppressed = assoc.offline_suppressed
+                        assoc.offline_since = 0.0
+                        assoc.offline_suppressed = 0
+                        assoc.keepalive_fail_streak = 0
+                    # Promote INSIDE the same lock block as the offline check:
+                    # a lock-free write here let a watchdog mark_link_down
+                    # interleave between check and promote, leaving
+                    # comms_state 'onLine' with offline_since stamped and the
+                    # meter subs marked lost — a mixed state neither restore
+                    # path (both gated on comms_state=='offline') could clear.
+                    assoc.comms_state = "onLine"
+                if restored_after:
+                    log.info(
+                        "🔌 [%s] LINK RESTORED — inbound commsStatus "
+                        "G2S_onLine after %.0fs offline (%d suppressed "
+                        "sends)", assoc.egm_id, restored_after,
+                        rest_suppressed)
+                # Check-and-set the once-per-epoch guards atomically so two
+                # concurrent onLine messages can't start two pingers or double-
+                # enqueue the one-shot extras. The spawn/enqueue happen OUTSIDE
+                # the lock: _start_keepalive_pinger and _enqueue both re-acquire
+                # assoc.lock and threading.Lock is not reentrant. GR-18: the
+                # epoch is captured HERE, in the same lock block that sets the
+                # guards, and passed into every pinger/enqueue below — a
+                # re-commsOnLine landing after this block resets the guards
+                # and bumps the epoch, so the jobs this in-flight handler
+                # already committed to must stay tagged with THIS epoch (a
+                # fresh read would re-tag them to the new epoch, double-
+                # starting the pinger and duplicating the join extras).
+                with assoc.lock:
+                    epoch = assoc.epoch
+                    first_join = not assoc.keepalive_pinger_started
+                    assoc.keepalive_pinger_started = True
+                    start_keepalive = bool(self.keepalive_ms) and \
+                        not assoc.keepalive_sent
+                    if start_keepalive:
+                        assoc.keepalive_sent = True
+                    start_harvest = self.harvest and not assoc.harvest_sent
+                    if start_harvest:
+                        assoc.harvest_sent = True
+                    start_subscribe = self.subscribe and not assoc.eventsub_sent
+                    if start_subscribe:
+                        assoc.eventsub_sent = True
+                    start_metersub = assoc.meter_subs_desired and \
+                        not assoc.metersub_sent
+                    if start_metersub:
+                        assoc.metersub_sent = True
+                    # GR-10: bootstrap the optionConfig inventory when we
+                    # have NONE, or when what we have was seeded from the
+                    # persisted store (stale-capable — the EGM may have
+                    # changed options while the host was down; the readback
+                    # is read-only and silence-tolerant, so one join-time
+                    # read buys ground truth). An inventory parsed LIVE this
+                    # process (config-sync re-fires only on deviceReset)
+                    # makes the read redundant, so re-joins skip it.
+                    need_optlist = not assoc.config_options or \
+                        assoc.config_seeded
+                    skew = assoc.egm_clock_skew_sec
+                if first_join:
+                    # Announce the join exactly ONCE per epoch. The AVP re-sends
+                    # a commsStatus G2S_onLine refresh ~every 30s while healthy;
+                    # the commsStatus line above already records each refresh, so
+                    # we don't re-print the banner (that was cosmetic log noise).
+                    assoc.joined_at = now_iso()
+                    assoc.joined_ts = time.time()
+                    log.info("=" * 64)
+                    log.info("🎰🎰🎰  [%s] MACHINE JOINED — commsState=G2S_onLine"
+                             "  🎰🎰🎰", assoc.egm_id)
+                    log.info("=" * 64)
+                    # DURABILITY: start the host keepAlive pinger so BOTH
+                    # transport directions stay warm and the EGM's idle/no-
+                    # response monitor never trips into the §2.3.9 re-handshake.
+                    # Thread self-cancels when the epoch is superseded.
+                    self._start_keepalive_pinger(assoc, epoch)
+                    # G2S-20 AUTO CLOCK-SYNC: the real AVP drifts (observed
+                    # ~19min behind) and >30s of skew risks G2S_APX011 request
+                    # expiry. Sync FIRST — ahead of the other post-join sends —
+                    # so they go out under a believable clock. Fires at most
+                    # once per epoch (first_join); a silent/refusing EGM just
+                    # leaves clock_sync at sent -> lazy timeout (no retry).
+                    big_skew = skew is not None and \
+                        abs(skew) > CLOCK_SKEW_SYNC_SEC
+                    if big_skew and self.auto_clock:
+                        log.info("=" * 64)
+                        log.info("🕒 [%s] AUTO CLOCK-SYNC — EGM clock skew "
+                                 "%+.1fs exceeds %ds; sending cabinet."
+                                 "setDateTime (disable with --no-auto-clock)",
+                                 assoc.egm_id, skew, CLOCK_SKEW_SYNC_SEC)
+                        log.info("=" * 64)
+                        self.enqueue_set_date_time(assoc, epoch=epoch)
+                    elif big_skew:
+                        log.warning("[%s] 🕒 EGM clock skew %+.1fs exceeds %ds "
+                                    "but auto clock-sync is DISABLED "
+                                    "(--no-auto-clock) — G2S_APX011 request-"
+                                    "expiry risk", assoc.egm_id, skew,
+                                    CLOCK_SKEW_SYNC_SEC)
+                    # Post-join extras (each once per epoch, ordered on the FIFO):
+                    if start_keepalive:
+                        self.enqueue_set_keep_alive(assoc, epoch=epoch)
+                    if start_harvest:
+                        self.enqueue_get_descriptor(assoc, epoch=epoch)
+                        # Also probe the host table — reveals whether host 1 is
+                        # registered/owns devices, explaining an empty harvest.
+                        self.enqueue_get_comm_host_list(assoc, epoch=epoch)
+                    if start_subscribe:
+                        # THE data path: profile (confirm ownership) ->
+                        # supportedEvents (catalog) -> setEventSub (firehose).
+                        # FIFO worker preserves this order.
+                        self.enqueue_get_event_handler_profile(assoc,
+                                                               epoch=epoch)
+                        self.enqueue_get_supported_events(assoc, epoch=epoch)
+                        self.enqueue_set_event_sub(assoc, epoch=epoch)
+                    if start_metersub:
+                        # G2S-16 re-arm: the AVP drops standing meter subs
+                        # across every re-handshake (subscriptionLost=true on
+                        # each commsOnLine) — without this, the periodic/EOD
+                        # meterInfo feed died silently after any EGM reboot
+                        # while /api/status kept showing the subs active.
+                        # Mirrors the per-epoch setEventSub re-arm; gated on
+                        # meter_subs_desired (now default TRUE — the live AVP
+                        # honors setMeterSub straight from the join, no
+                        # ownership cycle needed) so a deliberate
+                        # clearMeterSub stays cleared.
+                        self.enqueue_set_meter_sub(assoc, epoch=epoch)
+                    # Post-join reads, UN-GATED 2026-07-02: these used to ride
+                    # the post-ownership re-probe, but the "ownership gate"
+                    # was a symptom of the double-wrap ack bug — the live AVP
+                    # (first-light session) answers reads right out of the
+                    # join. Once per epoch, FIFO order behind the setMeterSub:
+                    # cabinet reads first, then the event-log backfill sweep.
+                    # The 119-device gamePlay sweep does NOT enqueue here —
+                    # it starts when descriptorList reveals the real device
+                    # list (staggered batches, see _start_game_play_sweep).
+                    self.enqueue_get_cabinet_status(assoc, epoch=epoch)
+                    self.enqueue_get_meter_info(assoc, epoch=epoch)
+                    self.enqueue_get_event_handler_log(assoc, epoch=epoch)
+                    # G2S-39 WAT join probe: status+profile for the two wat
+                    # devices the live AVP exposes (G2S_wat/1 and /2), so
+                    # /api/status.wat populates with zero operator action.
+                    # Four cheap silence-tolerant reads per epoch — nothing
+                    # like the 357-read gamePlay sweep this ordering rule
+                    # exists for.
+                    for wat_dev in ("1", "2"):
+                        self.enqueue_get_wat_status(assoc, wat_dev,
+                                                    epoch=epoch)
+                        self.enqueue_get_wat_profile(assoc, wat_dev,
+                                                     epoch=epoch)
+                    # G2S-40 voucher device join probe: status+profile for
+                    # the config-sync-revealed voucher device (else 1), so
+                    # /api/status.voucherDevice populates and the profile's
+                    # maxValIds drives the getValidationData issuance cap
+                    # without operator action. Two more cheap silence-
+                    # tolerant reads, same rationale as the WAT probe.
+                    self.enqueue_get_voucher_status(assoc, epoch=epoch)
+                    self.enqueue_get_voucher_profile(assoc, epoch=epoch)
+                    # GR-10 one-shot: with an EMPTY option inventory (fresh
+                    # host, nothing persisted) ask for the whole thing —
+                    # deviceClass=G2S_all/deviceId=-1 like getDescriptor.
+                    # The answer is an optionList in response form; the
+                    # handler parses + persists it, lighting the handpay
+                    # permission lamp without waiting for a deviceReset.
+                    # Silence-tolerant like every other extra: an ignoring
+                    # EGM just leaves the inventory empty (and the next
+                    # epoch retries).
+                    if need_optlist:
+                        self.enqueue_get_option_list(assoc, epoch=epoch)
+            elif state:
+                assoc.comms_state = state.replace("G2S_", "")
+
+        elif cmd == "setKeepAliveAck" and stype == "G2S_response":
+            # GR-27: the EGM never originates keepAlives on this firmware
+            # (0 inbound in 8.5h live) — its idle pulse can only fire if WE
+            # go quiet longer than the interval, and our ping cadence is
+            # shorter. Link health is tracked via keepAliveAck responses to
+            # our own pings.
+            log.info("[%s] EGM confirmed setKeepAlive(%dms) — link health is "
+                     "tracked via keepAliveAck to our %ds pings (an "
+                     "EGM-originated pulse only fires if we go idle >%dms; "
+                     "never observed on this firmware)",
+                     assoc.egm_id, self.keepalive_ms, HOST_KEEPALIVE_SEC,
+                     self.keepalive_ms)
+
+        elif cmd == "descriptorList" and stype == "G2S_response":
+            el = req["commandEl"]
+            descs = [{
+                "deviceClass": attr(d, "deviceClass"),
+                "deviceId": attr(d, "deviceId"),
+                "active": attr(d, "deviceActive") or attr(d, "active"),
+            } for d in el]
+            assoc.descriptors = descs
+            # Cabinet IDENTITY (2026-07-07, AJ): the G2S_cabinet descriptor
+            # carries the machine's real make/model — vendorName="IGT"
+            # productName="AVP" releaseNum="AVP014 R2" serialNum=... — and we
+            # were counting it then throwing it away, so the UI had nothing
+            # better than a game title to name the cabinet with (a Game King
+            # runs 119 titles; none of them IS the machine). Fold it into
+            # assoc.cabinet["identity"] for /api/status.
+            for d in el:
+                if attr(d, "deviceClass") == "G2S_cabinet":
+                    ident = {}
+                    for f in ("vendorId", "productId", "vendorName",
+                              "productName", "releaseNum", "serialNum"):
+                        v = attr(d, f)
+                        if v:
+                            ident[f] = v
+                    if ident:
+                        with assoc.lock:
+                            assoc.cabinet["identity"] = ident
+                        log.info("🏷️  [%s] cabinet identity: %s %s (%s, s/n %s)",
+                                 assoc.egm_id, ident.get("vendorName", "?"),
+                                 ident.get("productName", "?"),
+                                 ident.get("releaseNum", "?"),
+                                 ident.get("serialNum", "?"))
+                    break
+            by_class = {}
+            for d in descs:
+                by_class[d["deviceClass"]] = by_class.get(d["deviceClass"], 0) + 1
+            log.info("=" * 64)
+            log.info("📋 [%s] DESCRIPTOR HARVEST — %d devices across %d classes",
+                     assoc.egm_id, len(descs), len(by_class))
+            for cls_name, n in sorted(by_class.items(), key=lambda kv: str(kv[0])):
+                log.info("    %-32s x%d", cls_name, n)
+            log.info("(full XML in the wire log — first real data for "
+                     "COMPATIBILITY.md)")
+            log.info("=" * 64)
+            # G2S-21 join-sequence gamePlay sweep (un-gated 2026-07-02): now
+            # that the descriptorList has revealed the REAL gamePlay device
+            # list (119 on the live AVP), read status/profile/denoms for each
+            # — staggered in small batches on an epoch-gated thread so the
+            # sweep never floods the FIFO ahead of interactive commands.
+            # Once per epoch: the harvest re-fires each epoch, so a
+            # re-handshake re-runs the sweep with fresh data.
+            if self.game_sweep:
+                with assoc.lock:
+                    start_sweep = not assoc.gamesweep_started
+                    assoc.gamesweep_started = True
+                if start_sweep:
+                    self._start_game_play_sweep(assoc)
+
+        elif cmd == "commHostList":
+            # THE ownership map (spec §8.13). Arrives as a G2S_response to
+            # getCommHostList OR unsolicited (G2S_request) when the host list
+            # changes — ack the latter (else CCE106). Parse each commHostItem's
+            # ownedDevice/configDevice/guestDevice into assoc.host_items so we
+            # know exactly what host 1 owns before/after the ownership cycle.
+            el = req["commandEl"]
+            parsed = {}
+            for it in el:
+                if localname(it.tag) != "commHostItem":
+                    continue
+                f = {k.rsplit('}', 1)[-1]: v for k, v in it.attrib.items()}
+                hid = f.get("hostId")
+                owned, config, guest = [], [], []
+                for child in it:
+                    cf = {k.rsplit('}', 1)[-1]: v for k, v in child.attrib.items()}
+                    dev = f'{cf.get("deviceClass")}/{cf.get("deviceId")}'
+                    tag = localname(child.tag)
+                    if tag == "ownedDevice":
+                        owned.append(dev)
+                    elif tag == "configDevice":
+                        config.append(dev)
+                    elif tag == "guestDevice":
+                        guest.append(dev)
+                if hid is not None:
+                    parsed[hid] = {
+                        "hostIndex": f.get("hostIndex"),
+                        "hostLocation": f.get("hostLocation"),
+                        "hostRegistered": f.get("hostRegistered"),
+                        "owned": owned, "config": config, "guest": guest}
+            with assoc.lock:
+                assoc.host_items = parsed
+            log.info("=" * 64)
+            log.info("[%s] 🗺️  COMM HOST LIST — %d host(s) [the ownership map!]",
+                     assoc.egm_id, len(parsed))
+            for hid, h in parsed.items():
+                log.info("    host %s idx=%s reg=%s owns=%d config=%d guest=%d",
+                         hid, h["hostIndex"], h["hostRegistered"],
+                         len(h["owned"]), len(h["config"]), len(h["guest"]))
+                if h["owned"]:
+                    log.info("       owned: %s", h["owned"])
+            log.info("(full XML in the wire log)")
+            log.info("=" * 64)
+            if stype == "G2S_request":
+                self.enqueue_comm_host_list_ack(assoc, req)
+
+        elif cmd == "eventReport":
+            # THE payoff: the AVP is streaming us an event it fired (spec §4.16).
+            # eventReport is EGM-originated; when eventPersist=true it is a
+            # G2S_request and the AVP holds it in its outbound queue until we
+            # eventAck the eventId. Log it, ring-buffer it for the status API,
+            # then ack so the queue drains and the next event flows.
+            el = req["commandEl"]
+            code = attr(el, "eventCode")
+            meta = event_meta(code)
+            ev = {
+                "eventCode": code,
+                "label": meta["label"],
+                "category": meta["category"],
+                "icon": meta["icon"],
+                "deviceClass": attr(el, "deviceClass"),
+                "deviceId": attr(el, "deviceId"),
+                "eventId": attr(el, "eventId"),
+                "eventText": attr(el, "eventText"),
+                "eventDateTime": attr(el, "eventDateTime"),
+                "transactionId": attr(el, "transactionId"),
+                "seenAt": now_iso(),
+            }
+            # G2S-13: parse the affected-data payloads (spec §4.16) instead of
+            # just recording their presence. deviceList carries device statuses,
+            # transactionList carries transaction records, meterList carries the
+            # affected device's meters — which we fold straight into assoc.meters
+            # so events drive the live meter view (bill value, win amount, etc.).
+            affected = []
+            meters_from_event = 0
+            ride_changed = []       # (key, old, new) — the fold's change log
+            for child in el:
+                tag = localname(child.tag)
+                affected.append(tag)
+                if tag == "meterList":
+                    # GR-08: key ride-along meters by each meter GROUP's own
+                    # deviceClass/deviceId — the same grouped parse the
+                    # meterInfo handler uses. The old flat iter() keyed them
+                    # by the EVENT's device (the group's identity lives on
+                    # the parent, so the fallback ALWAYS fired), corrupting
+                    # assoc.meters whenever an event carries another
+                    # device's meters.
+                    meters_from_event += self._fold_meter_groups(
+                        assoc, child, ride_changed)
+            ev["affected"] = affected
+            ev["affectedMeters"] = meters_from_event
+            ev["source"] = "live"
+            # G2S-23: noteAcceptor events carry the device status along
+            # (our subscription's sendDeviceStatus=true; Table 13.12 —
+            # affected device status = noteAcceptorStatus). Fold it so the
+            # doors/stacker/escrow picture stays live with zero class reads
+            # (which the pre-ownership AVP ignores anyway).
+            if ev["deviceClass"] == "G2S_noteAcceptor":
+                for st_el in el.iter():
+                    if localname(st_el.tag) == "noteAcceptorStatus":
+                        self._fold_note_acceptor_status(assoc, st_el, "event")
+                        break
+            # G2S-23: type the 💵 bill-in. G2S_NAE114 Note Stacked is THE
+            # money-in event (Tables 13.35/13.36 — the EGM inserts the log
+            # entry BEFORE raising the event, so the transaction record
+            # rides along under sendTransaction=true). Denom + amount come
+            # from that riding notesAcceptedLog record (Table 13.10; Table
+            # 13.12 names the affected element noteAcceptorLog — accept
+            # both). Ring/total mutation happens below under the SAME
+            # dedupe as the event itself, so an EGM retry of a persisted
+            # NAE114 can never double-count money.
+            bill = None
+            if code == "G2S_NAE114":
+                bill = {"currencyId": None, "denomId": None,
+                        "baseCashableAmt": None,
+                        "transactionId": ev["transactionId"],
+                        "eventId": ev["eventId"],
+                        "noteDateTime": ev["eventDateTime"],
+                        "seenAt": now_iso()}
+                for t_el in el.iter():
+                    if localname(t_el.tag) in ("noteAcceptorLog",
+                                               "notesAcceptedLog"):
+                        bill.update({
+                            "currencyId": attr(t_el, "currencyId"),
+                            "denomId": attr(t_el, "denomId"),
+                            "baseCashableAmt":
+                                attr(t_el, "baseCashableAmt"),
+                            "transactionId": attr(t_el, "transactionId")
+                            or ev["transactionId"],
+                            "noteDateTime": attr(t_el, "noteDateTime")
+                            or ev["eventDateTime"],
+                        })
+                        break
+                try:
+                    bill["amt"] = int(bill["baseCashableAmt"]
+                                      or bill["denomId"] or 0)
+                except (TypeError, ValueError):
+                    bill["amt"] = 0
+                raw_denom = bill["denomId"] or bill["baseCashableAmt"]
+                bill["denom"] = denom_dollars(raw_denom) if raw_denom \
+                    else None
+            # G2S-14 dedupe: a persisted event the EGM retries (or one we
+            # already merged from a getEventHandlerLog backfill) re-arrives
+            # with the SAME eventId (§4.1.7). Re-ack it — the EGM's outbound
+            # queue cannot drain otherwise — but never double-count in the
+            # ring. Meters above were re-folded (same values, harmless).
+            # The dedupe key is (eventId, eventDateTime), NOT eventId alone:
+            # eventIds are only unique per LOG LIFETIME (§4.1.7), so after a
+            # RAM/NVRAM clear the EGM restarts them near 1 and a recycled id
+            # would collide with a pre-clear ring entry — the event was acked
+            # but silently vanished from the ring/count. A genuine retry (or
+            # a backfill overlap) resends the SAME stored record and thus the
+            # same eventDateTime; a recycled id after a clear does not.
+            with assoc.lock:
+                dup = bool(ev["eventId"]) and any(
+                    e.get("eventId") == ev["eventId"]
+                    and e.get("eventDateTime") == ev["eventDateTime"]
+                    for e in assoc.events)
+                if not dup:
+                    assoc.event_count += 1
+                    assoc.events.append(ev)
+                    if len(assoc.events) > 200:
+                        assoc.events = assoc.events[-200:]
+                    if bill is not None:
+                        assoc.bill_in_count += 1
+                        assoc.bill_in_session_amt += bill["amt"]
+                        assoc.bill_ins.append(bill)
+                        if len(assoc.bill_ins) > 200:
+                            assoc.bill_ins = assoc.bill_ins[-200:]
+                total = assoc.event_count
+                bill_n = assoc.bill_in_count
+                bill_total = assoc.bill_in_session_amt
+            if dup:
+                log.info("🔔 [%s] duplicate eventReport %s eventId=%s (EGM "
+                         "retry or already backfilled) -> re-ack, not "
+                         "re-counted", assoc.egm_id, code, ev["eventId"])
+            else:
+                # G2S-12: semantic hooks fire for LIVE, non-duplicate events
+                # only (never for backfill merges or retried persisted
+                # events) — the activity tape is what happened, once.
+                self.fire_event_hooks(assoc, ev, bill)
+                log.info("🔔 [%s] EVENT #%d %s [%s] from %s/%s (eventId=%s "
+                         "txn=%s)%s%s",
+                         assoc.egm_id, total, code, ev["label"],
+                         ev["deviceClass"], ev["deviceId"], ev["eventId"],
+                         ev["transactionId"],
+                         f' "{ev["eventText"]}"' if ev["eventText"] else "",
+                         (f" +{','.join(affected)}"
+                          + (f" ({meters_from_event} meters)"
+                             if meters_from_event else "")) if affected else "")
+                # mediaDisplay/playerContext recon (#18): IGT vendor event
+                # codes (IGT_MDE*/IGT_PCE*) get an extra grep-stamp — the
+                # probe ladder's event evidence must never scroll by
+                # unnoticed in the journal. Pass-through observability
+                # ONLY: no hook, no behavior, no EVENT_HOOK_CODES entry.
+                if code and code.startswith(("IGT_MDE", "IGT_PCE")):
+                    log.info("🖥️ [%s] IGT VENDOR EVENT %s (%s/%s)%s — "
+                             "mediaDisplay/playerContext ladder evidence",
+                             assoc.egm_id, code, ev["deviceClass"],
+                             ev["deviceId"],
+                             f' "{ev["eventText"]}"' if ev["eventText"]
+                             else "")
+                if bill is not None:
+                    log.info("=" * 64)
+                    log.info("💵 [%s] BILL IN — %s (#%d this session, "
+                             "session total %s)", assoc.egm_id,
+                             bill["denom"] or "amount unknown (no "
+                             "transaction record rode along)",
+                             bill_n, "${:,.2f}".format(bill_total / 100000))
+                    log.info("=" * 64)
+            if stype == "G2S_request" and ev["eventId"]:
+                self.enqueue_event_ack(assoc, req, ev["eventId"])
+
+        elif cmd == "eventHandlerProfile" and stype == "G2S_response":
+            el = req["commandEl"]
+            forced = [c for c in el if localname(c.tag) == "forcedSubscription"]
+            log.info("=" * 64)
+            log.info("[%s] ✅ eventHandlerProfile — we OWN eventHandler device 1 "
+                     "(setEventSub will be honored)", assoc.egm_id)
+            log.info("    configId=%s queueBehavior=%s timeToLive=%s "
+                     "requiredForPlay=%s forcedSubs=%d",
+                     attr(el, "configurationId"), attr(el, "queueBehavior"),
+                     attr(el, "timeToLive"), attr(el, "requiredForPlay"),
+                     len(forced))
+            for f in forced:
+                log.info("    forced: %s/%s eventCode=%s",
+                         attr(f, "deviceClass"), attr(f, "deviceId"),
+                         attr(f, "eventCode"))
+            log.info("=" * 64)
+
+        elif cmd == "supportedEvents" and stype == "G2S_response":
+            el = req["commandEl"]
+            evs = [{
+                "deviceClass": attr(e, "deviceClass"),
+                "deviceId": attr(e, "deviceId"),
+                "eventCode": attr(e, "eventCode"),
+                "eventText": attr(e, "eventText"),
+            } for e in el if localname(e.tag) == "supportedEvent"]
+            assoc.supported_events = evs
+            by_class = {}
+            for e in evs:
+                by_class[e["deviceClass"]] = by_class.get(e["deviceClass"], 0) + 1
+            log.info("=" * 64)
+            log.info("📇 [%s] SUPPORTED EVENTS — %d event(s) across %d class(es)",
+                     assoc.egm_id, len(evs), len(by_class))
+            for cls_name, n in sorted(by_class.items(), key=lambda kv: str(kv[0])):
+                log.info("    %-32s x%d", cls_name, n)
+            log.info("(full catalog in the wire log)")
+            log.info("=" * 64)
+
+        elif cmd == "setEventSubAck" and stype == "G2S_response":
+            assoc.subscribed = True
+            log.info("=" * 64)
+            log.info("🎉 [%s] setEventSubAck — SUBSCRIPTION INSTALLED. The AVP "
+                     "will now push eventReports.", assoc.egm_id)
+            log.info("=" * 64)
+
+        elif cmd in ("eventSubList", "clearEventSubAck") and \
+                stype == "G2S_response":
+            log.info("[%s] %s received", assoc.egm_id, cmd)
+
+        elif cmd == "eventHandlerLogList" and stype == "G2S_response":
+            # Response to getEventHandlerLog (spec §4.21) — the per-host
+            # persisted event log, listed NEWEST-FIRST (§1.14.5). Merge into
+            # the recent-events ring so events raised while we were offline
+            # backfill the same surface live eventReports feed (G2S-14).
+            # Dedupe by (eventId, eventDateTime) against the ring — ids are
+            # unique per LOG LIFETIME only (§4.1.7) — plus skip logSequence
+            # <= the high-water mark from earlier sweeps (incremental
+            # reconnect backfills re-fetch overlap); the high-water resets
+            # itself when the sweep proves the log restarted (RAM clear). The
+            # log stores only affected-data POINTERS (§4.21.1-3), so entries
+            # carry the affected list names but no meter payloads. An empty
+            # list is the spec answer for 'nothing there' — never an error.
+            el = req["commandEl"]
+            entries = []
+            for item in el:
+                if localname(item.tag) != "eventHandlerLog":
+                    continue
+                code = attr(item, "eventCode")
+                meta = event_meta(code)
+                try:
+                    seq = int(attr(item, "logSequence") or 0)
+                except ValueError:
+                    seq = 0
+                entries.append((seq, {
+                    "eventCode": code,
+                    "label": meta["label"],
+                    "category": meta["category"],
+                    "icon": meta["icon"],
+                    "deviceClass": attr(item, "deviceClass"),
+                    "deviceId": attr(item, "deviceId"),
+                    "eventId": attr(item, "eventId"),
+                    "eventText": attr(item, "eventText"),
+                    "eventDateTime": attr(item, "eventDateTime"),
+                    "transactionId": attr(item, "transactionId"),
+                    "seenAt": now_iso(),
+                    "source": "backfill",
+                    "logSequence": seq,
+                    "eventAck": attr(item, "eventAck") or "false",
+                    "affected": [localname(c.tag) for c in item],
+                    "affectedMeters": 0,
+                }))
+            entries.sort(key=lambda p: p[0])   # merge oldest-first
+            merged = dupes = 0
+            restarted_from = 0
+            with assoc.lock:
+                # Dedupe by (eventId, eventDateTime), matching the live
+                # eventReport handler: ids are only unique per LOG LIFETIME
+                # (§4.1.7) and restart near 1 after a RAM/NVRAM clear.
+                known = {(e.get("eventId"), e.get("eventDateTime"))
+                         for e in assoc.events if e.get("eventId")}
+                prev_last = assoc.eh_log_last_sequence
+                # Log-restart detection: logSequence is also per-log-lifetime
+                # (§4.1.7), and a sweep is always full (lastSequence=0/
+                # totalEntries=0 -> the NEWEST entries, §1.14.5), so a sweep
+                # whose maximum sits BELOW our high-water can only mean the
+                # EGM rebuilt its log (RAM/NVRAM clear). Reset the high-water
+                # or every fresh entry would be skipped as 'already merged'
+                # until the new sequence climbed past the old one. (The
+                # commsOnLine metersReset flag is deliberately NOT used for
+                # this: the real AVP raises all four reset flags on every
+                # boot commsOnLine — capture 20250725 — so it cannot
+                # discriminate an actual RAM clear from a plain reboot, and
+                # resetting on it would re-merge rolled-off entries.)
+                if entries and prev_last and entries[-1][0] and \
+                        entries[-1][0] < prev_last:
+                    restarted_from = prev_last
+                    prev_last = 0
+                    assoc.eh_log_last_sequence = 0
+                for seq, ev in entries:
+                    if (seq and seq <= prev_last) or \
+                            (ev["eventId"], ev["eventDateTime"]) in known:
+                        dupes += 1
+                        continue
+                    if ev["eventId"]:
+                        known.add((ev["eventId"], ev["eventDateTime"]))
+                    assoc.events.append(ev)
+                    assoc.event_count += 1
+                    merged += 1
+                if merged:
+                    # GR-26: a backfill merge appends OLDER entries after
+                    # newer live ones (live 264-266 preceded backfilled
+                    # 247-262 in the overnight snapshot), misleading any
+                    # array-order consumer — the Test Panel renders the raw
+                    # reversed ring. Re-time-order by (eventDateTime,
+                    # logSequence); the sort is stable and live entries
+                    # carry no logSequence (0), so arrival order is kept
+                    # within equal timestamps with backfills after live.
+                    assoc.events.sort(
+                        key=lambda e: (e.get("eventDateTime") or "",
+                                       e.get("logSequence") or 0))
+                if len(assoc.events) > 200:
+                    assoc.events = assoc.events[-200:]
+                if entries:
+                    assoc.eh_log_last_sequence = max(
+                        assoc.eh_log_last_sequence, entries[-1][0])
+                assoc.eh_backfill_count += merged
+                last_seq = assoc.eh_log_last_sequence
+                backfilled = assoc.eh_backfill_count
+            if restarted_from:
+                log.warning("[%s] 🧹 EVENT LOG RESTARTED — sweep max "
+                            "logSequence %d is below the stored high-water %d "
+                            "(EGM RAM/NVRAM clear, §4.1.7 per-log-lifetime "
+                            "sequences); high-water reset, entries merged "
+                            "fresh", assoc.egm_id, entries[-1][0],
+                            restarted_from)
+            if entries:
+                log.info("🔔 [%s] LOG BACKFILL — %d log entr%s: %d merged, "
+                         "%d duplicate/known skipped; lastSequence=%d "
+                         "(backfilled total %d)", assoc.egm_id, len(entries),
+                         "y" if len(entries) == 1 else "ies", merged, dupes,
+                         last_seq, backfilled)
+            else:
+                log.info("[%s] eventHandlerLogList empty — nothing to "
+                         "backfill (lastSequence stays %d)", assoc.egm_id,
+                         last_seq)
+
+        elif cmd == "commConfigModeStatus":
+            # Response to enterCommConfigMode/getCommConfigModeStatus (spec §8.9).
+            # When config mode is ON and we are mid-cycle, fire setCommChange.
+            el = req["commandEl"]
+            enabled = (attr(el, "enabled") or "").lower() == "true"
+            cfg = attr(el, "configurationId")
+            log.info("[%s] commConfigModeStatus enabled=%s configId=%s (stage=%s)",
+                     assoc.egm_id, enabled, cfg, assoc.commconfig_stage)
+            if enabled and assoc.commconfig_stage == "entering":
+                with assoc.lock:
+                    assoc.commconfig_stage = "changing"
+                    owned = list(assoc.pending_owned)
+                    guest = list(assoc.pending_guest)
+                    config_id = assoc.pending_config_id
+                log.info("[%s] ⚙️  config mode ON — sending setCommChange cfg=%s "
+                         "(%d owned+config, %d guest kept)", assoc.egm_id,
+                         config_id, len(owned), len(guest))
+                self.enqueue_set_comm_change(assoc, config_id, owned, guest)
+
+        elif cmd == "commChangeStatus":
+            # Response to setCommChange/authorizeCommChange, OR an unsolicited
+            # push (spec §8.18). Drives the ownership state machine:
+            #   changing   + txn  -> authorizeCommChange (authorizing)
+            #   authorizing + applied -> applied (+ re-probe reads/subs)
+            # Ack if it arrived as a request (§8.19).
+            el = req["commandEl"]
+            cfg = attr(el, "configurationId")
+            txn = attr(el, "transactionId")
+            change_status = attr(el, "changeStatus")
+            change_exc = attr(el, "changeException") or "0"
+            log.info("[%s] commChangeStatus cfg=%s txn=%s status=%s exc=%s "
+                     "(stage=%s)", assoc.egm_id, cfg, txn, change_status,
+                     change_exc, assoc.commconfig_stage)
+            if stype == "G2S_request":
+                self.enqueue_comm_change_status_ack(assoc, req, cfg, txn)
+            st = (change_status or "").lower()
+            failed = (change_exc not in (None, "0", "")) or \
+                "error" in st or "abort" in st or "cancel" in st
+            if failed:
+                with assoc.lock:
+                    assoc.commconfig_stage = "failed"
+                log.warning("[%s] ❌ OWNERSHIP CHANGE FAILED (status=%s exc=%s) — "
+                            "EGM rejected/aborted the set; exiting commConfig "
+                            "mode to release the EGM", assoc.egm_id,
+                            change_status, change_exc)
+                self.enqueue_enter_comm_config_mode(assoc, enable=False)
+            elif assoc.commconfig_stage == "changing" and txn:
+                with assoc.lock:
+                    assoc.pending_txn_id = txn
+                    assoc.commconfig_stage = "authorizing"
+                log.info("[%s] change validated (txn=%s) — authorizing",
+                         assoc.egm_id, txn)
+                self.enqueue_authorize_comm_change(
+                    assoc, cfg or assoc.pending_config_id, txn)
+            elif assoc.commconfig_stage == "authorizing" and "appl" in st:
+                with assoc.lock:
+                    assoc.commconfig_stage = "applied"
+                log.info("=" * 64)
+                log.info("[%s] 🎉 OWNERSHIP APPLIED — host 1 now owns the claimed "
+                         "devices. Re-probing reads + subscription...",
+                         assoc.egm_id)
+                log.info("=" * 64)
+                # Confirm the gate opened: re-read the ownership map and
+                # re-arm the event subscription. The read/subscription
+                # PROBES that used to ride here (setMeterSub, cabinet reads,
+                # getEventHandlerLog, the gamePlay sweep) moved into the
+                # normal join sequence 2026-07-02 — the first-light session
+                # proved the live AVP honors them without any ownership
+                # cycle (the "ownership gate" was a symptom of the
+                # double-wrap ack bug). This branch stays functional for a
+                # hypothetical virgin machine that really does need claiming.
+                self.enqueue_get_comm_host_list(assoc)
+                if self.subscribe:
+                    self.enqueue_set_event_sub(assoc)
+                # §8.7: the host exits config mode once the change applies —
+                # leaving the EGM parked on its config-mode screen strands it
+                # (observed live 2026-07-07). Rides the FIFO after the
+                # ownership-map re-read.
+                self.enqueue_enter_comm_config_mode(assoc, enable=False)
+                # G2S-23: noteAcceptor read path — status (doors/stacker/
+                # enabled) then profile (notes-table readback).
+                self.enqueue_get_note_acceptor_status(assoc)
+                self.enqueue_get_note_acceptor_profile(assoc)
+
+        elif cmd == "commConfigProfile" and stype == "G2S_response":
+            el = req["commandEl"]
+            log.info("[%s] commConfigProfile configId=%s minLogEntries=%s "
+                     "noResponseTimer=%s", assoc.egm_id,
+                     attr(el, "configurationId"), attr(el, "minLogEntries"),
+                     attr(el, "noResponseTimer"))
+
+        elif cmd == "resetStarted" and stype == "G2S_response":
+            # cabinet.resetProcessor honored (§3.17, NO attributes) — the
+            # machine is about to warm-reboot. commsClosing + offline
+            # demotion + rejoin all follow the existing paths; here we stamp
+            # the probe verdict (attributed by the recorded sessionId) and
+            # shout. (Not this AVP014 R2 — it APX008s resetProcessor, bench-
+            # proven 2026-07-07 — but another machine may answer this.)
+            with assoc.lock:
+                pr = assoc.last_reset_probe
+                if pr.get("kind") == "resetProcessor" and \
+                        pr.get("sessionId") == req["sessionId"]:
+                    pr["outcome"] = "resetStarted"
+                    pr["outcomeAt"] = now_iso()
+            log.warning("🔄 [%s] EGM RESET STARTED — resetProcessor honored; "
+                        "machine is rebooting (expect commsClosing, then a "
+                        "fresh commsOnLine in a few minutes)", assoc.egm_id)
+            self._reset_activity(assoc, "🔄 Cabinet reset started",
+                                 "resetStarted")
+
+        elif cmd == "downloadStatus" and stype == "G2S_response":
+            # download (RB plan-B reboot): response to setDownloadState.
+            # Log fold only — no durable state, so there is nothing to go
+            # stale across new_epoch (the e873eec lesson). Wire-proven
+            # 2026-07-07 (AVP014 R2): setDownloadState enable=true answers
+            # a clean downloadStatus (accepted). hostEnabled/egmEnabled
+            # ABSENT = TRUE (the repo rule).
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            data.setdefault("hostEnabled", "true")
+            data.setdefault("egmEnabled", "true")
+            rest = {k: v for k, v in data.items()
+                    if k not in ("hostEnabled", "egmEnabled")}
+            log.info("⬇️ [%s] downloadStatus dev=%s — hostEnabled=%s "
+                     "egmEnabled=%s%s", assoc.egm_id, req["deviceId"],
+                     data["hostEnabled"], data["egmEnabled"],
+                     f" {rest}" if rest else "")
+
+        elif cmd == "scriptStatus" and stype in ("G2S_request",
+                                                 "G2S_response"):
+            # download (RB): the solicited G2S_response to setScript, AND
+            # the EGM-ORIGINATED status change — §10.31/Table 10.2: the EGM
+            # reports a script transition (e.g. the terminal state of the
+            # reboot script, sent after the machine comes back) as
+            # sessionType=G2S_request, which MUST be answered with
+            # scriptStatusAck (§10.32). Before this branch took requests,
+            # they fell through to the unknown-request APX008 — repudiating
+            # the very message that confirms a reboot succeeded. Both forms
+            # fold the state into last_reset_probe + the activity tape (the
+            # reboot's verdict must be visible in /api/status).
+            # LOUD on the states that matter — an in-progress/completed reset
+            # script means the machine is (about to be) rebooting, and an
+            # error is the verdict on the whole plan-B path. The nested
+            # commandStatusList.systemCmdStatus carries the per-command
+            # exception (Table 10.48; exception 12 = "unable to reset EGM").
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            state = data.get("scriptStatus") or "(unreported)"
+            sys_exc = None
+            for sub in el.iter():
+                if localname(sub.tag) == "systemCmdStatus":
+                    sys_exc = attr(sub, "exception") or "0"
+                    break
+            verdict = {
+                "G2S_inProgress": "RUNNING — EGM reboot imminent",
+                "G2S_completed": "COMPLETED — EGM rebooting (expect "
+                                 "commsClosing, then a fresh commsOnLine)",
+                "G2S_error": "FAILED (scriptException=%s%s)"
+                             % (data.get("scriptException", "0"),
+                                ", systemCmd exception 12 = unable to reset"
+                                if sys_exc == "12" else ""),
+            }.get(state)
+            # Fold into the probe (attributed by scriptId, or sessionId on
+            # the setScript response) — mutated in place, snapshot dict-copies.
+            with assoc.lock:
+                pr = assoc.last_reset_probe
+                if pr.get("kind") == "script" and (
+                        pr.get("scriptId") == data.get("scriptId")
+                        or pr.get("sessionId") == req["sessionId"]):
+                    pr["scriptStatus"] = state
+                    if data.get("scriptException"):
+                        pr["scriptException"] = data["scriptException"]
+                    if sys_exc not in (None, "0"):
+                        pr["systemCmdException"] = sys_exc
+                    pr["outcome"] = {
+                        "G2S_inProgress": "inProgress",
+                        "G2S_completed": "completed",
+                        "G2S_error": "error:%s" % data.get(
+                            "scriptException", "0"),
+                    }.get(state, pr.get("outcome", "sent"))
+                    pr["outcomeAt"] = now_iso()
+            if verdict:
+                log.warning("=" * 64)
+                log.warning("⬇️ [%s] RESET SCRIPT STATUS scriptId=%s "
+                            "state=%s — %s", assoc.egm_id,
+                            data.get("scriptId"), state, verdict)
+                log.warning("=" * 64)
+                self._reset_activity(
+                    assoc, f"⬇️ Reset script {state.replace('G2S_', '')}",
+                    state.replace("G2S_", ""))
+            else:
+                log.info("⬇️ [%s] scriptStatus scriptId=%s state=%s "
+                         "exception=%s", assoc.egm_id, data.get("scriptId"),
+                         state, data.get("scriptException", "0"))
+            if stype == "G2S_request":
+                # §10.32: scriptStatusAck has no additional attributes or
+                # elements — the bare element under the download class.
+                self.enqueue_class_response(
+                    assoc, req, "<g2s:scriptStatusAck/>", "scriptStatusAck")
+
+        elif cmd == "cabinetStatus" and stype == "G2S_response":
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            # hostEnabled/egmEnabled ABSENT = TRUE (Table 3.3 defaults + the
+            # repo rule). Fold the default explicitly so a disable -> enable
+            # round-trip whose enable response omits hostEnabled cannot leave
+            # a stale "false" in assoc.cabinet (the restore path is sacred).
+            data.setdefault("hostEnabled", "true")
+            data.setdefault("egmEnabled", "true")
+            # Cabinet control (G2S-20 rest): a cabinetStatus whose sessionId
+            # echoes the pending setCabinetState IS its application response
+            # (§3.7) — confirm when the echoed hostEnabled matches what we
+            # asked for, "disagree" when the EGM reports otherwise (§3.19:
+            # setCabinetState has no class-specific errors; failure surfaces
+            # exactly as this status disagreement).
+            verdict = want = None
+            with assoc.lock:
+                assoc.cabinet.update(data)
+                csc = assoc.cabinet_state_change
+                if csc.get("result") in ("sent", "acked") and \
+                        req["sessionId"] == csc.get("sessionId"):
+                    want = csc.get("enable")
+                    verdict = ("confirmed" if data["hostEnabled"] == want
+                               else "disagree")
+                    csc["result"] = verdict
+                    csc["confirmedAt"] = now_iso()
+                    csc["hostEnabled"] = data["hostEnabled"]
+                    csc["egmState"] = data.get("egmState")
+            if verdict == "confirmed":
+                log.info("=" * 64)
+                log.info("🖥️  [%s] CABINET STATE %s CONFIRMED — "
+                         "hostEnabled=%s egmState=%s", assoc.egm_id,
+                         "ENABLE" if data["hostEnabled"] == "true"
+                         else "DISABLE", data["hostEnabled"],
+                         data.get("egmState"))
+                log.info("=" * 64)
+            elif verdict == "disagree":
+                log.warning("🖥️ [%s] CABINET STATE DISAGREEMENT — asked "
+                            "enable=%s but the EGM reports hostEnabled=%s "
+                            "(egmState=%s)", assoc.egm_id, want,
+                            data["hostEnabled"], data.get("egmState"))
+            log.info("=" * 64)
+            log.info("🖥️  [%s] CABINET STATUS egmState=%s", assoc.egm_id,
+                     data.get("egmState"))
+            doors = {k: v for k, v in data.items()
+                     if "door" in k.lower() or "tilt" in k.lower()}
+            log.info("    doors/tilts: %s", doors or "(none reported)")
+            log.info("    hostEnabled=%s hostLocked=%s egmEnabled=%s "
+                     "lastGamePlayId=%s", data.get("hostEnabled"),
+                     data.get("hostLocked"), data.get("egmEnabled"),
+                     data.get("gamePlayId"))
+            log.info("=" * 64)
+
+        elif cmd == "cabinetProfile" and stype == "G2S_response":
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            with assoc.lock:
+                assoc.cabinet["profile"] = data
+            log.info("[%s] cabinetProfile currency=%s locale=%s machineNum=%s "
+                     "timeZone=%s", assoc.egm_id, data.get("currencyId"),
+                     data.get("localeId"), data.get("machineNum"),
+                     data.get("timeZoneOffset"))
+
+        elif cmd == "dateTime" and stype == "G2S_response":
+            el = req["commandEl"]
+            egm_dt = attr(el, "egmDateTime") or attr(el, "dateTime")
+            with assoc.lock:
+                assoc.cabinet["egmDateTime"] = egm_dt
+            log.info("[%s] 🕒 EGM dateTime=%s (host=%s)", assoc.egm_id,
+                     egm_dt, now_iso())
+
+        elif cmd == "cabinetDateTime" and stype == "G2S_response":
+            # The application response to BOTH setDateTime and getDateTime
+            # (spec §3.15 — there is no setDateTimeAck). Record the EGM clock,
+            # refresh the skew, and confirm a pending clock sync (G2S-20).
+            el = req["commandEl"]
+            egm_dt = attr(el, "cabinetDateTime")
+            dt = parse_g2s_datetime(egm_dt)
+            skew = None if dt is None else round(
+                (dt - datetime.now(timezone.utc)).total_seconds(), 3)
+            confirmed = False
+            with assoc.lock:
+                assoc.cabinet["egmDateTime"] = egm_dt
+                if skew is not None:
+                    assoc.egm_clock_skew_sec = skew
+                if assoc.clock_sync.get("result") in ("sent", "acked"):
+                    assoc.clock_sync["result"] = "confirmed"
+                    assoc.clock_sync["confirmedAt"] = now_iso()
+                    assoc.clock_sync["egmReported"] = egm_dt
+                    confirmed = True
+            skew_txt = "unknown" if skew is None else f"{skew:+.1f}s"
+            if confirmed:
+                log.info("=" * 64)
+                log.info("🕒 [%s] CLOCK SYNC CONFIRMED — cabinetDateTime=%s "
+                         "(skew now %s)", assoc.egm_id, egm_dt, skew_txt)
+                log.info("=" * 64)
+            else:
+                log.info("[%s] 🕒 cabinetDateTime=%s (host=%s, skew=%s)",
+                         assoc.egm_id, egm_dt, now_iso(), skew_txt)
+
+        elif cmd == "meterInfo":
+            # EVERY meterInfo delivery lands here — ONE shared parser (§5.19):
+            # the G2S_response to our on-demand getMeterInfo, the periodic
+            # subscription push (G2S_notification — fire and forget, NO
+            # app-level response allowed, §5.4), and the EOD push
+            # (G2S_request — MUST be meterInfoAck'd or the EGM re-collects
+            # and resends). Flatten every simpleMeter (meterName+meterValue)
+            # under each meter group into assoc.meters keyed
+            # "class/id/meterName", then stamp last_meter_report.
+            el = req["commandEl"]
+            info_type = attr(el, "meterInfoType")
+            changed = []
+            count = self._fold_meter_groups(assoc, el, changed)
+            with assoc.lock:
+                assoc.last_meter_report = now_iso()
+                assoc.last_meter_report_type = info_type
+                total_known = len(assoc.meters)
+            # GR-02: DIGEST line — the 2,142-meter periodic push repeats
+            # every 60s and its full body only reaches the wire log at
+            # DEBUG (--wire-full/-v); this line + a few changed values is
+            # the at-a-glance record.
+            if changed:
+                samples = ", ".join(
+                    f"{k.split('/', 2)[2] if k.count('/') >= 2 else k}"
+                    f"={new}" + (f" (was {old})" if old is not None else "")
+                    for k, old, new in changed[:3])
+                more = f", +{len(changed) - 3} more" if len(changed) > 3 \
+                    else ""
+                delta = f", {len(changed)} changed [{samples}{more}]"
+            else:
+                delta = ", 0 changed"
+            log.info("📊 [%s] meterInfo type=%s — %d meters parsed%s "
+                     "(total known %d)", assoc.egm_id,
+                     info_type, count, delta, total_known)
+            if stype == "G2S_request":
+                self.enqueue_meter_info_ack(assoc, req)
+
+        elif cmd == "meterSubList" and stype == "G2S_response":
+            # Response to setMeterSub/getMeterSub/clearMeterSub (spec §5.24):
+            # the EGM's standing-subscription record in EXPANDED device form
+            # (wildcards resolved). Child get*Meters selectors present = an
+            # active subscription; an empty list = none/cleared.
+            el = req["commandEl"]
+            sub_type = attr(el, "meterSubType") or "G2S_unknown"
+            selectors = [{
+                "kind": localname(s.tag),
+                "deviceClass": attr(s, "deviceClass"),
+                "deviceId": attr(s, "deviceId"),
+            } for s in el]
+            sub = {"meterSubType": sub_type, "active": bool(selectors),
+                   "selectors": selectors, "at": now_iso()}
+            if sub_type == "G2S_onPeriodic":
+                sub["periodicInterval"] = attr(el, "periodicInterval")
+                sub["periodicBase"] = attr(el, "periodicBase")
+            elif sub_type == "G2S_onEOD":
+                sub["eodBase"] = attr(el, "eodBase")
+            with assoc.lock:
+                assoc.meter_subs[sub_type] = sub
+            if sub["active"]:
+                extra = (f" every {sub['periodicInterval']}ms"
+                         if sub_type == "G2S_onPeriodic"
+                         else f" at eodBase={sub['eodBase']}ms")
+                log.info("=" * 64)
+                log.info("🎉 [%s] METER SUBSCRIPTION ACTIVE — %s%s, %d "
+                         "selector(s); expect 📊 meterInfo pushes",
+                         assoc.egm_id, sub_type, extra, len(selectors))
+                log.info("=" * 64)
+            else:
+                log.info("📊 [%s] meterSubList %s — no subscription "
+                         "(cleared or never set)", assoc.egm_id, sub_type)
+
+        elif cmd == "gamePlayStatus" and stype == "G2S_response":
+            # Response to getGamePlayStatus (spec §6.11, Table 6.5). themeId/
+            # paytableId are REQUIRED; hostEnabled/egmEnabled are optional
+            # with DEFAULT TRUE — absent is normal, never a fault, and no
+            # re-enable logic ever hangs off them. egmEnabled=false with zero
+            # active denoms is a legal non-fault state too (§6.2.2/§6.15).
+            el = req["commandEl"]
+            dev = req["deviceId"]
+            data = {
+                "themeId": attr(el, "themeId"),
+                "paytableId": attr(el, "paytableId"),
+                "hostEnabled": attr(el, "hostEnabled") or "true",
+                "egmEnabled": attr(el, "egmEnabled") or "true",
+                "generalTilt": attr(el, "generalTilt") or "false",
+                "reelTilt": attr(el, "reelTilt") or "false",
+                "configurationId": attr(el, "configurationId") or "0",
+                "statusAt": now_iso(),
+            }
+            # gamePlay control (G2S-22): a gamePlayStatus whose sessionId
+            # echoes the pending setGamePlayState IS its application response
+            # (§6.9) — confirm when the echoed hostEnabled matches what we
+            # asked for, "disagree" otherwise. The ABSENT-hostEnabled default
+            # folded above makes a bare enable response confirm cleanly (the
+            # restore path is sacred). Wholesale replacement of the nested
+            # record — never in-place (snapshot() shares it by reference).
+            verdict = want = None
+            with assoc.lock:
+                gp = assoc.game_play.setdefault(dev, {})
+                gp.update(data)
+                assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
+                sc = gp.get("stateChange") or {}
+                if sc.get("result") in ("sent", "acked") and \
+                        req["sessionId"] == sc.get("sessionId"):
+                    want = sc.get("enable")
+                    verdict = ("confirmed" if data["hostEnabled"] == want
+                               else "disagree")
+                    gp["stateChange"] = dict(
+                        sc, result=verdict, confirmedAt=now_iso(),
+                        hostEnabled=data["hostEnabled"],
+                        egmEnabled=data["egmEnabled"])
+            if verdict == "confirmed":
+                log.info("🎰 [%s] GAME PLAY STATE %s CONFIRMED dev=%s — "
+                         "hostEnabled=%s egmEnabled=%s", assoc.egm_id,
+                         "ENABLE" if data["hostEnabled"] == "true"
+                         else "DISABLE", dev, data["hostEnabled"],
+                         data["egmEnabled"])
+            elif verdict == "disagree":
+                log.warning("🎰 [%s] GAME PLAY STATE DISAGREEMENT dev=%s — "
+                            "asked enable=%s but the EGM reports "
+                            "hostEnabled=%s", assoc.egm_id, dev, want,
+                            data["hostEnabled"])
+            log.info("🎰 [%s] gamePlayStatus dev=%s theme=%s paytable=%s "
+                     "hostEnabled=%s egmEnabled=%s tilt=%s/%s", assoc.egm_id,
+                     dev, data["themeId"], data["paytableId"],
+                     data["hostEnabled"], data["egmEnabled"],
+                     data["generalTilt"], data["reelTilt"])
+            self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
+
+        elif cmd == "gamePlayProfile" and stype == "G2S_response":
+            # Response to getGamePlayProfile (spec §6.13, Tables 6.6-6.11).
+            # wagerCategoryList/winLevelList each carry >=1 item; the
+            # theoPaybackPct meterValue has 2 implied decimals (8900 = 89.00%,
+            # inferred from the §6.24.3.2 example).
+            el = req["commandEl"]
+            dev = req["deviceId"]
+            wager_cats, win_levels = [], []
+            for child in el:
+                tag = localname(child.tag)
+                if tag == "wagerCategoryList":
+                    wager_cats = [{
+                        "wagerCategory": attr(it, "wagerCategory"),
+                        "theoPaybackPct": attr(it, "theoPaybackPct"),
+                        "minWagerCredit": attr(it, "minWagerCredit") or "1",
+                        "maxWagerCredit": attr(it, "maxWagerCredit") or "1",
+                    } for it in child
+                        if localname(it.tag) == "wagerCategoryItem"]
+                elif tag == "winLevelList":
+                    win_levels = [{
+                        "winLevelIndex": attr(it, "winLevelIndex"),
+                        "winLevelCombo": attr(it, "winLevelCombo") or "",
+                        "progressiveAllowed":
+                            attr(it, "progressiveAllowed") or "false",
+                    } for it in child if localname(it.tag) == "winLevelItem"]
+            profile = {
+                "themeId": attr(el, "themeId"),
+                "paytableId": attr(el, "paytableId"),
+                "maxWagerCredits": attr(el, "maxWagerCredits") or "1",
+                "progAllowed": attr(el, "progAllowed") or "false",
+                "secondaryAllowed": attr(el, "secondaryAllowed") or "false",
+                "centralAllowed": attr(el, "centralAllowed") or "false",
+                "wagerCategories": wager_cats,
+                "winLevels": win_levels,
+                "profileAt": now_iso(),
+            }
+            with assoc.lock:
+                gp = assoc.game_play.setdefault(dev, {})
+                gp["profile"] = profile
+                # theme/paytable are required on BOTH status and profile —
+                # keep the top-level identity fresh from either source.
+                if profile["themeId"]:
+                    gp["themeId"] = profile["themeId"]
+                if profile["paytableId"]:
+                    gp["paytableId"] = profile["paytableId"]
+                assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
+            self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
+            theo = ""
+            if wager_cats:
+                try:  # 2 implied decimals: 9412 -> 94.12%
+                    theo = " theo=%.2f%%" % (
+                        int(wager_cats[0]["theoPaybackPct"]) / 100)
+                except (TypeError, ValueError):
+                    pass
+            log.info("🎰 [%s] gamePlayProfile dev=%s theme=%s paytable=%s "
+                     "maxWagerCredits=%s wagerCats=%d winLevels=%d%s",
+                     assoc.egm_id, dev, profile["themeId"],
+                     profile["paytableId"], profile["maxWagerCredits"],
+                     len(wager_cats), len(win_levels), theo)
+
+        elif cmd == "gameDenomList" and stype == "G2S_response":
+            # Response to getGameDenoms (spec §6.16, Tables 6.15-6.17):
+            # gameDenom singles (denomId+active required) and gameRange spans
+            # (denomMin/denomMax required, denomInterval default 1000), denoms
+            # in millicents. ZERO active denoms is legal — the device just
+            # reports egmEnabled=false in gamePlayStatus (§6.2.2), not a fault.
+            el = req["commandEl"]
+            dev = req["deviceId"]
+            denoms, ranges = [], []
+            for child in el:
+                tag = localname(child.tag)
+                if tag == "gameDenom":
+                    denoms.append({
+                        "denomId": attr(child, "denomId"),
+                        "active": attr(child, "active") or "false"})
+                elif tag == "gameRange":
+                    ranges.append({
+                        "denomMin": attr(child, "denomMin"),
+                        "denomMax": attr(child, "denomMax"),
+                        "denomInterval": attr(child, "denomInterval") or "1000",
+                        "active": attr(child, "active") or "false"})
+            active = [d["denomId"] for d in denoms
+                      if d["active"].lower() == "true" and d["denomId"]]
+            with assoc.lock:
+                gp = assoc.game_play.setdefault(dev, {})
+                gp["denoms"] = denoms
+                gp["denomRanges"] = ranges
+                gp["activeDenoms"] = active
+                gp["denomsAt"] = now_iso()
+                assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
+            self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
+            log.info("🎰 [%s] gameDenomList dev=%s — %d denom(s), %d "
+                     "range(s); active=[%s]%s", assoc.egm_id, dev,
+                     len(denoms), len(ranges), ",".join(active),
+                     "" if active else
+                     " — 0 active is legal (egmEnabled=false per §6.2.2)")
+
+        elif cmd == "noteAcceptorStatus" and stype == "G2S_response":
+            # Response to BOTH getNoteAcceptorStatus and setNoteAcceptorState
+            # (§13.9/§13.8 — point-to-point delivery always answers; only a
+            # multicast one would not). The EGM originates no noteAcceptor
+            # commands (§13.7), so a G2S_response here is always paired to
+            # one of ours by sessionId. Fold via the shared parser (absent
+            # hostEnabled/egmEnabled = true, fault booleans default false).
+            data, raised = self._fold_note_acceptor_status(
+                assoc, req["commandEl"], "read")
+            log.info("💵 [%s] noteAcceptorStatus dev=%s hostEnabled=%s "
+                     "egmEnabled=%s escrow=%s%s", assoc.egm_id,
+                     req["deviceId"], data["hostEnabled"],
+                     data["egmEnabled"], data["noteValueInEscrow"],
+                     " ⚠️ " + ",".join(raised) if raised else "")
+
+        elif cmd == "noteAcceptorProfile" and stype == "G2S_response":
+            # Response to getNoteAcceptorProfile (§13.12, Tables 13.4-13.6):
+            # profile scalars + the noteAcceptorData per-note table — the
+            # readback view of the config-sync's G2S_noteAcceptorDataTable,
+            # so it REPLACES the promoted notes wholesale (same table,
+            # freshest source wins). Optional attrs get their Table 13.4
+            # defaults; noteEnabled/voucherEnabled are required but a
+            # nonconforming EGM omitting them just leaves ours unset.
+            el = req["commandEl"]
+            dev = req["deviceId"]
+            notes = []
+            for child in el:
+                if localname(child.tag) != "noteAcceptorData":
+                    continue
+                notes.append({
+                    "currencyId": attr(child, "currencyId"),
+                    "denomId": attr(child, "denomId"),
+                    "baseCashableAmt": attr(child, "baseCashableAmt"),
+                    "noteActive": attr(child, "noteActive") or "false",
+                    "denom": denom_dollars(attr(child, "denomId")),
+                })
+            profile = {
+                "configurationId": attr(el, "configurationId") or "0",
+                "restartStatus": attr(el, "restartStatus") or "true",
+                "useDefaultConfig": attr(el, "useDefaultConfig") or "false",
+                "requiredForPlay": attr(el, "requiredForPlay") or "false",
+                "noMessageTimer": attr(el, "noMessageTimer") or "0",
+                "minLogEntries": attr(el, "minLogEntries") or "35",
+                "noteEnabled": attr(el, "noteEnabled"),
+                "voucherEnabled": attr(el, "voucherEnabled"),
+                "profileAt": now_iso(),
+            }
+            active = [n["denom"] for n in notes
+                      if (n["noteActive"] or "").lower() == "true"]
+            with assoc.lock:
+                na = assoc.note_acceptor
+                na["profile"] = profile
+                if profile["noteEnabled"] is not None:
+                    na["noteEnabled"] = profile["noteEnabled"]
+                if profile["voucherEnabled"] is not None:
+                    na["voucherEnabled"] = profile["voucherEnabled"]
+                if notes:
+                    na["notes"] = notes
+                    na["activeNotes"] = active
+                    na["notesSource"] = "profile"
+                    na["notesAt"] = now_iso()
+            log.info("💵 [%s] noteAcceptorProfile dev=%s noteEnabled=%s "
+                     "voucherEnabled=%s — %d note(s), active: %s",
+                     assoc.egm_id, dev, profile["noteEnabled"],
+                     profile["voucherEnabled"], len(notes),
+                     " ".join(active) or "(none)")
+            if profile["requiredForPlay"] == "true":
+                log.warning("[%s] ⚠️ noteAcceptor requiredForPlay=TRUE — a "
+                            "setNoteAcceptorState disable would take the "
+                            "WHOLE EGM down via evaluate(cabinet.egmState) "
+                            "(Table 13.4/§13.19.1)", assoc.egm_id)
+
+        elif cmd == "commsClosing":
+            log.warning("[%s] commsClosing reason=%s — EGM is tearing down",
+                        assoc.egm_id, attr(req["commandEl"], "reason"))
+            assoc.comms_state = "closing"
+            if self.inline:
+                return self._inline(assoc, "<g2s:commsClosingAck/>",
+                                    req["sessionId"])
+            self.enqueue_comms_closing_ack(assoc, req)
+
+        elif cmd == "optionList":
+            # optionConfig is a HOST-OWNED class: the EGM directs its config
+            # sync at us. Answering APX007 ('class not supported') repudiated
+            # the class and left the EGM's bring-up unsettled (a likely reason
+            # it never pulsed keepAlive). Reply with the prescribed bare
+            # optionListAck carried under <g2s:optionConfig> (spec §9.13/§9.14).
+            # TWO arrival forms, ONE parse (GR-10): the unsolicited config-sync
+            # push is a G2S_request needing the optionListAck; the answer to
+            # our getOptionList is the SAME command in G2S_response form
+            # (§9.13 'sent in response to a getOptionList') and draws NO ack.
+            # PARSE either: this is IGT AVP's real device inventory +
+            # config (getDescriptor stays silent on this EGM). Each <deviceOptions>
+            # is one device; capture its class/id, option groups/items, and the
+            # count of current-value rows. Store under assoc.lock, persist to
+            # the durable inventory store, then ack (request form only).
+            el = req["commandEl"]
+            synced = []
+            for dev in el:
+                if localname(dev.tag) != "deviceOptions":
+                    continue
+                dcls = attr(dev, "deviceClass")
+                did = attr(dev, "deviceId")
+                groups, items, value_rows = [], [], 0
+                # G2S-27: harvest each option's COMPLETE current-value set,
+                # keyed by the addressing 4-tuple, so setOption can validate
+                # the option exists and copy+edit the whole set (§9.15).
+                dev_options = {}
+                for grp in dev:
+                    if localname(grp.tag) != "optionGroup":
+                        continue
+                    gid = attr(grp, "optionGroupId")
+                    groups.append(gid)
+                    for item in grp:
+                        if localname(item.tag) != "optionItem":
+                            continue
+                        oid = attr(item, "optionId")
+                        items.append(oid)
+                        cur_vals, lossy = [], False
+                        for sub in item:
+                            if localname(sub.tag) == "optionCurrentValues":
+                                value_rows += sum(1 for _ in sub)
+                                cur_vals, lossy = \
+                                    parse_option_current_values(sub)
+                        okey = f"{dcls}/{did}/{gid}/{oid}"
+                        rec = {
+                            "deviceClass": dcls, "deviceId": did,
+                            "optionGroupId": gid, "optionId": oid,
+                            "securityLevel": attr(item, "securityLevel"),
+                            "currentValues": cur_vals,
+                            "paramIds": sorted(
+                                option_value_param_ids(cur_vals)),
+                        }
+                        if lossy:
+                            # Round-trip loss (nested complexValue / unknown
+                            # shape) — start_option_change_cycle refuses to
+                            # build a change from this option's pruned copy.
+                            rec["lossy"] = True
+                        dev_options[okey] = rec
+                key = f"{dcls}/{did}"
+                with assoc.lock:
+                    assoc.config_devices[key] = {
+                        "deviceClass": dcls, "deviceId": did,
+                        "optionGroups": groups, "optionItems": items,
+                        "valueRows": value_rows,
+                    }
+                    assoc.config_options.update(dev_options)
+                synced.append(key)
+                # G2S-25: the handpay device's option VALUES are the
+                # permission gate for remote key-off (G2S_enabledRemoteCredit
+                # & friends, §11.26.4-5 Table 11.46) — pull them out of the
+                # same config-sync push so a disabled reset-to-credits path
+                # is visible in /api/status BEFORE bench day. Only
+                # optionCurrentValues (live values) are read; parameter
+                # DEFINITIONS (booleanParameter etc.) are skipped, and the
+                # complexValue wrapper flattens to its child paramIds.
+                if dcls == "G2S_handpay":
+                    params = {}
+                    for cur in dev.iter():
+                        if localname(cur.tag) != "optionCurrentValues":
+                            continue
+                        for val in cur.iter():
+                            if localname(val.tag) in (
+                                    "booleanValue", "integerValue",
+                                    "decimalValue", "stringValue"):
+                                pid = attr(val, "paramId")
+                                if pid is not None:
+                                    params[pid] = (val.text or "").strip()
+                    if params:
+                        with assoc.lock:
+                            assoc.handpay_options = params
+                        # Case-folded like option_values_equal — an EGM may
+                        # legally spell the xs:boolean True/TRUE.
+                        rc = (params.get("G2S_enabledRemoteCredit")
+                              or "").strip().lower()
+                        log.info("💰 [%s] handpay options synced (%d params) "
+                                 "— remote key-off to credits %s", assoc.egm_id,
+                                 len(params),
+                                 "ENABLED ✅" if rc == "true" else
+                                 "DISABLED ❌ (clearHandpay will draw "
+                                 "G2S_JPX002)" if rc == "false" else
+                                 "unknown (G2S_enabledRemoteCredit not in "
+                                 "the push)")
+                # G2S-23: promote the noteAcceptor config-sync to first-class
+                # state. The G2S_noteAcceptorDataTable rows (§13.21.6-7 —
+                # complex param G2S_noteAcceptorData: currencyId/denomId/
+                # baseCashableAmt/noteActive per note) ARE the enabled-notes
+                # table; the noteAcceptorProfile read is just its readback
+                # view — so no wire traffic is needed for this part. The flat
+                # booleans (G2S_noteEnabled/G2S_voucherEnabled from
+                # G2S_noteAcceptorParams, §13.21.4-5, plus the protocol
+                # params) land in configParams. Only optionCurrentValues
+                # (live values) are read — parameter DEFINITIONS are skipped
+                # — and note-row sub-values are kept OUT of the flat map by
+                # walking direct children only.
+                elif dcls == "G2S_noteAcceptor":
+                    notes, params = [], {}
+                    for cur in dev.iter():
+                        if localname(cur.tag) != "optionCurrentValues":
+                            continue
+                        for val in cur:
+                            tag = localname(val.tag)
+                            if tag == "complexValue":
+                                pid = attr(val, "paramId")
+                                sub_vals = {
+                                    attr(s, "paramId"): (s.text or "").strip()
+                                    for s in val if attr(s, "paramId")}
+                                if pid == "G2S_noteAcceptorData":
+                                    notes.append({
+                                        "currencyId":
+                                            sub_vals.get("G2S_currencyId"),
+                                        "denomId":
+                                            sub_vals.get("G2S_denomId"),
+                                        "baseCashableAmt": sub_vals.get(
+                                            "G2S_baseCashableAmt"),
+                                        "noteActive": sub_vals.get(
+                                            "G2S_noteActive") or "false",
+                                        "denom": denom_dollars(
+                                            sub_vals.get("G2S_denomId")),
+                                    })
+                                else:
+                                    params.update(sub_vals)
+                            elif tag in ("booleanValue", "integerValue",
+                                         "decimalValue", "stringValue"):
+                                pid = attr(val, "paramId")
+                                if pid is not None:
+                                    params[pid] = (val.text or "").strip()
+                    if notes or params:
+                        active = [n["denom"] for n in notes
+                                  if (n["noteActive"] or "").lower()
+                                  == "true"]
+                        with assoc.lock:
+                            na = assoc.note_acceptor
+                            if notes:
+                                na["notes"] = notes
+                                na["activeNotes"] = active
+                                na["notesSource"] = "config-sync"
+                                na["notesAt"] = now_iso()
+                            if params.get("G2S_noteEnabled") is not None:
+                                na["noteEnabled"] = params["G2S_noteEnabled"]
+                            if params.get("G2S_voucherEnabled") is not None:
+                                na["voucherEnabled"] = \
+                                    params["G2S_voucherEnabled"]
+                            na["configParams"] = params
+                        log.info("💵 [%s] note table synced from config-sync "
+                                 "— %d note(s), active: %s; noteEnabled=%s "
+                                 "voucherEnabled=%s", assoc.egm_id,
+                                 len(notes), " ".join(active) or "(none)",
+                                 params.get("G2S_noteEnabled"),
+                                 params.get("G2S_voucherEnabled"))
+            src = ("CONFIG-SYNC" if stype == "G2S_request"
+                   else "getOptionList READBACK")
+            if synced:
+                with assoc.lock:
+                    # A LIVE optionList (either arrival form) is ground truth
+                    # — the store-seeded inventory no longer needs the
+                    # join-time getOptionList readback.
+                    assoc.config_seeded = False
+                log.info("=" * 64)
+                log.info("[%s] %s optionList — %d device(s): %s",
+                         assoc.egm_id, src, len(synced), ", ".join(synced))
+                for k in synced:
+                    d = assoc.config_devices[k]
+                    log.info("    %-26s groups=%s items=%s valueRows=%d",
+                             k, d["optionGroups"], d["optionItems"],
+                             d["valueRows"])
+                log.info("(config devices known: %d — full XML in wire log)",
+                         len(assoc.config_devices))
+                log.info("=" * 64)
+                # GR-10: mirror the refreshed inventory to disk so a warm
+                # host restart keeps it (config-sync re-fires only on
+                # deviceReset — before this, every restart went blind).
+                self.persist_config_inventory(assoc)
+                # G2S-27 post-apply verification: an optionList covering the
+                # changed device while the change record sits at
+                # result=applied IS the read-back — compare the refreshed
+                # inventory against the expected values and stamp the record
+                # verified/verifyFailed (either arrival form counts: our
+                # scoped getOptionList response OR an unsolicited config-sync
+                # push). Nested verify dict is assigned wholesale, never
+                # mutated, so snapshot()'s shallow copy stays consistent.
+                verified = mismatches = None
+                with assoc.lock:
+                    oc = assoc.option_change
+                    if oc.get("result") == "applied" and \
+                            (f"{oc.get('deviceClass')}/{oc.get('deviceId')}"
+                             in synced):
+                        okey = (f"{oc['deviceClass']}/{oc['deviceId']}/"
+                                f"{oc.get('optionGroupId')}/"
+                                f"{oc.get('optionId')}")
+                        vopt = assoc.config_options.get(okey)
+                        expected = dict(oc.get("params") or {})
+                        if vopt is not None and expected:
+                            readback = option_param_values(
+                                vopt.get("currentValues"))
+                            # option_values_equal is the SAME comparator the
+                            # enableRemoteHandpay no-op guard uses — booleans
+                            # case-fold, everything else strict (post-review
+                            # 2026-07-02).
+                            mism = {p: {"expected": e.get("new"),
+                                        "got": readback.get(p)}
+                                    for p, e in expected.items()
+                                    if not option_values_equal(
+                                        readback.get(p), e.get("new"))}
+                            oc["verify"] = {
+                                "at": now_iso(), "mismatches": mism,
+                                "readback": {p: readback.get(p)
+                                             for p in expected}}
+                            oc["result"] = ("verifyFailed" if mism
+                                            else "verified")
+                            oc["progressTs"] = time.time()
+                            verified, mismatches = not mism, mism
+                if verified is True:
+                    log.info("[%s] ✅ OPTION CHANGE VERIFIED — the EGM's "
+                             "read-back matches every changed param "
+                             "(stage stays 'applied')", assoc.egm_id)
+                elif verified is False:
+                    log.warning("[%s] ❌ OPTION CHANGE VERIFY FAILED — the "
+                                "EGM said applied but its read-back "
+                                "disagrees: %s", assoc.egm_id, mismatches)
+            if stype == "G2S_request":
+                log.info("[%s] optionConfig.optionList (config-sync) -> "
+                         "optionListAck", assoc.egm_id)
+                self.enqueue_class_response(
+                    assoc, req, "<g2s:optionListAck/>", "optionListAck")
+            else:
+                # Response form pairs with our getOptionList via sessionId —
+                # a response is never acked (§1.18: acks answer requests).
+                log.info("[%s] optionConfig.optionList (response to "
+                         "getOptionList, sessionId=%s) — parsed, no ack "
+                         "due", assoc.egm_id, req["sessionId"])
+
+        elif cmd == "optionChangeStatus":
+            # Response to setOptionChange/authorizeOptionChange/cancelOption-
+            # Change, OR the unsolicited terminal push (§9.18). Drives the
+            # G2S-27 change state machine AND acks a request-form push
+            # (optionChangeStatusAck, Table 9.39). changeStatus enum (Table
+            # A.1): G2S_pending/authorized/cancelled/applied/aborted/error.
+            el = req["commandEl"]
+            cfg = attr(el, "configurationId") or "0"
+            txn = attr(el, "transactionId") or "0"
+            change_status = attr(el, "changeStatus")
+            change_exc = attr(el, "changeException") or "0"
+            st = (change_status or "").lower()
+            log.info("[%s] optionConfig.optionChangeStatus configId=%s txn=%s "
+                     "status=%s exc=%s (stage=%s)", assoc.egm_id, cfg, txn,
+                     change_status, change_exc, assoc.optionconfig_stage)
+            # ALWAYS ack an unsolicited/terminal push arriving as a request
+            # (§9.18 — the EGM expects optionChangeStatusAck or it re-sends).
+            if stype == "G2S_request":
+                self.enqueue_class_response(
+                    assoc, req,
+                    f'<g2s:optionChangeStatusAck g2s:configurationId="{cfg}" '
+                    f'g2s:transactionId="{txn}"/>',
+                    "optionChangeStatusAck")
+            # State machine advance — only for OUR in-flight configId.
+            with assoc.lock:
+                mine = assoc.option_change.get("configId") is not None and \
+                    str(assoc.option_change.get("configId")) == cfg
+            if not mine:
+                # A push for a change we didn't initiate (or already retired) —
+                # acked above, nothing else to do (silence/foreign tolerance).
+                pass
+            else:
+                failed = (change_exc not in (None, "0", "")) or \
+                    "error" in st or "abort" in st
+                if failed:
+                    hint = OPTION_CHANGE_EXCEPTIONS.get(str(change_exc), "")
+                    with assoc.lock:
+                        assoc.optionconfig_stage = "failed"
+                        oc = assoc.option_change
+                        oc["result"] = f"error:{change_status or 'G2S_error'}"
+                        oc["changeException"] = change_exc
+                        oc["progressTs"] = time.time()
+                    log.warning("[%s] ❌ OPTION CHANGE FAILED cfg=%s "
+                                "(status=%s exc=%s%s)", assoc.egm_id, cfg,
+                                change_status, change_exc,
+                                f" — {hint}" if hint else "")
+                elif "cancel" in st:
+                    with assoc.lock:
+                        assoc.optionconfig_stage = "cancelled"
+                        assoc.option_change["result"] = "cancelled"
+                        assoc.option_change["progressTs"] = time.time()
+                    log.info("[%s] ⚙️  OPTION CHANGE CANCELLED cfg=%s (no "
+                             "values changed)", assoc.egm_id, cfg)
+                elif "appl" in st:
+                    with assoc.lock:
+                        assoc.optionconfig_stage = "applied"
+                        oc = assoc.option_change
+                        oc["result"] = "applied"
+                        oc["transactionId"] = txn
+                        oc["progressTs"] = time.time()
+                        oid = oc.get("optionId")
+                        params = dict(oc.get("params") or {})
+                        rb_dc = oc.get("deviceClass")
+                        rb_di = oc.get("deviceId")
+                    edit_str = ", ".join(
+                        f"{oid}.{p} = {e.get('new')!r}"
+                        for p, e in params.items()) or oid
+                    log.info("=" * 64)
+                    log.info("[%s] 🎉 OPTION CHANGE APPLIED cfg=%s txn=%s — "
+                             "%s is now LIVE on the EGM (NO rollback). "
+                             "Read-back getOptionList queued: §9.3.4 (p.344) "
+                             "says the EGM MUST also push an optionList "
+                             "after apply, but the host verifies + refreshes "
+                             "the inventory itself rather than depend on "
+                             "this AVP honoring it (either arrival form "
+                             "verifies).", assoc.egm_id, cfg, txn, edit_str)
+                    log.info("=" * 64)
+                    # G2S-27 post-apply read-back, scoped to the changed
+                    # device: the optionList handler re-parses + persists the
+                    # inventory (re-lighting handpayRemoteCreditAllowed) and
+                    # stamps the change record verified/verifyFailed. Enqueued
+                    # from this inbound-handler thread exactly like the
+                    # auto-authorize below — never from inside the FIFO
+                    # worker (the ce2602f deadlock).
+                    if rb_dc and rb_di:
+                        self.enqueue_get_option_list(
+                            assoc, device_class=rb_dc, device_id=rb_di)
+                elif assoc.optionconfig_stage == "setting" and \
+                        "pend" in st and txn and txn != "0":
+                    # setOptionChange validated — pending, awaiting authorize.
+                    with assoc.lock:
+                        assoc.pending_option_txn_id = txn
+                        assoc.optionconfig_stage = "authorizing"
+                        oc = assoc.option_change
+                        oc["transactionId"] = txn
+                        oc["result"] = "pending"
+                        oc["progressTs"] = time.time()
+                    log.info("[%s] option change validated (txn=%s) — "
+                             "authorizing", assoc.egm_id, txn)
+                    self.enqueue_authorize_option_change(assoc, cfg, txn)
+                elif "authoriz" in st:
+                    # authorizeOptionChange accepted — the EGM now applies per
+                    # applyCondition and will push the terminal applied status.
+                    with assoc.lock:
+                        assoc.option_change["result"] = "authorized"
+                        assoc.option_change["transactionId"] = txn
+                        assoc.option_change["progressTs"] = time.time()
+                    log.info("[%s] option change AUTHORIZED cfg=%s txn=%s — "
+                             "awaiting apply", assoc.egm_id, cfg, txn)
+
+        elif cmd == "optionChangeLogStatus" and stype == "G2S_response":
+            # Response to getOptionChangeLogStatus (§9.21) — the change-log
+            # high-water. Surface it in /api/status (optionChangeLog).
+            el = req["commandEl"]
+            last_seq = attr(el, "lastSequence") or "0"
+            total = attr(el, "totalEntries") or "0"
+            with assoc.lock:
+                assoc.option_change_log = {
+                    "lastSequence": last_seq, "totalEntries": total,
+                    "at": now_iso()}
+            log.info("[%s] optionChangeLogStatus lastSequence=%s totalEntries=%s",
+                     assoc.egm_id, last_seq, total)
+
+        elif cmd == "getValidationData" and stype == "G2S_request":
+            # voucher is a HOST-OWNED class (G2S-26 tier 1): ~1s after the
+            # optionConfig config-sync on every join the AVP asks us to fill
+            # its validation-id buffer (captured 2026-07-01: configurationId=0
+            # validationListId=0 numValidationIds=20 valIdListExpired=true).
+            # Reply with validationData (spec §21.15/§21.16): fresh 18-digit
+            # ids + seeds from the durable VoucherStore (never re-issued
+            # across restarts), deleteCurrent=true when the EGM's current
+            # list is unknown or expired so it atomically replaces the stale
+            # buffer. With no usable ids the EGM keeps voucher egmEnabled=
+            # false — this response is what turns ticket printing ON.
+            el = req["commandEl"]
+            egm_list_id = attr(el, "validationListId") or "0"
+            expired = (attr(el, "valIdListExpired") or "false").lower() \
+                == "true"
+            try:
+                num = int(attr(el, "numValidationIds") or "0")
+            except ValueError:
+                num = 0
+            # Issuance cap (G2S-40): the EGM can never legitimately ask for
+            # more ids than its own profile's maxValIds buffer size (Table
+            # 21.12, default 20) — when the join-probe voucherProfile has
+            # revealed it, that IS the cap. Until then fall back to the old
+            # 100-id sanity bound (generous: maxValIds is typically 20-40).
+            with assoc.lock:
+                prof_max = (assoc.voucher_device.get("profile")
+                            or {}).get("maxValIds")
+            try:
+                cap = int(prof_max)
+            except (TypeError, ValueError):
+                cap = 0
+            if cap <= 0:
+                cap = 100
+            num = max(0, min(num, cap))
+            known = self.voucher_store.last_list_id(assoc.egm_id)
+            delete_current = expired or egm_list_id != str(known)
+            if num > 0:
+                list_id, items = self.voucher_store.new_validation_list(
+                    assoc.egm_id, num)
+                items_xml = "".join(
+                    f'<g2s:validationIdItem g2s:validationId="{vid}" '
+                    f'g2s:validationSeed="{seed}"/>'
+                    for vid, seed in items)
+                with assoc.lock:
+                    assoc.voucher_list_id = list_id
+                    assoc.voucher_ids_sent = len(items)
+                    assoc.voucher_list_at = now_iso()
+                log.info("=" * 64)
+                log.info("🎫 [%s] issued validation list %d (%d ids, "
+                         "deleteCurrent=%s) — EGM had listId=%s expired=%s",
+                         assoc.egm_id, list_id, len(items),
+                         str(delete_current).lower(), egm_list_id, expired)
+                log.info("   ticket printing unblocks on the EGM once loaded "
+                         "(expect G2S_VCE102); ids persisted in %s",
+                         self.voucher_store.path)
+                log.info("=" * 64)
+            else:
+                # numValidationIds=0: buffer still above minLevelValIds. An
+                # EMPTY validationData is the prescribed reply (Table 21.15)
+                # and still resets the EGM's valIdListRefresh/Life timers.
+                list_id, items_xml, delete_current = egm_list_id, "", False
+                log.info("🎫 [%s] getValidationData(num=0) -> empty "
+                         "validationData (timer refresh, listId=%s)",
+                         assoc.egm_id, list_id)
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:validationData g2s:validationListId="{list_id}" '
+                f'g2s:deleteCurrent="{str(delete_current).lower()}">'
+                f'{items_xml}</g2s:validationData>',
+                "validationData")
+
+        elif cmd == "issueVoucher" and stype == "G2S_request":
+            # A ticket just PRINTED (spec §21.17). Persist the voucher, then
+            # ack with the bare transactionId echo (§21.18). The EGM retries
+            # issueVoucher until acked, so a re-send of an already-recorded
+            # transactionId must re-ack WITHOUT double-recording (§21.5).
+            # egmException=1 is a printer presentation error — still a valid
+            # issuance to store (Table 21.36).
+            el = req["commandEl"]
+            rec = {
+                "kind": "issue",
+                "transactionId": attr(el, "transactionId"),
+                "validationId": attr(el, "validationId"),
+                "voucherAmt": attr(el, "voucherAmt"),
+                "creditType": attr(el, "creditType"),
+                "transferDateTime": attr(el, "transferDateTime"),
+                "egmAction": attr(el, "egmAction"),
+                "voucherSequence": attr(el, "voucherSequence"),
+                "expireDateTime": attr(el, "expireDateTime"),
+                "egmException": attr(el, "egmException") or "0",
+                "seenAt": now_iso(),
+            }
+            dup = self.voucher_store.record_voucher(assoc.egm_id, rec)
+            try:
+                dollars = f"${int(rec['voucherAmt']) / 100000:,.2f}"
+            except (TypeError, ValueError):
+                dollars = f"amt={rec['voucherAmt']}"
+            if dup:
+                log.info("🎫 [%s] duplicate issueVoucher txn=%s (EGM retry) "
+                         "-> re-ack, not re-recorded", assoc.egm_id,
+                         rec["transactionId"])
+            else:
+                with assoc.lock:
+                    assoc.voucher_count += 1
+                    assoc.vouchers.append(rec)
+                    if len(assoc.vouchers) > 200:
+                        assoc.vouchers = assoc.vouchers[-200:]
+                    total = assoc.voucher_count
+                log.info("=" * 64)
+                log.info("🎫 [%s] VOUCHER ISSUED #%d — %s %s "
+                         "validationId=%s txn=%s seq=%s%s", assoc.egm_id,
+                         total, dollars, rec["creditType"],
+                         rec["validationId"], rec["transactionId"],
+                         rec["voucherSequence"],
+                         "" if rec["egmException"] == "0"
+                         else f' ⚠️ egmException={rec["egmException"]}')
+                log.info("=" * 64)
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:issueVoucherAck '
+                f'g2s:transactionId="{rec["transactionId"]}"/>',
+                "issueVoucherAck")
+
+        elif cmd == "redeemVoucher" and stype == "G2S_request":
+            # A ticket just went into the note acceptor (spec §21.19): the
+            # EGM escrows it for voucherHoldTime (15s default) awaiting our
+            # authorizeVoucher — the class-level RESPONSE to this request
+            # (§21.30.4: same sessionId, G2S_response). Decide from the
+            # durable VoucherStore: authorize with the ISSUED amount/
+            # creditType, or reject "invalid ticket" — voucherAmt=0 +
+            # hostException (Table 21.35) with hostAction left at its
+            # G2S_egmAction default so the EGM returns the ticket. NEVER a
+            # class error for a bad ticket (that forces a rejection metered
+            # as egmException=2, §21.19); VCX002/VCX001 only for a
+            # structurally broken command. A slow/lost authorize is
+            # harmless — the EGM times out, rejects, and ALWAYS commits;
+            # a late authorizeVoucher is ignored (§21.19), so this path is
+            # silence-tolerant by design. The EGM retries redeemVoucher
+            # while unanswered: authorize_redemption is idempotent per
+            # (egmId, transactionId), so a retry re-draws the SAME
+            # authorization.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId")
+            vid = attr(el, "validationId")
+            if not txn or not vid:
+                code = "G2S_VCX002" if not txn else "G2S_VCX001"
+                text = ("Invalid Transaction ID." if not txn
+                        else "Invalid Voucher ID.")
+                log.warning("[%s] redeemVoucher missing %s -> %s",
+                            assoc.egm_id,
+                            "transactionId" if not txn else "validationId",
+                            code)
+                self.enqueue_app_error(assoc, req, code, text)
+            else:
+                # hub.db phase 2: adjudicate through the UNION authority —
+                # an AVP-issued id delegates to the VoucherStore exactly as
+                # before; a SAS-minted ticket (printed on the BB2) resolves
+                # from the hub ledger and redeems HERE, cross-machine.
+                dec = self.tito.authorize(assoc.egm_id, txn, vid)
+                exc = dec["exc"]
+                player_id = attr(el, "playerId") or ""
+                id_number = attr(el, "idNumber") or ""
+                now = now_iso()
+                with assoc.lock:
+                    rrec = next((r for r in assoc.redemptions
+                                 if r.get("transactionId") == txn), None)
+                    if rrec is None:
+                        rrec = {"transactionId": txn, "validationId": vid,
+                                "requestedAt": now, "outcome": None,
+                                "egmException": None}
+                        assoc.redemptions.append(rrec)
+                        if len(assoc.redemptions) > 200:
+                            assoc.redemptions = assoc.redemptions[-200:]
+                        assoc.redeem_count += 1
+                    rrec.update({
+                        "voucherAmt": dec["amt"],
+                        "creditType": dec["creditType"],
+                        "hostException": str(exc),
+                        "authAction": ("authorized" if exc == 0
+                                       else "rejected"),
+                        "reason": dec["reason"], "authAt": now})
+                    if player_id:
+                        rrec["playerId"] = player_id
+                    if id_number:
+                        rrec["idNumber"] = id_number
+                try:
+                    dollars = f"${int(dec['amt']) / 100000:,.2f}"
+                except (TypeError, ValueError):
+                    dollars = f"amt={dec['amt']}"
+                if exc == 0:
+                    log.info("=" * 64)
+                    log.info("🎟️ [%s] TICKET IN — redeemVoucher txn=%s "
+                             "validationId=%s -> AUTHORIZED %s %s%s",
+                             assoc.egm_id, txn, vid, dollars,
+                             dec["creditType"],
+                             " (EGM retry, same authorization)"
+                             if dec["retry"] else "")
+                    log.info("   id held redeemPending until the EGM's "
+                             "commitVoucher (stack) closes it out")
+                    log.info("=" * 64)
+                else:
+                    log.info("🎟️ [%s] TICKET REJECTED — redeemVoucher "
+                             "txn=%s validationId=%s -> voucherAmt=0 "
+                             "hostException=%s (%s)", assoc.egm_id, txn,
+                             vid, exc, dec["reason"])
+                exc_attr = f' g2s:hostException="{exc}"' if exc else ""
+                self.enqueue_class_response(
+                    assoc, req,
+                    f'<g2s:authorizeVoucher g2s:transactionId="{txn}" '
+                    f'g2s:validationId="{vid}" '
+                    f'g2s:voucherAmt="{dec["amt"]}" '
+                    f'g2s:creditType="{dec["creditType"]}"{exc_attr}/>',
+                    "authorizeVoucher")
+
+        elif cmd == "commitVoucher" and stype == "G2S_request":
+            # Final leg of a redemption (spec §21.21) — the EGM ALWAYS sends
+            # it: after stacking (egmAction=G2S_redeemed, transferAmt = the
+            # full voucher amount) or after rejecting (G2S_rejected,
+            # transferAmt=0, egmException per Table 21.36 — including 5, the
+            # voucherHoldTime timeout when the host stayed silent). Close
+            # the redemption out in the durable store: redeemed CONSUMES the
+            # id; rejected RESETS a matching redeemPending id back to issued
+            # so the ticket stays redeemable (p.905). Then ack with the bare
+            # transactionId echo (§21.22 — p.905's "commitTransferAck" is a
+            # spec typo for commitVoucherAck). The EGM retries commitVoucher
+            # until acked, so a duplicate re-acks WITHOUT double-recording
+            # (§21.5); the store transition is idempotent regardless.
+            el = req["commandEl"]
+            rec = {
+                "kind": "commit",
+                "transactionId": attr(el, "transactionId"),
+                "validationId": attr(el, "validationId"),
+                "voucherAmt": attr(el, "voucherAmt"),
+                "creditType": attr(el, "creditType"),
+                "transferAmt": attr(el, "transferAmt") or "0",
+                "transferDateTime": attr(el, "transferDateTime"),
+                "egmAction": attr(el, "egmAction"),
+                "egmException": attr(el, "egmException") or "0",
+                "seenAt": now_iso(),
+            }
+            dup = self.voucher_store.record_voucher(assoc.egm_id, rec)
+            redeemed = rec["egmAction"] == "G2S_redeemed"
+            new_state = None
+            if not dup:
+                try:
+                    new_state = self.tito.close(
+                        assoc.egm_id, rec["transactionId"],
+                        rec["validationId"], rec["egmAction"])
+                except Exception as e:  # noqa: BLE001 — the EGM's commit
+                    # retransmit protocol is not ours to break: log the db
+                    # fault, still ack. The hub row stays redeemPending
+                    # until a bench void/sync — honest in the ledger.
+                    log.error("tito close(%s) db fault on commitVoucher: "
+                              "%s — id stays pending", rec["validationId"],
+                              e)
+                with assoc.lock:
+                    assoc.vouchers.append(rec)
+                    if len(assoc.vouchers) > 200:
+                        assoc.vouchers = assoc.vouchers[-200:]
+                    rrec = next((r for r in assoc.redemptions
+                                 if r.get("transactionId")
+                                 == rec["transactionId"]), None)
+                    if rrec is None:
+                        # commit without a redeemVoucher through us — host
+                        # restarted mid-redemption, or the EGM timed out on
+                        # a silent pre-ownership host. Synthesize the record
+                        # so the history stays complete (the keyedOff
+                        # pattern).
+                        rrec = {"transactionId": rec["transactionId"],
+                                "validationId": rec["validationId"],
+                                "voucherAmt": rec["voucherAmt"],
+                                "requestedAt": None, "hostException": None,
+                                "authAction": None,
+                                "source": "unsolicitedCommit"}
+                        assoc.redemptions.append(rrec)
+                        if len(assoc.redemptions) > 200:
+                            assoc.redemptions = assoc.redemptions[-200:]
+                        assoc.redeem_count += 1
+                    rrec.update({
+                        "outcome": "redeemed" if redeemed else "rejected",
+                        "egmException": rec["egmException"],
+                        "transferAmt": rec["transferAmt"],
+                        "committedAt": rec["seenAt"]})
+                    if redeemed:
+                        assoc.redeemed_count += 1
+                    else:
+                        assoc.redeem_rejected_count += 1
+            try:
+                dollars = f"${int(rec['transferAmt']) / 100000:,.2f}"
+            except (TypeError, ValueError):
+                dollars = f"transferAmt={rec['transferAmt']}"
+            if dup:
+                log.info("🎫 [%s] duplicate commitVoucher txn=%s (EGM retry) "
+                         "-> re-ack, not re-recorded", assoc.egm_id,
+                         rec["transactionId"])
+            elif redeemed:
+                log.info("=" * 64)
+                log.info("🎟️ [%s] TICKET REDEEMED — %s transferred, "
+                         "validationId=%s txn=%s (id now %s)", assoc.egm_id,
+                         dollars, rec["validationId"], rec["transactionId"],
+                         new_state or "untracked")
+                log.info("=" * 64)
+            else:
+                log.info("🎟️ [%s] commitVoucher txn=%s validationId=%s "
+                         "REJECTED by EGM egmException=%s (%s) — %s",
+                         assoc.egm_id, rec["transactionId"],
+                         rec["validationId"], rec["egmException"],
+                         EGM_VOUCHER_EXCEPTIONS.get(rec["egmException"],
+                                                    "?"),
+                         "id reset to issued (ticket still redeemable)"
+                         if new_state == "issued"
+                         else f"id state={new_state}")
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:commitVoucherAck '
+                f'g2s:transactionId="{rec["transactionId"]}"/>',
+                "commitVoucherAck")
+
+        elif cmd == "handpayRequest" and stype == "G2S_request":
+            # THE lockup (G2S-25, spec §11.12): the EGM needs a handpay and
+            # has locked play (JPE101). Parse + park it in handpays_pending,
+            # then ack with the bare transactionId echo (§11.13) — the ack is
+            # NOT authorization, it just moves the EGM to G2S_handpayPend
+            # (JPE102) awaiting a key-off. The EGM re-sends handpayRequest
+            # until acked, so a duplicate transactionId (pending OR already
+            # closed) re-acks WITHOUT double-recording. handpayType: the
+            # normative enum is gameWin/bonusPay/cancelCredit but the spec's
+            # own example uses G2S_largeWin — store whatever arrives.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+
+            def hp_amt(name):
+                try:
+                    return max(0, int(attr(el, name) or "0"))
+                except ValueError:
+                    return 0
+            with assoc.lock:
+                dup = txn in assoc.handpays_pending or any(
+                    h.get("transactionId") == txn for h in assoc.handpays)
+                if not dup:
+                    rec = {
+                        "transactionId": txn,
+                        "deviceId": req["deviceId"],
+                        "handpayType": attr(el, "handpayType"),
+                        "handpayDateTime": attr(el, "handpayDateTime"),
+                        # request − egmPaid = what still needs keying off
+                        "pendingCashableAmt":
+                            hp_amt("requestCashableAmt")
+                            - min(hp_amt("egmPaidCashableAmt"),
+                                  hp_amt("requestCashableAmt")),
+                        "pendingPromoAmt":
+                            hp_amt("requestPromoAmt")
+                            - min(hp_amt("egmPaidPromoAmt"),
+                                  hp_amt("requestPromoAmt")),
+                        "pendingNonCashAmt":
+                            hp_amt("requestNonCashAmt")
+                            - min(hp_amt("egmPaidNonCashAmt"),
+                                  hp_amt("requestNonCashAmt")),
+                        "requestCashableAmt": hp_amt("requestCashableAmt"),
+                        "requestPromoAmt": hp_amt("requestPromoAmt"),
+                        "requestNonCashAmt": hp_amt("requestNonCashAmt"),
+                        "egmPaidCashableAmt": hp_amt("egmPaidCashableAmt"),
+                        # per-transaction key-off permissions (Table 11.6,
+                        # optional default false) — the truth about which
+                        # key-offs are allowed RIGHT NOW
+                        "localHandpay": attr(el, "localHandpay") or "false",
+                        "localCredit": attr(el, "localCredit") or "false",
+                        "localVoucher": attr(el, "localVoucher") or "false",
+                        "remoteHandpay": attr(el, "remoteHandpay") or "false",
+                        "remoteCredit": attr(el, "remoteCredit") or "false",
+                        "remoteVoucher": attr(el, "remoteVoucher") or "false",
+                        "state": "pending",
+                        "seenAt": now_iso(),
+                    }
+                    assoc.handpays_pending[txn] = rec
+                    assoc.handpay_count += 1
+                    total = assoc.handpay_count
+            if dup:
+                log.info("💰 [%s] duplicate handpayRequest txn=%s (EGM retry)"
+                         " -> re-ack, not re-recorded", assoc.egm_id, txn)
+            else:
+                dollars = "${:,.2f}".format(
+                    (rec["pendingCashableAmt"] + rec["pendingPromoAmt"]
+                     + rec["pendingNonCashAmt"]) / 100000)
+                log.info("=" * 64)
+                log.info("💰💰💰 [%s] HANDPAY PENDING #%d — %s type=%s "
+                         "txn=%s (machine locked)", assoc.egm_id, total,
+                         dollars, rec["handpayType"], txn)
+                log.info("   key-offs offered — remote: credit=%s voucher=%s "
+                         "handpay=%s | local: handpay=%s credit=%s voucher=%s",
+                         rec["remoteCredit"], rec["remoteVoucher"],
+                         rec["remoteHandpay"], rec["localHandpay"],
+                         rec["localCredit"], rec["localVoucher"])
+                log.info('   clear it: Test Panel CLEAR TO CREDITS, or POST '
+                         '/api/command {"action":"clearHandpay"}')
+                log.info("=" * 64)
+            self.enqueue_class_response(
+                assoc, req, f'<g2s:handpayAck g2s:transactionId="{txn}"/>',
+                "handpayAck")
+
+        elif cmd == "remoteKeyOffAck" and stype == "G2S_response":
+            # The EGM ACCEPTED our setRemoteKeyOff (spec §11.15) and fires
+            # JPE103 — the transfer is executing; keyedOff confirms it done.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or ""
+            with assoc.lock:
+                rec = assoc.handpays_pending.get(txn)
+                if rec is not None and rec.get("state") == "keyOffSent":
+                    rec["state"] = "keyOffAcked"
+                    rec["keyOffAckedAt"] = now_iso()
+            log.info("💰 [%s] remoteKeyOffAck txn=%s — key-off initiated "
+                     "(JPE103), awaiting keyedOff", assoc.egm_id, txn)
+
+        elif cmd == "keyedOff" and stype == "G2S_request":
+            # Transfer complete (spec §11.16) — the SAME confirmation for a
+            # remote key-off AND an attendant's local key (JPE104): a local
+            # key-off simply arrives with keyOffType=G2S_local* and no prior
+            # setRemoteKeyOff; player-cancelled cancelCredit arrives as
+            # G2S_cancelled with 0 amounts. Ack with the bare transactionId
+            # echo (§11.17 — finalizes the log, JPE105); the EGM re-sends
+            # keyedOff until acked, so a duplicate re-acks WITHOUT
+            # double-recording. keyOffTypes is an extensibleList — unknown
+            # (IGT_*) tokens are recorded verbatim, never rejected.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+            ko_type = attr(el, "keyOffType") or "G2S_unknown"
+
+            def ko_amt(name):
+                try:
+                    return max(0, int(attr(el, name) or "0"))
+                except ValueError:
+                    return 0
+            kcash, kpromo, knon = (ko_amt("keyOffCashableAmt"),
+                                   ko_amt("keyOffPromoAmt"),
+                                   ko_amt("keyOffNonCashAmt"))
+            with assoc.lock:
+                rec = assoc.handpays_pending.pop(txn, None)
+                dup = rec is None and any(
+                    h.get("transactionId") == txn for h in assoc.handpays)
+                if rec is None and not dup:
+                    # local key-off of a lockup whose handpayRequest we never
+                    # saw (e.g. pre-ownership) — synthesize the record so the
+                    # history is still complete
+                    rec = {"transactionId": txn,
+                           "deviceId": req["deviceId"],
+                           "handpayType": None,
+                           "seenAt": now_iso(),
+                           "source": "unsolicitedKeyedOff"}
+                    assoc.handpay_count += 1
+                if rec is not None:
+                    rec.update({
+                        "state": "keyedOff", "keyOffType": ko_type,
+                        "keyOffCashableAmt": kcash, "keyOffPromoAmt": kpromo,
+                        "keyOffNonCashAmt": knon,
+                        "keyOffDateTime": attr(el, "keyOffDateTime"),
+                        "keyedOffAt": now_iso()})
+                    assoc.handpays.append(rec)
+                    if len(assoc.handpays) > 200:
+                        assoc.handpays = assoc.handpays[-200:]
+                pending_left = len(assoc.handpays_pending)
+            if dup:
+                log.info("💰 [%s] duplicate keyedOff txn=%s (EGM retry) -> "
+                         "re-ack, not re-recorded", assoc.egm_id, txn)
+            else:
+                headline = {
+                    "G2S_remoteCredit": "HANDPAY CLEARED TO CREDITS 🎉",
+                    "G2S_localCredit": "HANDPAY CLEARED TO CREDITS (local key)",
+                    "G2S_remoteVoucher": "HANDPAY CLEARED TO VOUCHER",
+                    "G2S_localVoucher": "HANDPAY CLEARED TO VOUCHER (local key)",
+                    "G2S_remoteHandpay": "HANDPAY PAID BY HAND",
+                    "G2S_localHandpay": "HANDPAY PAID BY HAND (local key)",
+                    "G2S_cancelled": "HANDPAY CANCELLED (player resumed play)",
+                }.get(ko_type, f"HANDPAY KEYED OFF ({ko_type})")
+                log.info("=" * 64)
+                log.info("💰 [%s] %s — %s txn=%s type=%s "
+                         "(%d still pending)", assoc.egm_id, headline,
+                         "${:,.2f}".format((kcash + kpromo + knon) / 100000),
+                         txn, ko_type, pending_left)
+                log.info("=" * 64)
+            self.enqueue_class_response(
+                assoc, req, f'<g2s:keyedOffAck g2s:transactionId="{txn}"/>',
+                "keyedOffAck")
+
+        elif cmd == "requestPending" and stype == "G2S_response":
+            # wat (G2S-39, §22.26): the EGM accepted our initiateRequest and
+            # assigned the transactionId (echoing our requestId — the pairing
+            # key, like the optionConfig sessionId-echo tracking). The EGM
+            # now locks player input and follows with initiateTransfer.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+            rid = attr(el, "requestId") or "0"
+            rec = self.wat_store.on_request_pending(assoc.egm_id, rid, txn)
+            if rec is None:
+                log.warning("[%s] 🏦 requestPending for UNKNOWN requestId=%s "
+                            "(txn=%s) — not one of ours, ignored",
+                            assoc.egm_id, rid, txn)
+            else:
+                self._wat_mirror(assoc, rec)
+                log.info("🏦 [%s] requestPending — requestId=%s assigned "
+                         "txn=%s; awaiting the EGM's initiateTransfer",
+                         assoc.egm_id, rid, txn)
+
+        elif cmd == "initiateTransfer" and stype == "G2S_request":
+            # wat (G2S-39, §22.29): THE decision point. For a host push this
+            # carries our echoed requestId plus the EGM's max acceptable
+            # amounts (reduceAmts semantics); requestId=0 is the EGM-
+            # initiated cash-out-to-account leg (gated by setWatCashOut).
+            # The class-level RESPONSE is authorizeTransfer (§22.30): final
+            # accountId + amounts — ALL-ZERO amounts + hostException is the
+            # deny. Escrow debits the funding account HERE; commitTransfer
+            # reconciles to actuals. An EGM retry of the same transaction
+            # re-draws the IDENTICAL verdict without touching the account.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId")
+            if not txn or txn == "0":
+                self.enqueue_app_error(assoc, req, "G2S_WTX002",
+                                       "Invalid Transaction ID.")
+            else:
+                rid = attr(el, "requestId") or "0"
+                direction = attr(el, "watDirection") or "G2S_toEgm"
+                pay_method = attr(el, "payMethod") or "G2S_payCredit"
+
+                def wt_amt(name):
+                    try:
+                        return max(0, int(attr(el, name) or "0"))
+                    except ValueError:
+                        return 0
+                egm_amounts = (wt_amt("reqCashableAmt"),
+                               wt_amt("reqPromoAmt"),
+                               wt_amt("reqNonCashAmt"))
+                max_amt = wt_amt("maxAmt")
+                rec, created = self.wat_store.on_initiate(
+                    assoc.egm_id, txn, rid, req["deviceId"], direction,
+                    pay_method, egm_amounts, max_amt,
+                    attr(el, "accountId") or "")
+                if created:
+                    log.info("🏦 [%s] EGM-initiated WAT transfer — txn=%s "
+                             "%s (requestId=%s%s)", assoc.egm_id, txn,
+                             direction, rid,
+                             ", the cash-out-to-account leg"
+                             if rid == "0" and direction == "G2S_fromEgm"
+                             else "")
+                amounts, account_id, exc, escrowed, reason = \
+                    self._wat_decide_authorization(assoc, rec, egm_amounts,
+                                                   max_amt)
+                upd = self.wat_store.on_authorize(
+                    assoc.egm_id, txn, account_id, amounts, exc, escrowed)
+                self._wat_mirror(assoc, upd or rec)
+                if exc == 0:
+                    log.info("=" * 64)
+                    log.info("🏦 [%s] WAT AUTHORIZE txn=%s req=%s %s — %s %s "
+                             "account=%r (cash=%d promo=%d nonCash=%d mc)%s",
+                             assoc.egm_id, txn, rid, direction,
+                             denom_dollars(sum(amounts)),
+                             "to the credit meter"
+                             if direction == "G2S_toEgm"
+                             else "off the machine", account_id,
+                             amounts[0], amounts[1], amounts[2],
+                             " [escrowed]" if escrowed else f" [{reason}]")
+                    log.info("   awaiting commitTransfer with the ACTUAL "
+                             "amounts (escrow reconciles there)")
+                    log.info("=" * 64)
+                else:
+                    log.info("🏦 [%s] WAT DENY txn=%s req=%s — "
+                             "hostException=%s (%s): %s", assoc.egm_id, txn,
+                             rid, exc,
+                             WAT_HOST_EXCEPTIONS.get(str(exc), "?"), reason)
+                pay = (f' g2s:payMethod="{pay_method}"'
+                       if direction == "G2S_toEgm" else "")
+                acct_esc = html.escape(account_id or "", quote=True)
+                self.enqueue_class_response(
+                    assoc, req,
+                    f'<g2s:authorizeTransfer g2s:transactionId="{txn}" '
+                    f'g2s:requestId="{rid}" g2s:accountId="{acct_esc}" '
+                    f'g2s:watDirection="{direction}"{pay} '
+                    f'g2s:authCashableAmt="{amounts[0]}" '
+                    f'g2s:authPromoAmt="{amounts[1]}" '
+                    f'g2s:authNonCashAmt="{amounts[2]}" '
+                    f'g2s:hostException="{exc}"/>',
+                    "authorizeTransfer")
+
+        elif cmd == "commitTransfer" and stype == "G2S_request":
+            # wat (G2S-39, §22.31): the mandated close-out — ACTUAL amounts
+            # on success, all-zero + egmException on failure/cancel/deny.
+            # The EGM RETRIES until acked; the WatStore commitSeen latch
+            # marks the retry, and the account movement itself is
+            # ref-idempotent (adjust once=True keyed on the record+leg), so
+            # a retry normally no-ops but HEALS a crash that landed between
+            # the latch fsync and the movement fsync. Reconciliation: toEgm
+            # refunds (escrow − actual) per credit type — the full escrow
+            # when the transfer died; fromEgm credits the account with the
+            # actuals. The typed wat_transfer_* hooks fire here (not off
+            # WTE107 — see EVENT_HOOK_CODES).
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+            rid = attr(el, "requestId") or "0"
+            direction = attr(el, "watDirection") or "G2S_toEgm"
+
+            def wt_amt(name):
+                try:
+                    return max(0, int(attr(el, name) or "0"))
+                except ValueError:
+                    return 0
+            trans = (wt_amt("transCashableAmt"), wt_amt("transPromoAmt"),
+                     wt_amt("transNonCashAmt"))
+            egm_exc = attr(el, "egmException") or "0"
+            dup, rec = self.wat_store.on_commit(
+                assoc.egm_id, txn, rid, req["deviceId"], direction,
+                attr(el, "accountId") or "", trans, egm_exc)
+            if dup:
+                log.info("🏦 [%s] duplicate commitTransfer txn=%s (EGM "
+                         "retry) -> re-ack; the account movement below is "
+                         "ref-idempotent (no-op unless a crash ate it)",
+                         assoc.egm_id, txn)
+            # CRASH SAFETY: the account movement runs on BOTH paths, from
+            # the record's STORED amounts, idempotent via the per-(record,
+            # leg) ledger ref. on_commit fsyncs the commitSeen latch BEFORE
+            # this movement's fsync — two files can't commit atomically —
+            # so a power cut between them used to make the EGM's mandated
+            # §22.31 retry hit the dup path and the credit/refund was lost
+            # forever. Now the retry re-applies it as a no-op-or-heal; the
+            # latch is a fast path, not the correctness guarantee.
+            trans_rec = (int(rec.get("transCashableAmt") or 0),
+                         int(rec.get("transPromoAmt") or 0),
+                         int(rec.get("transNonCashAmt") or 0))
+            total = sum(trans_rec)
+            ok = rec.get("state") == "committed"
+            # NO HOUSE BACKFILL (AJ, CORRECTED 2026-07-12): the record's
+            # stored account is NOT rewritten to "house" when it vanished
+            # mid-flight — the two money legs below each handle a dead
+            # account per their own rule (fromEgm credit → loud unhomed
+            # HOLD, never a House credit of a player's cash-out; toEgm
+            # escrow refund → follows the delete-time fold to the House).
+            account_id = rec.get("accountId") or ""
+            acct_live = bool(account_id) and \
+                self.account_store.get(account_id) is not None
+            escrow = (int(rec.get("escrowCashable") or 0),
+                      int(rec.get("escrowPromo") or 0),
+                      int(rec.get("escrowNonCash") or 0))
+            if sum(escrow) == 0 and rec.get("watDirection") != "G2S_fromEgm":
+                # crash window: the escrow debit's fsync landed but
+                # on_authorize's record update did not (host died between
+                # the two stores) — the record shows no escrow, yet money
+                # moved. The ledger entry that moved it (ref …:escrow) is
+                # the recovery truth; without this, an all-zero timeout
+                # close-out (egmException=3) would strand the escrow.
+                led = self.account_store.ref_totals(
+                    self._wat_ref(assoc.egm_id, rec, "escrow"))
+                escrow = tuple(max(0, -d) for d in led)
+            if rec.get("watDirection") == "G2S_fromEgm":
+                if total > 0:
+                    aerr = None
+                    if account_id:
+                        _, aerr = self.account_store.adjust(
+                            account_id, trans_rec[0], trans_rec[1],
+                            trans_rec[2], note="WAT cash-out from EGM",
+                            ref=self._wat_ref(assoc.egm_id, rec, "commit"),
+                            once=True)
+                    if not account_id or aerr:
+                        # NO HOUSE FALLBACK — reject → ticket (AJ,
+                        # CORRECTED 2026-07-12): the credits left the
+                        # machine with no creditable wallet home (account
+                        # vanished in the authorize→commit gap, or the
+                        # record carries none). LOUD unhomed HOLD, NO
+                        # House ledger row — reconcile by meter. The
+                        # unwritten "…:commit" ref keeps once=True
+                        # airtight: the EGM's §22.31 retries can heal the
+                        # credit into a restored wallet but can never
+                        # double-anything, and the House is never
+                        # credited with a player's cash-out.
+                        self._flag_unhomed_cashout(
+                            assoc.egm_id, txn, total, account_id, aerr,
+                            path="G2S WAT commit")
+            elif sum(escrow) > 0:
+                refund = tuple(max(0, e - t)
+                               for e, t in zip(escrow, trans_rec))
+                if any(t > e for e, t in zip(escrow, trans_rec)):
+                    log.warning("[%s] 🏦 EGM committed MORE than "
+                                "authorized (txn=%s trans=%s escrow=%s) "
+                                "— refund clamped at 0", assoc.egm_id,
+                                txn, trans_rec, escrow)
+                if any(refund):
+                    # Refund destination: the funding account — or, when
+                    # it was deleted mid-flight, the House. This is NOT a
+                    # cash-out fallback: player-remove folds the whole
+                    # wallet to the House, so the un-spent escrow it
+                    # funded follows that same fold (auditable, noted).
+                    refund_to = account_id if acct_live else "house"
+                    _, aerr = self.account_store.adjust(
+                        refund_to, refund[0], refund[1], refund[2],
+                        note=(("WAT escrow reconcile (partial)"
+                               if ok else "WAT escrow refund "
+                               f"({rec.get('state')})")
+                              + ("" if refund_to == account_id else
+                                 f" — {account_id or 'account'} removed "
+                                 "mid-flight, follows the fold to house")),
+                        ref=self._wat_ref(assoc.egm_id, rec, "refund"),
+                        once=True)
+                    if aerr:  # refunds are credits — cannot overdraft
+                        log.error("[%s] 🏦 escrow refund FAILED: %s",
+                                  assoc.egm_id, aerr)
+            if not dup:
+                with assoc.lock:
+                    if ok and rec.get("watDirection") == "G2S_fromEgm":
+                        assoc.wat_from_egm_ok += total
+                    elif ok:
+                        assoc.wat_to_egm_ok += total
+                self._wat_mirror(assoc, rec)
+                if ok:
+                    log.info("=" * 64)
+                    log.info("🏦💸 [%s] WAT TRANSFER COMPLETE — %s %s "
+                             "account=%r txn=%s req=%s (cash=%d promo=%d "
+                             "nonCash=%d mc)", assoc.egm_id,
+                             denom_dollars(total),
+                             "ONTO the credit meter — no paper!"
+                             if rec.get("watDirection") == "G2S_toEgm"
+                             else "off the machine into the account",
+                             account_id, txn, rid,
+                             trans[0], trans[1], trans[2])
+                    log.info("=" * 64)
+                else:
+                    log.info("🏦 [%s] WAT transfer %s txn=%s req=%s — "
+                             "egmException=%s (%s)%s", assoc.egm_id,
+                             (rec.get("state") or "closed").upper(), txn,
+                             rid, egm_exc,
+                             WAT_EGM_EXCEPTIONS.get(str(egm_exc), "?"),
+                             " — escrow refunded in full"
+                             if sum(escrow) > 0 else "")
+                self.event_hooks.fire(
+                    "wat_transfer_completed" if ok
+                    else "wat_transfer_failed", {
+                        "hook": ("wat_transfer_completed" if ok
+                                 else "wat_transfer_failed"),
+                        "egmId": assoc.egm_id, "code": None,
+                        "label": ("💸 WAT transfer completed" if ok else
+                                  f"WAT transfer {rec.get('state')}"),
+                        "category": "wat", "icon": "🏦",
+                        "dateTime": attr(el, "transDateTime") or now_iso(),
+                        "device": f'G2S_wat/{req["deviceId"]}',
+                        "extras": {
+                            "transactionId": txn,
+                            "direction": rec.get("watDirection"),
+                            "accountId": account_id, "amt": total,
+                            "state": rec.get("state"),
+                            "egmException": str(egm_exc),
+                        },
+                    })
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:commitTransferAck g2s:transactionId="{txn}" '
+                f'g2s:requestId="{rid}"/>',
+                "commitTransferAck")
+
+        elif cmd == "cancelRequestAck" and stype == "G2S_response":
+            # wat (G2S-39, §22.28): the EGM acknowledged our cancelRequest.
+            # The record only flips to 'cancelled' at the mandated all-zero
+            # egmException=2 commitTransfer that follows.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+            upd = self.wat_store.mark_cancel(assoc.egm_id, txn,
+                                             "cancelAckedAt")
+            self._wat_mirror(assoc, upd)
+            log.info("🏦 [%s] cancelRequestAck txn=%s — awaiting the "
+                     "all-zero commitTransfer (egmException=2) close-out",
+                     assoc.egm_id, txn)
+
+        elif cmd == "watStatus" and stype == "G2S_response":
+            # wat (G2S-39, §22.15) — response to getWatStatus/setWatState/
+            # setWatLockOut/setWatCashOut. Folded into the merged per-device
+            # picture surfaced at /api/status wat.devices.
+            data = self._fold_wat_status(assoc, req["deviceId"],
+                                         req["commandEl"], "watStatus")
+            log.info("🏦 [%s] watStatus dev=%s — hostEnabled=%s "
+                     "egmEnabled=%s hostLocked=%s cashOutToWat=%s",
+                     assoc.egm_id, req["deviceId"], data["hostEnabled"],
+                     data["egmEnabled"], data["hostLocked"],
+                     data["cashOutToWat"])
+
+        elif cmd == "watProfile" and stype == "G2S_response":
+            # wat (G2S-39, §22.17) — every attribute captured verbatim, with
+            # the Table 22.6 defaults overlaid for the fields the /api
+            # contract names (absent = default per the schema).
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            for key, dflt in (("interfaceMode", "G2S_hostControl"),
+                              ("cashOutMode", "G2S_anyDevice"),
+                              ("cashOutDelay", "15000"),
+                              ("timeToLive", "30000"),
+                              ("authRequired", "false"),
+                              ("mixCreditTypes", "true"),
+                              ("allowNonCash", "true"),
+                              ("idReaderId", "0"),
+                              ("hashType", "G2S_none")):
+                data.setdefault(key, dflt)
+            data["profileAt"] = now_iso()
+            dev = req["deviceId"]
+            with assoc.lock:
+                merged = dict(assoc.wat_devices.get(dev) or {})
+                merged.update(data)
+                assoc.wat_devices[dev] = merged
+            log.info("🏦 [%s] watProfile dev=%s — interfaceMode=%s "
+                     "cashOutMode=%s authRequired=%s mixCreditTypes=%s "
+                     "allowNonCash=%s hashType=%s", assoc.egm_id, dev,
+                     data["interfaceMode"], data["cashOutMode"],
+                     data["authRequired"], data["mixCreditTypes"],
+                     data["allowNonCash"], data["hashType"])
+
+        elif cmd == "watLogStatus" and stype == "G2S_response":
+            # wat (G2S-39, §22.34) — the EGM transaction-log high-water.
+            el = req["commandEl"]
+            last_seq = attr(el, "lastSequence") or "0"
+            total = attr(el, "totalEntries") or "0"
+            with assoc.lock:
+                assoc.wat_egm_log = dict(
+                    assoc.wat_egm_log, lastSequence=last_seq,
+                    totalEntries=total, at=now_iso())
+            log.info("🏦 [%s] watLogStatus dev=%s lastSequence=%s "
+                     "totalEntries=%s", assoc.egm_id, req["deviceId"],
+                     last_seq, total)
+
+        elif cmd == "watLogList" and stype == "G2S_response":
+            # wat (G2S-39, §22.36) — the EGM's own WAT transaction log
+            # (accountIds arrive masked to the last 4 chars by spec).
+            el = req["commandEl"]
+            entries = [{k.rsplit('}', 1)[-1]: v for k, v in w.attrib.items()}
+                       for w in el if localname(w.tag) == "watLog"]
+            with assoc.lock:
+                assoc.wat_egm_log = dict(
+                    assoc.wat_egm_log, entries=entries[:25],
+                    entryCount=len(entries), entriesAt=now_iso())
+            log.info("🏦 [%s] watLogList dev=%s — %d entr%s (newest first, "
+                     "ring keeps 25)", assoc.egm_id, req["deviceId"],
+                     len(entries), "y" if len(entries) == 1 else "ies")
+
+        elif cmd == "getWatAccounts" and stype == "G2S_request":
+            # wat (G2S-39, §22.20) — EGM-controlled-mode account listing.
+            # Unlikely to fire on this hostControl AVP but answered anyway:
+            # every AccountStore account, PIN-less (authRequired=false —
+            # hashType=G2S_none is the permanent enthusiast decision).
+            el = req["commandEl"]
+            echo = "".join(
+                f' g2s:{k}="{html.escape(attr(el, k) or "", quote=True)}"'
+                for k in ("idReaderType", "idNumber", "playerId")
+                if attr(el, k))
+            snap = self.account_store.snapshot()
+            items = "".join(
+                '<g2s:watAccount '
+                f'g2s:accountId="{html.escape(a["id"], quote=True)}" '
+                'g2s:accountDescription="'
+                f'{html.escape(a.get("name") or "", quote=True)}" '
+                'g2s:authRequired="false" g2s:withdrawOk="true" '
+                'g2s:cashDepositOk="true" g2s:promoDepositOk="true" '
+                'g2s:nonCashDepositOk="true" g2s:selectAmt="true" '
+                'g2s:defaultAmt="0" g2s:withdrawMax="0" g2s:depositMax="0"/>'
+                for a in snap["accounts"])
+            log.info("🏦 [%s] getWatAccounts -> watAccountList (%d "
+                     "account(s))", assoc.egm_id, len(snap["accounts"]))
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:watAccountList{echo}>{items}</g2s:watAccountList>',
+                "watAccountList")
+
+        elif cmd == "getWatBalance" and stype == "G2S_request":
+            # wat (G2S-39, §22.22) — EGM-controlled-mode balance read.
+            el = req["commandEl"]
+            acct_id = attr(el, "accountId") or ""
+            account = self.account_store.get(acct_id)
+            if account is None:
+                self.enqueue_app_error(assoc, req, "G2S_WTX006",
+                                       "Invalid Wagering Account.")
+            else:
+                echo = "".join(
+                    f' g2s:{k}="'
+                    f'{html.escape(attr(el, k) or "", quote=True)}"'
+                    for k in ("idReaderType", "idNumber", "playerId")
+                    if attr(el, k))
+                log.info("🏦 [%s] getWatBalance %r -> watBalance "
+                         "(cash=%d promo=%d nonCash=%d mc)", assoc.egm_id,
+                         acct_id, account["cashableMillicents"],
+                         account["promoMillicents"],
+                         account["nonCashMillicents"])
+                self.enqueue_class_response(
+                    assoc, req,
+                    f'<g2s:watBalance{echo} '
+                    f'g2s:accountId="{html.escape(acct_id, quote=True)}" '
+                    f'g2s:cashableAmt="{account["cashableMillicents"]}" '
+                    f'g2s:promoAmt="{account["promoMillicents"]}" '
+                    f'g2s:nonCashAmt="{account["nonCashMillicents"]}" '
+                    'g2s:frozen="false"/>',
+                    "watBalance")
+
+        elif cmd == "getKeyPair" and stype == "G2S_request":
+            # wat (G2S-39, §22.18/19): hashType=G2S_none is the PERMANENT
+            # decision (PIN-less enthusiast accounts, no auth hardening) —
+            # answer with an empty key so a spec-faithful EGM that asks
+            # anyway stays satisfied. keyPairId echoes back (§22.19).
+            kp = attr(req["commandEl"], "keyPairId") or "1"
+            log.info("🏦 [%s] getKeyPair(keyPairId=%s) -> keyPair "
+                     "hashType=G2S_none (cert-less/PIN-less by decision)",
+                     assoc.egm_id, kp)
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:keyPair g2s:keyPairId="{kp}" '
+                'g2s:hashType="G2S_none"/>',
+                "keyPair")
+
+        elif cmd == "voucherStatus" and stype == "G2S_response":
+            # voucher device picture (G2S-39 companion, §21.12) — response
+            # to getVoucherStatus/setVoucherState. hostEnabled/egmEnabled
+            # ABSENT = TRUE (the repo rule).
+            el = req["commandEl"]
+            data = {
+                "deviceId": req["deviceId"],
+                "configurationId": attr(el, "configurationId") or "0",
+                "egmEnabled": attr(el, "egmEnabled") or "true",
+                "hostEnabled": attr(el, "hostEnabled") or "true",
+                "hostLocked": attr(el, "hostLocked") or "false",
+                "validationListId": attr(el, "validationListId") or "0",
+                "statusAt": now_iso(),
+            }
+            with assoc.lock:
+                assoc.voucher_device = dict(assoc.voucher_device,
+                                            status=data)
+            log.info("🎟️ [%s] voucherStatus dev=%s — hostEnabled=%s "
+                     "egmEnabled=%s validationListId=%s", assoc.egm_id,
+                     req["deviceId"], data["hostEnabled"],
+                     data["egmEnabled"], data["validationListId"])
+
+        elif cmd == "voucherProfile" and stype == "G2S_response":
+            # voucher device profile (§21.14) — captured verbatim (valId
+            # buffer sizing/timers/hold time/titles) beside the status.
+            el = req["commandEl"]
+            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+            data["deviceId"] = req["deviceId"]
+            data["profileAt"] = now_iso()
+            with assoc.lock:
+                assoc.voucher_device = dict(assoc.voucher_device,
+                                            profile=data)
+            log.info("🎟️ [%s] voucherProfile dev=%s — maxValIds=%s "
+                     "holdTime=%sms printOffLine=%s", assoc.egm_id,
+                     req["deviceId"], data.get("maxValIds", "20"),
+                     data.get("voucherHoldTime", "15000"),
+                     data.get("printOffLine", "true"))
+
+        elif cmd == "voucherLogStatus" and stype == "G2S_response":
+            el = req["commandEl"]
+            with assoc.lock:
+                assoc.voucher_device = dict(
+                    assoc.voucher_device,
+                    logStatus={"lastSequence": attr(el, "lastSequence")
+                               or "0",
+                               "totalEntries": attr(el, "totalEntries")
+                               or "0", "at": now_iso()})
+            log.info("🎟️ [%s] voucherLogStatus dev=%s lastSequence=%s "
+                     "totalEntries=%s", assoc.egm_id, req["deviceId"],
+                     attr(el, "lastSequence") or "0",
+                     attr(el, "totalEntries") or "0")
+
+        elif cmd == "voucherLogList" and stype == "G2S_response":
+            el = req["commandEl"]
+            entries = [{k.rsplit('}', 1)[-1]: v for k, v in w.attrib.items()}
+                       for w in el if localname(w.tag) == "voucherLog"]
+            with assoc.lock:
+                assoc.voucher_device = dict(
+                    assoc.voucher_device,
+                    log={"entries": entries[:25],
+                         "entryCount": len(entries), "at": now_iso()})
+            # G2S-40 reconcile: MERGE the EGM's transaction log into the
+            # durable VoucherStore — tickets issued/redeemed while the host
+            # was down get reconciled onto ids we minted; open (G2S_pending)
+            # entries are skipped whole, and masked/unknown ids stay ring
+            # history only (NEVER minted as money records — §21.26 masks
+            # every logged id to its last 4 digits). Everything already
+            # recorded dedupes on (egmId, kind, transactionId). Bounded +
+            # idempotent (see merge_egm_log), so an operator can mash the
+            # button.
+            summary = self.voucher_store.merge_egm_log(assoc.egm_id, entries)
+            log.info("🎟️ [%s] voucherLogList dev=%s — %d entr%s: %d known, "
+                     "%d merged (%d id records updated, %d open skipped, "
+                     "%d masked/unknown-id history-only)",
+                     assoc.egm_id, req["deviceId"], len(entries),
+                     "y" if len(entries) == 1 else "ies",
+                     summary["known"], summary["merged"],
+                     summary["idsUpdated"], summary["open"],
+                     summary["masked"])
+
+        elif cmd == "bonusStatus" and stype == "G2S_response":
+            # bonus (G2S-41, dossier §19.15) — response to getBonusStatus/
+            # setBonusState. Ch.19's body is LOST, so the attribute census
+            # is captured VERBATIM (clamped) rather than trusting the
+            # reconstruction. hostActive is the §19.4 watchdog evidence —
+            # the entry unique to the bonus class.
+            data = self._bonus_attrs(req["commandEl"])
+            data["deviceId"] = req["deviceId"]
+            data["statusAt"] = now_iso()
+            with assoc.lock:
+                first = "status" not in assoc.bonus
+                assoc.bonus = dict(assoc.bonus, status=data,
+                                   at=data["statusAt"])
+            if first:
+                log.info("=" * 64)
+                log.info("🎁 [%s] FIRST bonusStatus — the §19.4 watchdog "
+                         "evidence:", assoc.egm_id)
+            log.info("🎁 [%s] bonusStatus dev=%s — hostActive=%s "
+                     "hostEnabled=%s egmEnabled=%s bonusActive=%s "
+                     "hostLocked=%s", assoc.egm_id, req["deviceId"],
+                     data.get("hostActive", "(absent)"),
+                     data.get("hostEnabled", "(absent)"),
+                     data.get("egmEnabled", "(absent)"),
+                     data.get("bonusActive", "(absent)"),
+                     data.get("hostLocked", "(absent)"))
+            if first:
+                log.info("   (hostActive=false would mean the EGM does not "
+                         "count us an active bonus host — whether that "
+                         "gates awards, and whether a bonusActivity/"
+                         "keep-alive loop is needed, is FLAGGED FOR THE "
+                         "BENCH; v1 stays inert per the watchdog rule)")
+                log.info("=" * 64)
+
+        elif cmd == "bonusProfile" and stype == "G2S_response":
+            # bonus (G2S-41, dossier §19.17) — verbatim census. The
+            # noMessageTimer/requiredForPlay pair IS the §19.4 watchdog:
+            # surface it loudly so the bench decision has its evidence.
+            data = self._bonus_attrs(req["commandEl"])
+            data["deviceId"] = req["deviceId"]
+            data["profileAt"] = now_iso()
+            with assoc.lock:
+                assoc.bonus = dict(assoc.bonus, profile=data,
+                                   at=data["profileAt"])
+            log.info("🎁 [%s] bonusProfile dev=%s — noMessageTimer=%s "
+                     "noHostText=%r requiredForPlay=%s maxPendingBonus=%s "
+                     "timeToLive=%s idReaderId=%s", assoc.egm_id,
+                     req["deviceId"], data.get("noMessageTimer", "(absent)"),
+                     data.get("noHostText", ""),
+                     data.get("requiredForPlay", "(absent)"),
+                     data.get("maxPendingBonus", "(absent)"),
+                     data.get("timeToLive", "(absent)"),
+                     data.get("idReaderId", "(absent)"))
+            if data.get("requiredForPlay") == "true":
+                log.warning("🎁⚠️ [%s] bonusProfile requiredForPlay=TRUE — "
+                            "the EGM may DISABLE PLAY when the bonus host "
+                            "goes quiet longer than noMessageTimer=%s ms "
+                            "(§19.4/BNE108). Bench decision needed before "
+                            "any watchdog/keep-alive behavior ships — v1 "
+                            "deliberately sends none.", assoc.egm_id,
+                            data.get("noMessageTimer", "?"))
+
+        elif cmd == "bonusAwardAck" and stype == "G2S_response":
+            # bonus (G2S-41, dossier §19.20): the EGM ACCEPTED our
+            # setBonusAward and assigned the transactionId — this is where
+            # the host learns it (award now pending, BNE103). NO money
+            # moves here (debit-on-confirm waits for commitBonus).
+            el = req["commandEl"]
+            bid = attr(el, "bonusId") or ""
+            txn = attr(el, "transactionId") or ""
+            self._bonus_award_update(assoc, bid, txn=txn, state="acked",
+                                     transactionId=txn, ackedAt=now_iso())
+            log.info("🎁 [%s] bonusAwardAck — award %s ACCEPTED, EGM "
+                     "assigned transactionId=%s (BNE103 pending expected; "
+                     "commitBonus closes it out and THAT is the debit "
+                     "moment)", assoc.egm_id, bid or "?", txn or "?")
+
+        elif cmd == "commitBonus" and stype == "G2S_request":
+            # bonus (G2S-41, dossier §19.23) — THE money moment. The EGM
+            # closes the award out with the ACTUAL bonusPaidAmt; it RETRIES
+            # commitBonus until acked, so the House debit is idempotent on
+            # ref=g2sbonus:<transactionId> (adjust once=True) and the ack
+            # is ALWAYS re-sent. Money rule: debit ONLY when the exception
+            # is absent/zero AND bonusPaidAmt parses > 0 — an unpaid/failed
+            # award must never debit (skip + log LOUDLY). bonusException
+            # meanings beyond 0=success are unrecovered (§19.31.1) — any
+            # nonzero/unparseable value is treated as not-paid, never
+            # switched on.
+            el = req["commandEl"]
+            txn = attr(el, "transactionId") or "0"
+            bid = attr(el, "bonusId") or ""
+            exc_raw = attr(el, "bonusException")
+            paid_raw = attr(el, "bonusPaidAmt")
+            try:
+                exc_val = int(exc_raw) if exc_raw not in (None, "") else 0
+            except (TypeError, ValueError):
+                exc_val = None          # present-and-unparseable: NOT paid
+            try:
+                paid = int(paid_raw or "0")
+            except (TypeError, ValueError):
+                paid = -1               # unparseable: never debit
+            pay_method = (attr(el, "payMethod") or "")[:40]
+            credit_type = (attr(el, "creditType") or "")[:40]
+            # The debit's idempotency key IS the EGM transactionId — a
+            # commit without a parseable positive one (spec-invalid; txn
+            # fell back to "0") must NEVER debit: ref g2sbonus:0 would be
+            # SHARED by every such malformed commit, so the second
+            # distinct one would silently dedupe into an under-debit.
+            # Loud no-debit + ack is the honest close-out instead.
+            try:
+                txn_ok = int(txn) > 0
+            except (TypeError, ValueError):
+                txn_ok = False
+            success = exc_val == 0 and paid > 0 and txn_ok
+            if success:
+                _, err = self.account_store.adjust(
+                    "house", d_cash=-paid,
+                    note=f"G2S bonus paid ({bid or 'no bonusId'}, "
+                         f"{pay_method or 'payMethod?'})",
+                    ref=f"g2sbonus:{txn}", once=True)
+                if err:
+                    # house may go negative by design, so this only fires
+                    # on store-level faults — the award WAS paid on-glass.
+                    log.error("🎁💥 [%s] commitBonus txn=%s — House debit "
+                              "FAILED (%s); ledger is now OUT OF SYNC with "
+                              "the paid award, reconcile manually",
+                              assoc.egm_id, txn, err)
+                else:
+                    log.info("=" * 64)
+                    log.info("🎁💰 [%s] BONUS PAID — %s (txn=%s bonusId=%s "
+                             "payMethod=%s creditType=%s) — House debited "
+                             "(ref g2sbonus:%s, §-retry-safe)",
+                             assoc.egm_id, denom_dollars(paid), txn,
+                             bid or "?", pay_method or "?",
+                             credit_type or "?", txn)
+                    log.info("=" * 64)
+            else:
+                log.warning("=" * 64)
+                log.warning("🎁⚠️ [%s] commitBonus txn=%s bonusId=%s NOT "
+                            "DEBITED — bonusException=%r bonusPaidAmt=%r%s "
+                            "(an unpaid/failed/unparseable award must never "
+                            "debit the House; exception meanings are "
+                            "unrecovered — probe P-6)", assoc.egm_id, txn,
+                            bid or "?", exc_raw, paid_raw,
+                            "" if txn_ok else
+                            " missing/invalid transactionId ="
+                            " no idempotency key = no debit")
+                log.warning("=" * 64)
+            self._bonus_award_update(
+                assoc, bid, txn=txn,
+                state="committed" if success else "failed",
+                transactionId=txn,
+                paidAmt=paid if paid > 0 else 0,
+                paidAmtRaw=str(paid_raw)[:40] if paid_raw is not None
+                else None,
+                exception="0" if exc_raw in (None, "")
+                else str(exc_raw)[:40],
+                payMethodUsed=pay_method, creditTypeUsed=credit_type,
+                bonusDateTime=(attr(el, "bonusDateTime") or "")[:40],
+                committedAt=now_iso())
+            # ALWAYS ack (§19.24 — transactionId + bonusId echo; the sync
+            # HTTP reply already carried ONLY the message-level g2sAck, the
+            # d556ad2 rule — this is the host-originated class response).
+            self.enqueue_class_response(
+                assoc, req,
+                f'<g2s:commitBonusAck g2s:transactionId="{txn}" '
+                f'g2s:bonusId="{html.escape(bid, quote=True)}"/>',
+                "commitBonusAck")
+
+        elif cmd == "bonusActivity":
+            # bonus (G2S-41, dossier §19.18) — direction/trigger UNKNOWN in
+            # the recovered spec (probe P-9). Accept EITHER sessionType,
+            # capture the evidence, never switch on it. A request form
+            # still needs a close-out; APX008 is the honest answer until
+            # the bench resolves the pairing.
+            active = attr(req["commandEl"], "bonusActive")
+            with assoc.lock:
+                assoc.bonus = dict(assoc.bonus, activity={
+                    "bonusActive": str(active)[:16]
+                    if active is not None else None,
+                    "sessionType": stype, "at": now_iso()})
+            log.info("🎁❗ [%s] bonusActivity (%s) bonusActive=%r — P-9 WIRE "
+                     "EVIDENCE (direction/trigger unknown in the recovered "
+                     "spec); captured to /api/status bonus.activity",
+                     assoc.egm_id, stype, active)
+            if stype == "G2S_request":
+                self.enqueue_app_error(assoc, req, "G2S_APX008",
+                                       "Command not supported.")
+
+        elif cmd == "bonusLogStatus" and stype == "G2S_response":
+            # bonus (G2S-41, dossier §19.28) — the EGM bonus-log high-water.
+            el = req["commandEl"]
+            with assoc.lock:
+                assoc.bonus = dict(assoc.bonus, egmLog=dict(
+                    (assoc.bonus.get("egmLog") or {}),
+                    lastSequence=attr(el, "lastSequence") or "0",
+                    totalEntries=attr(el, "totalEntries") or "0",
+                    at=now_iso()))
+            log.info("🎁 [%s] bonusLogStatus dev=%s lastSequence=%s "
+                     "totalEntries=%s", assoc.egm_id, req["deviceId"],
+                     attr(el, "lastSequence") or "0",
+                     attr(el, "totalEntries") or "0")
+
+        elif cmd == "bonusLogList" and stype == "G2S_response":
+            # bonus (G2S-41, dossier §19.30) — the EGM's own bonus
+            # transaction log, attributes verbatim. The bonusState strings
+            # here are probe P-4's payoff: one live read retires the
+            # reconstructed enum, so shout them into the log.
+            el = req["commandEl"]
+            entries = [self._bonus_attrs(w) for w in el
+                       if localname(w.tag) == "bonusLog"]
+            with assoc.lock:
+                assoc.bonus = dict(assoc.bonus, egmLog=dict(
+                    (assoc.bonus.get("egmLog") or {}),
+                    entries=entries[:25], entryCount=len(entries),
+                    at=now_iso()))
+            states = sorted({e.get("bonusState") for e in entries
+                             if e.get("bonusState")})
+            log.info("🎁 [%s] bonusLogList dev=%s — %d entr%s (newest "
+                     "first); bonusState strings ON THE WIRE (P-4 payoff): "
+                     "%s", assoc.egm_id, req["deviceId"], len(entries),
+                     "y" if len(entries) == 1 else "ies",
+                     states or "(none)")
+
+        elif req["class"] == "mediaDisplay" and cmd in (
+                "mediaDisplayStatus", "mediaDisplayProfile",
+                "contentStatus", "contentToHostMessage",
+                "mediaDisplayAck", "contentLogStatus", "contentLogList"):
+            # mediaDisplay (#18 P3) — the probe ladder's inbound evidence.
+            # The vocabulary is RECON, so the fold trusts no schema: EVERY
+            # attribute is captured verbatim (localname -> clamped string,
+            # the bonus-census treatment), stashed per device under
+            # assoc.media (keyed by command name + lastCommand/lastSeen,
+            # replaced wholesale for snapshot safety), and shouted into
+            # the journal — the bench eye reads that line, then the next
+            # rung is chosen. NOTHING is switched on attribute values.
+            el = req["commandEl"]
+            # Names clamped too ([:64]) — a hostile/buggy attribute NCName
+            # must not bloat assoc.media and every /api/status poll.
+            data = {k.rsplit('}', 1)[-1][:64]: str(v)[:200]
+                    for k, v in el.attrib.items()}
+            dev = req["deviceId"]
+            with assoc.lock:
+                assoc.media[dev] = dict(assoc.media.get(dev) or {},
+                                        lastCommand=cmd,
+                                        lastSeen=now_iso(),
+                                        **{cmd: data})
+                # Capture the EGM-assigned transactionId (contentStatus /
+                # mediaDisplayAck carry it) so setActiveContent/release/
+                # getContentStatus can echo it without the bench re-typing.
+                txn = data.get("transactionId")
+                if txn and str(txn).isdigit() and int(txn) >= 1:
+                    assoc.media_txn[dev] = str(txn)
+                # Glass sequencer (#18 P4): a PENDING glass push for this
+                # device advances on the EGM's own narration — contentStatus
+                # pending/loaded => time for setActiveContent (echoing the
+                # txn the EGM just assigned THIS content: assoc.media_txn
+                # would be wrong here, the OLD content's release also
+                # narrates through this fold), executing => time for
+                # showMediaDisplay, and the show's mediaDisplayAck parks
+                # the stage at 'shown' (the card-IN recovery gate). The
+                # contentId must MATCH the push, so the release of the old
+                # content can never advance anything. Decision under the
+                # lock, enqueue AFTER it (_enqueue takes assoc.lock — the
+                # tap path's no-nesting rule); per-dev dicts replaced
+                # wholesale (the assoc.media snapshot rule). glass_epoch is
+                # captured HERE (GR-18): glass_push is a per-epoch guard
+                # (new_epoch clears it), so the enqueue below must carry
+                # the epoch this stage-advance belongs to — a fresh read
+                # after a re-commsOnLine in the release->enqueue window
+                # would retag the job and fire a stale setActiveContent /
+                # showMediaDisplay at the freshly rejoined cabinet.
+                glass_step = None
+                glass_epoch = assoc.epoch
+                push = assoc.glass_push.get(dev)
+                if push and cmd == "contentStatus" and \
+                        str(data.get("contentId") or "") == \
+                        push.get("contentId"):
+                    cstate = data.get("contentState") or ""
+                    if push.get("stage") == "loading" and \
+                            txn and str(txn).isdigit() and int(txn) >= 1:
+                        # BENCH LESSON (2026-07-10, live AVP): pending is
+                        # TOO EARLY for setActiveContent — the EGM answers
+                        # IGT_MDX005 "Content not loaded." until its browser
+                        # has actually fetched the page. Pending only RECORDS
+                        # the txn; the advance fires from the resident SPA's
+                        # own /api/glass/state poll (_glass_poll_advance —
+                        # a poll can only come from a fetched page, and its
+                        # 1.5s cadence is the retry heartbeat). contentLoaded,
+                        # when the EGM narrates it, still advances right here.
+                        if cstate == "IGT_contentLoaded":
+                            assoc.glass_push[dev] = dict(
+                                push, txn=str(txn), stage="activating",
+                                lastTryTs=time.time(), tries=1)
+                            glass_step = ("setActiveContent",
+                                          push["contentId"], str(txn))
+                        elif cstate == "IGT_contentPending":
+                            assoc.glass_push[dev] = dict(push,
+                                                         txn=str(txn))
+                    elif push.get("stage") in ("loading", "activating") \
+                            and cstate == "IGT_contentExecuting":
+                        assoc.glass_push[dev] = dict(push, stage="showing")
+                        glass_step = ("showMediaDisplay", None, None)
+                elif push and cmd == "mediaDisplayAck" and \
+                        push.get("stage") == "showing":
+                    assoc.glass_push[dev] = dict(push, stage="shown")
+                    assoc.glass_visible = True
+                    glass_step = ("shown", None, None)
+            log.info("🖥️ [%s] mediaDisplay %s dev=%s attrs=%s — WIRE "
+                     "EVIDENCE (schema-adjudicated igtMediaDisplay v1.8; "
+                     "captured to /api/status mediaDisplay)", assoc.egm_id,
+                     cmd, dev, data)
+            if glass_step is not None:
+                if glass_step[0] == "setActiveContent":
+                    self.enqueue_set_active_content(
+                        assoc, dev, glass_step[1], glass_step[2],
+                        epoch=glass_epoch)
+                elif glass_step[0] == "showMediaDisplay":
+                    self.enqueue_show_media_display(assoc, dev,
+                                                    epoch=glass_epoch)
+                log.info("🪟 [%s] glass sequencer dev=%s -> %s",
+                         assoc.egm_id, dev,
+                         "SHOWN — resident page live"
+                         if glass_step[0] == "shown"
+                         else f"auto-{glass_step[0]}")
+            if stype == "G2S_request":
+                # contentToHostMessage's name suggests EGM->host requests
+                # exist; the ack verb is unrecovered — APX008 is the
+                # honest close-out (the bonusActivity precedent) so the
+                # EGM's outbound queue never stalls on us. enqueue_app_error
+                # emits the class element in ITS OWN namespace via
+                # EXT_NS_PREFIX (the MSX004 law).
+                self.enqueue_app_error(assoc, req, "G2S_APX008",
+                                       "Command not supported.")
+
+        elif stype == "G2S_request":
+            # Unknown request: answer so the EGM doesn't stall. APX008 =
+            # command not supported within a class we DO speak; APX007 =
+            # class not supported at all (§1.18.3.3). GR-21: SPOKEN_CLASSES
+            # (module top) replaces the stale inline tuple — claiming "class
+            # not supported" for a class we visibly send requests in has
+            # documented consequences on this AVP (the optionConfig APX007
+            # repudiation left its bring-up unsettled).
+            code = ("G2S_APX008" if req["class"] in SPOKEN_CLASSES
+                    else "G2S_APX007")
+            text = ("Command not supported." if code == "G2S_APX008"
+                    else "Class not supported.")
+            log.warning("[%s] unhandled request %s.%s -> %s",
+                        assoc.egm_id, req["class"], cmd, code)
+            self.enqueue_app_error(assoc, req, code, text)
+
+        else:
+            log.info("[%s] %s.%s (%s) logged, no response required",
+                     assoc.egm_id, req["class"], cmd, stype)
+        return None
+
+    def _inline(self, assoc, command_xml, session_id):
+        """--inline fallback: build the app response for the synchronous HTTP
+        reply (spec-violating; only when the EGM endpoint is unreachable).
+        commandId allocation is locked since handler threads run concurrently."""
+        with assoc.lock:
+            inner, _ = self.build_inner_command(
+                assoc, command_xml, "G2S_response", session_id, "0")
+        return inner
+
+
+# ----------------------------------------------------------------------------
+# HTTP layer
+# ----------------------------------------------------------------------------
+
+# G2S-36 Test Panel: content types for the webui/ static tree, keyed by
+# extension (stdlib-only — no mimetypes surprises across Pi OS images).
+# Anything unknown ships as octet-stream rather than guessing.
+WEBUI_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain; charset=utf-8",
+    # BB2 glass (fleet tell 2026-07-10): the WMS media window is a FLASH 7
+    # player (capabilitiesList: IGT_flash/7/swf — it MDX006-rejects any
+    # non-.swf mediaURI), so WMS-bound glass content ships as SWF.
+    ".swf": "application/x-shockwave-flash",
+    ".woff2": "font/woff2",
+}
+
+
+def tail_file_lines(path, n):
+    """Best-effort tail of a text file for /api/debug/log: seek to a window
+    near the end (~400 bytes/line heuristic) so a 10MB rotating host log is
+    never read whole per poll on the Pi. The partial first line from a
+    mid-file seek is dropped. Returns a list (possibly short), or None when
+    the file is unreadable."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            window = (n + 1) * 400
+            seeked = size > window
+            f.seek(size - window if seeked else 0)
+            data = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = data.splitlines()
+    if seeked and lines:
+        lines = lines[1:]
+    return lines[-n:]
+
+
+class G2SRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # the AVP reuses one keep-alive connection
+    # GR-16: the stdlib default timeout is None — recv blocks forever, so a
+    # hard power-pull mid keep-alive connection (no FIN; the home-machine
+    # norm) parked one handler thread + fd permanently per power cycle.
+    # handle_one_request treats the timeout as connection-close and the
+    # thread exits cleanly; 120s is far above the 10s keepAlive cadence, so
+    # a healthy link never trips it.
+    timeout = 120
+    host_engine = None              # set by main()
+
+    def log_message(self, fmt, *args):
+        log.debug("http: " + fmt, *args)
+
+    def _send(self, code, body, content_type="text/xml; charset=utf-8",
+              soap=True):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if soap:
+            self.send_header("SOAPAction", '""')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_webui(self, rel_path):
+        """G2S-36: static serving for the Test Panel — files under G2S/webui/
+        only. Content-type by extension (WEBUI_CONTENT_TYPES); traversal-proof:
+        the request path is unquoted by do_GET, then the resolved real path
+        must stay strictly under webui/ (normalize + prefix check), so
+        /webui/../g2s_host.py and %2e%2e variants all 404. Files are read per
+        request so the page can be edited live without restarting the host."""
+        name = rel_path.lstrip("/")
+        if name in ("hello.html", "glass_ping.html"):
+            # mediaDisplay P9 proof (#18): the AVP's built-in browser
+            # fetching a probe page IS the on-glass evidence — one loud
+            # line with its User-Agent, greppable from the journal. These
+            # two pages ONLY (the kiosk polling home.html must not spam).
+            log.info("🖥️ GLASS FETCH /webui/%s UA=%r", name,
+                     self.headers.get("User-Agent") or "")
+        root = os.path.realpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "webui"))
+        full = os.path.realpath(os.path.join(root, rel_path.lstrip("/")))
+        if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            return self._send(404, '{"error": "not found"}',
+                              "application/json", soap=False)
+        ctype = WEBUI_CONTENT_TYPES.get(
+            os.path.splitext(full)[1].lower(), "application/octet-stream")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, '{"error": "not found"}',
+                              "application/json", soap=False)
+        if name in ("hello.html", "banner.html", "glass_ping.html"):
+            # Glass-facing brand pages carry the collector's GAMEROOM NAME
+            # "in lights" (the gameroom-name pattern, serve-time edition):
+            # a {{GAMEROOM}} token is substituted here so the QNX/WebKit534
+            # pages stay static and ES5-free — no client JS, no poll.
+            # Neutral fallback until the collector names their room.
+            try:
+                gname = self.host_engine.hub_store.host_setting(
+                    "gameroom_name", "") or "GAME ROOM"
+            except Exception:  # noqa: BLE001 — a db fault must not 500 a page
+                gname = "GAME ROOM"
+            data = data.replace(b"{{GAMEROOM}}",
+                                html.escape(gname).encode("utf-8"))
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # No-cache: the webui files are read per request and change on every
+        # deploy — without this a browser (esp. the AVP's QNX/WebKit534 kiosk)
+        # serves a stale page and a UI update looks "not deployed". Files are
+        # tiny and LAN-served, so revalidating every load costs nothing.
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        # Strip the query string, then unquote BEFORE routing/serving so
+        # percent-encoded traversal (%2e%2e) is normalized away by the
+        # realpath prefix check in _serve_webui rather than sneaking past it.
+        path = urllib.parse.unquote(self.path.split("?", 1)[0])
+        if path.startswith("/api/status"):
+            engine = self.host_engine
+            with engine.assoc_lock:        # avoid 'dict changed size' vs new EGM
+                assocs = list(engine.associations.values())
+            snap = {a.egm_id: a.snapshot() for a in assocs}
+            # Machine linking (task #20): stamp each G2S entry's SAS-leg
+            # link from the in-memory map (hub.db truth cached at init +
+            # settings writes) — null when unlinked, and NO db read on
+            # the 2 s poll.
+            _nicks = engine.hub_store.names()
+            for a in assocs:
+                snap[a.egm_id]["sasLink"] = engine.sas_links.get(a.egm_id)
+                # 'known' = the hub has a PERSISTED identity for this cabinet:
+                # a config-inventory record (only written AFTER a real join
+                # reads optionConfig/gamePlay) or an operator-set nickname
+                # (names() is WHERE nickname IS NOT NULL). A REGISTERED machine
+                # (AJ: "make sure it wont hit registered machines — sometimes
+                # registered machines will be offline") — exempt from the
+                # never-joined reaper and shown even while offline/mid-join.
+                # Neither signal can be tripped by an anonymous phantom that
+                # only ever hit :8081 without joining or being named.
+                snap[a.egm_id]["known"] = bool(
+                    engine.config_store.get(a.egm_id)) or bool(
+                    _nicks.get(a.egm_id))
+            # Register G2S machines in the hub.db registry (throttled — a
+            # cheap upsert, but not every 2s poll). Lock-safe: runs outside
+            # assoc.lock. Gives the AVP a registry row + server-side name slot.
+            engine.register_g2s_machines(assocs)
+            # G2S-13 live activity tape: newest-first semantic entries from
+            # the typed event hooks (engine-level — one tape across EGMs).
+            snap["activity"] = engine.activity_snapshot()
+            snap["_engine"] = engine.engine_meta()
+            # The SAS floor: machines reported by sas_host.py satellites
+            # (protocol-agnostic hub — the Home UI shows G2S + SAS side by
+            # side). Reserved key: the UI's EGM iteration must skip it like
+            # activity/_engine.
+            snap["sas"] = engine.sas_snapshot()
+            # Server-side machine names (hub.db) — {machineKey: nickname}.
+            # The UI prefers these over its localStorage cache so the kiosk
+            # and a phone agree. Another reserved key the EGM loop skips.
+            snap["names"] = engine.hub_store.names()
+            # hub.db phase 2: cross-machine TITO ledger counts (best-effort,
+            # degrades to {} — bench/UI visibility). Reserved key.
+            snap["tito"] = engine.hub_store.tito_counts()
+            # Companion RFID floor (phase 1): reader daemons + the active
+            # carded sessions ({egmId: {uid, name, since}} — the UI's tile
+            # badge). Two more reserved keys the EGM loop skips; both {}
+            # until a companion reports (dormant on a fob-less floor).
+            snap["companions"] = engine.companion_snapshot()
+            snap["cardSessions"] = engine.card_sessions_snapshot()
+            # Glass nav v1: live glass-session summary (count + tier/name
+            # per EGM — NO token values; the token travels only in the
+            # carded EGM's own /api/glass/state poll). Reserved key the
+            # UI's EGM loop must skip like cardSessions.
+            snap["glassSessions"] = engine.glass_sessions.summary()
+            # Host-wide options (C4) — the Settings tab's host card reads
+            # this; the write path is POST /api/settings. Reserved key.
+            # "ticket" is ALWAYS present (absent fields null) — the UI
+            # feature-detects the subsection on the key, and rev drives
+            # the per-machine "ticket header pending" note against each
+            # SAS entry's ticketData.appliedRev.
+            _th = engine.ticket_header()
+            snap["hostOptions"] = {
+                "sysvalFallback": engine.sysval_fallback(),
+                # the collector's gameroom name (Settings ▸ prefill); "" unset.
+                "gameroomName": engine.hub_store.host_setting(
+                    "gameroom_name", ""),
+                # Collector economy (2026-07-13, de-caged 07-15): the bank's
+                # current balance (so Options ▸ House Bankroll prefills) and
+                # whether it may run negative. The Bank is just bankroll
+                # minus handouts — machine take-tracking is GONE.
+                "houseBankrollMc": int((engine.account_store.get("house")
+                                        or {}).get("cashableMillicents", 0)
+                                       or 0),
+                "houseAllowNegative": engine.house_allow_negative(),
+                "ticket": {"propName": _th.get("propName"),
+                           "line1": _th.get("line1"),
+                           "line2": _th.get("line2"),
+                           "titleCash": _th.get("titleCash"),
+                           "rev": int(_th.get("rev") or 0)}}
+            # UI build stamp: home.html's mtime. The DSI kiosk (chromium
+            # --incognito, nobody ever presses F5 on it) reloads itself when
+            # this changes, so a webui deploy shows up without restarting
+            # the kiosk service. One stat per poll — negligible.
+            try:
+                snap["uiStamp"] = int(os.path.getmtime(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "webui", "home.html")))
+            except OSError:
+                pass
+            # smib.html's OWN mtime: the BB2 panel is a kiosk too (no keyboard
+            # to F5), but it must NOT self-reload mid-session, so it watches
+            # this separately from uiStamp/uiBuild and only reloads while idle
+            # (attract). A webui deploy then reaches the panel without bouncing
+            # its kiosk browser. One extra stat per poll — negligible.
+            try:
+                snap["smibStamp"] = int(os.path.getmtime(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "webui", "smib.html")))
+            except OSError:
+                pass
+            # allow_nan=False: a non-finite value must never reach the wire as
+            # a bare NaN/Infinity token (unparseable by browsers). Ingest
+            # already rejects them; this is the belt-and-suspenders. On the
+            # (should-be-impossible) TypeError, drop the sas section rather
+            # than 500 the poll that the whole UI depends on.
+            try:
+                body = json.dumps(snap, indent=2, allow_nan=False)
+            except ValueError:
+                snap["sas"] = {"_error": "a SAS report held a non-finite "
+                               "value and was dropped"}
+                body = json.dumps(snap, indent=2, allow_nan=False)
+            self._send(200, body, "application/json", soap=False)
+        elif path.startswith("/api/accounts"):
+            # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
+            self._send(200, json.dumps(
+                self.host_engine.account_store.snapshot(), indent=2),
+                "application/json", soap=False)
+        elif path.startswith("/api/players"):
+            # Player Maintenance: the Players composite (accounts ⋈ fobs
+            # ⋈ carded/glass sessions + the House row + the unassigned-fob
+            # pool). NEVER-500 — the Wallet tab's Players card polls this;
+            # a peek must not take down a UI poll loop. Write path is POST.
+            try:
+                body = json.dumps(self.host_engine.build_players(),
+                                  indent=2, allow_nan=False)
+            except Exception as e:  # noqa: BLE001 — never-500 endpoint
+                body = json.dumps({"ok": False,
+                                   "error": str(e)[:200]
+                                   or "players build failed"})
+            self._send(200, body, "application/json", soap=False)
+        elif path.startswith("/api/fobs"):
+            # RFID fob registry (hub.db v8) — the Settings tab's Fobs &
+            # Companions card. The write path is POST /api/fobs.
+            self._send(200, json.dumps(
+                {"ok": True, "fobs": self.host_engine.hub_store.fobs(),
+                 "maxFobs": MAX_FOBS, "tiers": list(FOB_TIERS)},
+                indent=2), "application/json", soap=False)
+        elif path.startswith("/api/glass/ping"):
+            # mediaDisplay path-A interactivity probe (#18 P9):
+            # glass_ping.html's big button XHRs here from the EGM's
+            # built-in browser — a pong painted back on the glass proves
+            # page->host interactivity end to end. Read-only, no auth (the
+            # slot VLAN is the trust boundary); ?src= is clamped + echoed
+            # so the journal line says who pinged.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            src = (qs.get("src") or ["?"])[0][:32]
+            log.info("🖥️ GLASS PING src=%s UA=%r", src,
+                     self.headers.get("User-Agent") or "")
+            self._send(200, json.dumps(
+                {"ok": True, "pong": now_iso(), "src": src}),
+                "application/json", soap=False)
+        elif path.startswith("/api/glass/state"):
+            # Glass nav v1: the resident SPA's ~1.5s poll — the carded/
+            # attract flip + the session token for THIS egm (minted at
+            # card-IN, revoked at card-OUT; the poll flip IS the
+            # navigation event). Same trust posture as /api/glass/ping
+            # above (the slot VLAN is the boundary). NEVER-500: the poll
+            # loop the whole glass UI hangs off must survive any hub-side
+            # fault.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            egm = (qs.get("egm") or [""])[0].strip()[:64]
+            src = (qs.get("src") or [""])[0].strip()[:16]
+            sdev = (qs.get("dev") or [""])[0].strip()[:8]
+            try:
+                body = json.dumps(self.host_engine.glass_state(
+                    egm, peer=self.client_address[0], src=src, dev=sdev),
+                    allow_nan=False)
+            except Exception as e:  # noqa: BLE001 — never-500 endpoint
+                body = json.dumps({"ok": False,
+                                   "error": str(e)[:200]
+                                   or "glass state failed"})
+            self._send(200, body, "application/json", soap=False)
+        elif path.startswith("/api/glass/data"):
+            # Glass destub v1: the panel's compact feature reads
+            # (?sess=&view=cashout|tickets|handpay|games|settings). Token-
+            # resolved (401 unknown), egmId forced from the token; the admin
+            # views 403 for a plain player. NEVER-500 (the /api/glass/state
+            # posture): the panel's poll loop must survive any hub fault, so
+            # a builder bug answers a degraded 200 rather than an HTTP error.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            sess = (qs.get("sess") or [""])[0].strip()
+            view = (qs.get("view") or [""])[0].strip()[:16]
+            try:
+                status, data = self.host_engine.glass_data(sess, view)
+                body = json.dumps(data, allow_nan=False)
+            except Exception as e:  # noqa: BLE001 — never-500 endpoint
+                status = 200
+                body = json.dumps({"ok": False,
+                                   "error": str(e)[:200]
+                                   or "glass data failed"})
+            self._send(status, body, "application/json", soap=False)
+        elif path.startswith("/api/gamenames"):
+            # hub.db game-name overrides (v6): {key: title} the UI merges
+            # over the shipped igt_games.json catalog (the games modal ✎
+            # button). Best-effort read — a db fault answers {} so the
+            # modal keeps its catalog titles, never a 500.
+            self._send(200, json.dumps(
+                {"ok": True,
+                 "names": self.host_engine.hub_store.game_names()},
+                indent=2), "application/json", soap=False)
+        elif path.startswith("/api/names"):
+            # hub.db machine registry: server-side names + rows. GET returns
+            # {names:{key:nick}, machines:[...]} — the durable source the UI
+            # prefers over its localStorage cache.
+            hs = self.host_engine.hub_store
+            self._send(200, json.dumps(
+                {"names": hs.names(), "machines": hs.machines()}, indent=2),
+                "application/json", soap=False)
+        elif path.startswith("/api/debug/log"):
+            # G2S-39: tail of the ACTIVE rotating host log (?lines=, cap
+            # 1000) + the same _engine block /api/status carries — the
+            # remote bench-debug peek without an SSH session.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            try:
+                n = int((qs.get("lines") or ["200"])[0])
+            except ValueError:
+                n = 200
+            n = max(1, min(n, 1000))
+            engine = self.host_engine
+            lines = (tail_file_lines(engine.host_log_file, n)
+                     if engine.host_log_file else None)
+            self._send(200, json.dumps({
+                "lines": lines or [],
+                "logFile": engine.host_log_file,
+                "engine": engine.engine_meta()}, indent=2),
+                "application/json", soap=False)
+        elif path.startswith("/api/vouchers"):
+            # G2S-40 ticket browser: the DURABLE VoucherStore (not the
+            # last-25 presentation rings). ?vid= is an exact-match lookup;
+            # otherwise newest-first with ?limit/?offset paging and
+            # ?state=/?egmId= filters. See VoucherStore.api_vouchers.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            one = lambda k, d="": (qs.get(k) or [d])[0].strip()  # noqa: E731
+            try:
+                limit = int(one("limit", "50") or 50)
+            except ValueError:
+                limit = 50
+            try:
+                offset = int(one("offset", "0") or 0)
+            except ValueError:
+                offset = 0
+            self._send(200, json.dumps(
+                self.host_engine.voucher_store.api_vouchers(
+                    limit=limit, offset=offset,
+                    state=one("state") or None,
+                    egm_id=one("egmId") or None,
+                    vid=one("vid") or None), indent=2),
+                "application/json", soap=False)
+        elif path.startswith("/api/tito/tickets"):
+            # hub.db phase 2 Cage view: the cross-machine SAS ticket ledger
+            # (tito_tickets), same paging dialect as /api/vouchers — ?vid=
+            # exact lookup (canonical OR vn16), else newest-first with
+            # ?limit/?offset/?state=. The UI merges this with the voucher
+            # list into one Tickets page. Best-effort read: a db fault
+            # answers an empty envelope, never a 500.
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query)
+            one = lambda k, d="": (qs.get(k) or [d])[0].strip()  # noqa: E731
+            try:
+                limit = int(one("limit", "50") or 50)
+            except ValueError:
+                limit = 50
+            try:
+                offset = int(one("offset", "0") or 0)
+            except ValueError:
+                offset = 0
+            self._send(200, json.dumps(
+                self.host_engine.hub_store.tito_list(
+                    limit=limit, offset=offset,
+                    state=one("state") or None,
+                    vid=one("vid") or None), indent=2),
+                "application/json", soap=False)
+        # (NO /api/ticket_qr — a UI-rendered QR was built here and CUT by
+        # owner decision 2026-07-07: the machines already print barcoded
+        # tickets that phones scan directly. Ticket lookup is /api/vouchers.)
+        elif path in ("/", "/ui"):
+            # G2S-40 routing: / prefers the Home UI (webui/home.html — the
+            # player/operator front door; it links to /test for the bench
+            # console) and falls back to the Test Panel while home.html
+            # doesn't exist yet — a fresh checkout mid-rollout still gets a
+            # working root page.
+            root = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "webui")
+            if os.path.isfile(os.path.join(root, "home.html")):
+                self._serve_webui("home.html")
+            else:
+                self._serve_webui("index.html")
+        elif path in ("/home", "/home.html"):
+            self._serve_webui("home.html")
+        elif path in ("/test", "/testpanel", "/index.html"):
+            # G2S-36: the Test Panel bench cockpit — a single self-contained
+            # HTML file (inline CSS+JS, no CDN: the slot VLAN is offline) that
+            # polls /api/status and drives /api/command. Supersedes the first-
+            # cut console.html, which stays reachable at /console.
+            self._serve_webui("index.html")
+        elif path in ("/console", "/console.html"):
+            self._serve_webui("console.html")
+        elif path.startswith("/webui/"):
+            self._serve_webui(path[len("/webui/"):])
+        else:
+            self._send(404, '{"error": "not found"}',
+                       "application/json", soap=False)
+
+    def _handle_command(self, raw):
+        """POST /api/command {action, egmId?} — trigger a host-originated G2S
+        request on demand (interactive probing + Test Panel backend, RM-02).
+        Maps action -> the engine's existing thread-safe enqueue_* methods; the
+        per-assoc FIFO worker serializes the actual send, so this never races
+        the join choreography. Read-only/non-destructive actions, plus
+        deliberate bench operations (claimOwnership, voidValidationId)."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError):
+            return self._send(400, '{"ok": false, "error": "invalid JSON"}',
+                              "application/json", soap=False)
+        action = req.get("action")
+        egm_id = req.get("egmId")
+        actions = {
+            "getDescriptor": engine.enqueue_get_descriptor,
+            "getCommHostList": engine.enqueue_get_comm_host_list,
+            "getEventHandlerProfile": engine.enqueue_get_event_handler_profile,
+            "getSupportedEvents": engine.enqueue_get_supported_events,
+            "setEventSub": engine.enqueue_set_event_sub,
+            # eventHandler log backfill (G2S-14) — full 0/0 sweep of the
+            # per-host persisted event log, merged with dedupe by
+            # (eventId, eventDateTime)
+            "getEventHandlerLog": engine.enqueue_get_event_handler_log,
+            "keepAlive": engine.enqueue_host_keep_alive,
+            "setKeepAlive": engine.enqueue_set_keep_alive,
+            # cabinet read (G2S-17)
+            "getCabinetStatus": engine.enqueue_get_cabinet_status,
+            "getCabinetProfile": engine.enqueue_get_cabinet_profile,
+            "getDateTime": engine.enqueue_get_date_time,
+            # cabinet clock sync (G2S-20) — pushes the host's current time
+            "setDateTime": engine.enqueue_set_date_time,
+            # cabinet control (G2S-20 rest): {"enable": false, "disableText":
+            # "..."} disables the WHOLE machine (in-flight game completes,
+            # then money+play stop; PERSISTS across an EGM restart per the
+            # profile's restartStatus); enable omitted/true is the sacred
+            # full restore (all Table 3.2 flags explicit true). Deliberate
+            # bench action; a getCabinetStatus refresh rides behind the set.
+            "setCabinetState": engine.enqueue_set_cabinet_state,
+            # remote reboot (RB, ported from the 2026-07-07 Pi hotfix) —
+            # cabinet.resetProcessor (§3.16), a warm restart that keeps
+            # NVRAM. Deliberate bench action for the weak-VBAT machine:
+            # reboots the EGM without dropping mains. Bench-proven
+            # 2026-07-07: THIS AVP (AVP014 R2) answers G2S_APX008
+            # (optional command, unimplemented) — harmless; kept because
+            # other machines may honor it. Verdict surfaces at
+            # /api/status.lastResetProbe (resetStarted / APX008 / CBX002).
+            "resetProcessor": engine.enqueue_reset_processor,
+            # download-class reset script (§10.30/§10.37) — plan B, the
+            # path this AVP CONFIRMED supports (idle-gated: G2S_APX999
+            # "EGM is not idle..." while tilted; retry untilted). Optional
+            # {"scriptId": N} override; the default is fresh per attempt
+            # (DLX006 = scriptId already used).
+            "rebootEgmScript": engine.enqueue_reboot_script,
+            # gamePlay read (G2S-21) — these accept an optional "deviceId"
+            # in the request body (default "1"; a multi-game cabinet exposes
+            # one gamePlay device per theme+paytable)
+            "getGamePlayStatus": engine.enqueue_get_game_play_status,
+            "getGamePlayProfile": engine.enqueue_get_game_play_profile,
+            "getGameDenoms": engine.enqueue_get_game_denoms,
+            # gamePlay full sweep (G2S-21) — on-demand trigger for the
+            # staggered status/profile/denoms read of EVERY gamePlay device
+            # (operator "refresh all games"). Deliberately NOT auto-fired on
+            # join: a 119-device × 3-read flood starves the per-assoc FIFO
+            # ahead of the join choreography (the --game-sweep flag re-enables
+            # the auto path for bench experiments). This is the explicit
+            # opt-in — the sweep is epoch-gated and silence-tolerant, so a
+            # double-click just re-trickles harmlessly.
+            "gameSweep": engine._start_game_play_sweep,
+            # gamePlay STATUS-only refresh (GR-30) — the UI "refresh games"
+            # button. One paced pass of getGamePlayStatus across every device
+            # (NOT profile/denoms — those are static, so this is ~1/3 the
+            # traffic of gameSweep) to pull the LIVE hostEnabled/egmEnabled
+            # after a game was toggled at the EGM's own operator/e-key menu
+            # (which fires no host event). On-demand, not on a timer — no idle
+            # flood. Returns {devices:N}; epoch-gated, silence-tolerant.
+            "refreshGameStatus": engine.refresh_game_play_status,
+            # idReader bench probe (RFID phase 1, the GR-30 posture):
+            # getIdReaderStatus + getIdReaderProfile for the owned idReader
+            # device — surfaces egmPhysicallyControls BEFORE the first live
+            # tap. Optional "deviceId" override; status-only, on-demand.
+            "idReaderProbe": engine.id_reader_probe,
+            # carded-session explicit logout (RFID phase 1): pops the card
+            # session for this EGM and sends the card-OUT setIdValidation
+            # — the machine-tile 💳 badge's "Log out <name>". With
+            # auto-logout disabled by default, this is the UI's only way
+            # to end a session short of a physical re-tap.
+            "cardOut": engine.card_out,
+            # gamePlay control (G2S-22): {"deviceId": "1", "enable": false,
+            # "disableText": "..."} sets hostEnabled on ONE gamePlay device
+            # (theme+paytable combo); enable omitted/true is the restore.
+            # Deliberate bench action — a disable applies only at 0 credits
+            # + idle (§6.9) and sits silently pending until then; the EGM
+            # answers gamePlayStatus + GPE003/004.
+            "setGamePlayState": engine.enqueue_set_game_play_state,
+            # noteAcceptor read (G2S-23) — optional "deviceId" in the body
+            # (default: the config-sync-revealed acceptor, else 1)
+            "getNoteAcceptorStatus": engine.enqueue_get_note_acceptor_status,
+            "getNoteAcceptorProfile": engine.enqueue_get_note_acceptor_profile,
+            # noteAcceptor acceptance toggle (G2S-23): {"enable": false,
+            # "disableText": "..."} disables bill acceptance, enable omitted/
+            # true re-enables. Deliberate bench action — changes machine
+            # behavior (and persists across an EGM restart per the profile's
+            # restartStatus); the EGM answers noteAcceptorStatus + NAE003/004.
+            "setNoteAcceptorState": engine.enqueue_set_note_acceptor_state,
+            # meters read (G2S-15)
+            "getMeterInfo": engine.enqueue_get_meter_info,
+            # meters subscriptions (G2S-16): standing periodic (60s) + EOD
+            # subs, one request per subType. setMeterSub/clearMeterSub are
+            # owner-only — pre-ownership the AVP acks then stays silent.
+            "setMeterSub": engine.enqueue_set_meter_sub,
+            "getMeterSub": engine.enqueue_get_meter_sub,
+            "clearMeterSub": engine.enqueue_clear_meter_sub,
+            # handpay reset-to-credits (G2S-25): sends setRemoteKeyOff for
+            # the oldest pending lockup (or explicit "hpId"=transactionId);
+            # keyOffType defaults to the credit-meter token G2S_remoteCredit,
+            # "keyOffType" in the body overrides (voucher/handpay tokens).
+            # Safe path — never disables play; the EGM enforces permissions.
+            "clearHandpay": engine.enqueue_set_remote_key_off,
+            # handpay reset button (G2S-25 UI): setRemoteKeyOff for the
+            # NEWEST pending lockup — the one the operator at the machine
+            # just watched land. Honest {"ok":false,"error":"no pending
+            # handpay"} when nothing is locked up (clearHandpay's miss is
+            # log-only), and the reply carries the per-txn remoteCredit
+            # gate so the UI can explain a JPX002 refusal up front.
+            "resetHandpay": engine.reset_newest_handpay,
+            # voucher redemption (G2S-26 tier 2): mark a validation id void
+            # in the durable store so redemption rejects it (hostException
+            # 99) — bench unstick, store-only, nothing sent to the EGM.
+            # Takes "validationId" in the body.
+            "voidValidationId": engine.void_validation_id,
+            # commConfig read (G2S-18)
+            "getCommConfigProfile": engine.enqueue_get_comm_config_profile,
+            "getCommConfigModeStatus": engine.enqueue_get_comm_config_mode_status,
+            # commConfig ownership cycle (G2S-19). claimOwnership runs the full
+            # enter->change->authorize sequence (optional "devices" list in the
+            # body overrides the claim set); enterCommConfigMode is the raw
+            # first step for manual stepping. WARNING: both DISABLE play.
+            # exitCommConfigMode (enable=false) releases an EGM stranded on
+            # its config-mode screen after a rejected/wedged cycle.
+            "enterCommConfigMode": engine.enqueue_enter_comm_config_mode,
+            "exitCommConfigMode": engine.enqueue_enter_comm_config_mode,
+            "claimOwnership": engine.start_ownership_cycle,
+            # optionConfig change cycle (G2S-27). setOption runs the full
+            # guarded setOptionChange -> authorize -> apply sequence for ONE
+            # option value ({deviceClass, deviceId, optionId, value} + optional
+            # paramId/optionGroupId/applyCondition); it VALIDATES the option
+            # against the config-sync inventory and REFUSES unknowns. cancelOption
+            # aborts a pending change. getOptionChangeStatus reads the change-log
+            # high-water (getOptionChangeLogStatus). WARNING: setOption can
+            # RECONFIGURE the machine — no rollback once applied.
+            "setOption": engine.start_option_change_cycle,
+            "cancelOption": engine.cancel_option_change,
+            "getOptionChangeStatus":
+                engine.enqueue_get_option_change_log_status,
+            # purpose-built bench flip (G2S-25/27): enable remote handpay
+            # key-off-to-credits on G2S_handpay/1 in ONE multi-param
+            # setOptionChange (no args; no-op if already enabled). Same
+            # guarded cycle as setOption — applied status triggers a scoped
+            # getOptionList read-back that verifies the values and re-lights
+            # handpayRemoteCreditAllowed. Deliberate bench operation:
+            # RECONFIGURES the machine, no rollback once applied.
+            "enableRemoteHandpay": engine.enable_remote_handpay,
+            # optionConfig inventory refresh (GR-10): full-wildcard
+            # getOptionList (values only) — repopulates config_devices/
+            # config_options (+ the handpay permission lamp) on demand and
+            # persists them, instead of waiting for the EGM's next
+            # deviceReset config-sync. Read-only on the EGM.
+            "getOptionList": engine.enqueue_get_option_list,
+            # wat (G2S-39): addCredits is THE killer feature — push credits
+            # onto the machine from an account, no paper. Body:
+            # {deviceId?:1, accountId?:"house", cashableMillicents,
+            # promoMillicents?, nonCashMillicents?} — MILLICENTS ($1=100000).
+            # The house account may go negative (it is the bank); player
+            # accounts are escrow-checked at authorizeTransfer.
+            "addCredits": engine.start_wat_credit_push,
+            "watStatus": engine.enqueue_get_wat_status,
+            "watProfile": engine.enqueue_get_wat_profile,
+            # watEnable/watDisable = wat.setWatState (WTE003/004 on the EGM)
+            "watEnable": engine.enqueue_set_wat_state,
+            "watDisable": engine.enqueue_set_wat_state,
+            # {deviceId?, enable}: route EGM cash-outs to the WAT host —
+            # true on at most ONE wat device (the engine auto-releases any
+            # other holder first, §22.24/G2S_WTX004)
+            "setWatCashOut": engine.enqueue_set_wat_cash_out,
+            # {requestId? or transactionId?}: cancel a still-pending push
+            # (§22.27 — impossible once authorized). BOTH omitted = cancel
+            # the NEWEST still-active transfer; a record with no txn yet
+            # (EGM never answered requestPending) cancels LOCALLY.
+            "watCancel": engine.cancel_wat_request,
+            "getWatLog": engine.enqueue_get_wat_log,
+            "getWatLogStatus": engine.enqueue_get_wat_log_status,
+            # bonus (G2S-41): reads + the host-initiated award. Ch.19 is
+            # dossier-reconstructed and the build is INERT until an operator
+            # explicitly probes/awards (no auto traffic, no option writes —
+            # the §19.4 watchdog rule). bonusAward body: {"amountMillicents":
+            # 1..100000000, "deviceId"?: "1", "payMethod"?: one of
+            # G2S_payAny/G2S_payHandpay/G2S_payVoucher, "textMessage"?:
+            # clamped 128}. Money: House debited at commitBonus ONLY
+            # (debit-on-confirm, ref g2sbonus:<txn>, retry-idempotent).
+            "getBonusStatus": engine.enqueue_get_bonus_status,
+            "getBonusProfile": engine.enqueue_get_bonus_profile,
+            "setBonusState": engine.enqueue_set_bonus_state,
+            "bonusAward": engine.start_bonus_award,
+            "getBonusLog": engine.enqueue_get_bonus_log,
+            "getBonusLogStatus": engine.enqueue_get_bonus_log_status,
+            # mediaDisplay probe ladder (#18 P3): ONE action, rung-
+            # parameterized — the climbing happens from the bench, rung by
+            # rung, with journal observability between. Body: {"rung":
+            # "status|profile|enable|disable|load|show|hide|release|
+            # contentStatus", "deviceId"?: "3", "uri"?: (load only —
+            # default the host's own hello.html), "contentId"?: "7"}.
+            # INERT until fired: no auto traffic, no option writes, and
+            # mediaDisplay stays OUT of SPOKEN_CLASSES (the dormancy gate).
+            "mediaDisplayProbe": engine.start_media_display_probe,
+            # glass navigation v1 (#18 P4): the ONE-command push of the
+            # resident SPA — [releaseContent old ->] loadContent, then the
+            # contentStatus fold auto-advances (setActiveContent at
+            # pending/loaded, showMediaDisplay at executing). Body:
+            # {"deviceId"?: "1", "page"?: "glass.html"}. glassHide hides
+            # the window; the content stays resident. Same dormancy law as
+            # the probe ladder: NOTHING fires at join — only this command
+            # and the throttled card-IN recovery ever run the sequencer.
+            "glassShow": engine.start_glass_show,
+            "glassHide": engine.start_glass_hide,
+            # voucher device reads + printing toggle (G2S-39 companion;
+            # optional "deviceId" — default: the config-sync-revealed
+            # voucher device, else 1)
+            "getVoucherStatus": engine.enqueue_get_voucher_status,
+            "getVoucherProfile": engine.enqueue_get_voucher_profile,
+            "getVoucherLogStatus": engine.enqueue_get_voucher_log_status,
+            "getVoucherLog": engine.enqueue_get_voucher_log,
+            "setVoucherState": engine.enqueue_set_voucher_state,
+        }
+        if action not in actions:
+            return self._send(400, json.dumps({
+                "ok": False, "error": f"unknown action {action!r}",
+                "actions": sorted(actions)}),
+                "application/json", soap=False)
+        # 🪙 Linked-machine wallet routing (AJ 2026-07-11): while a SAS leg
+        # is linked, SAS is the MONEY authority — the pair's G2S wat can be
+        # a dead stub (the WMS BB2 is exactly that: APX007 + no options), so
+        # a WAT push at the G2S face would never land. addCredits aimed at a
+        # linked machine reroutes to the same SAS aft_transfer path the SAS
+        # tiles and glass walletFund use, keyed off sas_links at the hub
+        # edge so EVERY client (Home UI, glass, curl) gets the right wire
+        # without knowing about linking. Runs BEFORE the assoc lookup on
+        # purpose: the SAS leg keeps working while the G2S leg is offline.
+        if action == "addCredits":
+            _target = egm_id
+            if not _target:
+                with engine.assoc_lock:
+                    if len(engine.associations) == 1:
+                        _target = next(iter(engine.associations))
+            _leg = engine.sas_links.get(_target) if _target else None
+            if _leg:
+                return self._add_credits_via_sas(engine, _target, _leg, req)
+        with engine.assoc_lock:
+            egms = list(engine.associations)
+            if egm_id:
+                assoc = engine.associations.get(egm_id)
+            elif len(engine.associations) == 1:
+                assoc = next(iter(engine.associations.values()))
+            else:
+                assoc = None
+        if assoc is None:
+            return self._send(404, json.dumps({
+                "ok": False, "error": "no matching association", "egms": egms}),
+                "application/json", soap=False)
+        state = assoc.comms_state
+        kwargs = {}
+        if action in ("getGamePlayStatus", "getGamePlayProfile",
+                      "getGameDenoms", "setGamePlayState",
+                      "getNoteAcceptorStatus",
+                      "getNoteAcceptorProfile", "setNoteAcceptorState",
+                      "watStatus", "watProfile", "watEnable", "watDisable",
+                      "setWatCashOut", "getWatLog", "getWatLogStatus",
+                      "addCredits", "getVoucherStatus", "getVoucherProfile",
+                      "getVoucherLogStatus", "getVoucherLog",
+                      "setVoucherState", "idReaderProbe") \
+                and req.get("deviceId") is not None:
+            kwargs["device_id"] = str(req["deviceId"])
+        # G2S-40 owner-device default: an owner-type wat action with NO
+        # explicit deviceId targets the LOWEST owned wat device (not the
+        # hardcoded "1" — which is the guest device on a cabinet where we
+        # own only /2). Reads keep their own resolver; watCancel resolves
+        # from the transfer record. Inert before ownership is revealed
+        # (default_wat_device -> "1").
+        if action in ("watEnable", "watDisable", "setWatCashOut",
+                      "addCredits") and req.get("deviceId") is None:
+            kwargs["device_id"] = engine.default_wat_device(assoc)
+        # bonus (G2S-41): strict validation — junk draws HTTP 400 here;
+        # runtime refusals (offline, ownership guard) answer ok:false at
+        # 200 from the engine method (the addCredits precedent). deviceId
+        # digits-only: it lands inside a wire XML attribute.
+        if action in ("getBonusStatus", "getBonusProfile", "setBonusState",
+                      "bonusAward", "getBonusLog", "getBonusLogStatus"):
+            if req.get("deviceId") is not None:
+                dev = str(req["deviceId"])
+                if not dev.isdigit() or not 1 <= int(dev) <= 999:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "deviceId must be a positive integer "
+                                 "(bonus device — default 1)"}),
+                        "application/json", soap=False)
+                kwargs["device_id"] = dev
+        if action == "setBonusState":
+            kwargs["enable"] = str(req.get("enable", True)).lower() \
+                not in ("false", "0", "")
+            if req.get("disableText"):
+                kwargs["disable_text"] = str(req["disableText"])[:128]
+        if action == "bonusAward":
+            amt = req.get("amountMillicents")
+            if isinstance(amt, bool) or not isinstance(amt, int) or \
+                    not 1 <= amt <= 100_000_000:
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "amountMillicents must be an integer "
+                             "1..100000000 (millicents — $1 = 100000)"}),
+                    "application/json", soap=False)
+            kwargs["amount_mc"] = amt
+            if req.get("payMethod") is not None:
+                if req["payMethod"] not in BONUS_PAY_METHODS:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "payMethod must be one of "
+                                 f"{sorted(BONUS_PAY_METHODS)}"}),
+                        "application/json", soap=False)
+                kwargs["pay_method"] = req["payMethod"]
+            if req.get("textMessage") is not None:
+                if not isinstance(req["textMessage"], str):
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "textMessage must be a string"}),
+                        "application/json", soap=False)
+                tm = req["textMessage"].strip()[:BONUS_TEXT_MAX]
+                if tm:
+                    kwargs["text_message"] = tm
+        if action == "mediaDisplayProbe":
+            # mediaDisplay (#18 P3): the bonus split — TYPE junk draws HTTP
+            # 400 here; rung/ownership refusals answer ok:false at 200 from
+            # the orchestrator. deviceId/contentId digits-only: both land
+            # inside wire XML attributes (the MSX005 id law).
+            kwargs["rung"] = str(req.get("rung") or "")
+            if req.get("deviceId") is not None:
+                dev = str(req["deviceId"])
+                if not dev.isdigit() or not 1 <= int(dev) <= 999:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "deviceId must be a positive integer "
+                                 "(the AVP exposes IGT_mediaDisplay/1..6)"}),
+                        "application/json", soap=False)
+                kwargs["device_id"] = dev
+            if req.get("contentId") is not None:
+                cnt = str(req["contentId"])
+                if not cnt.isdigit():
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "contentId must be pure-numeric (the "
+                                 "MSX005 id law)"}),
+                        "application/json", soap=False)
+                kwargs["content_id"] = cnt
+            if req.get("transactionId") is not None:
+                txn = str(req["transactionId"])
+                if not txn.isdigit() or int(txn) < 1:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "transactionId must be an integer >=1 "
+                                 "(g2s:c_baseTransaction; the EGM assigns "
+                                 "it at load)"}),
+                        "application/json", soap=False)
+                kwargs["transaction_id"] = txn
+            if req.get("lastSequence") is not None:
+                ls = str(req["lastSequence"])
+                if not ls.isdigit():
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "lastSequence must be a non-negative "
+                                 "integer (getContentLog)"}),
+                        "application/json", soap=False)
+                kwargs["last_sequence"] = ls
+            if req.get("uri") is not None:
+                u = req["uri"]
+                if not isinstance(u, str) or \
+                        not u.startswith(("http://", "https://")):
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "uri must be an http(s) URL the EGM's "
+                                 "browser can GET"}),
+                        "application/json", soap=False)
+                if len(u) > 512:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "uri too long (max 512 chars) — a "
+                                 "silently-truncated URL would reach the "
+                                 "EGM's browser broken mid-string"}),
+                        "application/json", soap=False)
+                kwargs["uri"] = u
+        if action in ("glassShow", "glassHide"):
+            # glass nav v1: TYPE junk draws HTTP 400 here; runtime refusals
+            # (unowned device, push in flight) answer ok:false at 200 from
+            # the engine (the mediaDisplayProbe split). deviceId digits-only
+            # (wire XML attribute); page must be a bare webui/*.html name —
+            # it lands in the mediaURI the cabinet's browser GETs, so a
+            # path-ish value would escape the webui tree or 404 on-glass.
+            if req.get("deviceId") is not None:
+                dev = str(req["deviceId"])
+                if not dev.isdigit() or not 1 <= int(dev) <= 999:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "deviceId must be a positive integer "
+                                 "(the AVP exposes IGT_mediaDisplay/1..6)"}),
+                        "application/json", soap=False)
+                kwargs["device_id"] = dev
+            if action == "glassShow" and req.get("page") is not None:
+                pg = str(req["page"])
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", pg) \
+                        or ".." in pg or not pg.endswith(".html"):
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "page must be a bare webui/*.html "
+                                 "filename (default glass.html)"}),
+                        "application/json", soap=False)
+                kwargs["page"] = pg
+        if action == "getOptionList":
+            # GR-10 refresh defaults to the full wildcard; the bonus dossier
+            # probes scope it ({"deviceClass": "G2S_bonus"}) — the engine
+            # method always supported the scoping, this passes it through.
+            if req.get("deviceClass"):
+                kwargs["device_class"] = str(req["deviceClass"])
+            if req.get("deviceId") is not None:
+                kwargs["device_id"] = str(req["deviceId"])
+        if action in ("setNoteAcceptorState", "setCabinetState",
+                      "setGamePlayState", "setVoucherState"):
+            # JSON true/false or string forms; omitted = enable (Tables 13.2/
+            # 3.2 defaults). disableText only matters on a disable.
+            kwargs["enable"] = str(req.get("enable", True)).lower() \
+                not in ("false", "0", "")
+            if req.get("disableText"):
+                kwargs["disable_text"] = str(req["disableText"])
+        if action == "setWatCashOut":
+            # separate from the tuple above: setWatCashOut has no
+            # disableText (Table 22.15 carries only cashOutToWat)
+            kwargs["enable"] = str(req.get("enable", True)).lower() \
+                not in ("false", "0", "")
+        if action == "watEnable":
+            kwargs["enable"] = True
+        elif action == "watDisable":
+            kwargs["enable"] = False
+            if req.get("disableText"):
+                kwargs["disable_text"] = str(req["disableText"])
+        if action == "addCredits":
+            kwargs["account_id"] = str(req.get("accountId") or "house")
+            kwargs["cashable"] = req.get("cashableMillicents") or 0
+            kwargs["promo"] = req.get("promoMillicents") or 0
+            kwargs["non_cash"] = req.get("nonCashMillicents") or 0
+        if action == "watCancel":
+            if req.get("requestId") is not None:
+                kwargs["request_id"] = str(req["requestId"])
+            if req.get("transactionId") is not None:
+                kwargs["txn_id"] = str(req["transactionId"])
+        if action == "clearHandpay":
+            if req.get("hpId") is not None:
+                kwargs["txn_id"] = str(req["hpId"])
+            if req.get("keyOffType"):
+                kwargs["key_off_type"] = str(req["keyOffType"])
+        if action == "voidValidationId":
+            kwargs["validation_id"] = str(req.get("validationId") or "")
+        if action == "rebootEgmScript" and req.get("scriptId") is not None:
+            # RB: explicit scriptId override for a DLX006 re-fire; omitted
+            # = a fresh per-attempt default (epoch seconds).
+            kwargs["script_id"] = str(req["scriptId"])
+        if action == "exitCommConfigMode":
+            kwargs["enable"] = False
+        if action == "claimOwnership" and req.get("devices"):
+            # explicit claim list ["G2S_printer/1", ...] — overrides the
+            # default commHostList+config-sync union. §8.15 setHostItem
+            # OVERWRITES the owned list, so an explicit list MUST be the
+            # complete intended set, not just the additions.
+            devs = []
+            for s in req["devices"]:
+                dc, _, di = str(s).partition("/")
+                if not dc or not di:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": f"bad device {str(s)!r} — want 'class/id'"}),
+                        "application/json", soap=False)
+                devs.append((dc, di))
+            kwargs["owned"] = devs
+        if action == "setOption":
+            # optionConfig change cycle (G2S-27) — the target option + new value.
+            # deviceId defaults to "1"; paramId/optionGroupId/applyCondition are
+            # optional (see start_option_change_cycle for the defaults).
+            kwargs["device_class"] = req.get("deviceClass")
+            kwargs["device_id"] = str(req.get("deviceId") or "1")
+            kwargs["option_id"] = req.get("optionId")
+            kwargs["value"] = req.get("value")
+            if req.get("paramId"):
+                kwargs["param_id"] = str(req["paramId"])
+            if isinstance(req.get("values"), dict) and req["values"]:
+                # Multi-param form (§9.15 sends the complete set either
+                # way): {paramId: newValue} edits SEVERAL params of ONE
+                # option in ONE atomic transaction — the engine supported
+                # it all along (see start_option_change_cycle), first
+                # exposed for the mediaDisplay window-geometry resize
+                # (2026-07-10: 6 geometry params must change together or
+                # the window walks through 5 nonsense shapes).
+                kwargs["values"] = req["values"]
+            if req.get("optionGroupId"):
+                kwargs["option_group_id"] = str(req["optionGroupId"])
+            if req.get("applyCondition"):
+                kwargs["apply_condition"] = str(req["applyCondition"])
+            if req.get("disableCondition"):
+                kwargs["disable_condition"] = str(req["disableCondition"])
+        result = actions[action](assoc, **kwargs)  # enqueue_* re-acquires
+        #                                            assoc.lock
+        log.info("[%s] /api/command action=%s enqueued (commsState=%s)",
+                 assoc.egm_id, action, state)
+        payload = {"ok": True, "action": action, "egmId": assoc.egm_id,
+                   "commsState": state}
+        # Store-level actions (voidValidationId) answer synchronously with a
+        # result dict — merge it so the Test Panel tape shows the outcome
+        # ("ok": False overrides for an unknown/missing id, still HTTP 200).
+        if isinstance(result, dict):
+            payload.update(result)
+        return self._send(200, json.dumps(payload),
+                          "application/json", soap=False)
+
+    def _handle_glass_action(self, raw):
+        """POST /api/glass/action {sess, action, ...} — the glass SPA's ONLY
+        write path (glass destub v1). The hub is the authority: the token
+        resolves to the server-side record (401 for a missing/unknown/idle-
+        expired sess — the resolve refreshes the operator idle clock), the
+        egmId is taken from THAT record (a body egmId is IGNORED — a page can
+        only ever act on its own cabinet), and access is re-resolved LIVE
+        (_session_is_admin), never a client-claimed tier. Verbs:
+          logout          — any carded session: the SAME shared card-out a
+                             physical re-tap runs (expect_tok closes the
+                             resolve→act TOCTOU).
+          walletFund      — any carded session WITH a linked player wallet:
+                             pushes THAT wallet onto THIS machine via the
+                             exact engine methods sendCredits drives (WAT
+                             addCredits / SAS aft_transfer). accountId is the
+                             SESSION's, never the body's; amount bounded.
+          cashOutToWallet — any carded session with a linked wallet: arms
+                             setWatCashOut so the machine's own cash-out
+                             mirrors to the player's wallet. Moves no money.
+          clearHandpay    — ADMIN only: reset the pending lockup to credits.
+          refreshGames    — ADMIN only: status-only gamePlay refresh.
+        Anything outside a session's band answers an honest 403 — NEVER a
+        500."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError):
+            req = None
+        if not isinstance(req, dict):
+            return self._send(400, '{"ok": false, "error": "invalid JSON"}',
+                              "application/json", soap=False)
+        tok = req.get("sess")
+        rec = engine.glass_sessions.resolve(tok) \
+            if isinstance(tok, str) and tok else None
+        if rec is None:
+            return self._send(401, json.dumps(
+                {"ok": False, "error": "unknown session"}),
+                "application/json", soap=False)
+        action = str(req.get("action") or "")
+        egm_id = rec.get("egmId")           # FROM THE TOKEN — body egmId ignored
+        uid = rec.get("uid")
+        admin = engine._session_is_admin(uid, rec.get("tier"))
+        # The carded player's OWN wallet (fob -> account), resolved server-
+        # side — the SESSION is the account authority, never the body. None
+        # unless a player-kind account is linked.
+        acct_id = None
+        try:
+            fob = engine.hub_store.fob_get(uid or "")
+            aid = str((fob or {}).get("accountId") or "").strip()
+            acct = engine.account_store.get(aid) if aid else None
+            if acct is not None and acct.get("kind") == "player":
+                acct_id = aid
+        except Exception:  # noqa: BLE001 — a db fault just means "no wallet"
+            acct_id = None
+        # Is THIS token an active admin overlay stacked over a carded friend?
+        # The wallet verbs below would otherwise move/disarm the FRIEND's money
+        # under the admin's token — the render hides the controls, but a hand-
+        # crafted POST bypasses the UI, so we also refuse them server-side (the
+        # money-leak fix, defense in depth).
+        with engine.companion_lock:
+            _ov = engine.admin_overlays.get(egm_id)
+            is_overlay_tok = bool(_ov and _ov.get("tok") == tok)
+
+        def done(status, payload):
+            payload.setdefault("ok", status == 200)
+            payload.setdefault("action", action)
+            payload.setdefault("egmId", egm_id)
+            return self._send(status, json.dumps(payload),
+                              "application/json", soap=False)
+
+        if action == "logout":
+            if is_overlay_tok:
+                # "Done" on an admin overlay ENDS THE OVERLAY, it does not log
+                # anyone out: pop+restore hands the glass back to the friend
+                # underneath (who never lost their session). Running the shared
+                # card-out here would card the innocent friend off the machine.
+                engine._admin_overlay_pop(egm_id, restore=True)
+                log.info("🧑‍💼 [%s] admin overlay ended by Done — "
+                         "player restored", egm_id)
+                return done(200, {"ok": True, "overlayEnded": True})
+            # expect_tok closes the resolve->act TOCTOU: a card switch that
+            # superseded this token no-ops the card-out (the new user's
+            # session stands; the requester's token is dead either way).
+            sess = engine._glass_card_out(egm_id, expect_tok=tok)
+            log.info("💳 [%s] card OUT — %s (glass logout button%s)",
+                     egm_id, (sess or rec).get("name"),
+                     "" if sess else "; session already gone")
+            return done(200, {"ok": True, "name": (sess or rec).get("name")})
+
+        if action in GLASS_WALLET_ACTIONS:
+            if is_overlay_tok:
+                return done(403, {"ok": False,
+                                  "error": "wallet actions are disabled while "
+                                           "supervising another player"})
+            if acct_id is None:
+                return done(403, {"ok": False,
+                                  "error": "link a player card to use your "
+                                           "wallet"})
+            if action == "walletFund":
+                status, payload = engine.glass_wallet_fund(
+                    egm_id, acct_id, req.get("cents"))
+                return done(status, payload)
+            if action == "cashOutNow":
+                # HOST-CONTROL immediate cash-out (SAS/BB2): the panel button
+                # pulls the machine's credits to the wallet now — no physical
+                # button. accountId is the SESSION's, never the body's.
+                status, payload = engine.glass_cash_out_now(
+                    egm_id, acct_id, expect_tok=tok)
+                return done(status, payload)
+            # cashOutToWallet — JSON true/false or string forms; omitted=enable
+            enable = str(req.get("enable", True)).lower() \
+                not in ("false", "0", "")
+            status, payload = engine.glass_cash_out_to_wallet(
+                egm_id, acct_id, enable, expect_tok=tok)
+            return done(status, payload)
+
+        if action in GLASS_ADMIN_ACTIONS:
+            if not admin:
+                return done(403, {"ok": False, "error": "not authorized"})
+            with engine.assoc_lock:
+                assoc = engine.associations.get(egm_id)
+            if assoc is None:
+                return done(404, {"ok": False,
+                                  "error": "machine not connected"})
+            if action == "clearHandpay":
+                # reset the pending lockup to credits — the SAME reset a
+                # reset-fob fires. A specific transactionId keys THAT lockup
+                # off; omitted keys the NEWEST (the one the operator just saw).
+                txn = req.get("transactionId")
+                if txn is not None:
+                    txn = str(txn)
+                    engine.enqueue_set_remote_key_off(assoc, txn_id=txn)
+                    return done(200, {"ok": True, "hpId": txn})
+                res = engine.reset_newest_handpay(assoc)
+                ok = not (isinstance(res, dict) and res.get("ok") is False)
+                payload = dict(res) if isinstance(res, dict) else {}
+                payload["ok"] = ok
+                return done(200, payload)   # honest ok:false at 200
+            # refreshGames — status-only gamePlay refresh
+            res = engine.refresh_game_play_status(assoc)
+            ok = not (isinstance(res, dict) and res.get("ok") is False)
+            payload = dict(res) if isinstance(res, dict) else {}
+            payload["ok"] = ok
+            return done(200, payload)
+
+        return done(403, {"ok": False, "error": "not yet"})
+
+    @staticmethod
+    def _reject_nonfinite(_c):
+        # json.loads parse_constant hook: NaN/Infinity/-Infinity would
+        # otherwise deserialize and then re-serialize into /api/status as
+        # bare tokens that break every browser's JSON.parse (SAS-bridge F0).
+        raise ValueError("non-finite JSON constant not allowed")
+
+    # -- /api/tito/* — the hub validation authority's satellite edge --------
+    # The SAS satellites (Zero SMIBs + the Pi's own sas_host) call these for
+    # every TITO money operation, making hub.db the ONE cross-machine ticket
+    # authority. This edge speaks CENTS (the SAS world's unit) and converts
+    # to the hub ledger's MILLICENTS at the boundary. Unauthenticated on the
+    # floor AP like the rest of /api/sas/* — so validation is strict and a
+    # failure answers ok:false (the satellite then takes its SAFE fallback:
+    # local sid-02 mint for a cash-out, reject-and-return for a ticket-in).
+
+    _TITO_MAX_CENTS = 9_999_999_999     # mirror of TicketStore ceiling —
+                                        # the 5-byte-BCD wire max, not policy
+
+    @staticmethod
+    def _tito_machine(smib, address):
+        return f"sas:{smib}:{address}"
+
+    @staticmethod
+    def _tito_txn(smib, address, validation):
+        # Deterministic per (machine, ticket): a poll-thread retry of the
+        # same insertion re-draws the identical authorization; the sync
+        # replay of a journaled close rebuilds the same holder identity.
+        return f"sas:{smib}:{address}:{validation}"
+
+    def _handle_tito(self, raw, peer):
+        engine = self.host_engine
+        sub = self.path[len("/api/tito/"):].split("?", 1)[0].strip("/")
+        try:
+            req = json.loads(raw, parse_constant=self._reject_nonfinite) \
+                if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+
+        def fail(code, msg):
+            return self._send(code, json.dumps({"ok": False, "error": msg}),
+                              "application/json", soap=False)
+
+        def ok(**kw):
+            return self._send(200, json.dumps({"ok": True, **kw}),
+                              "application/json", soap=False)
+
+        smib = req.get("smibId")
+        smib = smib.strip()[:128] if isinstance(smib, str) else ""
+        if not smib:
+            return fail(400, "smibId required (string)")
+        try:
+            address = int(req.get("address"))
+        except (TypeError, ValueError):
+            return fail(400, "address required (int)")
+        if not 0 <= address <= 127:
+            return fail(400, "address out of range")
+        machine = self._tito_machine(smib, address)
+
+        def digits(key, lo=8, hi=18):
+            v = req.get(key)
+            v = v.strip() if isinstance(v, str) else ""
+            return v if v.isdigit() and lo <= len(v) <= hi else ""
+
+        if sub == "mint":
+            try:
+                cents = int(req.get("amountCents"))
+            except (TypeError, ValueError):
+                return fail(400, "amountCents required (int)")
+            if not 0 < cents <= self._TITO_MAX_CENTS:
+                return fail(400, f"amountCents out of range "
+                                 f"(1..{self._TITO_MAX_CENTS})")
+            try:
+                m = engine.hub_store.tito_mint(
+                    f"sas:{smib}", address, cents * 1000)
+            except Exception as e:  # noqa: BLE001 — edge answers honestly,
+                log.error("tito mint for %s failed: %s", machine, e)
+                return fail(503, f"mint unavailable: {e}")  # client falls back
+            log.info("🎫 tito MINT %s -> vn %s (%dc%s)", machine,
+                     m["validationNumber"], cents,
+                     ", reused" if m["reused"] else "")
+            # Activity tape: one line per NEW cash-out — a reused mint is
+            # the 0x57 re-fire of the SAME cash-out seconds later, so it
+            # must not tape twice. Prep is wrapped: nothing here may break
+            # the money path before the response is sent (fire() already
+            # swallows callback errors, this covers the label build too).
+            if not m["reused"]:
+                try:
+                    engine.event_hooks.fire("tito", {
+                        "hook": "tito", "egmId": machine, "code": None,
+                        "label": f"🎫 Ticket-out minted — vn "
+                                 f"{m['validationNumber']} "
+                                 f"(${cents / 100:.2f}) at {machine}",
+                        "category": "tito", "icon": "🎫",
+                        "dateTime": now_iso(), "device": f"sas/{address}",
+                        "extras": {"validation": m["validationNumber"],
+                                   "amountMc": cents * 1000}})
+                except Exception:  # noqa: BLE001 — tape is decoration
+                    log.exception("tito mint activity fire failed (ignored)")
+            return ok(validationNumber=m["validationNumber"],
+                      systemId=m["systemId"], seq=m["seq"],
+                      reused=m["reused"])
+
+        if sub == "issued":
+            vn = digits("validationNumber")
+            if not vn:
+                return fail(400, "validationNumber required (8..18 digits)")
+            try:
+                cents = int(req.get("amountCents"))
+            except (TypeError, ValueError):
+                return fail(400, "amountCents required (int)")
+            if not 0 < cents <= self._TITO_MAX_CENTS:
+                return fail(400, "amountCents out of range")
+            tno = req.get("ticketNumber")
+            tno = int(tno) if isinstance(tno, int) \
+                and not isinstance(tno, bool) and 0 <= tno < 2 ** 31 \
+                else None
+            src = req.get("source")
+            src = src.strip()[:32] if isinstance(src, str) else "egm"
+            issued_at = req.get("issuedAt")
+            issued_at = issued_at.strip()[:32] \
+                if isinstance(issued_at, str) else None
+            try:
+                r = engine.hub_store.tito_record_issued(
+                    vn, cents * 1000, f"sas:{smib}", address,
+                    ticket_number=tno, source=src or "egm",
+                    issued_at=issued_at)
+            except ValueError as e:
+                return fail(400, str(e))
+            except Exception as e:  # noqa: BLE001
+                log.error("tito issued(%s) failed: %s", vn, e)
+                return fail(503, f"ledger unavailable: {e}")
+            # Activity tape: the paper-in-hand moment. Duplicate re-reports
+            # (satellite retry / stale re-capture) change nothing in the
+            # ledger and must not re-tape. Prep wrapped — see the mint fire.
+            if not r["duplicate"]:
+                try:
+                    engine.event_hooks.fire("tito", {
+                        "hook": "tito", "egmId": machine, "code": None,
+                        "label": f"🎫 Ticket printed — vn {vn} "
+                                 f"(${cents / 100:.2f}) at {machine}",
+                        "category": "tito", "icon": "🎫",
+                        "dateTime": now_iso(), "device": f"sas/{address}",
+                        "extras": {"validation": vn,
+                                   "amountMc": cents * 1000}})
+                except Exception:  # noqa: BLE001 — tape is decoration
+                    log.exception("tito issued activity fire failed "
+                                  "(ignored)")
+            # Collision containment (#): a reused validation number never
+            # silently vanishes now — surface it LOUDLY so it is visible, not
+            # just logged. "reissued" = spent row re-issued to the fresh paper
+            # (redeemable); "conflict" = a live ticket holds the number, needs
+            # a human (redeem/void then reprint).
+            if r.get("collision"):
+                reissued = r["collision"] == "reissued"
+                prior_mc = int(r.get("priorAmountMc") or 0)
+                label = (f"⚠️ Ticket number {vn} was reused — re-issued for "
+                         f"${cents / 100:.2f} (prior ${prior_mc / 100000:.2f} "
+                         f"{r.get('priorState')}); paper is redeemable"
+                         if reissued else
+                         f"⛔ Ticket number {vn} reused while a live ticket "
+                         f"still holds it — needs attention (redeem/void the "
+                         f"old one, then reprint)")
+                log.warning("🎫 collision surfaced at %s: %s", machine, label)
+                try:
+                    engine.event_hooks.fire("tito", {
+                        "hook": "tito", "egmId": machine, "code": None,
+                        "label": label, "category": "tito",
+                        "icon": "⚠️" if reissued else "⛔",
+                        "dateTime": now_iso(), "device": f"sas/{address}",
+                        "extras": {"validation": vn,
+                                   "collision": r["collision"],
+                                   "attention": True}})
+                except Exception:  # noqa: BLE001 — tape is decoration
+                    log.exception("tito collision activity fire failed "
+                                  "(ignored)")
+            return ok(state=r["state"], duplicate=r["duplicate"],
+                      collision=r.get("collision"))
+
+        if sub == "authorize":
+            validation = digits("canonical") or digits("vn16")
+            if not validation:
+                return fail(400, "canonical or vn16 required (digits)")
+            try:
+                reported = int(req.get("reportedAmountCents") or 0)
+            except (TypeError, ValueError):
+                reported = 0
+            txn = self._tito_txn(smib, address, validation)
+            dec = engine.tito.authorize(machine, txn, validation,
+                                        reported * 1000 or None)
+            if dec["exc"] == 0:
+                amt_mc = int(dec["amt"])
+                # v1 fences for a SAS redeemer: whole cents + cashable only.
+                # Either fence RELEASES the hold (close rejected) so the
+                # returned paper stays redeemable where it came from.
+                if amt_mc % 1000:
+                    engine.tito.close(machine, txn, validation,
+                                      "G2S_rejected")
+                    log.warning("tito authorize %s: %dmc not whole cents "
+                                "-> rejected for SAS", validation, amt_mc)
+                    return ok(authorized=False, amountCents=0,
+                              reason="amount not a whole cent — cannot "
+                                     "represent on SAS", retry=False)
+                if dec["creditType"] != "G2S_cashable":
+                    engine.tito.close(machine, txn, validation,
+                                      "G2S_rejected")
+                    return ok(authorized=False, amountCents=0,
+                              reason=f"creditType {dec['creditType']} not "
+                                     "redeemable on SAS (cashable only)",
+                              retry=False)
+                log.info("=" * 64)
+                log.info("🎟️ TICKET IN at %s — %s AUTHORIZED $%.2f%s",
+                         machine, validation, amt_mc / 100000,
+                         " (retry)" if dec["retry"] else "")
+                log.info("=" * 64)
+                return ok(authorized=True, amountCents=amt_mc // 1000,
+                          reason=dec["reason"], retry=dec["retry"])
+            log.info("🎟️ TICKET REJECTED at %s — %s: %s", machine,
+                     validation, dec["reason"])
+            return ok(authorized=False, amountCents=0,
+                      reason=dec["reason"], retry=False)
+
+        if sub == "commit":
+            validation = digits("canonical") or digits("vn16")
+            if not validation:
+                return fail(400, "canonical or vn16 required (digits)")
+            redeemed = bool(req.get("redeemed"))
+            txn = self._tito_txn(smib, address, validation)
+            try:
+                state = engine.tito.close(
+                    machine, txn, validation,
+                    "G2S_redeemed" if redeemed else "G2S_rejected")
+            except Exception as e:  # noqa: BLE001 — an ok:true here would
+                # stop the satellite journaling the close; be honest so the
+                # sync replays it once the ledger is back
+                log.error("tito commit(%s) failed: %s", validation, e)
+                return fail(503, f"ledger unavailable: {e}")
+            if redeemed and state == "redeemed":
+                log.info("🎟️ TICKET REDEEMED at %s — %s consumed",
+                         machine, validation)
+                # Activity tape: the consumed moment, with amount/origin
+                # from the hub ledger when it owns the row (tito_list is a
+                # cheap read-only vid lookup that never raises; a Voucher-
+                # Store-owned id just misses and the label omits them). A
+                # differing origin is the headline: cross-machine TITO.
+                # Prep wrapped — nothing may break the money path here.
+                try:
+                    rows = engine.hub_store.tito_list(
+                        vid=validation).get("tickets") or [{}]
+                    amt, origin = rows[0].get("amountMc"), \
+                        rows[0].get("origin")
+                    label = f"🎟️ Ticket redeemed — {validation}"
+                    if isinstance(amt, int):
+                        label += f" (${amt / 100000:.2f})"
+                    label += f" at {machine}"
+                    # origin is "sas:<smib>" while machine is
+                    # "sas:<smib>:<addr>" — prefix match = same machine.
+                    if origin and machine != origin \
+                            and not machine.startswith(origin + ":"):
+                        label += f" — cross-machine: {origin} → {machine}"
+                    extras = {"validation": validation}
+                    if isinstance(amt, int):
+                        extras["amountMc"] = amt
+                    engine.event_hooks.fire("tito", {
+                        "hook": "tito", "egmId": machine, "code": None,
+                        "label": label, "category": "tito", "icon": "🎟️",
+                        "dateTime": now_iso(), "device": f"sas/{address}",
+                        "extras": extras})
+                except Exception:  # noqa: BLE001 — tape is decoration
+                    log.exception("tito redeem activity fire failed "
+                                  "(ignored)")
+            return ok(state=state)
+
+        if sub == "void":
+            validation = digits("canonical") or digits("vn16")
+            if not validation:
+                return fail(400, "canonical or vn16 required (digits)")
+            try:
+                prior = engine.hub_store.tito_void(validation)
+            except Exception as e:  # noqa: BLE001
+                log.error("tito void(%s) failed: %s", validation, e)
+                return fail(503, f"ledger unavailable: {e}")
+            return ok(prior=prior)
+
+        if sub == "sync":
+            tickets = req.get("tickets")
+            closes = req.get("closes")
+            norm_tickets = []
+            for t in (tickets if isinstance(tickets, list) else [])[:500]:
+                if not isinstance(t, dict):
+                    continue
+                vn = t.get("validationNumber")
+                vn = vn.strip() if isinstance(vn, str) else ""
+                try:
+                    cents = int(t.get("amountCents") or 0)
+                except (TypeError, ValueError):
+                    continue
+                norm_tickets.append({
+                    "vn": vn, "amountMc": cents * 1000,
+                    "state": t.get("state"), "address": address,
+                    "ticketNumber": t.get("ticketNumber"),
+                    "issuedAt": t.get("issuedAt"),
+                    "redeemedAt": t.get("redeemedAt"),
+                    "redeemedBy": t.get("redeemedBy")})
+            try:
+                r = engine.hub_store.tito_sync_merge(
+                    f"sas:{smib}", req.get("validationSeq"), norm_tickets)
+            except Exception as e:  # noqa: BLE001
+                log.error("tito sync from %s failed: %s", machine, e)
+                return fail(503, f"ledger unavailable: {e}")
+            # Journaled closes replay through the UNION authority — an
+            # AVP-issued voucher's close must reach the VoucherStore, which
+            # the hub SQLite ledger cannot see (review 2026-07-08). Each
+            # close rebuilds the ORIGINAL holder identity: the journal
+            # carries the address the redemption ran under (the top-level
+            # address is only the fallback), and the txn formula matches
+            # what /api/tito/authorize used.
+            closes_applied = 0
+            try:
+                for cl in (closes if isinstance(closes, list)
+                           else [])[:100]:
+                    if not isinstance(cl, dict):
+                        continue
+                    v = cl.get("validation")
+                    v = v.strip() if isinstance(v, str) else ""
+                    if not v.isdigit() or not 8 <= len(v) <= 18:
+                        continue
+                    try:
+                        cl_addr = int(cl.get("address", address))
+                    except (TypeError, ValueError):
+                        cl_addr = address
+                    if not 0 <= cl_addr <= 127:
+                        cl_addr = address
+                    st = engine.tito.close(
+                        self._tito_machine(smib, cl_addr),
+                        self._tito_txn(smib, cl_addr, v), v,
+                        "G2S_redeemed" if cl.get("redeemed")
+                        else "G2S_rejected")
+                    if st is not None:
+                        closes_applied += 1
+            except Exception as e:  # noqa: BLE001 — the tickets merge
+                # already landed (idempotent to re-send); refuse the sync
+                # so the satellite KEEPS its journal and replays later
+                log.error("tito sync close-replay from %s failed: %s",
+                          machine, e)
+                return fail(503, f"close replay failed: {e}")
+            return ok(closesApplied=closes_applied, **r)
+
+        return fail(404, f"unknown tito op {sub!r}")
+
+    def _handle_sas_report(self, raw, peer):
+        """POST /api/sas/report — SAS floor registry ingest. sas_host.py
+        satellites (the Pi's own co-located host + Zero SMIBs on the
+        CasinoNet AP) report machine state here. Unauthenticated on the AP,
+        so the ingest is defensive: non-finite numbers are rejected (they
+        would poison /api/status for every client), and sas_report() bounds
+        every stored structure."""
+        try:
+            payload = json.loads(raw, parse_constant=self._reject_nonfinite) \
+                if raw.strip() else {}
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        reply = self.host_engine.sas_report(payload, peer)
+        # ok:false here is a client/capacity error, not a conflict — 400
+        # (registry full / rejected). 200 on success (F4).
+        return self._send(200 if reply.get("ok") else 400,
+                          json.dumps(reply), "application/json", soap=False)
+
+    def _handle_companion_report(self, raw, peer):
+        """POST /api/companion/report — Companion RFID daemon ingest (the
+        _handle_sas_report wrapper posture verbatim: non-finite JSON
+        rejected before it can poison /api/status, and companion_report()
+        bounds every stored structure)."""
+        try:
+            payload = json.loads(raw, parse_constant=self._reject_nonfinite) \
+                if raw.strip() else {}
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        reply = self.host_engine.companion_report(payload, peer)
+        return self._send(200 if reply.get("ok") else 400,
+                          json.dumps(reply), "application/json", soap=False)
+
+    def _handle_fobs(self, raw):
+        """POST /api/fobs {action: "set"|"delete", uid, tier?, label?,
+        accountId?} — the fob registry write path (Settings ▸ Fobs &
+        Companions). The /api/gamenames posture: unauthenticated on the
+        floor AP, so the store enforces UID normalization + tier/length
+        bounds + the row cap, and every failure answers 400 — never a
+        500. "set" is a partial upsert (absent fields keep their stored/
+        default values); replies echo the stored row."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        uid = req.get("uid")
+        uid = uid.strip() if isinstance(uid, str) else ""
+        if not uid:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "uid required (string)"}),
+                "application/json", soap=False)
+        action = req.get("action")
+        hs = self.host_engine.hub_store
+        try:
+            if action == "set":
+                # accountId is validated HERE like player_action's
+                # linkFob (exists + kind=player; "" clears the link): a
+                # fob linked to "house" would paint the BANK's balance as
+                # a carded player's credits, and a typo id renders the
+                # fob nowhere in the Players card
+                acct_id = req.get("accountId")
+                if isinstance(acct_id, str) and acct_id.strip():
+                    acct = self.host_engine.account_store.get(
+                        acct_id.strip())
+                    if acct is None:
+                        return self._send(400, json.dumps(
+                            {"ok": False, "error":
+                             f"unknown account {acct_id.strip()!r} — "
+                             "link an existing player"}),
+                            "application/json", soap=False)
+                    if acct.get("kind") != "player":
+                        return self._send(400, json.dumps(
+                            {"ok": False, "error":
+                             "fobs link to players, not the house"}),
+                            "application/json", soap=False)
+                fob, err = hs.fob_set(uid, tier=req.get("tier"),
+                                      label=req.get("label"),
+                                      account_id=req.get("accountId"))
+                if err or fob is None:
+                    return self._send(400, json.dumps(
+                        {"ok": False, "error": err or "fob write failed"}),
+                        "application/json", soap=False)
+                log.info("💳 fob %s: tier=%s label=%r account=%r",
+                         fob.get("uid"), fob.get("tier"), fob.get("label"),
+                         fob.get("accountId"))
+                return self._send(200, json.dumps({"ok": True, "fob": fob}),
+                                  "application/json", soap=False)
+            if action == "delete":
+                removed = hs.fob_delete(uid)
+                log.info("💳 fob %s delete (removed=%s)", uid, bool(removed))
+                return self._send(200, json.dumps(
+                    {"ok": True, "deleted": bool(removed), "uid": uid}),
+                    "application/json", soap=False)
+        except Exception as e:  # noqa: BLE001 — never 500 a registry write
+            return self._send(400, json.dumps(
+                {"ok": False, "error": str(e)}),
+                "application/json", soap=False)
+        return self._send(400, json.dumps(
+            {"ok": False, "error": "action must be 'set' or 'delete'"}),
+            "application/json", soap=False)
+
+    _SAS_CMD_SEQ = itertools.count(1)
+
+    def _add_credits_via_sas(self, engine, egm_id, leg, req):
+        """addCredits for a SAS-LINKED machine: translate the G2S wallet
+        push (MILLICENTS, three buckets) into the satellite aft_transfer
+        (CENTS, cashable only) and queue it on the linked leg — the same
+        wire the SAS tiles and glass walletFund use, with the same money
+        guards as _handle_sas_command's aft_transfer arm (strict ints, the
+        SAS ceiling, courtesy player check, parked-machine 409). Promo/
+        non-cash buckets refuse loudly: in-house SAS AFT moves cashable
+        only, and money paths never guess. Settle semantics are the reused
+        path's own: debit-on-confirm of the echoed accountId, House covers
+        a player who comes up short in the gap."""
+        def bad(code, msg):
+            return self._send(code, json.dumps({"ok": False, "error": msg}),
+                              "application/json", soap=False)
+        for f in ("promoMillicents", "nonCashMillicents"):
+            if req.get(f):
+                return bad(400, "this machine is SAS-linked — the SAS "
+                                "transfer moves cashable credits only "
+                                f"({f} must be 0)")
+        mc = req.get("cashableMillicents")
+        if isinstance(mc, bool) or not isinstance(mc, int) or mc < 1000:
+            return bad(400, "cashableMillicents must be an integer ≥ 1000 "
+                            "($0.01) — this machine is SAS-linked and SAS "
+                            "is natively cents")
+        if mc % 1000:
+            return bad(400, "cashableMillicents must be a whole cent "
+                            "(divisible by 1000) — SAS is natively cents")
+        cents = mc // 1000
+        if cents > engine.SAS_AFT_MAX_CENTS:
+            return bad(400, f"cents must be 1..{engine.SAS_AFT_MAX_CENTS} "
+                            "(SAS uses cents; $1 = 100)")
+        account_id = str(req.get("accountId") or "house").strip()[:64]
+        acct = engine.account_store.get(account_id)
+        if acct is None:
+            return bad(400, f"unknown account {account_id!r}")
+        if acct.get("kind") != "house":
+            have = int(acct.get("cashableMillicents") or 0)
+            if have < mc:
+                return bad(400, f"{acct.get('name') or account_id} has "
+                                f"${have / 100000:.2f} — can't fund a "
+                                f"${cents / 100:.2f} push (players can't "
+                                "go negative)")
+        # C5 parity: an operator-disabled leg refuses at the hub edge (the
+        # parked satellite would only answer with an honest rejection).
+        if (engine.hub_store.machine_prefs(leg) or {}).get("sasEnabled") \
+                is False:
+            return bad(409, "SAS is disabled for this machine (Settings)")
+        with engine.sas_lock:
+            entry = engine.sas_machines.get(leg) or {}
+        smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+        cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
+               "type": "aft_transfer", "cents": cents,
+               "accountId": account_id}
+        reply = engine.sas_enqueue_command(smib, cmd)
+        ok = bool(reply.get("ok"))
+        log.info("🪙 [wallet:%s] addCredits $%.2f from %s routed over the "
+                 "SAS leg %s (%s)", egm_id, cents / 100, account_id, leg,
+                 reply.get("id") if ok else reply.get("error"))
+        return self._send(200 if ok else 400, json.dumps(dict(
+            reply, ok=ok, path="sas", egmId=egm_id, sasLink=leg,
+            cents=cents, accountId=account_id)),
+            "application/json", soap=False)
+
+    def _handle_sas_command(self, raw, peer):
+        """POST /api/sas/command {smibId, type, ...} — queue a command for
+        a SAS satellite; it delivers in the SMIB's next report reply (~1s)
+        and the verdict rides back in the following report's
+        commandResults. Types: "legacy_bonus" (+credits) awards credits on
+        the glass; "handpay_reset" keys a locked-up handpay off to the
+        credit meter (no amount — the win is whatever the machine
+        latched). "aft_register" self-registers AFT against the asset the
+        satellite READS off the machine (no credits, no asset from the
+        hub — there is no pool). "aft_transfer" takes an optional
+        accountId (R1 funding parity) — the funding account, courtesy
+        pre-checked at queue time and debited at settle via the
+        satellite's echo; absent = House. Unauthenticated on the AP like
+        the rest of /api/sas/*, and these move (or gate) MONEY on the
+        machine — so validation is strict: exact type whitelist,
+        int-not-bool credits with a hard ceiling (bonus only — a
+        reset/register must NOT carry one), known SMIB only."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw, parse_constant=self._reject_nonfinite) \
+                if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        smib = req.get("smibId")
+        smib = smib.strip()[:128] if isinstance(smib, str) else ""
+        if not smib:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "smibId required (string)"}),
+                "application/json", soap=False)
+        cmd_type = req.get("type")
+        if cmd_type not in ("legacy_bonus", "handpay_reset", "aft_register",
+                            "aft_transfer", "aft_set_host_cashout",
+                            "sas_disable", "sas_enable", "set_validation_id"):
+            return self._send(400, json.dumps(
+                {"ok": False, "error":
+                 "type must be 'legacy_bonus', 'handpay_reset', "
+                 "'aft_register', 'aft_transfer', 'aft_set_host_cashout', "
+                 "'sas_disable', 'sas_enable' or 'set_validation_id'"}),
+                "application/json", soap=False)
+        cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
+               "type": cmd_type}
+        if cmd_type == "legacy_bonus":
+            credits = req.get("credits")
+            if (not isinstance(credits, int) or isinstance(credits, bool)
+                    or not 1 <= credits <= engine.SAS_BONUS_MAX_CREDITS):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "credits must be an integer 1.."
+                     f"{engine.SAS_BONUS_MAX_CREDITS}"}),
+                    "application/json", soap=False)
+            cmd["credits"] = credits
+        elif cmd_type == "set_validation_id":
+            # Optional system_id (1..99) overrides the enhanced-validation
+            # barcode namespace the satellite seeds via 0x4C. Omit to use the
+            # satellite's configured default (system 1). Not money — the seed
+            # assigns the EGM's validation-ID range; it moves no credits.
+            sid = req.get("system_id")
+            if sid is not None:
+                if (not isinstance(sid, int) or isinstance(sid, bool)
+                        or not 1 <= sid <= 99):
+                    return self._send(400, json.dumps(
+                        {"ok": False,
+                         "error": "system_id must be an integer 1..99"}),
+                        "application/json", soap=False)
+                cmd["system_id"] = sid
+        elif cmd_type == "aft_transfer":
+            # House->EGM cashable AFT credit push. Amount in CENTS (SAS is
+            # natively cents; the hub debits House cents*1000 millicents on the
+            # satellite's CONFIRMED report). Strict like the bonus — int, not
+            # bool, hard ceiling — this moves credits on the machine.
+            cents = req.get("cents")
+            if (not isinstance(cents, int) or isinstance(cents, bool)
+                    or not 1 <= cents <= engine.SAS_AFT_MAX_CENTS):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "cents must be an integer 1.."
+                     f"{engine.SAS_AFT_MAX_CENTS} (SAS uses cents; $1 = 100)"}),
+                    "application/json", soap=False)
+            cmd["cents"] = cents
+            # Optional lock:false forces the spec-legal LOCKLESS path; default
+            # (absent) is lock-first, which the WMS BB2 requires for host->EGM.
+            lock = req.get("lock")
+            if lock is not None:
+                if not isinstance(lock, bool):
+                    return self._send(400, json.dumps(
+                        {"ok": False, "error": "lock must be a boolean"}),
+                        "application/json", soap=False)
+                cmd["lock"] = lock
+            # R1 funding parity: optional funding account. Money moves at
+            # SETTLE time (debit-on-confirm of the echoed accountId), so
+            # this is only a COURTESY pre-check — refuse a push a player
+            # can't cover RIGHT NOW (the balance can still move in the
+            # gap; the settle's House-fallback is the money-never-lost
+            # guarantee). House needs no check — it is the bank and may
+            # go negative. Absent accountId = House (deployed-UI compat).
+            account_id = req.get("accountId")
+            if account_id is not None:
+                if not isinstance(account_id, str) or not account_id.strip():
+                    return self._send(400, json.dumps(
+                        {"ok": False,
+                         "error": "accountId must be a non-empty string"}),
+                        "application/json", soap=False)
+                account_id = account_id.strip()[:64]
+                acct = engine.account_store.get(account_id)
+                if acct is None:
+                    return self._send(400, json.dumps(
+                        {"ok": False,
+                         "error": f"unknown account {account_id!r}"}),
+                        "application/json", soap=False)
+                if acct.get("kind") != "house":
+                    have = int(acct.get("cashableMillicents") or 0)
+                    if have < cents * 1000:
+                        return self._send(400, json.dumps(
+                            {"ok": False, "error":
+                             f"{acct.get('name') or account_id} has "
+                             f"${have / 100000:.2f} — can't fund a "
+                             f"${cents / 100:.2f} push (players can't go "
+                             "negative)"}),
+                            "application/json", soap=False)
+                cmd["accountId"] = account_id
+        elif cmd_type == "aft_set_host_cashout":
+            # Arm/disarm AFT host-cashout (the machine->wallet return leg).
+            # Moves no money (the machine's cash-out button does) — the arm is
+            # a hub-side flag, no wire write. Validation is strict: a REAL bool
+            # "enable".
+            enable = req.get("enable")
+            if not isinstance(enable, bool):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "enable must be a boolean"}),
+                    "application/json", soap=False)
+            cmd["enable"] = enable
+            # SECURITY (finding #3): the raw (unauthenticated) endpoint must NOT
+            # ARM a cash-out. This leg's destination is a CREDIT wallet, pinned
+            # ONLY through the carded glass session (glass_cash_out_to_wallet
+            # resolves the account from the session token, never a body field).
+            # A raw ENABLE could only arm the satellite with NO hub pin — its
+            # 0x6A would then pull the machine's whole balance with no valid
+            # home, exactly what the reject->ticket rule forbids. So the raw
+            # path allows ONLY disarm (enable=false — an idempotent revert to
+            # the ticket default, safe from anywhere); arming rides the
+            # token-authenticated glass toggle (which applies the self-
+            # determined from-EGM gate). A client accountId is likewise refused
+            # — the destination is never client-named on this credit leg.
+            if req.get("accountId") is not None:
+                return self._send(400, json.dumps(
+                    {"ok": False, "error":
+                     "accountId is not accepted here — a player wallet is "
+                     "pinned only through the carded glass session"}),
+                    "application/json", soap=False)
+            if enable:
+                return self._send(403, json.dumps(
+                    {"ok": False, "error":
+                     "arming cash-out-to-wallet is not allowed on the raw "
+                     "command endpoint — it must ride a carded glass session "
+                     "so the hub can pin the destination wallet; only disarm "
+                     "(enable=false) is accepted here"}),
+                    "application/json", soap=False)
+        elif "credits" in req:
+            # Only legacy_bonus carries an amount — a reset pays whatever the
+            # machine latched at lockup, and aft_register moves no money at
+            # all. A credits field on either means the caller mixed the
+            # contracts up; refuse rather than guess (same strictness as the
+            # bonus path — these are money-adjacent operations).
+            return self._send(400, json.dumps(
+                {"ok": False,
+                 "error": f"{cmd_type} takes no credits field"}),
+                "application/json", soap=False)
+        # C5: a machine the operator disabled in Settings refuses EVERY
+        # command type at the hub edge — the parked satellite would only
+        # answer with an honest sas_disabled rejection, so refuse up front.
+        # 409, not 400: the request is well-formed, the machine's state
+        # conflicts. Multidrop-safe: only refuse when every reported
+        # address on this smib is disabled (a sibling may still be live —
+        # the satellite adjudicates per machine). prefs reads run OUTSIDE
+        # sas_lock (hub_store has its own lock; button-press cadence).
+        with engine.sas_lock:
+            smib_keys = [k for k, e in engine.sas_machines.items()
+                         if (e.get("smibId") or k.split("/", 1)[0]) == smib]
+        if smib_keys and all(
+                (engine.hub_store.machine_prefs(k) or {}).get("sasEnabled")
+                is False for k in smib_keys):
+            return self._send(409, json.dumps(
+                {"ok": False,
+                 "error": "SAS is disabled for this machine (Settings)"}),
+                "application/json", soap=False)
+        reply = engine.sas_enqueue_command(smib, cmd)
+        if reply.get("ok"):
+            _emoji = {"legacy_bonus": "🎁", "handpay_reset": "🔑",
+                      "aft_register": "🎫", "aft_transfer": "💵",
+                      "sas_disable": "🔒", "sas_enable": "🔓",
+                      "set_validation_id": "🎟️"}.get(cmd_type, "•")
+            _amt = (f" {cmd['credits']} credits" if cmd_type == "legacy_bonus"
+                    else f" ${cmd['cents'] / 100:.2f} from "
+                    f"{cmd.get('accountId') or 'house'}"
+                    if cmd_type == "aft_transfer" else "")
+            log.info("%s [sas:%s] %s%s queued by %s (%s)", _emoji, smib,
+                     cmd_type, _amt, peer, cmd["id"])
+        return self._send(200 if reply.get("ok") else 400,
+                          json.dumps(reply), "application/json", soap=False)
+
+    def _handle_set_name(self, raw):
+        """POST /api/names {machineKey, name} — set (or clear, with empty
+        name) a machine's operator nickname in hub.db, and/or its SAS
+        display denomination (denomCents, CENTS per credit, R2; 0/null
+        clears). Presence-checked — only fields present in the request are
+        touched, so today's UI ({machineKey,name}) behaves exactly as
+        before. Works for any machine key (G2S egmId or SAS smibId/address);
+        creates the row if the machine hasn't reported yet. This is the
+        durable, cross-device name — it replaces the old per-browser
+        localStorage naming."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        key = req.get("machineKey")
+        key = key.strip() if isinstance(key, str) else ""
+        if not key:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "machineKey required (string)"}),
+                "application/json", soap=False)
+        proto = str(req.get("protocol") or "unknown")[:8]
+        out = {"ok": True, "machineKey": key}
+        try:
+            # denom first: it is the newly-typed field most likely to be
+            # junk — failing BEFORE the name write means a 400 leaves
+            # nothing half-saved and the retry writes both.
+            if "denomCents" in req:
+                out["denomCents"] = self.host_engine.hub_store.set_denom(
+                    key, req.get("denomCents"), proto)
+            if "name" in req:
+                out["name"] = self.host_engine.hub_store.set_nickname(
+                    key, req.get("name"), proto)
+        except Exception as e:  # noqa: BLE001 — never 500 a pref write
+            return self._send(400, json.dumps(
+                {"ok": False, "error": str(e)}),
+                "application/json", soap=False)
+        log.info("🏷️  machine %s prefs: name=%r denom=%r", key,
+                 out.get("name", "…"), out.get("denomCents", "…"))
+        return self._send(200, json.dumps(out),
+                          "application/json", soap=False)
+
+    def _handle_game_name(self, raw):
+        """POST /api/gamenames {key, title} — set (or clear, with an
+        empty/null title) one game-name override in hub.db (v6). key is
+        the catalog key the UI's prettyTheme consults (6-digit family +
+        3-char game code, e.g. '014001H18'); the stored title wins over
+        the shipped igt_games.json entry on every device. /api/names
+        posture: unauthenticated on the floor AP, so the store enforces
+        the key/title bounds + the row cap, and every failure answers
+        400 — never a 500."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        key = req.get("key")
+        key = key.strip() if isinstance(key, str) else ""
+        if not key:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "key required (string)"}),
+                "application/json", soap=False)
+        try:
+            stored = self.host_engine.hub_store.game_name_set(
+                key, req.get("title"))
+        except Exception as e:  # noqa: BLE001 — never 500 a pref write
+            return self._send(400, json.dumps(
+                {"ok": False, "error": str(e)}),
+                "application/json", soap=False)
+        log.info("🏷️  game name %s: %r", key,
+                 stored if stored is not None else "(catalog)")
+        return self._send(200, json.dumps(
+            {"ok": True, "key": key, "title": stored}),
+            "application/json", soap=False)
+
+    def _handle_settings(self, raw):
+        """POST /api/settings (C5) — the Settings tab's write path.
+        Presence-checked like /api/names (only fields present are touched):
+          {"machineKey": ..., "sasEnabled": bool}  per-machine SAS toggle
+          {"machineKey": ..., "sasCashoutReady": bool} LEGACY no-op — the
+                                                   machine->wallet cash-out gate
+                                                   is now self-determined from
+                                                   the machine's 0x74 from-EGM
+                                                   bit; this echoes the DERIVED
+                                                   state and ignores the value
+          {"machineKey": ..., "sasLink": str|null} link a G2S card's SAS
+                                                   leg (task #20) — the SAS
+                                                   key, null/"" unlinks
+          {"sysvalFallback": bool}                 host option
+          {"ticketPropName"/"ticketLine1"/"ticketLine2"/"ticketTitleCash":
+           str}  ticket-header fields (C3) — strict strings, stripped,
+                 64-char bound, "" clears the tenant. ANY accepted ticket
+                 write bumps ticket_rev (the SAS satellites' re-apply
+                 trigger), refreshes the reply cache, and fans the header
+                 to every ONLINE G2S EGM via the option-change cycle
+                 (verdicts logged + echoed as "ticketPush").
+        Unauthenticated on the AP like /api/names, so validation is strict
+        (REAL bools only — 1/0 is not consent for a switch that parks a
+        machine's serial poll) and every failure answers 400, never a
+        500. Replies {"ok": true, ...echo of what was set}."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        out = {"ok": True}
+        try:
+            # sasLink (task #20) rides machineKey too — only claim the
+            # pair here when it is NOT a pure link write, so machineKey
+            # alone still answers today's exact 400.
+            if "sasEnabled" in req or ("machineKey" in req
+                                       and "sasLink" not in req
+                                       and "sasCashoutReady" not in req):
+                key = req.get("machineKey")
+                key = key.strip() if isinstance(key, str) else ""
+                if not key:
+                    raise ValueError("machineKey required (string)")
+                enabled = req.get("sasEnabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError("sasEnabled must be a boolean")
+                out["machineKey"] = key
+                out["sasEnabled"] = engine.hub_store.set_sas_enabled(
+                    key, enabled)
+                # Stamp the LIVE floor entry too (entries carry hub.db
+                # truth stamped at report ingest) — otherwise a machine
+                # whose satellite is dead keeps its last-stamped value in
+                # /api/status forever and a disabled tile never hides.
+                # A reporting satellite restamps the same value ~1 s later.
+                with engine.sas_lock:
+                    e = engine.sas_machines.get(key)
+                    if e is not None:
+                        e["sasEnabled"] = out["sasEnabled"]
+            if "sasCashoutReady" in req:
+                # LEGACY no-op: the machine->wallet cash-out gate is no longer a
+                # manual flag (CONFIRMED 2026-07-12) — it SELF-DETERMINES from
+                # the machine's live 0x74 from-EGM bit (sas_from_egm_ready). A
+                # client that still posts sasCashoutReady is answered with the
+                # DERIVED state, never a stored flag, so nobody can force a fake
+                # ON. machineKey + a strict bool are still required (the same
+                # 1/0-isn't-consent contract), but the boolean is ignored.
+                key = req.get("machineKey")
+                key = key.strip() if isinstance(key, str) else ""
+                if not key:
+                    raise ValueError("machineKey required (string)")
+                if not isinstance(req.get("sasCashoutReady"), bool):
+                    raise ValueError("sasCashoutReady must be a boolean")
+                out["machineKey"] = key
+                with engine.sas_lock:
+                    e = engine.sas_machines.get(key)
+                    out["sasCashoutReady"] = engine.sas_from_egm_ready(e or {})
+                out["sasCashoutReadyNote"] = (
+                    "gate is automatic — derived from the machine's 0x74 "
+                    "from-EGM bit; the posted value is ignored")
+            if "sasLink" in req:
+                # Machine linking (task #20): bind/unbind a G2S card's SAS
+                # leg. String = the SAS machine key, null/"" = unlink.
+                # Strict — this switch moves METER AUTHORITY between the
+                # protocol feeds, so anything else is a 400 (set_sas_link
+                # re-validates and raises too).
+                key = req.get("machineKey")
+                key = key.strip() if isinstance(key, str) else ""
+                if not key:
+                    raise ValueError("machineKey required (string)")
+                link = req.get("sasLink")
+                if link is not None and not isinstance(link, str):
+                    raise ValueError("sasLink must be a string or null")
+                # ONE owner per SAS leg: a second G2S card claiming an
+                # already-linked key would double-face that leg's credits
+                # (two tiles, one machine) — the exact floor double-count
+                # linking exists to kill. Refuse before anything is written.
+                want = link.strip() if isinstance(link, str) else ""
+                if want:
+                    owner = next((mk for mk, sk in engine.sas_links.items()
+                                  if sk == want and mk != key), None)
+                    if owner is not None:
+                        raise ValueError(
+                            f"sasLink {want} already linked to {owner} "
+                            "— unlink that machine first")
+                out["machineKey"] = key
+                # A hub-db fault surfaces via set_sas_link's own raise ->
+                # 400 (link unchanged) — the write is refused, never half-
+                # applied.
+                out["sasLink"] = engine.hub_store.set_sas_link(key, link)
+                # Single writer of the in-memory map (readers are
+                # GIL-atomic dict lookups — see the __init__ comment).
+                if out["sasLink"] is None:
+                    engine.sas_links.pop(key, None)
+                else:
+                    engine.sas_links[key] = out["sasLink"]
+                    # This machine now has a SAS SMIB, so its reader is the
+                    # CO-LOCATED one (auto-bound). Drop any EXPLICIT reader row
+                    # still pointing at this machine: otherwise the explicit +
+                    # the auto reader would BOTH resolve here (double-bind), and
+                    # since machineReaderOpts hides the picker for a SAS machine
+                    # the stale explicit binding could never be cleared from the
+                    # UI. (If the explicit reader IS the co-located one, it just
+                    # re-binds via co-location — same result, no picker needed.)
+                    with engine._sat_write_lock:
+                        for sid, srow in list(engine.sat_bindings.items()):
+                            if (srow.get("g2sEgmId") or "") == key:
+                                crow, _ = engine.hub_store.sat_set(
+                                    sid, egm_id="")
+                                if crow:
+                                    engine.sat_bindings[sid] = crow
+                                    log.info("🔗 [link:%s] cleared explicit "
+                                             "reader %s (its SMIB reader is "
+                                             "co-located now)", key, sid)
+                log.info("🔗 [link:%s] sasLink=%s",
+                         key, out["sasLink"] or "(cleared)")
+            if "sysvalFallback" in req:
+                sv = req.get("sysvalFallback")
+                if not isinstance(sv, bool):
+                    raise ValueError("sysvalFallback must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "sysval_fallback", "on" if sv else "off")
+                # Refresh the engine's TTL cache NOW — the next satellite
+                # reply and /api/status poll carry the new value with no
+                # SYSVAL_CACHE_SEC limbo after the click.
+                engine._sysval_cache = (sv, time.time())
+                out["sysvalFallback"] = sv
+            if "houseAllowNegative" in req:
+                # Collector "let the bank go into the red?" switch. Strict
+                # bool (a switch that governs whether a friend can be refused
+                # money — 1/0 is not consent). ON (default) = the bank always
+                # covers a friend; OFF = floors at $0 with a friendly "top up"
+                # nudge on the Players ▸ Fund path.
+                han = req.get("houseAllowNegative")
+                if not isinstance(han, bool):
+                    raise ValueError("houseAllowNegative must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "house_allow_negative", "on" if han else "off")
+                out["houseAllowNegative"] = han
+            if "houseBankrollMc" in req:
+                # "My casino starts with $X" (collector economy) — SET the
+                # bank's cashable balance to the given millicents (delta =
+                # target − current) via the already-correct AccountStore.adjust
+                # seam. NOT a durable host_setting: account_state.json IS the
+                # truth; if it's ever wiped you just start your game room over.
+                # Strict non-negative int with a sane fun-money ceiling.
+                bmc = req.get("houseBankrollMc")
+                if isinstance(bmc, bool) or not isinstance(bmc, int):
+                    raise ValueError(
+                        "houseBankrollMc must be an integer (millicents)")
+                if bmc < 0 or bmc > 10**15:      # $10B fun-money ceiling
+                    raise ValueError("houseBankrollMc out of range (0..$10B)")
+                house = engine.account_store.get("house") or {}
+                cur = int(house.get("cashableMillicents", 0) or 0)
+                delta = bmc - cur
+                if delta != 0:
+                    ref = f"set-bankroll:{int(time.time() * 1000)}"
+                    _, err = engine.account_store.adjust(
+                        "house", d_cash=delta, note="set bankroll", ref=ref)
+                    if err:
+                        raise ValueError(f"could not set bankroll: {err}")
+                out["houseBankrollMc"] = bmc
+            if "gameroomName" in req:
+                # The collector's GAMEROOM NAME (AJ: "CabiNet is what i call the
+                # whole package. People can name their gameroom"). A hub-wide
+                # personalization shown player-facing (glass/kiosk attract +
+                # footer) in place of the old fixed "FUNCINO" brand. Strict
+                # string, stripped, bounded; "" CLEARS it (the UI falls back to
+                # a neutral placeholder). Read live off host_setting by the
+                # glass_state poll + /api/status hostOptions — no push needed.
+                gn = req.get("gameroomName")
+                if not isinstance(gn, str):
+                    raise ValueError("gameroomName must be a string")
+                gn = gn.strip()
+                if len(gn) > MAX_GAMEROOM_NAME_LEN:
+                    raise ValueError(f"gameroomName must be <= "
+                                     f"{MAX_GAMEROOM_NAME_LEN} characters")
+                engine.hub_store.set_host_setting("gameroom_name", gn)
+                out["gameroomName"] = gn or None      # cleared echoes null
+            tf_map = (("ticketPropName", "ticket_prop_name"),
+                      ("ticketLine1", "ticket_line1"),
+                      ("ticketLine2", "ticket_line2"),
+                      ("ticketTitleCash", "ticket_title_cash"))
+            tf_present = [(jk, tk) for jk, tk in tf_map if jk in req]
+            if tf_present:
+                # Ticket header (C3). Validate EVERY present field before
+                # writing ANY — a 400 on the third field must not leave a
+                # half-saved header (and no rev bump means no push of a
+                # partial save). Strict strings only; stripped; 64-char
+                # bound (the printed-line width); "" clears the tenant
+                # (hub.db deletes the row — absent = unset, C1).
+                clean = []
+                for jk, tk in tf_present:
+                    tv = req.get(jk)
+                    if not isinstance(tv, str):
+                        raise ValueError(f"{jk} must be a string")
+                    tv = tv.strip()
+                    if len(tv) > MAX_TICKET_FIELD_LEN:
+                        raise ValueError(f"{jk} must be <= "
+                                         f"{MAX_TICKET_FIELD_LEN} "
+                                         "characters")
+                    clean.append((jk, tk, tv))
+                for jk, tk, tv in clean:
+                    engine.hub_store.set_host_setting(tk, tv)
+                    out[jk] = tv or None          # cleared echoes null
+                # EVERY accepted write bumps the rev (C2) — including a
+                # clear: satellites see ticketData vanish/refresh, and the
+                # UI's pending note re-anchors.
+                out["ticketRev"] = engine.hub_store.bump_ticket_rev()
+                # Refresh the reply TTL cache NOW (the sysval pattern) —
+                # the next satellite reply and /api/status poll carry the
+                # new header with no TICKET_CACHE_SEC limbo.
+                engine._ticket_cache = (engine.hub_store.ticket_header(),
+                                        time.time())
+                # C3 fan-out: push to every ONLINE G2S EGM via the proven
+                # option-change cycle (no-op unless propName is set).
+                # Verdicts are logged inside and echoed for the UI toast.
+                out["ticketPush"] = engine.push_ticket_header_g2s()
+            if "companionId" in req:
+                # Satellite assignment (v11, zero-config onboarding): bind a
+                # Companion to a machine FROM THE UI so the hub — not the unit's
+                # flags — owns the routing. Presence-checked like the rest: only
+                # the fields present are touched. g2sEgmId sets/​clears (""/null =
+                # unassign) the carded-session binding; sasSmib/sasAddress are the
+                # niche reset-fob routing; label is the friendly name. The store
+                # re-validates + caps; we then update the in-memory map as the
+                # SINGLE writer (readers are GIL-atomic — the sas_links idiom),
+                # so the next companion report resolves the new binding live.
+                cid = req.get("companionId")
+                cid = cid.strip() if isinstance(cid, str) else ""
+                if not cid:
+                    raise ValueError("companionId required (string)")
+                kw = {}
+                for jk, sk in (("g2sEgmId", "egm_id"), ("sasSmib", "sas_smib"),
+                               ("sasAddress", "sas_address"),
+                               ("label", "label")):
+                    if jk in req:
+                        v = req.get(jk)
+                        if v is None:
+                            v = ""          # null = clear (unassign), like ""
+                        if not isinstance(v, str):
+                            raise ValueError(f"{jk} must be a string or null")
+                        kw[sk] = v
+                if not kw:
+                    raise ValueError("send companionId + at least one of "
+                                     "g2sEgmId, sasSmib, sasAddress, label")
+                # Serialize the whole assign+displace cycle: two concurrent POSTs
+                # assigning DIFFERENT readers to the SAME machine could otherwise
+                # interleave their exclusivity loops and mutually clear each
+                # other, leaving the machine reader-less (the HTTP server is
+                # threaded). Under the lock the read-modify-write is atomic.
+                with engine._sat_write_lock:
+                    row, err = engine.hub_store.sat_set(
+                        cid, kind="companion", **kw)
+                    if err:
+                        raise ValueError(err)
+                    engine.sat_bindings[row["satId"]] = row
+                    # One reader per machine, enforced HERE (server-side) so the
+                    # UI can make the assign a SINGLE atomic write. When this
+                    # reader is bound to machine E, drop the g2sEgmId of any
+                    # OTHER reader serving E — the newest pick wins. Clears only
+                    # the machine binding (label + any manual reset-fob leg on
+                    # the displaced row are kept, so it stays a recognizable,
+                    # unassigned reader).
+                    new_egm = row.get("g2sEgmId") or ""
+                    displaced = []
+                    displaced_failed = []
+                    if new_egm:
+                        for other_id, orow in list(engine.sat_bindings.items()):
+                            if other_id == row["satId"]:
+                                continue
+                            if (orow.get("g2sEgmId") or "") == new_egm:
+                                crow, cerr = engine.hub_store.sat_set(
+                                    other_id, egm_id="")
+                                if crow:
+                                    engine.sat_bindings[other_id] = crow
+                                    displaced.append(other_id)
+                                elif cerr:
+                                    # the displace WRITE failed — the old reader
+                                    # is still bound (a transient double-bind).
+                                    # Surface it (don't silently 200-OK) so the
+                                    # UI can retry; the assign itself did commit.
+                                    displaced_failed.append(other_id)
+                                    log.warning("satellite exclusivity: could "
+                                                "not unbind %s from %s: %s",
+                                                other_id, new_egm, cerr)
+                if displaced:
+                    out["displaced"] = displaced
+                    log.info("🛠️  [satellite:%s] took machine %s from %s",
+                             row["satId"], new_egm, displaced)
+                if displaced_failed:
+                    out["displacedFailed"] = displaced_failed
+                out["companionId"] = row["satId"]
+                out["binding"] = {"g2sEgmId": row["g2sEgmId"],
+                                  "sasSmib": row["sasSmib"],
+                                  "sasAddress": row["sasAddress"],
+                                  "label": row["label"]}
+                log.info("🛠️  [satellite:%s] assigned egm=%s sas=%s/%s "
+                         "label=%r", row["satId"], row["g2sEgmId"],
+                         row["sasSmib"], row["sasAddress"], row["label"])
+            if len(out) == 1:
+                raise ValueError("nothing to set — send machineKey + "
+                                 "sasEnabled, machineKey + sasLink, "
+                                 "machineKey + sasCashoutReady, "
+                                 "companionId + g2sEgmId (assign a Companion), "
+                                 "sysvalFallback, houseAllowNegative, "
+                                 "houseBankrollMc, gameroomName and/or the "
+                                 "ticket-header fields (ticketPropName/"
+                                 "ticketLine1/ticketLine2/ticketTitleCash)")
+        except Exception as e:  # noqa: BLE001 — never 500 a settings write
+            return self._send(400, json.dumps(
+                {"ok": False, "error": str(e)}),
+                "application/json", soap=False)
+        log.info("⚙️  /api/settings %s", {k: v for k, v in out.items()
+                                          if k != "ok"})
+        return self._send(200, json.dumps(out),
+                          "application/json", soap=False)
+
+    def _handle_sas_forget(self, raw, peer):
+        """POST /api/sas/forget {key} — drop a stale SAS machine tile from the
+        floor (a reconfigured/retired satellite that no longer reports under
+        this smibId/address). Same strict validation as the rest of /api/sas/*;
+        NON-DESTRUCTIVE to the ticket/AFT ledger (see engine.sas_forget). The
+        `key` is the sas_snapshot map key exactly ('smibId/address')."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        # Match the stored registry key VERBATIM — sas_report builds the key
+        # without stripping (an operator-set smibId may legitimately carry a
+        # leading/trailing space), and the UI echoes the exact sas_snapshot
+        # key, so stripping here could only ever MISMATCH a real key and leave
+        # its ghost tile un-removable. Clamp length + reject empty only.
+        key = req.get("key")
+        key = key[:160] if isinstance(key, str) else ""
+        if not key:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "key required (string 'smibId/address')"}),
+                "application/json", soap=False)
+        res = self.host_engine.sas_forget(key)
+        if not res["removed"]:
+            return self._send(404, json.dumps(
+                {"ok": False, "error": f"no such machine {key!r}", **res}),
+                "application/json", soap=False)
+        log.info("🗑️  [sas] forgot %s (stillReporting=%s) by %s",
+                 key, res["stillReporting"], peer)
+        return self._send(200, json.dumps({"ok": True, **res}),
+                          "application/json", soap=False)
+
+    def _handle_g2s_forget(self, raw, peer):
+        """POST /api/g2s/forget {egmId} — drop a dark/offline G2S machine
+        tile from the floor (R4, sas_forget's mirror). NON-DESTRUCTIVE:
+        hub.db prefs, config inventory, vouchers, WAT and accounts keep
+        their state (see engine.g2s_forget); a still-online machine
+        re-handshakes on its own and the tile returns."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        # Match the association key VERBATIM (the SAS-forget rule): the UI
+        # echoes the exact egmId the association registry uses, so stripping
+        # could only ever MISMATCH a real key. Clamp length + reject empty.
+        egm = req.get("egmId")
+        egm = egm[:160] if isinstance(egm, str) else ""
+        if not egm:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": "egmId required (string)"}),
+                "application/json", soap=False)
+        res = self.host_engine.g2s_forget(egm)
+        if not res["removed"]:
+            return self._send(404, json.dumps(
+                {"ok": False, "error": f"no such machine {egm!r}", **res}),
+                "application/json", soap=False)
+        log.info("🗑️  [g2s] forgot %s (stillLive=%s) by %s",
+                 egm, res["stillLive"], peer)
+        return self._send(200, json.dumps({"ok": True, **res}),
+                          "application/json", soap=False)
+
+    def _handle_accounts(self, raw):
+        """POST /api/accounts (G2S-39) — create/adjust/rename/delete the
+        enthusiast WAT accounts. All store-level (nothing hits the wire);
+        the overdraft rule lives in AccountStore.adjust: house MAY go
+        negative, players may not. Deltas are MILLICENTS."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError):
+            return self._send(400, '{"ok": false, "error": "invalid JSON"}',
+                              "application/json", soap=False)
+        action = req.get("action")
+        store = engine.account_store
+        account, err = None, None
+        if action == "create":
+            account, err = store.create(req.get("name"))
+        elif action == "adjust":
+            try:
+                account, err = store.adjust(
+                    req.get("id"),
+                    int(req.get("deltaCashableMillicents") or 0),
+                    int(req.get("deltaPromoMillicents") or 0),
+                    int(req.get("deltaNonCashMillicents") or 0),
+                    note=str(req.get("note") or ""), ref="api")
+            except (TypeError, ValueError):
+                err = "deltas must be integer millicents ($1 = 100000)"
+        elif action == "rename":
+            account, err = store.rename(req.get("id"), req.get("name"))
+        elif action == "delete":
+            # the raw delete keeps the SAME invariants as the Players
+            # remove composite: no carded-in delete, no dangling fob
+            # links (store.delete itself refuses a nonzero balance) —
+            # anything non-trivial points at Players ▸ Remove, which
+            # folds credits and unlinks fobs ledger-visibly
+            aid = str(req.get("id") or "").strip()
+            egm = engine._player_carded_map().get(aid)
+            if egm:
+                err = f"{aid!r} is carded in at {egm} — card out first"
+            elif any(str(f.get("accountId") or "").strip() == aid
+                     for f in engine.hub_store.fobs() if aid):
+                err = (f"{aid!r} still has linked fobs — use Players ▸ "
+                       "Remove (it unlinks them and folds credits)")
+            else:
+                account, err = store.delete(req.get("id"))
+        else:
+            err = (f"unknown action {action!r} — "
+                   "create/adjust/rename/delete")
+        if err:
+            return self._send(400, json.dumps({"ok": False, "error": err}),
+                              "application/json", soap=False)
+        log.info("🏦 /api/accounts %s -> %s (%s): cash=%s promo=%s "
+                 "nonCash=%s mc", action, account.get("id"),
+                 account.get("name"), account.get("cashableMillicents"),
+                 account.get("promoMillicents"),
+                 account.get("nonCashMillicents"))
+        return self._send(200, json.dumps({"ok": True, "account": account}),
+                          "application/json", soap=False)
+
+    def _handle_players(self, raw):
+        """POST /api/players {action, ...} — Player Maintenance write path
+        (see G2SHost.player_action: create/remove/linkFob/unlinkFob/fund/
+        rename). The _handle_accounts posture: invalid JSON and honest
+        refusals answer 400 with ok:false; a handler fault answers the
+        same ok:false shape rather than a bare 500 (the Players card's
+        fetch path shares the never-500 rule with the GET side)."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._send(400, json.dumps(
+                {"ok": False, "error": f"invalid JSON: {e}"}),
+                "application/json", soap=False)
+        try:
+            reply = self.host_engine.player_action(req)
+        except Exception as e:  # noqa: BLE001 — never 500 the Players card
+            reply = {"ok": False,
+                     "error": str(e)[:200] or "player action failed"}
+        return self._send(200 if reply.get("ok") else 400,
+                          json.dumps(reply), "application/json", soap=False)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        # Cap the body: an EGM SOAP meterInfo push is ~250KB; a SAS report is
+        # a few KB. 2MB is generous headroom and stops a hostile/buggy peer on
+        # the AP from pinning hundreds of MB per POST (SAS-bridge review F2).
+        if length > MAX_POST_BYTES:
+            log.warning("POST from %s too large (%d > %d) — refused",
+                        self.client_address[0], length, MAX_POST_BYTES)
+            return self._send(413, json.dumps(
+                {"ok": False, "error": "payload too large"}),
+                "application/json", soap=False)
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        peer = self.client_address[0]
+        action = (self.headers.get("SOAPAction") or "").strip('"')
+        # SAS floor reports are periodic (every 1s per satellite) — route them
+        # AROUND the verbatim wire logger below (like the meterInfo digest) so
+        # steady-state satellite traffic never spams the wire capture (F1).
+        if self.path.startswith("/api/sas/report"):
+            wire.debug("IN  <<< POST %s from %s (%d bytes, SAS report)\n%s",
+                       self.path, peer, len(raw), raw)
+            return self._handle_sas_report(raw, peer)
+        # Companion RFID reports are periodic too (heartbeat every ~5s idle)
+        # — the same routing around the verbatim wire logger as SAS reports.
+        if self.path.startswith("/api/companion/report"):
+            wire.debug("IN  <<< POST %s from %s (%d bytes, companion "
+                       "report)\n%s", self.path, peer, len(raw), raw)
+            return self._handle_companion_report(raw, peer)
+        # GR-02: the periodic meterInfo push is ~225KB verbatim every 60s —
+        # ~15MB/h of wire log machine-on. Meter-heavy bodies log an INFO
+        # digest; the full body still records at DEBUG, which reaches the
+        # wire file only under --wire-full / -v.
+        if len(raw) >= WIRE_DIGEST_MIN_BYTES and "meterInfo" in raw:
+            wire.info("IN  <<< POST %s from %s SOAPAction=%s\n[meterInfo "
+                      "digest: %d bytes, ~%d simpleMeters — full body "
+                      "logged at DEBUG; run with --wire-full to capture]",
+                      self.path, peer, action, len(raw),
+                      raw.count("simpleMeter"))
+            wire.debug("IN  <<< POST %s from %s SOAPAction=%s (full body)\n%s",
+                       self.path, peer, action, raw)
+        else:
+            wire.info("IN  <<< POST %s from %s SOAPAction=%s\n%s",
+                      self.path, peer, action, raw)
+
+        if self.path.startswith("/api/command"):
+            return self._handle_command(raw)
+        if self.path.startswith("/api/glass/action"):
+            return self._handle_glass_action(raw)
+        if self.path.startswith("/api/tito/"):
+            return self._handle_tito(raw, peer)
+        if self.path.startswith("/api/sas/forget"):
+            return self._handle_sas_forget(raw, peer)
+        if self.path.startswith("/api/g2s/forget"):
+            return self._handle_g2s_forget(raw, peer)
+        if self.path.startswith("/api/sas/command"):
+            return self._handle_sas_command(raw, peer)
+        if self.path.startswith("/api/accounts"):
+            return self._handle_accounts(raw)
+        if self.path.startswith("/api/players"):
+            return self._handle_players(raw)
+        if self.path.startswith("/api/gamenames"):
+            return self._handle_game_name(raw)
+        if self.path.startswith("/api/fobs"):
+            return self._handle_fobs(raw)
+        if self.path.startswith("/api/names"):
+            return self._handle_set_name(raw)
+        if self.path.startswith("/api/settings"):
+            return self._handle_settings(raw)
+
+        if self.path != "/G2S":
+            log.warning("POST to unexpected path %s from %s (handling anyway)",
+                        self.path, peer)
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            log.error("SOAP parse error from %s: %s", peer, e)
+            self._send(500, "")
+            return
+
+        # Transport version negotiation -> byte-matched bare ack, no cert.
+        if root.find(f".//{{{WSDL_NS}}}g2sTransportReqVersion") is not None \
+                or action == SOAPACTION_TRANSPORT:
+            log.info("transport version request from %s -> ack 1.0 (cert-less)",
+                     peer)
+            wire.info("IN  >>> transport ack to %s\n%s", peer, TRANSPORT_ACK)
+            self._send(200, TRANSPORT_ACK)
+            return
+
+        inner, egm_id, host_id = self.host_engine.extract_escaped_inner(root)
+        if inner is None:
+            log.error("no g2sRequest payload from %s", peer)
+            self._send(500, "")
+            return
+
+        reply_inner = self.host_engine.handle_g2s_message(
+            html.unescape(inner), egm_id)
+        body = self.host_engine.wrap_sync_response(reply_inner)
+        wire.info("IN  >>> sync reply to %s\n%s", peer, body)
+        self._send(200, body)
+
+
+# ----------------------------------------------------------------------------
+# Watchdog: surface the re-handshake loop early during bench runs
+# ----------------------------------------------------------------------------
+
+def watchdog(engine):
+    while True:
+        time.sleep(20)
+        # Companion RFID (phase 1): the carded-session expiry sweep — a
+        # BENCH KNOB, a no-op at the shipped CARD_SESSION_MAX_SEC=0 (the
+        # session is the wallet link; logout is explicit-only by design).
+        # Dormant while card_sessions is empty — zero cost on a fob-less
+        # floor. Guarded so a sweep fault can never kill the watchdog (this
+        # thread also owns the GR-01 silence demotion).
+        try:
+            engine.sweep_card_sessions()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("card-session sweep failed: %s", e)
+        # Admin overlay reclaim: a supervisor who tapped OVER a carded friend
+        # and walked away is popped after ADMIN_OVERLAY_IDLE_SEC (unlike the
+        # card sweep this is ALWAYS armed — an overlay is an override, not a
+        # wallet link). Dormant while admin_overlays is empty; same guard.
+        try:
+            engine.sweep_admin_overlays()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("admin-overlay sweep failed: %s", e)
+        # Prune anonymous never-joined associations gone silent (a client that
+        # hit :8081 once and vanished) — registered/known cabinets are spared,
+        # so an offline registered machine is never reaped. Dormant while every
+        # association has joined; same never-take-the-watchdog-down guard.
+        try:
+            engine.reap_stale_associations()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("stale-association reap failed: %s", e)
+        # Glass nav v1: the content-push sequencer's stage-timeout sweep —
+        # dormant while no glass push is armed (same posture as the card
+        # sweep above, same never-take-the-watchdog-down guard).
+        try:
+            engine.sweep_glass_pushes()
+        except Exception as e:  # noqa: BLE001 — never take the watchdog down
+            log.error("glass-push sweep failed: %s", e)
+        for assoc in list(engine.associations.values()):
+            if assoc.comms_state == "onLine":
+                # The host keepAlive pinger POSTs every HOST_KEEPALIVE_SEC and
+                # the EGM must answer keepAliveAck, which refreshes
+                # last_keepalive. Warn on BOTH failure modes: acks that were
+                # arriving and stopped, AND acks that NEVER arrived after we
+                # have been onLine a few intervals (the lastKeepAlive=0 case
+                # that was previously silently ignored). GR-01: past
+                # KEEPALIVE_SILENCE_DEMOTE_SEC of ack silence the link is
+                # DEMOTED to offline instead of warned about forever — this
+                # branch then self-silences (the overnight outage wrote 1,449
+                # identical WARNINGs here at a 20s cadence). The silence
+                # demotion backstops the consecutive-failure one in
+                # post_to_egm for black-hole cases where POSTs still complete.
+                online_for = (time.time() - assoc.joined_ts
+                              if assoc.joined_ts else 0)
+                if assoc.last_keepalive:
+                    quiet = time.time() - assoc.last_keepalive
+                    if quiet > KEEPALIVE_SILENCE_DEMOTE_SEC:
+                        engine.mark_link_down(
+                            assoc, f"no keepAliveAck for {quiet:.0f}s "
+                                   f"(silence threshold "
+                                   f"{KEEPALIVE_SILENCE_DEMOTE_SEC}s)")
+                    elif quiet > HOST_KEEPALIVE_SEC * 3:
+                        log.warning(
+                            "[%s] joined but keepAliveAcks STOPPED "
+                            "(last %.0fs ago) — link may be dead despite "
+                            "onLine state", assoc.egm_id, quiet)
+                elif online_for > KEEPALIVE_SILENCE_DEMOTE_SEC:
+                    engine.mark_link_down(
+                        assoc, f"onLine {online_for:.0f}s but no keepAlive/"
+                               f"keepAliveAck ever received")
+                elif online_for > HOST_KEEPALIVE_SEC * 3:
+                    log.warning(
+                        "[%s] onLine %.0fs but NO keepAlive/keepAliveAck ever "
+                        "received — host pings unanswered, link may be dead",
+                        assoc.egm_id, online_for)
+                continue
+            if assoc.comms_online_seen >= 3 and \
+                    time.time() - assoc.last_comms_online < 90:
+                log.warning(
+                    "[%s] still looping (commsOnLine x%d, state=%s, "
+                    "outbound ok=%d fail=%d) — check the wire log for what "
+                    "the EGM rejected", assoc.egm_id, assoc.comms_online_seen,
+                    assoc.comms_state, assoc.outbound_ok, assoc.outbound_fail)
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+def open_file_paths():
+    """Best-effort set of file paths currently held OPEN by any live process
+    (Linux /proc fd scan, stdlib-only; empty set where /proc or permission is
+    unavailable). Used by sweep_log_dir: a RUNNING sibling instance whose EGM
+    has been powered off since it started sits indefinitely in exactly the
+    stub/pair_stub shape (0-byte wire log, <4KB startup-only host log, mtimes
+    settled >10min), and deleting its open files makes it silently write to
+    unlinked inodes for the rest of its run."""
+    paths = set()
+    try:
+        pids = [n for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return paths
+    for pid in pids:
+        fd_dir = os.path.join("/proc", pid, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:  # raced exit / another user's process — skip
+            continue
+        for fd in fds:
+            try:
+                paths.add(os.readlink(os.path.join(fd_dir, fd)))
+            except OSError:
+                continue
+    return paths
+
+
+def sweep_log_dir(log_dir, retention_days=LOG_RETENTION_DAYS):
+    """GR-02/GR-20 startup housekeeping — reclaim ONLY the litter this
+    process family creates (names matching our own g2s_host_*/g2s_wire_*
+    run files, rotated .N included; nothing else in the directory is
+    touched). Removes (a) zero-byte files — the EADDRINUSE crash loop
+    minted a stub wire log per doomed start, 47 of them overnight; (b) a
+    host stub paired with an empty/absent wire log (the ~140B "voucher
+    store loaded"-only files from the same loop); (c) anything older than
+    retention_days. Files younger than 10 minutes are left alone so a
+    concurrently-starting instance's fresh pair is never swept, and files
+    held open by ANY live process are never removed (the EADDRINUSE
+    fast-fail only guards a same-port second start — a sibling on another
+    --port sharing this logs/ dir, e.g. an isolated bench host beside the
+    systemd unit, is otherwise indistinguishable from crash-loop litter).
+    Runs BEFORE this run's handlers are created; best-effort (unremovable
+    files are skipped). Returns the number of files removed."""
+    removed = 0
+    now = time.time()
+    cutoff = now - retention_days * 86400
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return 0
+    open_paths = None  # lazy /proc scan — only when something qualifies
+    for name in names:
+        if not (name.startswith("g2s_host_") or name.startswith("g2s_wire_")) \
+                or ".log" not in name:
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        settled = now - st.st_mtime > 600
+        stale = st.st_mtime < cutoff
+        stub = st.st_size == 0 and settled
+        pair_stub = False
+        if name.startswith("g2s_host_") and st.st_size < 4096 and settled:
+            wire_path = os.path.join(
+                log_dir, name.replace("g2s_host_", "g2s_wire_", 1))
+            try:
+                pair_stub = os.stat(wire_path).st_size == 0
+            except OSError:
+                pair_stub = not os.path.exists(wire_path)
+        if stale or stub or pair_stub:
+            if open_paths is None:
+                open_paths = open_file_paths()
+            if os.path.realpath(path) in open_paths:
+                continue  # live sibling instance's open log — never sweep
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def main():
+    ap = argparse.ArgumentParser(description="CabiNet G2S host (MVP)")
+    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8081)
+    ap.add_argument("--host-id", default="1")
+    ap.add_argument("--sync-timer", type=int, default=30000)
+    ap.add_argument("--no-auto-enable", action="store_true",
+                    help="stay in sync state (skip setCommsState) — harvest mode")
+    ap.add_argument("--keepalive", type=int, default=15,
+                    help="after join, setKeepAlive with this interval in "
+                         "SECONDS so the EGM pulses (0 = off). Positive "
+                         "link-health signal — default 15.")
+    ap.add_argument("--harvest", action="store_true",
+                    help="after join, getDescriptor for the full device "
+                         "inventory (logged; feeds COMPATIBILITY.md)")
+    ap.add_argument("--no-subscribe", action="store_true",
+                    help="skip the post-join eventHandler bring-up "
+                         "(getEventHandlerProfile/getSupportedEvents/"
+                         "setEventSub). Subscriptions are ON by default — this "
+                         "is the AVP's real data path.")
+    ap.add_argument("--no-auto-clock", action="store_true",
+                    help="disable the join-time auto clock-sync (cabinet."
+                         "setDateTime when the observed EGM skew exceeds "
+                         f"{CLOCK_SKEW_SYNC_SEC}s)")
+    ap.add_argument("--host-uri", default="http://192.168.50.2:8081/G2S",
+                    help="our own G2S host URL as the AVP has it configured — "
+                         "used for commConfig.setCommChange's hostLocation. Must "
+                         "match the AVP's Override-DHCP-Configured-Host URI.")
+    ap.add_argument("--game-sweep", action="store_true",
+                    help="run the full 119-device gamePlay status/profile/denom "
+                         "sweep at join (357 reads — OFF by default because it "
+                         "starves the FIFO worker of interactive/money commands)")
+    ap.add_argument("--no-seed", action="store_true",
+                    help="skip the boot-time seeding of registered cabinets as "
+                         "offline tiles (production seeds so a known machine "
+                         "never vanishes on restart; a BENCH/replay host wants "
+                         "this OFF so it starts with zero associations — the "
+                         "avp_replay live-guard refuses a host that already has "
+                         "any)")
+    ap.add_argument("--inline", action="store_true",
+                    help="LAST RESORT: return app responses in the synchronous "
+                         "HTTP reply (spec-violating July-2025 architecture)")
+    ap.add_argument("--log-dir", default="logs")
+    ap.add_argument("--wire-full", action="store_true",
+                    help="log FULL meter-heavy wire bodies (the ~225KB "
+                         "periodic meterInfo push) instead of the INFO "
+                         "digest — ~15MB/h machine-on; -v implies this")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    # GR-20: claim the port FIRST, before any log-file or engine work. Under
+    # systemd Restart=on-failure a held :8081 (manual bench run vs the unit)
+    # crash-looped 39 starts in ~2 minutes — RestartSec=3 never trips the
+    # default 5-per-10s start limit — littering a stub host+wire log pair
+    # per attempt. One plain fatal line instead; the unit's StartLimit
+    # settings (deploy/casinonet-g2s.service) backstop any other loop.
+    try:
+        server = ThreadingHTTPServer((args.bind, args.port), G2SRequestHandler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(f"FATAL: {args.bind}:{args.port} is already in use — "
+                  "another g2s_host holds the port (casinonet-g2s unit or a "
+                  "manual bench run?). systemctl stop casinonet-g2s first.",
+                  file=sys.stderr)
+            sys.exit(1)
+        raise
+
+    os.makedirs(args.log_dir, exist_ok=True)
+    swept = sweep_log_dir(args.log_dir)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # GR-02: rotating handlers — the un-rotated per-run files grew without
+    # bound (~370MB/day machine-on measured overnight) on the Pi's SD card.
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.handlers.RotatingFileHandler(
+                os.path.join(args.log_dir, f"g2s_host_{stamp}.log"),
+                maxBytes=HOST_LOG_MAX_BYTES, backupCount=HOST_LOG_BACKUPS,
+                encoding="utf-8"),
+        ])
+    wire_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(args.log_dir, f"g2s_wire_{stamp}.log"),
+        maxBytes=WIRE_LOG_MAX_BYTES, backupCount=WIRE_LOG_BACKUPS,
+        encoding="utf-8")
+    wire_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s\n"))
+    wire.addHandler(wire_handler)
+    # DEBUG carries the full meter-heavy bodies the INFO digest replaces.
+    wire.setLevel(logging.DEBUG if (args.wire_full or args.verbose)
+                  else logging.INFO)
+    wire.propagate = False
+    if swept:
+        log.info("log sweep: removed %d stale file(s) from %s (zero-byte/"
+                 "stub pairs + runs older than %dd)", swept, args.log_dir,
+                 LOG_RETENTION_DAYS)
+
+    engine = G2SHost(host_id=args.host_id, sync_timer=args.sync_timer,
+                     inline=args.inline, auto_enable=not args.no_auto_enable,
+                     keepalive_ms=args.keepalive * 1000, harvest=args.harvest,
+                     subscribe=not args.no_subscribe, host_uri=args.host_uri,
+                     auto_clock=not args.no_auto_clock,
+                     game_sweep=args.game_sweep)
+    # G2S-39: /api/debug/log tails the ACTIVE rotating host log this run.
+    engine.host_log_file = os.path.join(args.log_dir,
+                                        f"g2s_host_{stamp}.log")
+    G2SRequestHandler.host_engine = engine
+
+    # Boot the floor with the registered fleet already visible (offline) so a
+    # known cabinet never blinks out of the UI across a restart/power-blip —
+    # it goes dark, not missing (AJ). Never blocks startup. A bench/replay host
+    # passes --no-seed so it starts association-free (the avp_replay live-guard
+    # refuses any host that already shows an association).
+    if not args.no_seed:
+        try:
+            engine.seed_registered_machines()
+        except Exception as e:  # noqa: BLE001 — seeding must never stop the host
+            log.error("registered-machine seed failed: %s", e)
+
+    threading.Thread(target=watchdog, args=(engine,), daemon=True).start()
+
+    log.info("CabiNet G2S host listening on %s:%d (endpoint /G2S, "
+             "host-id=%s, cert-less, %s)", args.bind, args.port, args.host_id,
+             "INLINE fallback mode" if args.inline else
+             "two-channel spec architecture")
+    log.info("status: http://%s:%d/api/status — wire log: %s",
+             args.bind, args.port,
+             os.path.join(args.log_dir, f"g2s_wire_{stamp}.log"))
+    if os.geteuid() == 0:
+        log.warning("running as root is NOT required and the old integrated-"
+                    "DHCP behavior is gone; prefer running unprivileged")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("shutting down")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

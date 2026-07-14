@@ -1,0 +1,4 @@
+# SAS SMIB satellite deps (the G2S hub itself is stdlib-only)
+pyserial
+crcmod
+loguru

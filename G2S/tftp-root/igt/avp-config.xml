@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- IGT Slimeline AVP G2S Configuration -->
+<AVPConfiguration>
+    <System>
+        <DeviceId>IGT-AVP-001</DeviceId>
+        <CabinetType>Slimeline</CabinetType>
+        <Manufacturer>IGT</Manufacturer>
+        <Model>AVP</Model>
+    </System>
+    
+    <G2S>
+        <HostDiscovery>
+            <Method>DHCP</Method>
+            <FallbackMethod>DNS</FallbackMethod>
+            <DNSNames>
+                <Name>g2s.local</Name>
+                <Name>g2shost.local</Name>
+                <Name>casinonet.local</Name>
+            </DNSNames>
+        </HostDiscovery>
+        
+        <Host>
+            <Primary>
+                <Protocol>HTTP</Protocol>
+                <Address>dhcp-provided</Address>
+                <Port>8081</Port>
+                <Path>/G2S</Path>
+            </Primary>
+            <Secondary>
+                <Protocol>HTTP</Protocol>
+                <Address>dhcp-provided</Address>
+                <Port>8081</Port>
+                <Path>/G2S</Path>
+            </Secondary>
+        </Host>
+        
+        <Communications>
+            <HeartbeatInterval>60</HeartbeatInterval>
+            <RetryCount>3</RetryCount>
+            <RetryDelay>5</RetryDelay>
+            <Timeout>30</Timeout>
+            <SOAPWrapper>true</SOAPWrapper>
+        </Communications>
+        
+        <Enrollment>
+            <AutoEnroll>true</AutoEnroll>
+            <RequireCertificate>false</RequireCertificate>
+            <TrustSelfSigned>true</TrustSelfSigned>
+        </Enrollment>
+    </G2S>
+    
+    <AFT>
+        <Enabled>true</Enabled>
+        <SupportedTypes>
+            <Type>hostToEgm</Type>
+            <Type>egmToHost</Type>
+            <Type>bonusToGame</Type>
+            <Type>debitToGame</Type>
+            <Type>inHouseToGame</Type>
+        </SupportedTypes>
+        <MaxTransferAmount>100000</MaxTransferAmount>
+        <MinTransferAmount>100</MinTransferAmount>
+    </AFT>
+    
+    <Network>
+        <DHCP>
+            <Enabled>true</Enabled>
+            <SendHostname>true</SendHostname>
+            <Hostname>IGT-AVP-{MAC}</Hostname>
+            <VendorClass>IGT-AVP</VendorClass>
+        </DHCP>
+        <DNS>
+            <UseDHCP>true</UseDHCP>
+            <SearchDomains>
+                <Domain>casinonet.local</Domain>
+                <Domain>g2s.local</Domain>
+            </SearchDomains>
+        </DNS>
+    </Network>
+    
+    <Logging>
+        <Level>INFO</Level>
+        <G2SMessages>true</G2SMessages>
+        <NetworkEvents>true</NetworkEvents>
+    </Logging>
+</AVPConfiguration>

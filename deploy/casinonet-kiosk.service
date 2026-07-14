@@ -1,0 +1,68 @@
+[Unit]
+Description=CabiNet kiosk UI on the DSI touchscreen (tty1, cage + chromium)
+# Boot order: the kiosk points at the local G2S host, so pull it in and start
+# after it — chromium retries on its own, but starting in order avoids a
+# flash of "connection refused" on the 5" panel.
+After=multi-user.target systemd-user-sessions.service casinonet-g2s.service
+Wants=casinonet-g2s.service
+# The kiosk owns VT1. The curses debug console moved to tty2
+# (casinonet-console.service) — reach it with Ctrl+Alt+F2 (cage -s below
+# allows VT switching) or `sudo chvt 2`.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+# Cap restart storms the same way casinonet-g2s.service does (GR-20).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aj
+Group=aj
+WorkingDirectory=/home/aj
+# --- seat/TTY plumbing cage needs on Debian 13 (trixie) -------------------
+# cage is a Wayland compositor: it needs DRM master on the GPU and the input
+# devices, which systemd-logind only grants to a *session* bound to a seat.
+# PAMName=login + TTYPath makes pam_systemd register this service as a real
+# logind session on seat0/tty1 (that also sets XDG_RUNTIME_DIR=/run/user/1000
+# so cage has a place for its Wayland socket). Assumptions: Pi 5 with the
+# KMS/DRM stack (vc4/v3d — stock on Raspberry Pi OS / Debian 13), user aj in
+# the video/render/input groups (stock for the first user on RPi OS; logind
+# session grants make the groups belt-and-braces anyway).
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+# Pull VT1 to the foreground before cage starts (the '+' runs it as root even
+# though the service runs as aj) — mirrors casinonet-console.service, which
+# used to need this on tty1 and now sits on tty2 without it.
+ExecStartPre=+/usr/bin/chvt 1
+# cage: bare-bones Wayland kiosk compositor.
+#   -s : allow VT switching (Ctrl+Alt+F2 reaches the tty2 debug console;
+#        drop -s to lock visitors onto the kiosk page)
+#   -d : don't decorate the client (no title bar)
+# chromium flags per the kiosk brief; --ozone-platform=wayland makes chromium
+# talk to cage natively (no Xwayland). Chromium is preinstalled on the Pi;
+# on Raspberry Pi OS images where the binary is `chromium-browser`, adjust
+# ExecStart (Debian 13 proper ships /usr/bin/chromium).
+# /home?kiosk=1 → the Home UI forces kiosk layout (bottom tab bar, 48px
+# targets) regardless of what chromium reports for the viewport.
+ExecStart=/usr/bin/cage -s -d -- /usr/bin/chromium \
+    --kiosk \
+    --noerrdialogs \
+    --disable-infobars \
+    --incognito \
+    --no-first-run \
+    --touch-events=enabled \
+    --ozone-platform=wayland \
+    "http://127.0.0.1:8081/home?kiosk=1"
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

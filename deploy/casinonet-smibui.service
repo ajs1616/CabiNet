@@ -1,0 +1,86 @@
+[Unit]
+Description=CabiNet SMIB player screen (gameroom glass on the 1024x600 HDMI panel)
+# The WMS BB2E can't be host-skinned on its own glass (Flash-7/CGC, CLOSED
+# 07-10), so the full Funcino player UI lives on THIS Zero's external HDMI
+# panel: attract "TAP YOUR FOB" -> fob tap -> the carded player screen, with
+# every function the IGT glass has. The page is a THIN CLIENT of the hub's
+# /api/glass/* endpoints (identical to the AVP glass, but polls src=smib so it
+# never touches the AVP-only mediaDisplay sequencer). This unit just parks a
+# cog-drm browser on the panel pointed at G2S/webui/smib.html.
+#
+# Rides BESIDE casinonet-sas + casinonet-companion on the same Zero and must
+# NEVER starve the money-critical SAS loop (424Mi board) -> see the memory
+# safety block in [Service] (OOMScoreAdjust + MemoryMax).
+After=network-online.target
+Wants=network-online.target
+# cog owns tty1 directly (there is NO seatd/logind seat on this Lite image), so
+# conflict the login getty out. getty is cleanly restored when the kiosk stops
+# (TTYReset). Order after it so the VT is free before cog grabs DRM master.
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+# Cap restart storms exactly like every sibling unit (GR-20). cog exits nonzero
+# if the panel / DRM master is momentarily unavailable; Restart=always + this
+# cap is the same shape as casinonet-companion.service.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Runs as ROOT on purpose (no User=): cog-drm needs DRM master, which on this
+# board (no seatd/logind seat) comes from owning an ACTIVE VT. Root owning tty1
+# is the low-risk, proven default for a cog-drm kiosk. (aj is in video/render/
+# input so User=aj is theoretically possible, but root is the simplest path.)
+WorkingDirectory=/root
+
+# --- Hub URL = the hub's WIRED slot-net IP (the Ethernet-HAT move, #8) -----
+# WIRED 192.168.50.2, NOT the Wi-Fi AP 192.168.60.1: the Zero is dual-homed
+# (wired eth0 .50.102 + Wi-Fi wlan0 .60.87) and a packet to .60.1 is FORCED out
+# Wi-Fi by the 60.0/24 link route. The glass POSTs /api/glass/action as a
+# RELATIVE url, so it inherits THIS origin -- on Wi-Fi that surfaced as
+# intermittent wallet-transfer HTTP 400s. Moved to wired 2026-07-13 to match
+# casinonet-sas. (Relocating the hub again = one-line change here + restart.)
+# The ?egm= value is the BB2's egmId with its colons %-encoded (%3A). Each % is
+# DOUBLED to %% so systemd's specifier expander passes a literal % through
+# (Environment values undergo %-specifier expansion; %%3A -> %3A on the wire).
+Environment=SMIB_URL=http://192.168.50.2:8081/webui/smib.html?egm=WMS_00%%3A11%%3A22%%3A33%%3A44%%3A55
+# Belt-and-braces DRM platform selection (the -P drm flag below already does it).
+Environment=COG_PLATFORM=drm
+
+# --- cog on tty1, straight to the vc4 KMS CRTC (no X, no Wayland) ---------
+# Proven on the real Zero 2026-07-12: cog 0.18.4 / WPE WebKit 2.48.1, DRM/KMS
+# platform, auto-selects the connector's native 1024x600, single fullscreen
+# window, ~68-75MB RSS, flat across a 3.5min soak. No --width/--height needed;
+# cog-drm draws no pointer (nothing to hide) and scans out continuously (no
+# DPMS/blank while it owns the CRTC). Harmless journal noise: "Renderer
+# 'modeset' does not support rotation 0" and "Can't connect to a11y bus".
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardOutput=journal
+StandardError=journal
+# Pull tty1 to the foreground so cog grabs DRM master on an ACTIVE VT (there is
+# no logind seat here to arbitrate one). Runs as root (the whole unit does).
+ExecStartPre=/usr/bin/chvt 1
+ExecStart=/usr/bin/cog -P drm ${SMIB_URL}
+Restart=always
+RestartSec=5
+
+# --- memory safety: the kiosk dies before the money-critical SAS loop -----
+# HARD RULE: under memory pressure the OOM killer takes the KIOSK, never
+# casinonet-sas / casinonet-companion.
+# 1) OOMScoreAdjust makes the kernel pick the kiosk FIRST. This is honored
+#    TODAY independent of cgroups -- the memory cgroup controller is disabled by
+#    the Pi firmware default `cgroup_disable=memory`. Pair it with
+#    OOMScoreAdjust=-800 on casinonet-sas + casinonet-companion (see runbook).
+OOMScoreAdjust=1000
+# 2) MemoryMax/High cap the kiosk once the memory cgroup is enabled (append
+#    `cgroup_enable=memory cgroup_memory=1` to /boot/firmware/cmdline.txt and
+#    reboot -- see runbook 3c). Until then these are silent no-ops, but they
+#    cost nothing and enforce for real after the fix. 220M leaves >=60MB
+#    headroom above cog's ~87MB resident tree on the 424Mi board.
+MemoryHigh=200M
+MemoryMax=220M
+
+[Install]
+WantedBy=multi-user.target

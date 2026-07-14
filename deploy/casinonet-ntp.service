@@ -1,0 +1,14 @@
+[Unit]
+Description=CabiNet NTP server (slot network, pinned to eth0)
+After=network.target casinonet-dhcp.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aj/CasinoNet/G2S
+ExecStart=/usr/bin/python3 -u python/web/ntp_server.py --interface eth0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

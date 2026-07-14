@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<g2sConfig>
+  <host>192.168.50.2</host>
+  <port>8443</port>
+  <secure>true</secure>
+</g2sConfig>

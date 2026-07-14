@@ -1,0 +1,24 @@
+[Unit]
+Description=CabiNet G2S host (port 8081)
+After=network.target
+Wants=network.target
+# GR-20: cap restart storms. A held :8081 (manual bench run vs this unit)
+# crash-looped 39 starts in ~2 minutes on 2026-07-02 — RestartSec=3 cycles
+# never trip systemd's default 5-per-10s limit. With a 60s window, 5 failed
+# starts stop the unit instead of looping until a human intervenes.
+# (g2s_host.py now also fails fast on EADDRINUSE before creating any log
+# files, so a doomed start no longer litters stub log pairs.)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aj
+Group=aj
+WorkingDirectory=/home/aj/CasinoNet/G2S
+ExecStart=/usr/bin/python3 -u g2s_host.py --harvest
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

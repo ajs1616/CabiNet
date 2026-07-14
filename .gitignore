@@ -1,0 +1,134 @@
+# Virtual environments (never commit — use an out-of-tree venv)
+venv/
+.venv/
+G2S/venv/
+G2S/bin/
+G2S/lib/
+G2S/lib64/
+G2S/pyvenv.cfg
+pyvenv.cfg
+
+# Local Claude settings
+.claude/settings.local.json
+
+# Known wrong-layer regression servers (kept on disk, do not track)
+g2s_simple_server.py
+sas_simple_server.py
+
+# Bytecode
+__pycache__/
+*.py[cod]
+*.class
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Backups
+*~
+
+# Backup files
+*.backup
+*.pre-igt
+*.messy
+*.old
+
+# Data files
+data/*.json
+data/dnsmasq.conf
+data/network_log.json
+
+# G2S host runtime state (voucher validation ids — machine-local, never commit)
+G2S/data/voucher_state.json
+G2S/data/voucher_state.json.tmp
+
+# G2S host runtime state (optionConfig inventory cache, GR-10 — machine-local)
+G2S/data/config_inventory.json
+G2S/data/config_inventory.json.tmp
+
+# G2S host runtime state (WAT transfer ledger + enthusiast accounts, G2S-39 —
+# machine-local money state, never commit)
+G2S/data/wat_state.json
+G2S/data/wat_state.json.tmp
+G2S/data/account_state.json
+G2S/data/account_state.json.tmp
+# hub.db — the SQLite spine (machine registry + names now; TITO/accounts
+# later). Runtime state, never commit; WAL/SHM sidecars + quarantine too.
+G2S/data/hub.db
+G2S/data/hub.db-wal
+G2S/data/hub.db-shm
+G2S/data/hub.db.corrupt*
+G2S/data/hub.db.seq
+G2S/data/hub.db.seq.tmp
+SAS/data/hub_client_journal.json
+SAS/data/hub_client_journal.json.tmp
+
+# SAS host runtime state (TITO ticket ledger, core/sas_ticket_store.py —
+# machine-local money state, never commit; the root-anchored 'data/*.json'
+# above does NOT cover SAS/data)
+SAS/data/sas_ticket_state.json
+SAS/data/sas_ticket_state.json.tmp
+SAS/data/sas_ticket_state.json.corrupt
+
+# Temporary scripts
+integrate-*.sh
+setup-*.sh
+repair-*.sh
+
+# DHCP configs
+vlan50-dhcp.conf
+slot-dhcp.conf
+generated-dhcp.conf
+
+# Test files
+casinonet-universal-final.py
+
+# IDE and temp files
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+
+# TFTP root: served config is LOAD-BEARING and versioned — DHCP option 67
+# points clients at these files (igt/g2s.xml is what the AVP path hands
+# out), and BENCH_BRINGUP_WMS.md §7 says new capture-driven files must be
+# committed. The old blanket 'tftp-root/' ignore made fixes to served
+# config invisible to git (deploy only worked because push_to_pi.sh rsyncs
+# the working tree). Only the top-level files that
+# G2S/python/web/universal_discovery.py REGENERATES at runtime stay ignored.
+G2S/tftp-root/g2s.txt
+G2S/tftp-root/g2s.xml
+G2S/tftp-root/config.ini
+G2S/tftp-root/discovery.json
+# universal_discovery.py can also spawn a nested tftp-root next to itself
+G2S/python/web/tftp-root/
+
+# Process ID files
+.openg2s_pids
+*.pid
+
+# Archives
+*.zip
+*.tar.gz
+
+# admin flag migration one-shot marker (per-deployment runtime state)
+G2S/data/.admin_migration_done
+
+# Test caches
+.pytest_cache/
+
+# Runtime state (never commit a floor's live data)
+G2S/data/
+SAS/data/
+Companion/data/
+*.db
+*.db-wal
+*.db-shm
+.openg2s_pids

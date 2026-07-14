@@ -1,0 +1,1414 @@
+<!DOCTYPE html>
+<html>
+<!-- CabiNet glass navigation v1 — the RESIDENT player-panel SPA (#glass-nav).
+     ================================================================
+     ONE page per glass window (IGT_mediaDisplay dev 1, Service Window,
+     256x1024 portrait — the proven renderer). The hub pushes it ONCE
+     (glassShow: loadContent -> setActiveContent -> showMediaDisplay) and it
+     STAYS: every screen change after that is a client-side view flip, because
+     a G2S content swap costs ~5-8s while a poll flip costs <=1.5s.
+
+     How it knows what to show: it polls GET /api/glass/state?egm=... every
+     1500ms (XHR + setTimeout re-arm, one request in flight — a slow hub
+     must not stack requests). RFID taps at the Companion change HUB-side
+     session state; the next poll flips this page between attract and the ONE
+     stacked home menu. The hub is the ONLY access authority — the page
+     merely renders what the state says and presents the hub-minted "sess"
+     token (kept in a JS closure var, NEVER in the URL) on its one real
+     action, logout. The home is STACKED off the state's "admin" flag: every
+     account gets MY WALLET + CASH OUT + LOG OUT; an admin account additionally
+     gets the backend stack (MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS) + an ADMIN
+     badge. MY WALLET is the two-way MONEY HUB: the live wallet balance (the
+     state poll's pre-formatted "credits") + what is on this machine, a chip
+     pad -> ADD that funds the machine from the wallet (walletFund, money
+     confirm), and a CASH OUT TO WALLET arm toggle that makes the machine's own
+     CASH OUT button send credits back to the wallet (cashOutToWallet — native
+     per protocol: WAT on the AVP, bench-gated SAS host-cashout on the BB2). It
+     polls GET /api/glass/data?view=cashout (~2s) for the live numbers + arm
+     state. MACHINE is the real read-only machine info. This build DESTUBS the
+     rest against the hub: CASH OUT (base) shows live machine+wallet balances (GET
+     /api/glass/data?view=cashout, ~2s poll) and the cash-out DESTINATION toggle
+     (cashOutToWallet -> WAT/SAS mirror); funding moved to MY WALLET; TICKETS / HANDPAY /
+     GAMES / SETTINGS (admin) each GET their /api/glass/data view and render
+     compact rows -- HANDPAY adds CLEAR (clearHandpay, confirm), GAMES is a
+     two-level drill (a button per machine-enabled GAME -> its paytables;
+     the hub groups + filters, egm-disabled titles never arrive) with a
+     REFRESH (refreshGames), TICKETS/SETTINGS are read-only. Every action goes
+     through POST /api/glass/action carrying ONLY the sess token: the hub
+     re-resolves admin and forces egmId from the token (body egmId ignored).
+
+     Behavior contract (glass_nav_CONTRACT.md):
+       * carded=false while a menu is up -> attract (hub-side card-out wins)
+       * 4 consecutive poll failures -> attract + "hub offline" note, keep polling
+       * uiBuild change -> location.reload() (live redeploys of this file)
+       * the carded menu stays up until logout/card-out; the machine's
+         SERVICE button hides/shows the whole kiosk window (there is no
+         in-window shrink — the old 45s mini-collapse was retired 2026-07-14
+         because the mediaDisplay window never resized with it)
+       * fun-money/credits wording only; brand = the collector's gameroom name
+
+     Target browser (wire-proven UA, worse-of-fleet): QtEmbedded QNX
+     AppleWebKit/534.34 Qt/4.8.2 (~Safari 5, 2011). ES5 ONLY — no arrow fns,
+     no template literals, no async niceties, className string ops (never the
+     class-token DOM API), no viewport units, block/absolute px only. -webkit-
+     transitions/animations OK. 100% self-contained (slot VLAN, no CDN).
+     Markup non-ASCII goes in as HTML entities, JS strings use \u escapes —
+     do not trust the QNX engine's charset sniffing.
+
+     GEOMETRY AUDIT (hand-verified, box-sizing:border-box everywhere):
+       page = 256 x 1024, overflow hidden, every .view = absolute 0,0 256x1024
+       nav column: left 16 + width 224 + right 16            = 256  OK
+       12px-inset rows: left 12 + width 232 + right 12       = 256  OK
+       .nb buttons: 84px outer (>=64 touch rule) + 14 gap
+         8-button admin stack from y=180: 8*84 + 7*14 = 672+98=770 -> ends y=950
+       stacked home (admin build): hello y=40(+30), nick y=80(+16),
+         credits y=104(+22), ADMIN badge y=132(+26), hairline y=168,
+         stack from y=180 -> ends y=950 < foot y=976          OK
+         (non-admin build hides the 5 admin buttons -> WALLET+CASHOUT+LOGOUT)
+       cashout: title y=40, machine-credits y=120/138, wallet y=214/232,
+         destination sec y=340, toggle y=372(+84)->456, hint y=470,
+         note y=630, BACK y=880                              OK
+       tickets/handpay list y=88, rows 46px, cap 12; games list y=100 rows
+         40px; handpay CLEAR + games REFRESH y=770(+84) < BACK y=880  OK
+       confirm (logout pattern): q y=300, sub y=348, YES y=430,
+         NO y=542, note y=650                                 OK
+       wallet-view (money hub): title y=40, label y=80, bal y=100(+40),
+         machine y=158/176, ADD sec y=226, chips y=258(+64), sel y=334,
+         ADD y=386(+84)->470, CASHOUT sec y=500, toggle y=528(+84)->612,
+         hint y=620, note y=704, BACK y=880                  OK
+       BACK buttons: y=880 + 84                              -> ends y=964  OK
+       footers: y=976 + ~16                                  -> ends y=992  OK
+       attract column: brand y=264(+40), nick y=330, tap y=520(+64),
+         note y=930(+60 wrap room)                           -> all < 1024  OK -->
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>GAME ROOM</title>
+<style type="text/css">
+html, body {
+  margin: 0; padding: 0;
+  width: 256px; height: 1024px; overflow: hidden;
+  background: #0b0f14;
+  font-family: Arial, Helvetica, sans-serif;
+  -webkit-user-select: none;
+}
+div { -webkit-box-sizing: border-box; box-sizing: border-box; }
+.view {
+  position: absolute; left: 0; top: 0; width: 256px; height: 1024px;
+  background: #0b0f14; overflow: hidden; display: none;
+}
+.hairline { position: absolute; left: 12px; width: 232px; height: 1px;
+            background: #24313f; overflow: hidden; }
+
+/* --- nav buttons: 84px outer (>=64px touch), 224 wide, centered ------- */
+.nb {
+  width: 224px; height: 84px; margin: 0 auto 14px auto;
+  line-height: 80px; text-align: center;
+  font-size: 19px; font-weight: bold; letter-spacing: 2px;
+  color: #e8c266; background: #141c26; border: 2px solid #2c3a4a;
+  cursor: pointer;
+}
+.nb:active { background: #26364a; }
+.nb-gold { color: #0b0f14; background: #e8c266; border-color: #e8c266; }
+.nb-gold:active { background: #f4d98c; }
+.nb-red { color: #ffd7d2; background: #58201a; border-color: #8a2f27; }
+.nb-red:active { background: #7c2c23; }
+
+/* --- attract ----------------------------------------------------------- */
+#at-rule1 { position: absolute; left: 68px; top: 240px; width: 120px;
+            height: 2px; background: #e8c266; overflow: hidden; }
+#at-brand { position: absolute; left: 0; top: 264px; width: 256px;
+            text-align: center; font-size: 34px; font-weight: bold;
+            letter-spacing: 5px; color: #e8c266;
+            /* ONE line always — a wrapped 2nd line would cover at-rule2
+               below it (the gold rule "disappears"). Long names are shrunk
+               to fit in updateTexts; overflow clips the extreme tail. */
+            white-space: nowrap; overflow: hidden; }
+#at-rule2 { position: absolute; left: 68px; top: 318px; width: 120px;
+            height: 2px; background: #e8c266; overflow: hidden; }
+#at-nick  { position: absolute; left: 12px; top: 340px; width: 232px;
+            text-align: center; font-size: 15px; color: #9fb2c8; }
+#at-tap   { position: absolute; left: 12px; top: 520px; width: 232px;
+            text-align: center; font-size: 22px; font-weight: bold;
+            line-height: 32px; color: #f0f4f8;
+            -webkit-animation: tapPulse 2.4s ease-in-out infinite; }
+@-webkit-keyframes tapPulse {
+  0%   { opacity: 0.35; }
+  50%  { opacity: 1; }
+  100% { opacity: 0.35; }
+}
+#at-note  { position: absolute; left: 12px; top: 930px; width: 232px;
+            text-align: center; font-size: 12px; line-height: 16px;
+            color: #c98a4f; }
+
+/* --- stacked home (base for everyone, +admin backend stack) ------------ */
+.hd-hello { position: absolute; left: 12px; top: 40px; width: 232px;
+            font-size: 26px; font-weight: bold; color: #f0f4f8;
+            overflow: hidden; white-space: nowrap; }
+.hd-sub   { position: absolute; left: 12px; top: 80px; width: 232px;
+            font-size: 13px; color: #9fb2c8;
+            overflow: hidden; white-space: nowrap; }
+#ph-credits { position: absolute; left: 12px; top: 104px; width: 232px;
+              font-size: 17px; font-weight: bold; color: #e8c266;
+              overflow: hidden; white-space: nowrap; display: none; }
+/* ADMIN badge: shown ONLY when state.admin (the old ATTENDANT/MANAGER strip,
+   now a single access badge); non-admin players never see it */
+#hm-badge { position: absolute; left: 12px; top: 132px; width: 232px;
+            height: 26px; line-height: 26px; text-align: center;
+            font-size: 13px; font-weight: bold; letter-spacing: 4px;
+            color: #e8c266; background: #2c230e; display: none; }
+.btncol   { position: absolute; left: 16px; top: 136px; width: 224px; }
+.foot     { position: absolute; left: 12px; top: 976px; width: 232px;
+            text-align: center; font-size: 12px; color: #55708a;
+            white-space: nowrap; overflow: hidden; }
+
+/* --- stub ("coming soon") ---------------------------------------------- */
+#st-glyph { position: absolute; left: 0; top: 250px; width: 256px;
+            text-align: center; font-size: 44px; color: #e8c266; }
+#st-title { position: absolute; left: 12px; top: 330px; width: 232px;
+            text-align: center; font-size: 20px; font-weight: bold;
+            letter-spacing: 3px; color: #9fb2c8; }
+#st-soon  { position: absolute; left: 12px; top: 376px; width: 232px;
+            text-align: center; font-size: 27px; font-weight: bold;
+            letter-spacing: 2px; color: #e8c266; }
+#st-blurb { position: absolute; left: 24px; top: 430px; width: 208px;
+            text-align: center; font-size: 14px; line-height: 20px;
+            color: #55708a; }
+.backslot { position: absolute; left: 16px; top: 880px; width: 224px; }
+
+/* --- MY WALLET (the two-way money hub: FUND + CASH OUT TO WALLET) ------
+   Own geometry — must NOT drift into the CASH OUT view's (#co-*). Chips are
+   68x64 at left 0/78/156 like the cashout pad; both money buttons are 84px
+   (>=64 touch). Balance font-size steps down on long values in updateTexts. */
+#wl-title { position: absolute; left: 12px; top: 40px; width: 232px;
+            font-size: 18px; font-weight: bold; letter-spacing: 3px;
+            color: #e8c266; }
+#wl-label { position: absolute; left: 12px; top: 80px; width: 232px;
+            text-align: center; font-size: 12px; letter-spacing: 3px;
+            color: #55708a; }
+#wl-bal   { position: absolute; left: 12px; top: 100px; width: 232px;
+            text-align: center; font-size: 40px; font-weight: bold;
+            color: #e8c266; overflow: hidden; white-space: nowrap; }
+#wl-mc-l  { position: absolute; left: 12px; top: 158px; width: 232px;
+            text-align: center; font-size: 11px; letter-spacing: 2px;
+            color: #55708a; }
+#wl-mc-v  { position: absolute; left: 12px; top: 176px; width: 232px;
+            text-align: center; font-size: 20px; font-weight: bold;
+            color: #dfe7ef; overflow: hidden; white-space: nowrap; }
+#wl-sec1  { position: absolute; left: 12px; top: 226px; width: 232px;
+            font-size: 12px; font-weight: bold; letter-spacing: 2px;
+            color: #9fb2c8; }
+#wl-chips { position: absolute; left: 16px; top: 258px; width: 224px;
+            height: 64px; }
+#wl-chip0 { left: 0; }  #wl-chip1 { left: 78px; }  #wl-chip2 { left: 156px; }
+#wl-sel   { position: absolute; left: 12px; top: 374px; width: 232px;
+            text-align: center; font-size: 11px; letter-spacing: 1px;
+            color: #6b7f96; }
+#wl-fund-msg { position: absolute; left: 12px; top: 360px; width: 232px;
+               text-align: center; font-size: 12px; line-height: 16px;
+               color: #c98a4f; }
+#wl-sec2  { position: absolute; left: 12px; top: 500px; width: 232px;
+            font-size: 12px; font-weight: bold; letter-spacing: 2px;
+            color: #9fb2c8; }
+#wl-toggle { font-size: 15px; letter-spacing: 1px; }
+#wl-toggle-hint { position: absolute; left: 24px; top: 620px; width: 208px;
+                  text-align: center; font-size: 12px; line-height: 16px;
+                  color: #55708a; }
+#wl-note  { position: absolute; left: 12px; top: 704px; width: 232px;
+            text-align: center; font-size: 13px; line-height: 18px;
+            color: #c98a4f; }
+
+/* --- machine info ------------------------------------------------------ */
+#mi-title { position: absolute; left: 12px; top: 40px; width: 232px;
+            font-size: 18px; font-weight: bold; letter-spacing: 3px;
+            color: #e8c266; }
+#mi-rows  { position: absolute; left: 12px; top: 100px; width: 232px; }
+.mi-l { font-size: 11px; letter-spacing: 2px; color: #55708a;
+        margin-bottom: 3px; }
+.mi-v { font-size: 16px; color: #dfe7ef; margin-bottom: 20px;
+        overflow: hidden; white-space: nowrap; }
+
+/* --- logout confirm ----------------------------------------------------- */
+#lo-q    { position: absolute; left: 12px; top: 300px; width: 232px;
+           text-align: center; font-size: 26px; font-weight: bold;
+           letter-spacing: 2px; color: #f0f4f8; }
+#lo-sub  { position: absolute; left: 24px; top: 348px; width: 208px;
+           text-align: center; font-size: 14px; line-height: 20px;
+           color: #9fb2c8; }
+#lo-yes  { position: absolute; left: 16px; top: 430px; }
+#lo-no   { position: absolute; left: 16px; top: 542px; }
+#lo-note { position: absolute; left: 12px; top: 650px; width: 232px;
+           text-align: center; font-size: 13px; line-height: 18px;
+           color: #c98a4f; }
+
+
+/* --- shared positioned button slot (a .nb sits in it at an inline top) -- */
+.btnslot { position: absolute; left: 16px; width: 224px; }
+/* greyed nav button (no wallet / not fundable): onclick short-circuits too */
+.nb-off { color: #3a4757; background: #0f151d; border-color: #1c2634;
+          cursor: default; }
+
+/* --- CASH OUT (base, live: machine credits + wallet + the cash-out
+   DESTINATION toggle; funding lives in MY WALLET). Own geometry, must NOT
+   drift into #wl-*. .chip/.chip-sel/.chip-off are shared by the wallet's
+   FUND pad and are defined here. */
+#co-title { position: absolute; left: 12px; top: 40px; width: 232px;
+            font-size: 18px; font-weight: bold; letter-spacing: 3px;
+            color: #e8c266; }
+.co-l { position: absolute; left: 12px; width: 232px; font-size: 11px;
+        letter-spacing: 2px; color: #55708a; }
+.co-v { position: absolute; left: 12px; width: 232px; font-size: 22px;
+        font-weight: bold; overflow: hidden; white-space: nowrap; }
+#co-mc-l { top: 120px; }   #co-mc-v { top: 138px; color: #e8c266; }
+#co-wl-l { top: 214px; }   #co-wl-v { top: 232px; color: #dfe7ef; }
+.chip { position: absolute; top: 0; width: 68px; height: 64px;
+        line-height: 60px; text-align: center; font-size: 18px;
+        font-weight: bold; color: #e8c266; background: #141c26;
+        border: 2px solid #2c3a4a; cursor: pointer; }
+.chip-sel { color: #0b0f14; background: #e8c266; border-color: #e8c266; }
+.chip-off { color: #3a4757; background: #0f151d; border-color: #1c2634;
+            cursor: default; }
+#co-sec2 { position: absolute; left: 12px; top: 340px; width: 232px;
+           font-size: 12px; font-weight: bold; letter-spacing: 2px;
+           color: #9fb2c8; }
+#co-toggle { font-size: 15px; letter-spacing: 1px; }
+#co-toggle-hint { position: absolute; left: 24px; top: 470px; width: 208px;
+                  text-align: center; font-size: 12px; line-height: 16px;
+                  color: #55708a; }
+#co-note { position: absolute; left: 12px; top: 630px; width: 232px;
+           text-align: center; font-size: 13px; line-height: 18px;
+           color: #c98a4f; }
+
+/* --- shared compact list rows (tickets / handpay) ---------------------- */
+.listbox { position: absolute; left: 12px; width: 232px; overflow: hidden; }
+.lr { position: relative; height: 46px; border-bottom: 1px solid #1c2634; }
+.lr-a { position: absolute; left: 0; top: 6px; font-size: 16px;
+        font-weight: bold; color: #e8c266; }
+.lr-s { position: absolute; right: 0; top: 8px; font-size: 12px;
+        color: #9fb2c8; white-space: nowrap; }
+.lr-b { position: absolute; left: 0; top: 26px; width: 232px; font-size: 11px;
+        color: #55708a; white-space: nowrap; overflow: hidden; }
+.lr-empty { text-align: center; font-size: 14px; color: #55708a;
+            padding-top: 40px; }
+
+/* --- games rows -------------------------------------------------------- */
+.gr { position: relative; height: 40px; border-bottom: 1px solid #1c2634; }
+.gr-n { position: absolute; left: 0; top: 11px; width: 176px; font-size: 13px;
+        color: #dfe7ef; white-space: nowrap; overflow: hidden; }
+.gr-e { position: absolute; right: 0; top: 12px; font-size: 12px;
+        font-weight: bold; letter-spacing: 1px; }
+
+/* --- admin sub-view titles + settings rows ----------------------------- */
+#tk-title, #hp-title, #gm-title, #se-title {
+  position: absolute; left: 12px; top: 40px; width: 232px;
+  font-size: 18px; font-weight: bold; letter-spacing: 3px; color: #e8c266;
+  white-space: nowrap; overflow: hidden; }
+#gm-asof { position: absolute; left: 12px; top: 72px; width: 232px;
+           font-size: 12px; color: #55708a; overflow: hidden;
+           white-space: nowrap; }
+#se-rows { position: absolute; left: 12px; top: 100px; width: 232px; }
+
+/* --- money confirm (reuses the logout-confirm layout) ------------------ */
+#cf-q   { position: absolute; left: 12px; top: 300px; width: 232px;
+          text-align: center; font-size: 26px; font-weight: bold;
+          letter-spacing: 2px; color: #f0f4f8; }
+#cf-sub { position: absolute; left: 24px; top: 348px; width: 208px;
+          text-align: center; font-size: 14px; line-height: 20px;
+          color: #9fb2c8; }
+#cf-note{ position: absolute; left: 12px; top: 650px; width: 232px;
+          text-align: center; font-size: 13px; line-height: 18px;
+          color: #c98a4f; }
+
+/* --- custom-amount keypad (portrait, 256-wide lane): modal opened from the
+   FUND selection so ADD isn't stuck at the biggest preset chip. ATM-style
+   entry; OK feeds selCents. Bounded by the wallet (the AFT cap is just the BCD wire max). */
+/* the SELECTED AMOUNT is the button: big, easy to hit, shows the live value
+   and opens the keypad (seeded empty) to type a custom one. */
+#wl-custom { position: absolute; left: 12px; top: 328px; width: 232px;
+             height: 44px; line-height: 42px; text-align: center;
+             font-size: 28px; font-weight: bold; letter-spacing: 1px;
+             color: #e8c266; background: #141c26;
+             border: 2px solid #2c3a4a; cursor: pointer; }
+#wl-custom:active { background: #26364a; }
+#wl-custom.chip-off { color: #3a4757; background: #0f151d;
+                      border-color: #1c2634; cursor: default; }
+#kp-scrim { position: absolute; left: 0; top: 0; width: 256px; height: 1024px;
+            background: rgba(6, 9, 13, 0.95); z-index: 60; display: none; }
+#kp-ttl { position: absolute; left: 12px; top: 92px; width: 232px;
+          text-align: center; font-size: 12px; letter-spacing: 3px;
+          color: #9fb2c8; }
+#kp-amt { position: absolute; left: 12px; top: 118px; width: 232px;
+          text-align: center; font-size: 44px; line-height: 52px;
+          font-weight: bold; color: #e8c266; overflow: hidden;
+          white-space: nowrap; }
+#kp-msg { position: absolute; left: 12px; top: 180px; width: 232px; height: 16px;
+          text-align: center; font-size: 12px; color: #c98a4f; }
+#kp-grid { position: absolute; left: 12px; top: 212px; width: 232px;
+           height: 440px; }
+.kp-key { position: absolute; width: 72px; height: 84px; line-height: 80px;
+          text-align: center; font-size: 30px; font-weight: bold;
+          color: #dfe7ef; background: #141c26; border: 2px solid #2c3a4a;
+          cursor: pointer; }
+.kp-key:active { background: #26364a; }
+#kp-clr { color: #ffd7d2; background: #58201a; border-color: #8a2f27; }
+#kp-clr:active { background: #7c2c23; }
+#kp-ok { color: #0b0f14; background: #e8c266; border-color: #e8c266; }
+#kp-ok:active { background: #f4d98c; }
+#kp-cancel { position: absolute; left: 0; top: 384px; width: 232px; height: 56px;
+             line-height: 52px; text-align: center; font-size: 18px;
+             letter-spacing: 2px; color: #9fb2c8; background: #0f151d;
+             border: 2px solid #1c2634; cursor: pointer; }
+#kp-cancel:active { background: #1c2634; }
+</style>
+</head>
+<body>
+
+<!-- ATTRACT: the resident idle state -->
+<div class="view" id="v-attract">
+  <div id="at-rule1"></div>
+  <div id="at-brand">GAME ROOM</div>
+  <div id="at-rule2"></div>
+  <div id="at-nick">&nbsp;</div>
+  <div id="at-tap">TAP YOUR FOB<br>TO BEGIN</div>
+  <div id="at-note"></div>
+</div>
+
+<!-- HOME: ONE stacked menu driven by state.admin.
+     Base (every account):  MY WALLET (gold) + LOG OUT (red).
+     Admin adds (updateTexts shows the .hm-admin buttons + #hm-badge only when
+     state.admin): MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS.
+     Extensible: to add a player feature, drop another .nb here and wire its
+     onclick below (openStub('X') for a coming-soon slice); to make it
+     admin-only, give it class "hm-admin" and add its id to ADMIN_BTNS. -->
+<div class="view" id="v-home">
+  <div class="hd-hello" id="ph-hello">Hello</div>
+  <div class="hd-sub" id="ph-nick">&nbsp;</div>
+  <!-- credits line: painted from the state poll's pre-formatted "credits"
+       string; the hub omits it when the fob has no linked account, and the
+       line hides with it (display:none is the default) -->
+  <div id="ph-credits">CREDITS &#8212;</div>
+  <div id="hm-badge">ADMIN</div>
+  <div class="hairline" style="top:168px;"></div>
+  <div class="btncol" style="top:180px;">
+    <div class="nb nb-gold" id="hb-wallet">MY WALLET</div>
+    <div class="nb" id="hb-cashout">CASH OUT</div>
+    <div class="nb hm-admin" id="hb-machine" style="display:none;">MACHINE</div>
+    <div class="nb hm-admin" id="hb-tickets" style="display:none;">TICKETS</div>
+    <div class="nb hm-admin" id="hb-handpay" style="display:none;">HANDPAY</div>
+    <div class="nb hm-admin" id="hb-games" style="display:none;">GAMES</div>
+    <div class="nb hm-admin" id="hb-settings" style="display:none;">SETTINGS</div>
+    <div class="nb nb-red" id="hb-logout">LOG OUT</div>
+  </div>
+  <div class="foot" id="ph-foot">GAME ROOM</div>
+</div>
+
+<!-- STUB: shared "coming soon" sub-view (title swapped per feature) -->
+<div class="view" id="v-stub">
+  <div id="st-glyph">&#10022;</div>
+  <div id="st-title">FEATURE</div>
+  <div id="st-soon">COMING SOON</div>
+  <div id="st-blurb">This feature lands in a later build. Your session stays active.</div>
+  <div class="backslot"><div class="nb" id="st-back">BACK</div></div>
+</div>
+
+<!-- MY WALLET: the two-way money hub. TOP = your wallet balance + what is on
+     this machine. FUND (chip pad -> ADD, walletFund, money confirm) moves
+     wallet -> machine. CASH OUT TO WALLET (arm toggle, cashOutToWallet) makes
+     the machine's own CASH OUT button send credits -> your wallet (no amount:
+     the button cashes the whole balance). Polls GET /api/glass/data
+     ?view=cashout every ~2s so the numbers + arm state stay live. -->
+<div class="view" id="v-wallet">
+  <div id="wl-title">MY WALLET</div>
+  <div id="wl-label">WALLET BALANCE</div>
+  <div id="wl-bal">&#8212;</div>
+  <div id="wl-mc-l">ON THIS MACHINE</div>
+  <div id="wl-mc-v">&#8212;</div>
+  <div id="wl-sec1">ADD TO MACHINE</div>
+  <div id="wl-chips">
+    <div class="chip" id="wl-chip0">$1</div>
+    <div class="chip" id="wl-chip1">$5</div>
+    <div class="chip" id="wl-chip2">$20</div>
+  </div>
+  <div id="wl-custom">$5.00</div>
+  <div id="wl-sel">TAP AMOUNT TO ENTER A CUSTOM VALUE</div>
+  <div id="wl-fund-msg" style="top:392px;"></div>
+  <div class="btnslot" style="top:414px;">
+    <div class="nb nb-gold" id="wl-add">ADD CREDITS</div></div>
+  <div id="wl-sec2">CASH OUT TO WALLET</div>
+  <div class="btnslot" style="top:528px;">
+    <div class="nb" id="wl-toggle">TO WALLET  OFF</div></div>
+  <div id="wl-toggle-hint"></div>
+  <div id="wl-note"></div>
+  <div class="backslot"><div class="nb" id="wl-back">BACK</div></div>
+</div>
+
+<!-- MACHINE INFO: real data from /api/glass/state, read-only -->
+<div class="view" id="v-machine">
+  <div id="mi-title">MACHINE</div>
+  <div id="mi-rows">
+    <div class="mi-l">NICKNAME</div>       <div class="mi-v" id="mi-nick">&#8212;</div>
+    <div class="mi-l">SIGNED IN</div>      <div class="mi-v" id="mi-who">&#8212;</div>
+    <div class="mi-l">SINCE</div>          <div class="mi-v" id="mi-since">&#8212;</div>
+    <div class="mi-l">HUB LINK</div>       <div class="mi-v" id="mi-link">&#8212;</div>
+    <div class="mi-l">GLASS WINDOW</div>   <div class="mi-v" id="mi-win">&#8212;</div>
+    <div class="mi-l">UI BUILD</div>       <div class="mi-v" id="mi-build">&#8212;</div>
+  </div>
+  <div class="backslot"><div class="nb" id="mi-back">BACK</div></div>
+</div>
+
+<!-- LOGOUT CONFIRM: YES posts the one real action -->
+<div class="view" id="v-logout">
+  <div id="lo-q">LOG OUT?</div>
+  <div id="lo-sub">Ends your session on this machine. Tap your fob to sign back in.</div>
+  <div class="nb nb-red" id="lo-yes">YES &#8212; LOG OUT</div>
+  <div class="nb" id="lo-no">NO &#8212; STAY</div>
+  <div id="lo-note"></div>
+</div>
+
+<!-- CASH OUT: base (any carded player). Live machine + wallet balances and the
+     cash-out DESTINATION toggle: OFF = the machine's CASH OUT button prints a
+     ticket (the default); ON = it sends credits to your wallet (cashOutToWallet
+     - the same arm surfaced in MY WALLET). Funding moved to MY WALLET. Greys
+     with a "link a card" note when the fob has no wallet. Polls GET
+     /api/glass/data?view=cashout every ~2s while open so the numbers + arm
+     state stay live. -->
+<div class="view" id="v-cashout">
+  <div id="co-title">CASH OUT</div>
+  <div class="co-l" id="co-mc-l">MACHINE CREDITS</div>
+  <div class="co-v" id="co-mc-v">&#8212;</div>
+  <div class="co-l" id="co-wl-l">MY WALLET</div>
+  <div class="co-v" id="co-wl-v">&#8212;</div>
+  <div id="co-sec2">CASH OUT DESTINATION</div>
+  <div class="btnslot" style="top:372px;">
+    <div class="nb" id="co-toggle">TO WALLET  OFF</div></div>
+  <div id="co-toggle-hint"></div>
+  <div id="co-note"></div>
+  <div class="backslot"><div class="nb" id="co-back">BACK</div></div>
+</div>
+
+<!-- TICKETS: admin, read-only. Recent vouchers + tito tickets for THIS machine,
+     newest first, from GET /api/glass/data?view=tickets. -->
+<div class="view" id="v-tickets">
+  <div id="tk-title">TICKETS</div>
+  <div class="listbox" id="tk-list" style="top:88px; height:560px;"></div>
+  <div class="backslot"><div class="nb" id="tk-back">BACK</div></div>
+</div>
+
+<!-- HANDPAY: admin. Pending handpays + a CLEAR button (money, confirm dialog)
+     shown only when the data view reports canClear. -->
+<div class="view" id="v-handpay">
+  <div id="hp-title">HANDPAY</div>
+  <div class="listbox" id="hp-list" style="top:88px; height:640px;"></div>
+  <div class="btnslot" style="top:770px;">
+    <div class="nb nb-gold" id="hp-clear" style="display:none;">CLEAR</div></div>
+  <div class="backslot"><div class="nb" id="hp-back">BACK</div></div>
+</div>
+
+<!-- GAMES: admin. Two-level drill — a button per machine-enabled game, tap
+     for its paytables (hub-grouped; egm-disabled titles filtered out — the
+     host can't enable those). REFRESH = status-only refreshGameStatus. -->
+<div class="view" id="v-games">
+  <div id="gm-title">GAMES</div>
+  <div id="gm-asof"></div>
+  <div class="listbox" id="gm-list" style="top:100px; height:620px;"></div>
+  <div class="btnslot" style="top:770px;">
+    <div class="nb" id="gm-refresh">REFRESH</div></div>
+  <div class="backslot"><div class="nb" id="gm-back">BACK</div></div>
+</div>
+
+<!-- SETTINGS: admin, read-only machine summary. NO writes v1. -->
+<div class="view" id="v-settings">
+  <div id="se-title">SETTINGS</div>
+  <div id="se-rows"></div>
+  <div class="backslot"><div class="nb" id="se-back">BACK</div></div>
+</div>
+
+<!-- MONEY CONFIRM: shared by ADD-from-wallet + CLEAR-handpay. Same layout as
+     the logout confirm; the pending action lives in a JS closure var. -->
+<div class="view" id="v-confirm">
+  <div id="cf-q">CONFIRM?</div>
+  <div id="cf-sub"></div>
+  <div class="btnslot" style="top:430px;">
+    <div class="nb nb-gold" id="cf-yes">CONFIRM</div></div>
+  <div class="btnslot" style="top:542px;">
+    <div class="nb" id="cf-no">CANCEL</div></div>
+  <div id="cf-note"></div>
+</div>
+
+
+<!-- CUSTOM-AMOUNT KEYPAD: modal overlay opened from the FUND selection so ADD
+     can be any amount (not just the biggest preset chip). ATM-style entry. -->
+<div id="kp-scrim">
+  <div id="kp-ttl">ADD &#183; AMOUNT</div>
+  <div id="kp-amt">$0.00</div>
+  <div id="kp-msg"></div>
+  <div id="kp-grid">
+    <div class="kp-key" id="kp7" style="left:0;   top:0;">7</div>
+    <div class="kp-key" id="kp8" style="left:80px; top:0;">8</div>
+    <div class="kp-key" id="kp9" style="left:160px;top:0;">9</div>
+    <div class="kp-key" id="kp4" style="left:0;   top:96px;">4</div>
+    <div class="kp-key" id="kp5" style="left:80px; top:96px;">5</div>
+    <div class="kp-key" id="kp6" style="left:160px;top:96px;">6</div>
+    <div class="kp-key" id="kp1" style="left:0;   top:192px;">1</div>
+    <div class="kp-key" id="kp2" style="left:80px; top:192px;">2</div>
+    <div class="kp-key" id="kp3" style="left:160px;top:192px;">3</div>
+    <div class="kp-key" id="kp-clr" style="left:0;   top:288px;">C</div>
+    <div class="kp-key" id="kp0"  style="left:80px; top:288px;">0</div>
+    <div class="kp-key" id="kp-ok" style="left:160px;top:288px;">OK</div>
+    <div id="kp-cancel">CANCEL</div>
+  </div>
+</div>
+
+<script type="text/javascript">
+(function () {
+  var POLL_MS = 1500;        // contract: ~1.5s state poll
+  var OFFLINE_AFTER = 4;     // contract: 4 failed polls -> offline note
+  var XHR_MS = 6000;         // watchdog abort; x.timeout is XHR2, too new here
+
+  // ---- page identity from our own URL (?egm=...&dev=...) ---------------
+  function qp(k) {
+    var m = new RegExp('[?&]' + k + '=([^&]*)').exec(location.search || '');
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+  var egmId = qp('egm');
+  var devId = qp('dev') || '1';
+
+  // ---- state: sess lives ONLY here (a closure var, never the URL) ------
+  var sess = null, tier = '', who = '', nick = '', sinceIso = '';
+  var admin = false;         // the MENU authority: state.admin from the hub
+                             // (account.admin, legacy-bridged to operator
+                             // fobs) -> shows the backend button stack + badge.
+                             // tier stays for the machine-info readout only.
+  var overlay = false;       // ADMIN OVERLAY: an admin tapped OVER a carded
+                             // friend. The hub minted the admin an override
+                             // token and set state.overlay -> render the admin
+                             // stack but HIDE the money buttons (MY WALLET /
+                             // CASH OUT) so the supervisor can't touch the
+                             // friend's wallet, and label LOG OUT as "DONE"
+                             // (its logout POST ends the overlay, restoring the
+                             // friend — the hub never cards the friend out).
+  var supervising = '';      // overlay only: the carded FRIEND's name (context
+                             // for the admin; never their wallet).
+  var gameroom = '';         // collector-set gameroom name (Settings tab) shown
+                             // in lights on attract + footer; '' -> neutral
+                             // fallback. CabiNet is the product, THIS is theirs.
+  var credits = '';          // pre-formatted "$X.XX" from the state poll;
+                             // '' = hub omitted it (unlinked fob) -> hidden
+  var deadSess = null;       // token we just logged out: a stale in-flight
+                             // poll can still deliver it (hub threads race)
+                             // and must NOT resurrect the menu with it
+  var lastBuild = null;      // uiBuild watermark; change -> self-reload
+  var failStreak = 0, hubOffline = false;
+  var hubNote = false;       // an ok:false note is painted; ok:true clears
+  var view = '';             // which .view is showing
+  var logoutBusy = false;
+
+  // ---- destub state: the glass-data sub-views + money-confirm -----------
+  var dataTimer = null;              // cashout's ~2s live-data re-poll handle
+  var confirmBusy = false;           // money-confirm POST in flight
+  var coToggleBusy = false;          // WAT-toggle POST in flight
+  var gmBusy = false;                // games REFRESH POST in flight
+  var gmData = null;                 // last games payload (grouped by game)
+  var gmGame = -1;                   // drilled-into game index, -1 = list
+  var pendingConfirm = null;         // {body, back} armed for the confirm view
+  var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
+  var selIdx = 1;                    // selected chip index (default $5)
+  var selCents = CHIPS[selIdx];      // its value in cents (what walletFund sends)
+  var lastPlayerSince = '';          // sinceIso of the last PLAYER we saw the
+                                     // seat held by — resets the FUND amount
+                                     // only when a DIFFERENT player sits down
+  var coMachineMc = 0;               // cashout view: machine credits (millicents)
+  var coWalletMc = null;             // wallet balance (millicents); null = no wallet
+  var coCanFund = false;             // funding allowed (linked + path available)
+  var coHasWallet = false;           // a wallet exists at all (gates the toggle)
+  var coCashToWat = false;           // current WAT-cash-out arm state
+  var hpCanClear = false;            // handpay CLEAR button gate (from the view)
+
+  function $(id) { return document.getElementById(id); }
+  function setText(id, s) { $(id).textContent = s; }
+
+  // ---- view switching: pure display flips, no layout churn --------------
+  var VIEWS = ['attract', 'home', 'stub', 'wallet', 'machine', 'logout',
+               'cashout', 'tickets', 'handpay', 'games', 'settings', 'confirm'];
+  // the admin-only buttons on the home stack; add an id here to gate a new
+  // button on state.admin (updateTexts show/hides the set as one). CASH OUT
+  // (hb-cashout) is BASE, not here — every carded account gets it.
+  var ADMIN_BTNS = ['hb-machine', 'hb-tickets', 'hb-handpay', 'hb-games', 'hb-settings'];
+  function show(name) {
+    stopDataPoll();   // any view flip cancels the cashout live-data re-poll
+    for (var i = 0; i < VIEWS.length; i++) {
+      $('v-' + VIEWS[i]).style.display = (VIEWS[i] === name) ? 'block' : 'none';
+    }
+    view = name;
+    // NOTE: the carded menu no longer auto-collapses — the machine's SERVICE
+    // button hides/shows the whole kiosk window (the old 45s mini-collapse was
+    // retired 2026-07-14; the mediaDisplay window never resized with it).
+  }
+  function home() { return 'home'; }   // one stacked home for every account
+
+  // ---- XHR with a manual watchdog (readyState 4 + status 0 = dead hub) ---
+  function xreq(method, url, body, cb) {
+    var x = new XMLHttpRequest(), done = false;
+    var dog = window.setTimeout(function () {
+      if (done) { return; }
+      done = true;
+      try { x.abort(); } catch (e) {}
+      cb(-1, null);
+    }, XHR_MS);
+    x.onreadystatechange = function () {
+      if (x.readyState !== 4 || done) { return; }
+      done = true;
+      window.clearTimeout(dog);
+      var data = null;
+      if (x.status === 200) {
+        try { data = JSON.parse(x.responseText); } catch (e2) { data = null; }
+      }
+      cb(x.status, data);
+    };
+    x.open(method, url, true);
+    if (body !== null) { x.setRequestHeader('Content-Type', 'application/json'); }
+    x.send(body);
+  }
+
+  // ---- the poll loop: ONE in flight, setTimeout re-arm after each reply --
+  // src=spa self-identifies this as the RESIDENT PAGE's own heartbeat (not
+  // a hub-UI/bench peek): the hub uses it as the restart-surviving
+  // residency signal AND the sequencer's fetch-proof setActiveContent
+  // trigger (the MDX003/MDX005 bench lessons, 2026-07-10).
+  function poll() {
+    xreq('GET', '/api/glass/state?egm=' + encodeURIComponent(egmId) +
+      '&src=spa&dev=' + encodeURIComponent(devId), null,
+      function (status, data) {
+        if (status === 200 && data) {
+          failStreak = 0;
+          if (hubOffline) { hubOffline = false; note(''); }
+          renderState(data);
+        } else {
+          failStreak++;
+          if (failStreak >= OFFLINE_AFTER && !hubOffline) {
+            hubOffline = true;
+            if (view !== 'attract') { show('attract'); }
+            note('hub offline \u2014 retrying');
+          }
+        }
+        window.setTimeout(poll, POLL_MS);
+      });
+  }
+
+  function renderState(s) {
+    if (s.ok === false) {
+      // hub answered but disowns us ("unknown egm") -> attract + say why
+      sess = null;
+      if (view !== 'attract') { show('attract'); }
+      note('hub: ' + (s.error || 'bad reply'));
+      hubNote = true;
+      updateTexts();
+      return;
+    }
+    // a good state clears any lingering ok:false note (e.g. "hub: unknown
+    // egm" painted while the hub was up but the AVP hadn't re-handshaked);
+    // the hubOffline recovery clear fires only ONCE and can be the very
+    // reply that painted the note, so recovery must be re-checked here
+    if (hubNote) { hubNote = false; note(''); }
+    if (s.nick !== undefined) { nick = s.nick || ''; }
+    if (s.gameroom !== undefined) { gameroom = s.gameroom || ''; }
+    if (s.egmId) { egmId = s.egmId; }   // hub-canonical casing wins
+    if (s.uiBuild !== undefined && s.uiBuild !== null) {
+      // live-redeploy hook: the hub stamps glass.html's mtime into the state;
+      // a change means a newer build of THIS page is being served -> reload
+      // (location.reload keeps ?egm=&dev=; sess re-arrives in the next state)
+      if (lastBuild !== null && s.uiBuild !== lastBuild) { location.reload(); return; }
+      lastBuild = s.uiBuild;
+    }
+    if (s.carded && s.sess && s.sess === deadSess) {
+      // a poll that was already in flight when our logout POST landed can
+      // deliver a snapshot taken BEFORE the hub's card-out: same (now
+      // revoked) token, carded:true. Rendering it would bounce the player
+      // attract -> menu -> attract for a poll cycle, so treat it as the
+      // card-out it already is; the next poll carries the hub's truth
+      // (and a NEW tap mints a different token, which passes below).
+      s.carded = false;
+    }
+    if (s.carded) {
+      if (s.sess && s.sess !== deadSess) { deadSess = null; } // superseded
+      tier = s.tier || 'player';
+      // admin is the MENU authority (account.admin, legacy-bridged to
+      // operator fobs host-side); tier is kept only for the machine readout
+      admin = (s.admin === true);
+      // overlay: an admin is supervising OVER a carded friend. It implies
+      // admin (the hub only sets it on an admin token) and drives the money-
+      // button hide + the DONE label below.
+      overlay = (s.overlay === true);
+      supervising = overlay ? (s.supervising || '') : '';
+      who = s.name || '';
+      sinceIso = s.sinceIso || '';
+      // "credits" is the hub's pre-formatted display string ("$X.XX");
+      // absent = this fob has no linked account, so the line hides. The hub
+      // SUPPRESSES credits during an overlay (the friend's balance must never
+      // paint under the admin's token) — belt-and-braces blank it here too.
+      credits = overlay ? '' : (
+        (s.credits === undefined || s.credits === null)
+          ? '' : String(s.credits));
+      var fresh = (s.sess && s.sess !== sess);   // new hub-minted session
+      if (s.sess) { sess = s.sess; }
+      // Reset the FUND amount when a DIFFERENT player takes the seat, keyed on
+      // the session start (sinceIso) — NOT the token. An admin overlay re-mints
+      // the player's token when it POPS, but the underlying card session
+      // (sinceIso) is unchanged, so the friend's amount must survive that.
+      // Sample ONLY in a real player state — never during an admin overlay.
+      if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
+        lastPlayerSince = sinceIso;
+        selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+      }
+      if (fresh || view === 'attract') {
+        show('home');          // card-in (or back from offline) -> home menu
+      } else if (!admin && (view === 'tickets' || view === 'handpay' ||
+                            view === 'games' || view === 'settings')) {
+        // Admin revoked mid-session (fob demoted / account.admin cleared,
+        // still carded) while the user sits INSIDE an admin sub-view: fall
+        // back to home so a demoted user can't keep viewing admin-only data
+        // (these sub-views don't re-poll). The hub already 403s any write.
+        show('home');
+      }
+      // A same-view admin flip on HOME just repaints the button set below
+      // (updateTexts); with one stacked home there is no view to swap.
+    } else {
+      sess = null; tier = ''; admin = false; overlay = false; supervising = '';
+      who = ''; sinceIso = ''; credits = '';
+      if (view !== 'attract') { show('attract'); }   // hub-side card-out wins
+    }
+    updateTexts();
+  }
+
+  function note(msg) { setText('at-note', msg); }
+  function fmtSince(iso) {
+    if (!iso || iso.length < 19) { return '\u2014'; }
+    return iso.substr(11, 8) + ' \u00b7 ' + iso.substr(0, 10);
+  }
+
+  // ---- small formatters for the destub views ----------------------------
+  // escape for the few innerHTML row builders (data is hub-minted, but names
+  // are free text \u2014 never trust the QNX engine to be tag-safe)
+  function esc(s) {
+    s = (s === null || s === undefined) ? '' : String(s);
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function fmtCents(c) {
+    c = c || 0;
+    var neg = c < 0; if (neg) { c = -c; }
+    var d = Math.floor(c / 100), r = c % 100;
+    return (neg ? '-$' : '$') + d + '.' + (r < 10 ? '0' + r : '' + r);
+  }
+  // millicents -> dollars string (1 cent = 1000 millicents, the hub-side rule)
+  function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
+  function sdot(a, b) {
+    a = (a === null || a === undefined) ? '' : String(a);
+    b = (b === null || b === undefined) ? '' : String(b);
+    return (a && b) ? (a + ' \u00b7 ' + b) : (a + b);
+  }
+  function dataErr(status) {
+    if (status === 403) { return 'Not permitted'; }
+    if (status === 401) { return 'Session ended'; }
+    return 'Could not load \u2014 try again';
+  }
+  function fmtLink(v) {
+    if (v === true) { return 'linked'; }
+    if (v === false) { return 'not linked'; }
+    return v;
+  }
+
+  function brandName() {
+    // the collector's gameroom name (Settings tab) painted in lights; until
+    // they set one, a neutral house label (never the product name "CabiNet" —
+    // that's the package, this glass shows the collector's own room).
+    return gameroom || 'GAME ROOM';
+  }
+
+  function updateTexts() {
+    var place = nick || egmId || '';
+    var brand = brandName();
+    setText('at-brand', brand);
+    // Fit the attract brand on ONE line (256px glass): step the size + tracking
+    // down for longer gameroom names so it never wraps onto the rule below it.
+    var bEl = $('at-brand'), bl = brand.length;
+    var bFont = '34px', bTrack = '5px';
+    if (bl > 24)      { bFont = '13px'; bTrack = '1px'; }
+    else if (bl > 18) { bFont = '15px'; bTrack = '1px'; }
+    else if (bl > 14) { bFont = '18px'; bTrack = '2px'; }
+    else if (bl > 11) { bFont = '22px'; bTrack = '3px'; }
+    else if (bl > 9)  { bFont = '28px'; bTrack = '4px'; }
+    bEl.style.fontSize = bFont;
+    bEl.style.letterSpacing = bTrack;
+    setText('at-nick', place);
+    setText('ph-hello', 'Hello ' + (who || 'Player'));
+    setText('ph-nick', place);
+    setText('ph-credits', credits ? ('CREDITS  ' + credits) : '');
+    $('ph-credits').style.display = credits ? 'block' : 'none';
+    $('ph-credits').style.fontSize =
+      (credits && credits.length > 14) ? '13px' : '17px';
+    setText('wl-bal', credits || '\u2014');
+    // the 232px column clips silently past ~$1M at 40px bold, so step
+    // the font DOWN on long balances: every digit stays on the glass
+    var wlLen = (credits || '\u2014').length;
+    $('wl-bal').style.fontSize =
+      wlLen <= 11 ? '40px' : wlLen <= 13 ? '32px'
+        : wlLen <= 16 ? '26px' : '20px';
+    // footer = just the gameroom name (the raw UTC "in since HH:MM" was
+    // confusing to players and served no purpose \u2014 dropped 2026-07-14)
+    setText('ph-foot', brand);
+    // ADMIN badge + the backend button stack: shown as one set off "admin"
+    $('hm-badge').style.display = admin ? 'block' : 'none';
+    for (var ai = 0; ai < ADMIN_BTNS.length; ai++) {
+      $(ADMIN_BTNS[ai]).style.display = admin ? 'block' : 'none';
+    }
+    // ADMIN OVERLAY: hide the money buttons (MY WALLET / CASH OUT) so a
+    // supervisor stacked over a friend can't reach the friend's wallet, and
+    // relabel the badge + LOG OUT (its POST ends the overlay, not a card-out).
+    // The hub also 403s wallet verbs on an overlay token (defense in depth).
+    $('hb-wallet').style.display = overlay ? 'none' : 'block';
+    $('hb-cashout').style.display = overlay ? 'none' : 'block';
+    setText('hb-logout', overlay ? 'DONE' : 'LOG OUT');
+    setText('hm-badge', overlay
+      ? ('SUPERVISOR' + (supervising ? (' · ' + supervising +
+          ' stays carded') : ' — friend stays carded'))
+      : 'ADMIN');
+    setText('mi-nick', nick || '\u2014');
+    setText('mi-who', who ? (who + ' \u00b7 ' + tier) : '\u2014');
+    setText('mi-since', fmtSince(sinceIso));
+    setText('mi-link', hubOffline ? 'OFFLINE' : 'online');
+    setText('mi-win', 'dev ' + devId + ' \u00b7 256\u00d71024');
+    setText('mi-build', lastBuild === null ? '\u2014' : String(lastBuild));
+  }
+
+  // ---- the ONE real action: logout -> hub runs the true G2S card-out ----
+  function doLogout() {
+    if (logoutBusy) { return; }
+    if (!sess) { show('attract'); return; }
+    logoutBusy = true;
+    setText('lo-note', 'signing out\u2026');
+    xreq('POST', '/api/glass/action',
+      JSON.stringify({ sess: sess, action: 'logout' }),
+      function (status, data) {
+        logoutBusy = false;
+        if ((status === 200 && data && data.ok !== false) || status === 401) {
+          // 401 = the hub already killed this session (e.g. a re-tap raced
+          // us) \u2014 same outcome the user asked for, so land on attract.
+          // Tombstone the token: a poll already in flight may still carry
+          // it carded:true and must not resurrect the menu (renderState).
+          deadSess = sess;
+          sess = null;
+          setText('lo-note', '');
+          show('attract');
+        } else {
+          setText('lo-note', 'hub refused (' +
+            (status > 0 ? 'HTTP ' + status : 'no reply') + ') \u2014 try again');
+        }
+      });
+  }
+
+  // ---- ADMIN OVERLAY "DONE": end the overlay, hand the glass back --------
+  // Posts the same logout verb, but the hub recognizes an overlay token and
+  // POPS THE OVERLAY (re-mints the friend's token) instead of carding anyone
+  // out. We do NOT flash attract — our admin token is now dead, and the next
+  // ~1.5s state poll arrives carded:true with the FRIEND's fresh token, which
+  // renderState treats as a card-in (fresh sess) and paints their home.
+  function doOverlayDone() {
+    if (logoutBusy || !sess) { return; }
+    logoutBusy = true;
+    setText('hb-logout', 'handing back…');
+    xreq('POST', '/api/glass/action',
+      JSON.stringify({ sess: sess, action: 'logout' }),
+      function (status, data) {
+        logoutBusy = false;
+        if ((status === 200 && data && data.ok !== false) || status === 401) {
+          // Tombstone our (now-dead) admin token so an in-flight poll still
+          // carrying it overlay:true can't repaint the supervisor stack; the
+          // next poll's player token differs and restores the friend.
+          deadSess = sess; sess = null;
+        } else {
+          // couldn't reach the hub — leave the overlay up, restore the label
+          setText('hb-logout', 'DONE');
+        }
+      });
+  }
+
+  // ---- glass DATA reads: GET /api/glass/data?sess=&view= (never-500) -----
+  // sess is our closure token; the hub re-resolves it and forces egmId FROM
+  // THE TOKEN, so the page never names a machine or an amount it isn't owed.
+  function fetchData(v, cb) {
+    if (!sess) { cb(401, null); return; }
+    xreq('GET', '/api/glass/data?sess=' + encodeURIComponent(sess) +
+      '&view=' + encodeURIComponent(v), null, cb);
+  }
+  function stopDataPoll() {
+    if (dataTimer !== null) { window.clearTimeout(dataTimer); dataTimer = null; }
+  }
+  // cashout is LIVE: one request in flight, re-armed every ~2s, and ONLY while
+  // its view is still up (a nav flip or card-out drops the re-arm cleanly)
+  function pollCashout() {
+    fetchData('cashout', function (status, data) {
+      if (view !== 'cashout') { return; }
+      if (status === 200 && data) { renderCashout(data); }
+      dataTimer = window.setTimeout(pollCashout, 2000);
+    });
+  }
+
+  // ---- glass WRITE actions: POST /api/glass/action ----------------------
+  // NEVER sends egmId — the hub forces it from the sess token (contract).
+  function postAction(obj, cb) {
+    obj.sess = sess;
+    xreq('POST', '/api/glass/action', JSON.stringify(obj), cb);
+  }
+
+  // ---- CASH OUT view: render + chip pad + funding gate ------------------
+  function renderCashout(d) {
+    coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
+      ? 0 : d.machineCreditsMc;
+    coWalletMc = (d.walletMc === undefined || d.walletMc === null)
+      ? null : d.walletMc;
+    coCanFund = (d.canFund === true);
+    coCashToWat = (d.cashOutToWat === true);
+    coHasWallet = (coWalletMc !== null) || coCanFund;
+    setText('co-mc-v', fmtMc(coMachineMc));
+    setText('co-wl-v', d.walletCredits ? String(d.walletCredits)
+      : (coWalletMc === null ? '—' : fmtMc(coWalletMc)));
+    setText('co-note', coHasWallet ? ''
+      : 'Link a card to send your cash-out to your wallet.');
+    setToggleFace();
+  }
+  function setToggleFace() {
+    setText('co-toggle', 'TO WALLET  ' + (coCashToWat ? 'ON' : 'OFF'));
+    var cn = 'nb' + (coCashToWat ? ' nb-gold' : '');
+    if (!coHasWallet) { cn += ' nb-off'; }
+    $('co-toggle').className = cn;
+    setText('co-toggle-hint', coHasWallet
+      ? 'ON sends your cash-out to your wallet. OFF prints a ticket.'
+      : '');
+  }
+  // grey a .nb button and mark it (onclick handlers read the state flag, not
+  // the class, so a stale className never re-enables an action)
+  function setBtnOff(id, off) {
+    var el = $(id), base = el.className.replace(/ *nb-off/g, '');
+    el.className = off ? (base + ' nb-off') : base;
+  }
+  function resetCashout() {
+    setText('co-mc-v', '—'); setText('co-wl-v', '—');
+    setText('co-note', '');
+    coCanFund = false; coHasWallet = false; coCashToWat = false;
+    setToggleFace();
+  }
+  function openCashout() {
+    resetCashout();
+    show('cashout');
+    pollCashout();          // fetches immediately, then re-arms every ~2s
+  }
+
+  // ---- MY WALLET money hub: same live data + same two actions as CASH OUT,
+  //      painted on its own DOM (the wallet is where funding belongs). Shares
+  //      the co* state vars + selIdx/selCents (one machine-wide selection +
+  //      arm state); wl-bal itself is painted by updateTexts from the state
+  //      poll's "credits". Reuses walletFund + cashOutToWallet verbatim. ------
+  function renderWallet(d) {
+    coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
+      ? 0 : d.machineCreditsMc;
+    coWalletMc = (d.walletMc === undefined || d.walletMc === null)
+      ? null : d.walletMc;
+    coCanFund = (d.canFund === true);
+    coCashToWat = (d.cashOutToWat === true);
+    coHasWallet = (coWalletMc !== null) || coCanFund;
+    setText('wl-mc-v', fmtMc(coMachineMc));
+    setText('wl-note', coHasWallet ? ''
+      : 'Link a card to move money to and from your wallet.');
+    paintWalletChips();
+    setBtnOff('wl-add', !coCanFund);
+    setWalletToggleFace();
+  }
+  function paintWalletChips() {
+    for (var i = 0; i < 3; i++) {
+      var cn = 'chip';
+      if (i === selIdx) { cn += ' chip-sel'; }
+      if (!coCanFund) { cn += ' chip-off'; }
+      $('wl-chip' + i).className = cn;
+    }
+    // the amount button carries the live selection (tap it to type a custom
+    // one); dims with the chips when funding is unavailable.
+    setText('wl-custom', fmtCents(selCents));
+    $('wl-custom').className = coCanFund ? '' : 'chip-off';
+  }
+  function setWalletToggleFace() {
+    setText('wl-toggle', 'TO WALLET  ' + (coCashToWat ? 'ON' : 'OFF'));
+    var cn = 'nb' + (coCashToWat ? ' nb-gold' : '');
+    if (!coHasWallet) { cn += ' nb-off'; }
+    $('wl-toggle').className = cn;
+    setText('wl-toggle-hint', coHasWallet
+      ? 'When ON, pressing this machine’s CASH OUT button sends your credits to your wallet.'
+      : '');
+  }
+  function selectWalletChip(i) {
+    if (!coCanFund) { return; }
+    selIdx = i; selCents = CHIPS[i];
+    paintWalletChips();
+    setText('wl-fund-msg', '');
+  }
+  // ---- custom-amount keypad (ATM-style: digits shift in as cents) ---------
+  var kpCents = 0;                        // amount being typed, in cents
+  function kpRepaint() {
+    setText('kp-amt', fmtCents(kpCents));
+    var msg = '';
+    if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
+      msg = 'More than your wallet (' + fmtMc(coWalletMc) + ')';
+    }
+    setText('kp-msg', msg);
+  }
+  function kpDigit(d) {
+    var n = kpCents * 10 + d;
+    if (n > 9999999999) { return; }       // 5-byte BCD wire max ($99,999,999.99, SAS_AFT_MAX_CENTS); real bound is the wallet balance (checked above)
+    kpCents = n; kpRepaint();
+  }
+  function openKeypad() {
+    if (!coCanFund) { return; }
+    kpCents = 0;                          // START EMPTY — type the amount fresh,
+    kpRepaint();                          // no preset to clear first (ATM-style)
+    $('kp-scrim').style.display = 'block';
+  }
+  function closeKeypad() { $('kp-scrim').style.display = 'none'; }
+  function kpOk() {
+    if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
+    selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
+    paintWalletChips();
+    setText('wl-fund-msg', '');
+    closeKeypad();
+  }
+  function resetWallet() {
+    closeKeypad();
+    setText('wl-mc-v', '—');
+    setText('wl-fund-msg', ''); setText('wl-note', '');
+    coCanFund = false; coHasWallet = false; coCashToWat = false;
+    paintWalletChips(); setBtnOff('wl-add', true); setWalletToggleFace();
+  }
+  function pollWallet() {
+    fetchData('cashout', function (status, data) {
+      if (view !== 'wallet') { return; }
+      if (status === 200 && data) { renderWallet(data); }
+      dataTimer = window.setTimeout(pollWallet, 2000);
+    });
+  }
+  function openWallet() {
+    resetWallet();
+    show('wallet');         // wl-bal is painted by updateTexts (state poll)
+    pollWallet();           // fetches immediately, then re-arms every ~2s
+  }
+
+  // ---- admin sub-view row builders + renderers --------------------------
+  function listRow(a, s, b) {
+    return '<div class="lr"><div class="lr-a">' + esc(a) + '</div>' +
+      '<div class="lr-s">' + esc(s) + '</div>' +
+      '<div class="lr-b">' + esc(b) + '</div></div>';
+  }
+  function emptyRow(msg) { return '<div class="lr-empty">' + esc(msg) + '</div>'; }
+
+  function renderTickets(status, d) {
+    var el = $('tk-list');
+    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
+    var arr = d.tickets || [], html = '', i, t;
+    if (!arr.length) { el.innerHTML = emptyRow('No tickets on this machine'); return; }
+    for (i = 0; i < arr.length && i < 12; i++) {
+      t = arr[i];
+      html += listRow(t.amount, t.state, sdot(t.id, t.when));
+    }
+    el.innerHTML = html;
+  }
+  function renderHandpay(status, d) {
+    var el = $('hp-list');
+    hpCanClear = false;
+    $('hp-clear').style.display = 'none';
+    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
+    var arr = d.pending || [], html = '', i, p;
+    if (!arr.length) { el.innerHTML = emptyRow('No pending handpays'); }
+    else {
+      for (i = 0; i < arr.length && i < 12; i++) {
+        p = arr[i];
+        html += listRow(p.amount, p.type, p.when);
+      }
+      el.innerHTML = html;
+    }
+    hpCanClear = (d.canClear === true);
+    $('hp-clear').style.display = hpCanClear ? 'block' : 'none';
+  }
+  // GAMES is a two-level view inside v-games: level 1 = one BUTTON per
+  // machine-enabled game (the hub already grouped + filtered — an
+  // egm-disabled title never arrives, the host couldn't enable it anyway);
+  // tap a game -> level 2 = that game's paytables. BACK walks the levels.
+  function renderGames(status, d) {
+    gmData = null; gmGame = -1;
+    if (status !== 200 || !d) {
+      setText('gm-title', 'GAMES'); setText('gm-asof', '');
+      $('gm-list').innerHTML = emptyRow(dataErr(status)); return;
+    }
+    gmData = d;
+    paintGameList();
+  }
+  // #gm-list is 620px tall with 40px .gr rows, so ~15 rows fit and overflow
+  // is hidden (WebKit-534 can't pan it). Cap the render to what fits; when
+  // there are more, spend the last slot on a "+N more" notice so clipped
+  // rows aren't silently unreachable with no indication.
+  function gmCap(arr) {
+    var CAP = 15, shown = arr.length, more = 0;
+    if (arr.length > CAP) { shown = CAP - 1; more = arr.length - shown; }
+    return { shown: shown, more: more };
+  }
+  function gmMoreRow(more) {
+    return more ? ('<div class="gr"><div class="gr-n" style="color:#55708a;">+' +
+      more + ' more not shown</div></div>') : '';
+  }
+  function paintGameList() {
+    var el = $('gm-list'), arr = (gmData && gmData.games) || [], html = '', i;
+    gmGame = -1;
+    setText('gm-title', 'GAMES');
+    setText('gm-asof', (gmData && gmData.asOf) ? ('as of ' + gmData.asOf) : '');
+    if (!arr.length) { el.innerHTML = emptyRow('No machine-enabled games'); return; }
+    var c = gmCap(arr);
+    for (i = 0; i < c.shown; i++) {
+      html += '<div class="gr" id="gm-g' + i + '"><div class="gr-n">' +
+        esc(arr[i].name) + '</div>' +
+        '<div class="gr-e" style="color:#e8c266;">' +
+        (arr[i].count || 0) + ' &rsaquo;</div></div>';
+    }
+    el.innerHTML = html + gmMoreRow(c.more);
+    for (i = 0; i < c.shown; i++) { $('gm-g' + i).onclick = gmOpenGame(i); }
+  }
+  function gmOpenGame(i) { return function () { paintPaytables(i); }; }
+  function paintPaytables(i) {
+    var el = $('gm-list'), g = ((gmData && gmData.games) || [])[i];
+    if (!g) { paintGameList(); return; }
+    gmGame = i;
+    setText('gm-title', g.name || 'GAME');
+    setText('gm-asof', (g.count || 0) + ' paytable' + (g.count === 1 ? '' : 's'));
+    var arr = g.paytables || [], html = '', j, p, on;
+    if (!arr.length) { el.innerHTML = emptyRow('No paytables'); return; }
+    var c = gmCap(arr);
+    for (j = 0; j < c.shown; j++) {
+      p = arr[j];
+      on = (p.on === true);
+      html += '<div class="gr"><div class="gr-n">' + esc(p.label || p.id) + '</div>' +
+        '<div class="gr-e" style="color:' + (on ? '#6fcf97' : '#c98a4f') + ';">' +
+        (on ? 'ON' : 'OFF') + '</div></div>';
+    }
+    el.innerHTML = html + gmMoreRow(c.more);
+  }
+  function renderSettings(status, d) {
+    var el = $('se-rows');
+    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
+    // EGM ID deliberately absent — serial-derived ids stay off the glass so
+    // machine photos are shareable (AJ, 2026-07-14).
+    var rows = [['NICKNAME', d.nick],
+                ['PROTOCOL', d.protocol], ['SAS LINK', fmtLink(d.sasLink)]];
+    var html = '', i;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i][1] === null || rows[i][1] === undefined || rows[i][1] === '') { continue; }
+      html += '<div class="mi-l">' + esc(rows[i][0]) + '</div>' +
+        '<div class="mi-v">' + esc(rows[i][1]) + '</div>';
+    }
+    el.innerHTML = html || emptyRow('No settings');
+  }
+
+  // ---- open an admin sub-view: show, paint "loading", GET, render -------
+  function openTickets() {
+    show('tickets'); $('tk-list').innerHTML = emptyRow('Loading…');
+    fetchData('tickets', function (s, d) {
+      if (view === 'tickets') { renderTickets(s, d); }
+    });
+  }
+  function openHandpay() {
+    show('handpay'); $('hp-list').innerHTML = emptyRow('Loading…');
+    $('hp-clear').style.display = 'none';
+    fetchData('handpay', function (s, d) {
+      if (view === 'handpay') { renderHandpay(s, d); }
+    });
+  }
+  function openGames() {
+    gmData = null; gmGame = -1;
+    show('games'); setText('gm-title', 'GAMES');
+    $('gm-list').innerHTML = emptyRow('Loading…'); setText('gm-asof', '');
+    fetchData('games', function (s, d) {
+      if (view === 'games') { renderGames(s, d); }
+    });
+  }
+  function openSettings() {
+    show('settings'); $('se-rows').innerHTML = emptyRow('Loading…');
+    fetchData('settings', function (s, d) {
+      if (view === 'settings') { renderSettings(s, d); }
+    });
+  }
+
+  // ---- money confirm: arm {body, back}, YES posts it, then re-open the
+  //      originating view so its numbers repaint (contract confirm pattern) --
+  function askConfirm(q, sub, body, back) {
+    pendingConfirm = { body: body, back: back };
+    setText('cf-q', q); setText('cf-sub', sub); setText('cf-note', '');
+    show('confirm');
+  }
+  function returnFrom(back) {
+    if (back === 'cashout') { openCashout(); }
+    else if (back === 'wallet') { openWallet(); }
+    else if (back === 'handpay') { openHandpay(); }
+    else { show(home()); }
+  }
+  function doConfirm() {
+    if (confirmBusy || !pendingConfirm) { return; }
+    confirmBusy = true;
+    setText('cf-note', 'working…');
+    var pc = pendingConfirm;
+    postAction(pc.body, function (status, data) {
+      confirmBusy = false;
+      if (status === 200 && data && data.ok !== false) {
+        pendingConfirm = null;
+        returnFrom(pc.back);
+      } else {
+        setText('cf-note', 'hub refused (' +
+          (status > 0 ? 'HTTP ' + status : 'no reply') + ') — ' +
+          ((data && data.error) ? String(data.error) : 'try again'));
+      }
+    });
+  }
+
+  // ---- wiring: stubs are LOCAL view flips, zero hub traffic --------------
+  function openStub(title) {
+    return function () { setText('st-title', title); show('stub'); };
+  }
+  // base (every account)
+  $('hb-wallet').onclick   = openWallet;                        // the money hub
+  $('hb-cashout').onclick  = openCashout;                       // NEW: real, live
+  $('hb-logout').onclick   = function () {
+    // In OVERLAY mode this button is "DONE": end the supervisor overlay
+    // directly (no YES/STAY confirm, no attract flash — the friend is not
+    // logging out); the next poll hands the glass back to them.
+    if (overlay) { doOverlayDone(); return; }
+    setText('lo-note', ''); show('logout');
+  };
+  // admin backend stack (buttons hidden by updateTexts unless state.admin)
+  $('hb-machine').onclick  = function () { show('machine'); };  // real read-only info
+  $('hb-tickets').onclick  = openTickets;
+  $('hb-handpay').onclick  = openHandpay;
+  $('hb-games').onclick     = openGames;
+  $('hb-settings').onclick = openSettings;
+
+  // CASH OUT: the toggle sets the machine's cash-out destination (OFF prints a
+  // ticket, ON mirrors credits to the wallet). Funding moved to MY WALLET.
+  $('co-toggle').onclick = function () {
+    if (!coHasWallet || coToggleBusy) { return; }
+    coToggleBusy = true;
+    setText('co-toggle-hint', 'updating…');
+    postAction({ action: 'cashOutToWallet', enable: !coCashToWat },
+      function (status, data) {
+        coToggleBusy = false;
+        if (status === 200 && data && data.ok !== false) {
+          coCashToWat = !coCashToWat;
+          setToggleFace();
+        } else {
+          // Surface a hub refusal (unlinked between poll and tap -> 403, or
+          // any non-ok) instead of silently reverting the face with no word,
+          // matching the ADD/CLEAR confirm path.
+          setToggleFace();
+          setText('co-toggle-hint', status === 200
+            ? 'hub refused — ' + ((data && data.error) || 'try again')
+            : 'hub refused (HTTP ' + status + ') — try again');
+        }
+      });
+  };
+  $('co-back').onclick = function () { show(home()); };
+
+  // MY WALLET money hub: chips + ADD (walletFund, money confirm) fund the
+  // machine; the toggle arms the machine's CASH OUT button -> wallet
+  // (cashOutToWallet, moves no money itself). Reuses the proven paths.
+  $('wl-chip0').onclick = function () { selectWalletChip(0); };
+  $('wl-chip1').onclick = function () { selectWalletChip(1); };
+  $('wl-chip2').onclick = function () { selectWalletChip(2); };
+  $('wl-custom').onclick = openKeypad;
+  for (var kpi = 0; kpi <= 9; kpi++) {
+    (function (dgt) { $('kp' + dgt).onclick = function () { kpDigit(dgt); }; })(kpi);
+  }
+  $('kp-clr').onclick = function () { kpCents = 0; kpRepaint(); };
+  $('kp-ok').onclick = kpOk;
+  $('kp-cancel').onclick = closeKeypad;
+  $('wl-add').onclick = function () {
+    if (!coCanFund) { return; }
+    if (coWalletMc !== null && selCents * 1000 > coWalletMc) {
+      setText('wl-fund-msg', 'Not enough in your wallet'); return;
+    }
+    askConfirm('ADD ' + fmtCents(selCents) + '?',
+      'Moves ' + fmtCents(selCents) + ' from your wallet to this machine.',
+      { action: 'walletFund', cents: selCents }, 'wallet');
+  };
+  $('wl-toggle').onclick = function () {
+    if (!coHasWallet || coToggleBusy) { return; }
+    coToggleBusy = true;
+    setText('wl-toggle-hint', 'updating…');
+    postAction({ action: 'cashOutToWallet', enable: !coCashToWat },
+      function (status, data) {
+        coToggleBusy = false;
+        if (status === 200 && data && data.ok !== false) {
+          coCashToWat = !coCashToWat;
+          setWalletToggleFace();
+        } else {
+          // Surface the hub's refusal VERBATIM — the hub owns the human
+          // wording (a SAS cash-out on a machine not reporting from-EGM answers
+          // "cash-out to wallet isn't set up on this machine yet"). Show it
+          // as-is: no "hub
+          // refused (HTTP nnn)" developer wrapper a guest must never see. Fall
+          // back to a plain line only when the hub gave no message. Never a
+          // fake ON — repaint the real state, then show why.
+          setWalletToggleFace();
+          setText('wl-toggle-hint',
+            (data && data.error) ? data.error : 'could not update — try again');
+        }
+      });
+  };
+  $('wl-back').onclick = function () { show(home()); };
+
+  // HANDPAY CLEAR: admin, money -> confirm (server re-checks admin + egmId)
+  $('hp-clear').onclick = function () {
+    if (!hpCanClear) { return; }
+    askConfirm('CLEAR HANDPAY?',
+      'Resets the pending handpay to credits on this machine.',
+      { action: 'clearHandpay' }, 'handpay');
+  };
+  // GAMES REFRESH: status-only, no confirm; re-open to repaint the list
+  $('gm-refresh').onclick = function () {
+    if (gmBusy) { return; }
+    gmBusy = true;
+    setText('gm-asof', 'refreshing…');
+    postAction({ action: 'refreshGames' }, function () {
+      gmBusy = false;
+      if (view === 'games') { openGames(); }
+    });
+  };
+  // money confirm dialog (shared by ADD-from-wallet + CLEAR-handpay)
+  $('cf-yes').onclick = doConfirm;
+  $('cf-no').onclick  = function () {
+    var b = pendingConfirm ? pendingConfirm.back : null;
+    pendingConfirm = null;
+    returnFrom(b);
+  };
+
+  // BACK routes to home() (not a remembered origin) so a hub-side tier flip
+  // mid-sub-view still lands the user on the menu that matches their fob
+  $('tk-back').onclick = function () { show(home()); };
+  $('hp-back').onclick = function () { show(home()); };
+  // GAMES back walks the levels: paytables -> game list -> home
+  $('gm-back').onclick = function () {
+    if (gmGame >= 0 && gmData) { paintGameList(); } else { show(home()); }
+  };
+  $('se-back').onclick = function () { show(home()); };
+  $('st-back').onclick = function () { show(home()); };
+  $('mi-back').onclick = function () { show(home()); };
+  $('lo-yes').onclick  = doLogout;
+  $('lo-no').onclick   = function () { show(home()); };
+
+  // ---- boot ---------------------------------------------------------------
+  show('attract');
+  if (!egmId) { note('missing egm= in page URL'); }
+  poll();
+})();
+</script>
+</body>
+</html>

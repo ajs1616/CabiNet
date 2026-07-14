@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Regenerated 2026-07-02: cert-less HTTP on 8081 is the permanent path (never HTTPS/8443).
+     Informational only - the AVP takes its G2S host from DHCP Option 43.
+     Canonical per-vendor file: tftp-root/igt/g2s.xml -->
+<IGTConfiguration>
+    <G2S>
+        <Host>http://192.168.50.2:8081/G2S</Host>
+        <Protocol>HTTP</Protocol>
+        <Port>8081</Port>
+    </G2S>
+</IGTConfiguration>

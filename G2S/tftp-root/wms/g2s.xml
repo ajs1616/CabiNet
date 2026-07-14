@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WMS BlueBird 2 Enhanced (BB2E) G2S bootstrap config - CabiNet
+
+  TODO(bench): SCHEMA UNVERIFIED. The <WMSConfiguration> element tree below
+  is CabiNet design fiction, derived from the IGT-side g2s.xml scaffold -
+  it is NOT from any WMS document, and it is UNKNOWN whether a BB2E ever
+  TFTP-fetches a file by this name (the IGT AVP never TFTP'd anything).
+  This file exists so that IF a BB2E asks TFTP for wms/g2s.xml, the fetch is
+  served and logged (journalctl -u casinonet-tftp) instead of timing out.
+  Treat a fetch of this file as a capture event, not a configuration event.
+  See G2S/BENCH_BRINGUP_WMS.md.
+
+  VALUES are the current proven stack (2026-07-01): host
+  http://192.168.50.2:8081/G2S, slot net 192.168.50.0/24, cert-less HTTP only.
+  (The former cert-era <Enrollment> block - RequireCertificate/AllowSelfSigned
+  - was removed 2026-07-01; cert-less is permanent, do not reintroduce it.)
+-->
+<WMSConfiguration>
+    <System>
+        <MachineType>BlueBird2e</MachineType>
+        <Manufacturer>WMS</Manufacturer>
+        <Model>BB2E</Model>
+    </System>
+
+    <G2S>
+        <HostDiscovery>
+            <Method>DHCP</Method>
+            <UseDHCPOption43>true</UseDHCPOption43>
+            <FallbackMethod>DNS</FallbackMethod>
+            <DNSNames>
+                <Name>g2s.local</Name>
+                <Name>g2shost.local</Name>
+                <Name>casinonet.local</Name>
+            </DNSNames>
+        </HostDiscovery>
+
+        <!-- Single-host topology: primary and secondary are the same
+             CabiNet host. HTTP on 8081 - never HTTPS/8443. -->
+        <Host>
+            <Primary>
+                <Protocol>HTTP</Protocol>
+                <Address>192.168.50.2</Address>
+                <Port>8081</Port>
+                <Path>/G2S</Path>
+            </Primary>
+            <Secondary>
+                <Protocol>HTTP</Protocol>
+                <Address>192.168.50.2</Address>
+                <Port>8081</Port>
+                <Path>/G2S</Path>
+            </Secondary>
+        </Host>
+
+        <Communications>
+            <HeartbeatInterval>60</HeartbeatInterval>
+            <RetryCount>3</RetryCount>
+            <RetryDelay>5</RetryDelay>
+            <Timeout>30</Timeout>
+        </Communications>
+    </G2S>
+
+    <AFT>
+        <Enabled>true</Enabled>
+        <TransferIn>true</TransferIn>
+        <TransferOut>true</TransferOut>
+        <Bonus>true</Bonus>
+        <Debit>true</Debit>
+        <InHouse>true</InHouse>
+        <MaxAmount>100000</MaxAmount>
+        <MinAmount>100</MinAmount>
+    </AFT>
+
+    <WAT>
+        <Enabled>true</Enabled>
+        <RequirePlayerCard>true</RequirePlayerCard>
+        <SessionTimeout>3600</SessionTimeout>
+    </WAT>
+
+    <Network>
+        <DHCP>
+            <Enabled>true</Enabled>
+            <SendHostname>true</SendHostname>
+            <Hostname>WMS-BB2-{MAC}</Hostname>
+            <!-- TODO(bench): real BB2E option-60 vendor-class string unknown;
+                 capture it and align with the DHCP server's match list
+                 (WMS-Gaming / WMS-BB2 / WMS-BlueBird). -->
+            <VendorClass>WMS-BB2</VendorClass>
+        </DHCP>
+    </Network>
+</WMSConfiguration>
