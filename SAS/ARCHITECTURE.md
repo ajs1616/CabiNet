@@ -44,7 +44,8 @@ A modern, fully network-based SAS (Slot Accounting System) implementation where 
 Each Raspberry Pi SMIB acts as a bridge between the gaming machine's serial SAS interface and the network-based server:
 
 #### Hardware Components
-- **Raspberry Pi 4B** (or Pi Zero 2 W for cost optimization)
+- **Raspberry Pi 3B+** (recommended — built-in Ethernet, cheap used) or 4B;
+  a Zero 2 W works but needs a USB-Ethernet HAT on the wired-only floor
 - **RS-232 HAT** with proper voltage levels for gaming machines
 - **7" Touch Display** for local control and diagnostics
 - **Power Supply** with battery backup

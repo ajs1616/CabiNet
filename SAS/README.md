@@ -1,8 +1,9 @@
 # SAS — CabiNet's SAS bridge stack
 
-This tree is the host side of CabiNet's SAS leg: a Pi Zero "SMIB" sits on the
+This tree is the host side of CabiNet's SAS leg: a small Raspberry Pi "SMIB"
+(a used **3B+** is the recommended board — built-in Ethernet) sits on the
 machine's SAS serial port, runs `sas_host.py`, and bridges the machine to the
-CabiNet hub over Ethernet. Live-proven daily on a WMS BB2 — meters, AFT credit
+CabiNet host over Ethernet. Live-proven daily on a WMS BB2 — meters, AFT credit
 transfers both directions, cross-machine TITO, legacy bonusing, and handpay
 reset all run on real iron.
 
@@ -53,8 +54,9 @@ validation modes".
 
 ## Running it
 
-Normally you don't run this by hand — `deploy/zero2w_sas_setup.sh` installs it
-as the `casinonet-sas` unit on the Zero (see `deploy/SMIB_FRESH_IMAGE.md`).
+Normally you don't run this by hand — `deploy/zero2w_sas_setup.sh` (works on
+any PL011 Pi despite the name) installs it as the `casinonet-sas` unit on the
+SMIB Pi (see `deploy/SMIB_FRESH_IMAGE.md`).
 Manually:
 
 ```bash
@@ -66,7 +68,9 @@ gateway (the CabiNet host is the DHCP server on the slot segment).
 
 ## Hardware
 
-- Pi Zero 2 W (or any Pi with a PL011 UART) + RS-232 level shifter (MAX232)
+- Pi 3B+ recommended (built-in Ethernet); any Pi with a PL011 UART works
+  (a Zero 2 W needs a USB-Ethernet HAT on the wired-only floor)
+- RS-232 level shifter (a $5 "MAX3232 RS232 to TTL" board)
 - SAS harness: TX, RX, GND to the machine's SAS port, 19200 baud
 - The PL011 requirement is real: 9-bit wakeup needs per-byte parity switching
 

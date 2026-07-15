@@ -73,10 +73,10 @@ def _resp(address, command, code):
 
 
 def _target(rev=1, prop="FUNCINO", line1="1 COLLECTOR WAY",
-            line2="GAME ROOM NV", title=None):
+            line2="GAME ROOM NV", title=None, expire=0):
     """A parsed-shape target dict (what parse_ticket_data_reply emits)."""
     return {"propName": prop, "line1": line1, "line2": line2,
-            "titleCash": title, "rev": rev}
+            "titleCash": title, "expireDays": expire, "rev": rev}
 
 
 def _elements(frame):
@@ -210,6 +210,22 @@ class TestBuildSetTicketData:
             except ValueError:
                 pass
 
+    def test_allow_no_text_len_03_expiration_only_form(self):
+        """Table 15.4a's length floor is 02; the len-03 form = host ID +
+        expiration with every text slot untouched — the expiration-only
+        write used after a 0x7C carried the text."""
+        frame = build_set_ticket_data(1, host_id=0x0203, expiration_days=30,
+                                      allow_no_text=True)
+        inner = b"\x03\x02" + b"\x1e"
+        assert frame == _crc(bytes([0x01, 0x7D, 0x03]) + inner)
+
+    def test_allow_no_text_still_validates_ranges(self):
+        try:
+            build_set_ticket_data(1, expiration_days=999, allow_no_text=True)
+            assert False, "must raise"
+        except ValueError:
+            pass
+
 
 class TestParseTicketDataFlag:
     def test_ack_and_nack(self):
@@ -237,7 +253,24 @@ class TestParseTicketDataReply:
         out = sas_host.parse_ticket_data_reply(dict(self.GOOD))
         assert out == {"propName": "FUNCINO", "line1": "1 COLLECTOR WAY",
                        "line2": "GAME ROOM NV", "titleCash": "FUN MONEY",
-                       "rev": 3}
+                       "expireDays": 0, "rev": 3}
+
+    def test_expire_days_absent_none_or_valid(self):
+        """Absent/null = old hub -> 0; a legal 0..255 int passes through."""
+        assert sas_host.parse_ticket_data_reply(
+            dict(self.GOOD))["expireDays"] == 0
+        assert sas_host.parse_ticket_data_reply(
+            dict(self.GOOD, expireDays=None))["expireDays"] == 0
+        for v in (0, 1, 30, 255):
+            assert sas_host.parse_ticket_data_reply(
+                dict(self.GOOD, expireDays=v))["expireDays"] == v
+
+    def test_expire_days_junk_rejects_the_whole_dict(self):
+        """A PRESENT junk expireDays is a malformed push — partial trust
+        is how wrong bytes reach a one-shot wire."""
+        for v in (True, False, "30", 3.5, -1, 256, [], {}):
+            assert sas_host.parse_ticket_data_reply(
+                dict(self.GOOD, expireDays=v)) is None
 
     def test_title_null_absent_or_blank_all_mean_no_title(self):
         for variant in (None, "", "   "):
@@ -391,14 +424,49 @@ class TestApplyTicketHeader:
             sleep=sleeps.append, **kw)
         return ok, detail, tp, sleeps
 
-    def test_7c_ack_is_the_whole_story(self):
-        ok, detail, tp, sleeps = self._apply([_resp(1, 0x7C, 0x01)])
+    def test_7c_ack_then_expiration_only_7d(self):
+        """The text rides 0x7C; the expiration byte can only ride 0x7D —
+        a 7C ACK is now followed by exactly one text-less 7D."""
+        ok, detail, tp, sleeps = self._apply(
+            [_resp(1, 0x7C, 0x01), _resp(1, 0x7D, 0x01)])
         assert ok is True and "0x7C" in detail
-        assert len(tp.frames) == 1
+        assert "expiration 0d via 0x7D (ACK)" in detail
+        assert len(tp.frames) == 2
         assert tp.frames[0] == build_set_extended_ticket_data(
             1, location="FUNCINO", address1="1 COLLECTOR WAY",
             address2="GAME ROOM NV")
-        assert sleeps == []                     # no second poll, no pacing
+        assert tp.frames[1] == build_set_ticket_data(
+            1, host_id=DEFAULT_SYSTEM_ID, expiration_days=0,
+            allow_no_text=True)
+        assert sleeps == [sas_host.SAS_POLL_FLOOR]
+
+    def test_expiration_7d_nack_or_silence_never_fails_the_header(self):
+        """The expiration write is advisory: a machine that refuses or
+        ignores the text-less 7D keeps its ACKed header (ok=True) with an
+        honest detail."""
+        ok, detail, _, _ = self._apply(
+            [_resp(1, 0x7C, 0x01), _resp(1, 0x7D, 0x00)],
+            target=_target(expire=30))
+        assert ok is True and "30d 0x7D NACK" in detail
+        ok, detail, _, _ = self._apply(
+            [_resp(1, 0x7C, 0x01), b""], target=_target(expire=30))
+        assert ok is True and "30d 0x7D silent" in detail
+
+    def test_expiration_days_ride_both_7d_forms(self):
+        """expireDays reaches the wire byte in the after-7C form AND the
+        7C-silent fallback form."""
+        _, _, tp, _ = self._apply(
+            [_resp(1, 0x7C, 0x01), _resp(1, 0x7D, 0x01)],
+            target=_target(expire=45))
+        assert tp.frames[1] == build_set_ticket_data(
+            1, host_id=DEFAULT_SYSTEM_ID, expiration_days=45,
+            allow_no_text=True)
+        _, _, tp, _ = self._apply(
+            [b"", _resp(1, 0x7D, 0x01)], target=_target(expire=45))
+        assert tp.frames[1] == build_set_ticket_data(
+            1, host_id=DEFAULT_SYSTEM_ID, expiration_days=45,
+            location="FUNCINO", address1="1 COLLECTOR WAY",
+            address2="GAME ROOM NV")
 
     def test_7c_nack_never_escalates_to_7d(self):
         ok, detail, tp, _ = self._apply([_resp(1, 0x7C, 0x00)])
@@ -408,6 +476,7 @@ class TestApplyTicketHeader:
     def test_7c_silence_falls_back_to_7d_ack_with_pacing(self):
         ok, detail, tp, sleeps = self._apply([b"", _resp(1, 0x7D, 0x01)])
         assert ok is True and "0x7D" in detail
+        assert "expiration 0d" in detail
         assert [f[1] for f in tp.frames] == [0x7C, 0x7D]
         assert tp.frames[1] == build_set_ticket_data(
             1, host_id=DEFAULT_SYSTEM_ID, expiration_days=0,
@@ -767,37 +836,46 @@ class TestTicketHeaderEndToEnd:
 
     def test_apply_on_first_online_session(self):
         run = _run_ticket_channel()
-        assert run["samples"]["after_apply1"] == 1
+        # a successful apply is now TWO frames: 0x7C text + the text-less
+        # 0x7D expiration write
+        assert run["samples"]["after_apply1"] == 2
         cmd, frame = run["machine"].ticket_frames[0]
         assert cmd == CMD_SET_EXTENDED_TICKET_DATA
         assert b"FUNCINO" in frame
+        cmd2, frame2 = run["machine"].ticket_frames[1]
+        assert cmd2 == CMD_SET_TICKET_DATA
+        assert frame2[2] == 0x03                  # len-03 expiration-only
 
     def test_same_rev_never_resends(self):
         """Rev 1 kept echoing for 4+ reports after the apply — the frame
-        count froze at 1."""
+        count froze at the apply's two frames."""
         run = _run_ticket_channel()
         assert run["samples"]["after_soak"] == \
-            run["samples"]["after_apply1"] == 1
+            run["samples"]["after_apply1"] == 2
 
     def test_park_defers_pending_rev(self):
         """Rev 2 arrived while the poll thread was provably parked (polls
         counter frozen): no frames moved, appliedRev stayed 1; the apply
         happened only after resume."""
         run = _run_ticket_channel()
-        assert run["samples"]["park_engaged"] == 1
-        assert run["samples"]["after_park"] == 1
+        assert run["samples"]["park_engaged"] == 2
+        assert run["samples"]["after_park"] == 2
         assert run["hub"].park_applied == 1
-        assert run["samples"]["after_apply2"] == 2
+        assert run["samples"]["after_apply2"] == 4
 
     def test_nack_gets_exactly_one_attempt_and_an_honest_verdict(self):
-        """The machine NACKed rev 3: one 0x7C attempt (no 0x7D — a NACK
-        is understanding, not silence), appliedRev pinned at 2, and the
-        snapshot detail says NACK."""
+        """The machine NACKed rev 3: one 0x7C attempt (no 0x7D of any kind
+        — a NACK is understanding, not silence), appliedRev pinned at 2,
+        and the snapshot detail says NACK."""
         run = _run_ticket_channel()
         assert run["samples"]["after_nacksoak"] == \
-            run["samples"]["after_apply2"] + 1 == 3
-        assert all(cmd == CMD_SET_EXTENDED_TICKET_DATA
-                   for cmd, _ in run["machine"].ticket_frames)
+            run["samples"]["after_apply2"] + 1 == 5
+        # frames alternate 7C,7D per ACKed apply; the NACKed rev adds ONE
+        # bare 7C at the tail
+        cmds = [cmd for cmd, _ in run["machine"].ticket_frames]
+        assert cmds == [CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA,
+                        CMD_SET_EXTENDED_TICKET_DATA, CMD_SET_TICKET_DATA,
+                        CMD_SET_EXTENDED_TICKET_DATA]
         final = run["hub"].final_td
         assert final["appliedRev"] == 2
         assert "NACK" in final["detail"]

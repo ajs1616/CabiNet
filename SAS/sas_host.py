@@ -283,14 +283,19 @@ def parse_ticket_data_reply(value):
     """C2 exact-shape guard for the report reply's "ticketData" key —
     the ticket-header target the hub pushes to every machine's printed
     tickets. The contract shape is {"propName": str, "line1": str,
-    "line2": str, "titleCash": str|null, "rev": int}; anything else —
-    non-dict, junk types, bool/negative rev, an unset/blank propName —
-    returns None and changes NOTHING (same discipline as the sasEnabled
-    exact-bool gate). titleCash may ride as null or be absent (both mean
-    'no title'). Strings are stripped, blank line1/line2/titleCash
-    normalize to ''/None (the applier omits them — C1: never push empty
-    over existing machine config), and every value is clamped to the
-    hub-side 64-char tenant bound defensively."""
+    "line2": str, "titleCash": str|null, "expireDays": int, "rev": int};
+    anything else — non-dict, junk types, bool/negative rev, an unset/
+    blank propName — returns None and changes NOTHING (same discipline as
+    the sasEnabled exact-bool gate). titleCash may ride as null or be
+    absent (both mean 'no title'). expireDays is the printed-ticket
+    expiration in days (0 = never — the collector-right default): ABSENT
+    means an old hub and rides as 0, but a PRESENT junk value (bool,
+    float, outside the one-byte 0x7D range 0..255) rejects the whole
+    dict — partially trusting a malformed push is how wrong bytes reach
+    the wire. Strings are stripped, blank line1/line2/titleCash normalize
+    to ''/None (the applier omits them — C1: never push empty over
+    existing machine config), and every value is clamped to the hub-side
+    64-char tenant bound defensively."""
     if not isinstance(value, dict):
         return None
     prop = value.get("propName")
@@ -298,6 +303,7 @@ def parse_ticket_data_reply(value):
     line2 = value.get("line2")
     title = value.get("titleCash")
     rev = value.get("rev")
+    exp = value.get("expireDays", 0)
     if not isinstance(prop, str) or not prop.strip():
         return None
     if not isinstance(line1, str) or not isinstance(line2, str):
@@ -306,9 +312,15 @@ def parse_ticket_data_reply(value):
         return None
     if not isinstance(rev, int) or isinstance(rev, bool) or rev < 0:
         return None
+    if exp is None:
+        exp = 0
+    if not isinstance(exp, int) or isinstance(exp, bool) \
+            or not 0 <= exp <= 255:
+        return None
     title = (title or "").strip()[:64] or None
     return {"propName": prop.strip()[:64], "line1": line1.strip()[:64],
-            "line2": line2.strip()[:64], "titleCash": title, "rev": rev}
+            "line2": line2.strip()[:64], "titleCash": title,
+            "expireDays": exp, "rev": rev}
 
 
 class TicketHeaderState:
@@ -402,11 +414,15 @@ def apply_ticket_header(transport, address, target, protocol=None,
          code 00 Location = propName, 01 Address 1 = line1, 02 Address 2
          = line2. Extended-validation hosts use 7C, its data takes
          precedence over 7D, and it has no positional side effects.
+      1b. On a 7C ACK: 0x7D in its text-less form (host ID + the hub's
+         expireDays byte, 00 = never) — 7C has no expiration slot, so
+         this is the only host write for the printed-ticket expiration.
+         Advisory: its verdict rides the detail but never fails a header
+         that 7C already applied.
       2. 0x7D Set Ticket Data (§15.4) — the fallback, ONLY on 7C silence
          (an old/standard-validation machine that never learned 7C). Its
-         positional layout forces a host ID (our system id) and an
-         expiration byte (00 = tickets never expire — the collector-right
-         value) alongside the same three text lines.
+         positional layout forces a host ID (our system id) and the
+         expiration byte alongside the same three text lines.
 
     A 7C NACK (flag 00) means the machine UNDERSTOOD and refused — no 7D
     escalation, honest failure verdict instead. titleCash has NO SAS
@@ -414,11 +430,12 @@ def apply_ticket_header(transport, address, target, protocol=None,
     printing a cash title there would brand the WRONG tickets), so it is
     reported as skipped, never guessed onto the wire. Empty line1/line2
     are OMITTED (C1: never push empty over existing machine config).
-    Poll-thread only; one sleep(pace) separates the two polls."""
+    Poll-thread only; one sleep(pace) separates consecutive polls."""
     proto = protocol or SASProtocol()
     loc = target["propName"]
     a1 = target["line1"] or None
     a2 = target["line2"] or None
+    days = int(target.get("expireDays") or 0)
     note = (" · titleCash skipped: no SAS field for the cash ticket title "
             "(6.02 §15.3 has only restricted/debit titles)"
             if target.get("titleCash") else "")
@@ -431,7 +448,24 @@ def apply_ticket_header(transport, address, target, protocol=None,
     flag = _ticket_set_flag(resp, address, CMD_SET_EXTENDED_TICKET_DATA,
                             proto)
     if flag is True:
-        return True, f"applied {fields} via 0x7C (ACK){note}"
+        # 0x7C carried the text but has NO expiration slot — 0x7D's
+        # host-id+expiration-only form (allow_no_text) is the one way to
+        # set it, and §15.4 precedence means this 7D cannot disturb the
+        # 7C text. Sent even for 0 (never expires): the hub value must WIN
+        # over whatever a previous host once burned into the machine. Its
+        # verdict rides the detail but never fails the header apply — an
+        # old machine that NACKs/ignores a text-less 7D keeps its header.
+        sleep(pace)
+        resp = transport.transact(build_set_ticket_data(
+            address, host_id=host_id, expiration_days=days,
+            allow_no_text=True))
+        eflag = _ticket_set_flag(resp, address, CMD_SET_TICKET_DATA, proto)
+        edetail = {True: f" · expiration {days}d via 0x7D (ACK)",
+                   False: f" · expiration {days}d 0x7D NACK — machine "
+                          "refused (expiration unchanged)",
+                   None: f" · expiration {days}d 0x7D silent — machine "
+                         "may not honor host expiration"}[eflag]
+        return True, f"applied {fields} via 0x7C (ACK){edetail}{note}"
     if flag is False:
         return False, ("0x7C NACK — the machine flagged the ticket data "
                        "invalid; no 0x7D fallback (it understood and "
@@ -439,12 +473,12 @@ def apply_ticket_header(transport, address, target, protocol=None,
 
     sleep(pace)
     resp = transport.transact(build_set_ticket_data(
-        address, host_id=host_id, expiration_days=0,
+        address, host_id=host_id, expiration_days=days,
         location=loc, address1=a1, address2=a2))
     flag = _ticket_set_flag(resp, address, CMD_SET_TICKET_DATA, proto)
     if flag is True:
-        return True, (f"applied {fields} via 0x7D fallback "
-                      f"(0x7C unsupported/silent){note}")
+        return True, (f"applied {fields} + expiration {days}d via 0x7D "
+                      f"fallback (0x7C unsupported/silent){note}")
     if flag is False:
         return False, ("0x7D NACK — the machine flagged the ticket data "
                        f"invalid (0x7C was silent){note}")

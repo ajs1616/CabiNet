@@ -102,6 +102,11 @@ MAX_DENOM_CENTS = 10_000
 HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      "ticket_prop_name", "ticket_line1", "ticket_line2",
                      "ticket_title_cash", "ticket_rev",
+                     # printed-ticket expiration in DAYS, 0/absent = never
+                     # (the collector-right default). One value drives both
+                     # protocols: the SAS 0x7D expiration byte (0..255) and
+                     # the G2S voucher options G2S_expireCashPromo/NonCash.
+                     "ticket_expire_days",
                      # the collector's GAMEROOM name (Settings tab) painted in
                      # lights on the player-facing glass/kiosk; absent/"" =
                      # neutral fallback. CabiNet is the product; this is theirs.
@@ -939,6 +944,15 @@ class HubStore:
                         "DELETE FROM host_settings WHERE k=?", (key,))
                     self._conn.commit()
                 return value
+        if key == "ticket_expire_days" and not value:
+            # empty = "never expires" (0) -> DELETE the row, the same
+            # unset-is-a-delete posture as the ticket text tenants;
+            # ticket_header() reads absent as expireDays 0.
+            with self.lock:
+                self._conn.execute(
+                    "DELETE FROM host_settings WHERE k=?", (key,))
+                self._conn.commit()
+            return value
         if key == "gameroom_name" and not value:
             # empty = the collector cleared their gameroom name -> DELETE the
             # row so host_setting reads "" and the glass falls back to the
@@ -985,13 +999,14 @@ class HubStore:
 
     def ticket_header(self):
         """One-SELECT best-effort read of the ticket-header tenants (C1):
-        {"propName","line1","line2","titleCash","rev"} — absent fields None,
-        rev an int (0 until the first save). Sits behind the engine's
-        TTL-cached report-reply path like host_setting, so a db error
-        (_warn_limited, dying-SD posture) degrades to all-unset — which the
-        callers read as "push nothing" — rather than raising."""
+        {"propName","line1","line2","titleCash","expireDays","rev"} — absent
+        fields None, rev an int (0 until the first save), expireDays an int
+        clamped 0..255 (0/absent = tickets never expire). Sits behind the
+        engine's TTL-cached report-reply path like host_setting, so a db
+        error (_warn_limited, dying-SD posture) degrades to all-unset —
+        which the callers read as "push nothing" — rather than raising."""
         out = {"propName": None, "line1": None, "line2": None,
-               "titleCash": None, "rev": 0}
+               "titleCash": None, "expireDays": 0, "rev": 0}
         colmap = {"ticket_prop_name": "propName", "ticket_line1": "line1",
                   "ticket_line2": "line2", "ticket_title_cash": "titleCash"}
         try:
@@ -999,7 +1014,8 @@ class HubStore:
                 rows = self._conn.execute(
                     "SELECT k, v FROM host_settings WHERE k IN "
                     "('ticket_prop_name','ticket_line1','ticket_line2',"
-                    "'ticket_title_cash','ticket_rev')").fetchall()
+                    "'ticket_title_cash','ticket_expire_days',"
+                    "'ticket_rev')").fetchall()
         except sqlite3.Error as e:
             self._warn_limited("ticket_header", e)
             return out
@@ -1007,6 +1023,11 @@ class HubStore:
             if r["k"] == "ticket_rev":
                 try:
                     out["rev"] = int(r["v"])
+                except (TypeError, ValueError):
+                    pass
+            elif r["k"] == "ticket_expire_days":
+                try:
+                    out["expireDays"] = max(0, min(255, int(r["v"])))
                 except (TypeError, ValueError):
                     pass
             elif r["v"]:            # "" reads as unset too (defensive —

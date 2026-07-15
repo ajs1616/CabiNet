@@ -268,7 +268,8 @@ def build_set_extended_ticket_data(address: int, location=None,
 
 def build_set_ticket_data(address: int, host_id: int = DEFAULT_SYSTEM_ID,
                           expiration_days: int = 0, location=None,
-                          address1=None, address2=None) -> bytes:
+                          address1=None, address2=None,
+                          allow_no_text: bool = False) -> bytes:
     """0x7D Set Ticket Data — SPEC-CITED (6.02 §15.4, Table 15.4a):
     [addr][7D][len 02-7E][host ID 2 binary][expiration 1 binary]
     [locLen][loc][addr1Len][addr1][addr2Len][addr2][crc]. Fields are
@@ -278,11 +279,16 @@ def build_set_ticket_data(address: int, host_id: int = DEFAULT_SYSTEM_ID,
     LSB-first (§2's global rule: 'All data exchanged in the binary format
     are sent least significant byte (LSB) first'). expiration_days 00 =
     tickets never expire (the collector-right default — 15.4a defines no
-    'do not change' for this slot, so sending 7D always sets it). At
-    least one text field is required here (the host-ID-only min-length-02
-    form and the length-00 interrogate are out of this builder's scope).
-    Max frame cross-check: 2+1+3*(1+40) = 126 = 0x7E, exactly the
-    table's length ceiling."""
+    'do not change' for this slot, so sending 7D always sets it).
+
+    allow_no_text=True permits the text-less len-03 form — host ID +
+    expiration only, every text slot untouched (Table 15.4a's length
+    floor is 02, so 03 is legal on the wire). That is the expiration-only
+    write the hub uses AFTER a 0x7C carried the text (7C text takes §15.4
+    precedence; 7C has no expiration slot, so 7D is the only way to set
+    it). Default False keeps the original all-None accident guard for
+    text pushes. Max frame cross-check: 2+1+3*(1+40) = 126 = 0x7E,
+    exactly the table's length ceiling."""
     if not 0 <= host_id <= 0xFFFF:
         raise ValueError(f"host_id must be 0..65535, got {host_id}")
     if not 0 <= expiration_days <= 0xFF:
@@ -290,8 +296,10 @@ def build_set_ticket_data(address: int, host_id: int = DEFAULT_SYSTEM_ID,
                          f"expires), got {expiration_days}")
     texts = [(location, "location"), (address1, "address1"),
              (address2, "address2")]
-    if all(text is None for text, _ in texts):
-        raise ValueError("set ticket data needs at least one text field")
+    if all(text is None for text, _ in texts) and not allow_no_text:
+        raise ValueError("set ticket data needs at least one text field "
+                         "(pass allow_no_text=True for the expiration-only "
+                         "form)")
     while texts and texts[-1][0] is None:
         texts.pop()                       # trailing fields: omit entirely
     inner = host_id.to_bytes(2, "little") + bytes([expiration_days])

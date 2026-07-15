@@ -4060,6 +4060,8 @@ class G2SHost:
                                    "line1": hdr.get("line1") or "",
                                    "line2": hdr.get("line2") or "",
                                    "titleCash": hdr.get("titleCash"),
+                                   "expireDays": int(hdr.get("expireDays")
+                                                     or 0),
                                    "rev": int(hdr.get("rev") or 0)}
         return reply
 
@@ -10509,6 +10511,67 @@ class G2SHost:
             log.info("🎫 [ticket:%s] header push -> %s", a.egm_id, v)
         return verdicts
 
+    def push_ticket_expiration_g2s(self):
+        """Fan the hub ticket-expiration setting (days, 0 = never) to every
+        ONLINE G2S EGM via the same proven option-change cycle as
+        push_ticket_header_g2s — but into the voucher device's PARAMS
+        option (G2S_voucherOptions/G2S_voucherOptions, a complexValue
+        block), touching only G2S_expireCashPromo / G2S_expireNonCash and
+        only where the option advertises them. Params already at target
+        skip via option_values_equal (all-at-target = clean wire no-op);
+        refusals are recorded and STOPPED at, never escalated — retry is
+        the operator re-saving (the push_ticket_header_g2s discipline).
+        NOTE the machine may enforce its own floor/ceiling on these
+        options (OCX013 invalid value surfaces in the verdict) — bench
+        truth wins over the hub's 0..255 bound."""
+        days = int(self.ticket_header().get("expireDays") or 0)
+        dc, di = "G2S_voucher", "1"
+        gid, oid = "G2S_voucherOptions", "G2S_voucherOptions"
+        want = str(days)
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        verdicts = []
+        for a in assocs:
+            with a.lock:
+                online = a.comms_state == "onLine"
+                opt = a.config_options.get(f"{dc}/{di}/{gid}/{oid}")
+                opt = dict(opt) if opt else None
+            if not online:
+                continue
+            v = {"egmId": a.egm_id, "ok": False, "days": days}
+            if not opt:
+                v["error"] = ("voucher params not in the config-sync "
+                              "inventory — run getOptionList on "
+                              "G2S_voucher/1, then re-save")
+            else:
+                vals = option_param_values(opt.get("currentValues"))
+                targets = {pid: want for pid in
+                           ("G2S_expireCashPromo", "G2S_expireNonCash")
+                           if pid in vals}
+                if not targets:
+                    v["error"] = ("option advertises no expiration params "
+                                  "(G2S_expireCashPromo/NonCash absent)")
+                else:
+                    changes = {pid: w for pid, w in targets.items()
+                               if not option_values_equal(vals.get(pid), w)}
+                    if not changes:
+                        v.update(ok=True, alreadyApplied=True)
+                    else:
+                        res = self.start_option_change_cycle(
+                            a, device_class=dc, device_id=di,
+                            option_group_id=gid, option_id=oid,
+                            values=changes)
+                        v["ok"] = bool(res.get("ok"))
+                        if v["ok"]:
+                            v["configId"] = res.get("configId")
+                            v["params"] = sorted(changes)
+                        else:
+                            v["error"] = str(res.get("error"))[:200]
+            verdicts.append(v)
+            log.info("🎫 [ticket:%s] expiration push (%sd) -> %s",
+                     a.egm_id, days, v)
+        return verdicts
+
     def enqueue_app_error(self, assoc, req, error_code, error_text):
         """Class-level error response: empty class element + errorCode (§1.18.9).
 
@@ -14209,6 +14272,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                            "line1": _th.get("line1"),
                            "line2": _th.get("line2"),
                            "titleCash": _th.get("titleCash"),
+                           "expireDays": int(_th.get("expireDays") or 0),
                            "rev": int(_th.get("rev") or 0)}}
             # UI build stamp: home.html's mtime. The DSI kiosk (chromium
             # --incognito, nobody ever presses F5 on it) reloads itself when
@@ -16135,13 +16199,14 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                       ("ticketLine2", "ticket_line2"),
                       ("ticketTitleCash", "ticket_title_cash"))
             tf_present = [(jk, tk) for jk, tk in tf_map if jk in req]
-            if tf_present:
-                # Ticket header (C3). Validate EVERY present field before
-                # writing ANY — a 400 on the third field must not leave a
-                # half-saved header (and no rev bump means no push of a
-                # partial save). Strict strings only; stripped; 64-char
-                # bound (the printed-line width); "" clears the tenant
-                # (hub.db deletes the row — absent = unset, C1).
+            exp_present = "ticketExpireDays" in req
+            if tf_present or exp_present:
+                # Ticket header + expiration (C3). Validate EVERY present
+                # field before writing ANY — a 400 on the third field must
+                # not leave a half-saved header (and no rev bump means no
+                # push of a partial save). Strict strings only; stripped;
+                # 64-char bound (the printed-line width); "" clears the
+                # tenant (hub.db deletes the row — absent = unset, C1).
                 clean = []
                 for jk, tk in tf_present:
                     tv = req.get(jk)
@@ -16153,9 +16218,28 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                          f"{MAX_TICKET_FIELD_LEN} "
                                          "characters")
                     clean.append((jk, tk, tv))
+                exp_days = None
+                if exp_present:
+                    # Expiration in DAYS, 0 = never (the collector-right
+                    # default). Strict int (never bool), 0..255 — the SAS
+                    # 0x7D slot is one byte, and one hub value drives both
+                    # protocol legs, so the tighter wire bound wins.
+                    ev = req.get("ticketExpireDays")
+                    if isinstance(ev, bool) or not isinstance(ev, int):
+                        raise ValueError("ticketExpireDays must be an "
+                                         "integer (days, 0 = never)")
+                    if not 0 <= ev <= 255:
+                        raise ValueError("ticketExpireDays must be 0..255 "
+                                         "(0 = never expires)")
+                    exp_days = ev
                 for jk, tk, tv in clean:
                     engine.hub_store.set_host_setting(tk, tv)
                     out[jk] = tv or None          # cleared echoes null
+                if exp_days is not None:
+                    engine.hub_store.set_host_setting(
+                        "ticket_expire_days", str(exp_days) if exp_days
+                        else "")                  # 0 clears the tenant
+                    out["ticketExpireDays"] = exp_days
                 # EVERY accepted write bumps the rev (C2) — including a
                 # clear: satellites see ticketData vanish/refresh, and the
                 # UI's pending note re-anchors.
@@ -16169,6 +16253,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # option-change cycle (no-op unless propName is set).
                 # Verdicts are logged inside and echoed for the UI toast.
                 out["ticketPush"] = engine.push_ticket_header_g2s()
+                if exp_days is not None:
+                    # Expiration rides its own G2S option (voucherParams,
+                    # not voucherTextFields) — separate cycle, own verdicts.
+                    out["ticketExpirePush"] = \
+                        engine.push_ticket_expiration_g2s()
             if "companionId" in req:
                 # Satellite assignment (v11, zero-config onboarding): bind a
                 # Companion to a machine FROM THE UI so the hub — not the unit's

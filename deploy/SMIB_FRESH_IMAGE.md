@@ -230,7 +230,7 @@ seatd/libseat/cage/chromium** — cog-drm needs none of them.
    ```
 3. Verify — the panel shows the attract, titled with the collector's GAMEROOM NAME
    (the hub substitutes it at serve time; neutral fallback "GAME ROOM"), and from
-   the Zero itself:
+   the SMIB Pi itself:
    ```bash
    systemctl is-active casinonet-smibui                                     # active
    curl -s -o /dev/null -w '%{http_code}\n' \
@@ -314,8 +314,9 @@ urgent on the 424Mi board.
 
 - **Host**: static **192.168.50.2** on the slot NIC = the slot segment.
   Serves DHCP + G2S :8081 on the slot net (see `deploy/TESTER_DEPLOY.md`).
-- **Wired satellite (the ONLY supported path):** plug the Zero's Ethernet/USB HAT
-  into the slot-segment switch. The host serves DHCP there, so it comes up on
+- **Wired satellite (the ONLY supported path):** plug the Pi into the
+  slot-segment switch (a 3B+ goes straight in; a Zero rides its USB-Ethernet
+  HAT). The host serves DHCP there, so it comes up on
   **192.168.50.0/24** and reaches the host as one local hop. Zero-config finds the
   host automatically — it IS the default gateway — so no `--hub` is needed
   (SAS `--hub auto`, Companion flagless).

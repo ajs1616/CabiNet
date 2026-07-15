@@ -3653,6 +3653,16 @@ async function ticketSave(){
     const v=(el.value||"").trim();
     if(v!==cur) body[key]=v;
   }
+  { // expiration: integer days 0..255, 0 = never; posted only on change
+    const el=$("st-ticket-expire");
+    if(el){
+      const cur=Number(tk.expireDays||0);
+      const v=Math.floor(Number(el.value));
+      if(!Number.isFinite(v)||v<0||v>255){
+        toast("Expiration must be 0–255 days (0 = never)",false); return;}
+      if(v!==cur) body.ticketExpireDays=v;
+    }
+  }
   if(!Object.keys(body).length){
     toast("Ticket header — nothing changed",true); return;}
   const ok=await settingsPost(body,"Ticket header");
@@ -3765,6 +3775,9 @@ function renderSettings(){
         <div class="tkf"><label for="st-ticket-title">Cash ticket title (where supported)</label>
           <input type="text" id="st-ticket-title" maxlength="64"
             value="${esc(tv("titleCash"))}" placeholder="CASHOUT"></div>
+        <div class="tkf"><label for="st-ticket-expire">Expiration (days &middot; 0 = never)</label>
+          <input type="number" id="st-ticket-expire" min="0" max="255" step="1"
+            value="${esc(String((tk&&tk.expireDays)||0))}" placeholder="0"></div>
         <div class="btnrow" style="margin-top:10px">
           <button class="btn slim gold" onclick="ticketSave()">
             <span class="bl">Save ticket header</span>

@@ -695,7 +695,25 @@ def main():
           "pre-bump",
           hdr == {"propName": "FUNCINO",
                   "line1": "This ain't worth shit", "line2": None,
-                  "titleCash": "CASH TICKET", "rev": 0}, hdr)
+                  "titleCash": "CASH TICKET", "expireDays": 0,
+                  "rev": 0}, hdr)
+    # ticket_expire_days tenant: whitelisted, int-clamped 0..255 in the
+    # blob, junk degrades to 0, empty = DELETE (never expires)
+    h7.set_host_setting("ticket_expire_days", "30")
+    check("ticket_expire_days rides the blob as int 30",
+          h7.ticket_header()["expireDays"] == 30)
+    h7.set_host_setting("ticket_expire_days", "9999")
+    check("ticket_expire_days clamps to 255 on an over-range tenant",
+          h7.ticket_header()["expireDays"] == 255)
+    h7.set_host_setting("ticket_expire_days", "junk")
+    check("junk ticket_expire_days tenant degrades to 0 (never)",
+          h7.ticket_header()["expireDays"] == 0)
+    h7.set_host_setting("ticket_expire_days", "45")
+    h7.set_host_setting("ticket_expire_days", "")
+    check("empty ticket_expire_days DELETES the row (0 = never)",
+          h7.host_setting("ticket_expire_days") is None
+          and h7.ticket_header()["expireDays"] == 0)
+    h7.set_host_setting("ticket_expire_days", "60")
     check("bump_ticket_rev counts 1, 2 and lands in the blob",
           h7.bump_ticket_rev() == 1 and h7.bump_ticket_rev() == 2
           and h7.ticket_header()["rev"] == 2)
@@ -705,7 +723,8 @@ def main():
           h7b.ticket_header() == {"propName": "FUNCINO",
                                   "line1": "This ain't worth shit",
                                   "line2": None,
-                                  "titleCash": "CASH TICKET", "rev": 2})
+                                  "titleCash": "CASH TICKET",
+                                  "expireDays": 60, "rev": 2})
     h7b.close()
     d67 = tempfile.mkdtemp()
     p67 = os.path.join(d67, "mig67.db")

@@ -18,8 +18,9 @@ whole casino *experience*, at home, for friends.
 - **Direct G2S over Ethernet** — plug-and-play join (the host is the DHCP
   server and hands the machine its host URL; zero machine-side config on IGT
   AVP), live meters, events, remote enable/disable.
-- **SAS via a Pi Zero bridge** — meters, AFT credit transfers both directions,
-  TITO, legacy bonusing, handpay reset.
+- **SAS via a small Pi bridge** (a used Pi 3B+ is perfect — Ethernet built
+  in) — meters, AFT credit transfers both directions, TITO, legacy
+  bonusing, handpay reset.
 - **Cross-machine TITO** — print a ticket on one machine, redeem it in another.
 - **Player wallets + RFID cards** — tap a fob, the machine knows who's playing;
   fund friends from the House bank; wallet↔machine transfers.
@@ -40,7 +41,7 @@ same doc.
 
 - `G2S/` — the host: G2S engine, web UI, DHCP/DNS/NTP/TFTP bootstrap servers,
   the SQLite hub spine, test gates under `G2S/tools/`
-- `SAS/` — the SAS bridge stack that runs on a Pi Zero SMIB
+- `SAS/` — the SAS bridge stack that runs on the SMIB Pi (3B+ recommended)
   (deps: pyserial, crcmod, loguru — see `SAS/requirements.txt`)
 - `Companion/` — the RFID reader daemon (stdlib-only)
 - `deploy/` — systemd units, setup scripts, the deploy guide

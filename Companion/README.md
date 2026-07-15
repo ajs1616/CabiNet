@@ -1,7 +1,8 @@
 # Companion — the RFID tap daemon
 
-Turns PN532 card taps into hub knowledge. Runs on the Zero **beside**
-`casinonet-sas` (one Zero = SAS + NFC, proven 2026-07-10). A single thread
+Turns PN532 card taps into hub knowledge. Runs on the SMIB Pi **beside**
+`casinonet-sas` (one Pi = SAS + NFC, proven 2026-07-10), or alone on a
+reader-only Pi (3B+ recommended — built-in Ethernet). A single thread
 polls the reader at ~5Hz, debounces a held card into one tap, and POSTs
 `{tapId, uid, at}` to the hub's `/api/companion/report`. Everything smart —
 fob lookup, tiers, G2S `setIdValidation` carded sessions, reset-tier SAS
@@ -12,15 +13,16 @@ dumb satellite on purpose.
   bring-up script; first card read: UID `6CB16F06`, S50 1K) + `MockRfidReader`.
 - `companion_host.py` — the daemon: debounce, bounded tap queue (64), ack
   watermark, edge-logged hub reporting.
-- `casinonet-companion.service` — systemd unit for the Zero.
+- `casinonet-companion.service` — systemd unit for the Pi.
 - `tests/test_companion.py` — `pytest Companion/ -q` (no hardware needed).
 
-## Wiring recap (PN532 V3 on the SAS Zero)
+## Wiring recap (PN532 V3)
 
-The Zero's hardware I2C pins are taken by the MAX232 SAS HAT, so the PN532
-rides a **software i2c-gpio bus** on spare GPIOs:
+On a SAS SMIB the Pi's hardware I2C pins are taken by the MAX232 SAS HAT,
+so the PN532 rides a **software i2c-gpio bus** on spare GPIOs — ONE wiring
+for the whole fleet, HAT or no HAT:
 
-| PN532 pin | Zero pin              |
+| PN532 pin | Pi pin                |
 |-----------|-----------------------|
 | SDA       | GPIO23 (physical 16)  |
 | SCL       | GPIO24 (physical 18)  |
@@ -51,7 +53,7 @@ enables the i2c-gpio overlay, rsyncs this directory, and installs the unit
 journalctl -u casinonet-companion -f     # expect: PN532 ready, then 💳 taps
 ```
 
-Stdlib-only — the Zero's system `python3` is enough, no venv. With zero-config
+Stdlib-only — the Pi's system `python3` is enough, no venv. With zero-config
 onboarding the reader self-IDs to the host and you bind it to a machine from
 the web UI (**Players ▸ Readers ▸ Assign**); `--g2s-egm` / `--sas-smib`
 flags on the `ExecStart` line are the manual-bind fallback.
