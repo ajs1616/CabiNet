@@ -518,6 +518,81 @@ def main():
           dec["exc"] == 2, dec)
 
     hs.close()
+
+    # -- v12 expired-ticket reaper: stamps, immortality, grace, display ----
+    print("\n— v12 expired-ticket reaper")
+    import sqlite3 as _sql
+    import time as _time
+    hs, d = fresh()
+
+    def _issue(days_ago, expire_days, amt=10_000):
+        m = hs.tito_mint("sas:smib-bb2", 1, amt)
+        hs.tito_record_issued(m["validationNumber"], amt, "sas:smib-bb2", 1)
+        back = _time.strftime("%Y-%m-%dT%H:%M:%S",
+                              _time.localtime(_time.time()
+                                              - days_ago * 86400))
+        with hs.lock:
+            hs._conn.execute(
+                "UPDATE tito_tickets SET issued_at=?, expire_days=? "
+                "WHERE canonical=?", (back, expire_days, m["canonical"]))
+            hs._conn.commit()
+        return m["canonical"]
+
+    hs.set_host_setting("ticket_expire_days", "30")
+    m = hs.tito_mint("sas:smib-bb2", 1, 5_000)
+    hs.tito_record_issued(m["validationNumber"], 5_000, "sas:smib-bb2", 1)
+    with hs.lock:
+        row = hs._conn.execute(
+            "SELECT expire_days FROM tito_tickets WHERE canonical=?",
+            (m["canonical"],)).fetchone()
+    check("issue stamps expire_days from the CURRENT setting",
+          row["expire_days"] == 30, dict(row))
+    hs.set_host_setting("ticket_expire_days", "")
+    m0 = hs.tito_mint("sas:smib-bb2", 1, 5_000)
+    hs.tito_record_issued(m0["validationNumber"], 5_000, "sas:smib-bb2", 1)
+    with hs.lock:
+        row = hs._conn.execute(
+            "SELECT expire_days FROM tito_tickets WHERE canonical=?",
+            (m0["canonical"],)).fetchone()
+    check("setting 0/absent stamps NULL (paper printed no expiration)",
+          row["expire_days"] is None, dict(row))
+
+    immortal = _issue(days_ago=400, expire_days=None)   # pre-v12/never row
+    fresh_exp = _issue(days_ago=10, expire_days=30)     # not yet expired
+    graced = _issue(days_ago=35, expire_days=30)        # expired, in grace
+    dead = _issue(days_ago=90, expire_days=30)          # expired + grace over
+    with hs.lock:
+        n = hs._reap_expired_locked(hs._conn)
+        hs._conn.commit()
+    check("reaper takes ONLY expired-past-grace rows", n == 1, n)
+    with hs.lock:
+        left = {r["canonical"] for r in hs._conn.execute(
+            "SELECT canonical FROM tito_tickets WHERE state='issued'"
+        ).fetchall()}
+    check("never-expire row is immortal at any age", immortal in left)
+    check("unexpired row survives", fresh_exp in left)
+    check("expired-but-in-grace row survives (hub honors it a while "
+          "longer than the machines)", graced in left)
+    check("expired-past-grace row is GONE (unknown = what the paper "
+          "promised)", dead not in left)
+
+    lst = hs.tito_list(state="expired")
+    check("?state=expired filter finds the in-grace row (display, "
+          "no grace)",
+          lst["total"] == 1 and lst["tickets"][0]["canonical"] == graced,
+          lst["total"])
+    all_rows = {t2["canonical"]: t2["state"]
+                for t2 in hs.tito_list(limit=100)["tickets"]}
+    check("list derives 'expired' display state for the in-grace row",
+          all_rows.get(graced) == "expired")
+    check("list keeps 'issued' for unexpired + immortal rows",
+          all_rows.get(fresh_exp) == "issued"
+          and all_rows.get(immortal) == "issued")
+    dec = hs.tito_authorize("IGT_AVP", "tg", graced)
+    check("in-grace expired ticket still REDEEMS (grace = money honored)",
+          dec.get("authorized") is True, dec)
+    hs.close()
+
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

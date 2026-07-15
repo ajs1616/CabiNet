@@ -65,7 +65,7 @@ import time
 
 log = logging.getLogger("g2s.hub_store")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Hard bounds — /api/names is unauthenticated (anyone on the floor VLAN/AP),
 # so the registry must stay bounded: without these, one hostile poster loops
@@ -149,6 +149,16 @@ MAX_OPEN_MINTS = 256
 # registry. At the cap the oldest REDEEMED rows (paper already consumed)
 # are pruned to make room; if nothing is prunable, new inserts refuse.
 MAX_TICKETS = 10_000
+# Expired-ticket reaper (v12): an ISSUED row whose per-row expire_days
+# snapshot (stamped from the ticket_expire_days setting AT ISSUE TIME —
+# what the paper actually printed) has passed gets reaped GRACE days later.
+# NULL/0 expire_days = the paper printed no expiration = immortal (the
+# collector-right default). The grace window keeps the ledger honoring a
+# just-expired paper a while longer than the machines do (clock skew,
+# drawer-found tickets) before the row — the drawer-ticket class that
+# would otherwise fill MAX_TICKETS with unprunable rows over the years —
+# is finally let go.
+EXPIRE_REAP_GRACE_DAYS = 30
 # A 'minted' row is only reused for the 0x57 re-fire of the SAME cash-out —
 # seconds apart. Past this window a matching mint is STALE (its issued-push
 # may simply not have landed yet) and reusing it could put one validation
@@ -580,6 +590,18 @@ class HubStore:
                     updated_at  TEXT NOT NULL,
                     meta        TEXT NOT NULL DEFAULT '{}'
                 )""")
+        if current < 12:
+            # v12: per-ticket expiration snapshot. expire_days is the
+            # ticket_expire_days setting AT ISSUE TIME (what that paper
+            # actually printed); NULL/0 = printed no expiration = the row
+            # is immortal. Every pre-v12 row is NULL — history is never
+            # retro-killed by a later setting. The reaper deletes issued
+            # rows expire_days + EXPIRE_REAP_GRACE_DAYS after issue.
+            try:
+                c.execute("ALTER TABLE tito_tickets "
+                          "ADD COLUMN expire_days INTEGER")
+            except sqlite3.OperationalError:
+                pass    # rerun-safe (column already there)
         if current < SCHEMA_VERSION:
             c.execute("INSERT INTO schema_meta(key,value) VALUES('version',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1680,10 +1702,47 @@ class HubStore:
             raise RuntimeError(f"hub db is EPHEMERAL (storage failed) — "
                                f"refusing tito {op}")
 
+    def _expire_days_now(self, c):
+        """The ticket_expire_days setting as the per-row stamp value:
+        1..255 -> that int; 0/absent/junk -> None (never expires — the row
+        outlives every reaper). Snapshotted at ISSUE time so later setting
+        changes never retro-kill paper printed under a different policy.
+        Reads DIRECTLY on the caller's connection — every stamp site holds
+        self.lock, and host_setting() would re-take it (a plain Lock:
+        self-deadlock, caught by the gate the first time)."""
+        try:
+            row = c.execute("SELECT v FROM host_settings WHERE "
+                            "k='ticket_expire_days'").fetchone()
+            v = int(row["v"]) if row else 0
+        except (TypeError, ValueError, sqlite3.Error):
+            v = 0
+        return v if 0 < v <= 255 else None
+
+    #: SQL for "this issued row's printed expiration (+ optional grace
+    #: days) has passed" — issued_at is the local-naive ISO the store
+    #: writes, which sqlite's datetime() parses directly.
+    _EXPIRED_SQL = ("state='issued' AND expire_days IS NOT NULL AND "
+                    "expire_days > 0 AND datetime(issued_at, '+' || "
+                    "(expire_days + ?) || ' days') < "
+                    "datetime('now','localtime')")
+
+    def _reap_expired_locked(self, c):
+        """MUST hold lock. Reap issued rows whose printed expiration passed
+        EXPIRE_REAP_GRACE_DAYS ago. Returns rows reaped. After the reap the
+        paper is unknown to the hub — exactly what its face promised."""
+        gone = c.execute(
+            "DELETE FROM tito_tickets WHERE " + self._EXPIRED_SQL,
+            (EXPIRE_REAP_GRACE_DAYS,)).rowcount
+        if gone:
+            log.info("tito ledger reaped %d expired ticket(s) "
+                     "(printed expiry + %dd grace)", gone,
+                     EXPIRE_REAP_GRACE_DAYS)
+        return gone
+
     def _make_room_locked(self, c):
         """MUST hold lock. True if an INSERT may proceed under MAX_TICKETS.
         At the cap, prunes the oldest REDEEMED rows (their paper is already
-        consumed) — never issued/pending rows (live money)."""
+        consumed), then reaps expired issued rows — never live money."""
         n = c.execute("SELECT COUNT(*) AS n FROM tito_tickets"
                       ).fetchone()["n"]
         if n < MAX_TICKETS:
@@ -1692,9 +1751,11 @@ class HubStore:
             "DELETE FROM tito_tickets WHERE canonical IN ("
             "SELECT canonical FROM tito_tickets WHERE state='redeemed' "
             "ORDER BY redeemed_at ASC LIMIT 100)").rowcount
+        if not gone:
+            gone = self._reap_expired_locked(c)
         if gone:
-            log.warning("tito ledger at cap (%d) — pruned %d oldest "
-                        "redeemed row(s)", MAX_TICKETS, gone)
+            log.warning("tito ledger at cap (%d) — pruned %d row(s)",
+                        MAX_TICKETS, gone)
             return True
         log.warning("tito ledger FULL (%d rows, none prunable) — refusing "
                     "new inserts", MAX_TICKETS)
@@ -1782,6 +1843,7 @@ class HubStore:
             if gone:
                 log.info("tito ledger pruned %d stale unprinted mint(s)",
                          gone)
+            self._reap_expired_locked(c)
             reuse_cutoff = time.strftime(
                 "%Y-%m-%dT%H:%M:%S",
                 time.localtime(time.time() - MINT_REUSE_TTL_SEC))
@@ -1866,9 +1928,10 @@ class HubStore:
                     c.execute(
                         "UPDATE tito_tickets SET state='issued', "
                         "amount_mc=?, ticket_number=?, issued_at=?, "
-                        "extra_json=COALESCE(?, extra_json) "
+                        "expire_days=?, extra_json=COALESCE(?, extra_json) "
                         "WHERE canonical=?",
                         (amt, ticket_number, issued_at or now,
+                         self._expire_days_now(c),
                          json.dumps(extra, separators=(",", ":"))
                          if extra else None, row["canonical"]))
                     c.commit()
@@ -1905,10 +1968,10 @@ class HubStore:
                     c.execute(
                         "UPDATE tito_tickets SET state='issued', amount_mc=?, "
                         "ticket_number=?, issued_at=?, minted_at=?, "
-                        "redeemed_at=NULL, redeemed_by=NULL, pending_json=NULL,"
-                        " extra_json=? WHERE canonical=?",
-                        (amt, ticket_number, issued_at or now, now, note,
-                         row["canonical"]))
+                        "expire_days=?, redeemed_at=NULL, redeemed_by=NULL, "
+                        "pending_json=NULL, extra_json=? WHERE canonical=?",
+                        (amt, ticket_number, issued_at or now, now,
+                         self._expire_days_now(c), note, row["canonical"]))
                     c.commit()
                     log.warning(
                         "🎫 tito COLLISION: vn %s reused (%s %dmc -> fresh "
@@ -1945,10 +2008,12 @@ class HubStore:
             c.execute(
                 "INSERT INTO tito_tickets (canonical, vn16, system_id, "
                 "origin, address, amount_mc, state, ticket_number, "
-                "issued_at, extra_json) VALUES (?,?,?,?,?,?,'issued',?,?,?)",
+                "issued_at, expire_days, extra_json) "
+                "VALUES (?,?,?,?,?,?,'issued',?,?,?,?)",
                 (canonical, vn if len(vn) == 16 else None,
                  int(vn[:2]) if len(vn) == 16 else None, origin,
                  int(address), amt, ticket_number, issued_at or now,
+                 self._expire_days_now(c),
                  json.dumps(extra, separators=(",", ":")) if extra else None))
             c.commit()
             log.info("🎫 tito ledger: vn %s ISSUED %dmc by %s (unminted "
@@ -2230,6 +2295,17 @@ class HubStore:
                         "SELECT * FROM tito_tickets WHERE canonical=? "
                         "OR vn16=?", (str(vid).strip(),) * 2).fetchall()
                     total = len(rows)
+                elif state == "expired":
+                    # derived DISPLAY state: issued + past its printed
+                    # expiry (no grace — the paper already reads expired;
+                    # the reaper's grace only delays the delete)
+                    cond = self._EXPIRED_SQL
+                    total = c.execute(
+                        "SELECT COUNT(*) AS n FROM tito_tickets WHERE "
+                        + cond, (0,)).fetchone()["n"]
+                    rows = c.execute(
+                        f"SELECT * FROM tito_tickets WHERE {cond} {order} "
+                        "LIMIT ? OFFSET ?", (0, limit, offset)).fetchall()
                 elif state is not None:
                     total = c.execute(
                         "SELECT COUNT(*) AS n FROM tito_tickets "
@@ -2250,9 +2326,27 @@ class HubStore:
         # Row conversion OUTSIDE the lock (machines() pattern) — fetchall
         # already materialized the rows. amount_mc -> amountMc stays
         # MILLICENTS (the hub.db money rule; UI renders $ via /100000).
+        # Display derivation: an issued row past its printed expiry SHOWS
+        # as 'expired' (the UI's chip/filter; the raw state stays issued
+        # in the db until the reaper's grace runs out — this list feeds a
+        # UI, never a money decision).
+        def _row_state(r):
+            try:
+                ed = r["expire_days"]
+            except (KeyError, IndexError):
+                ed = None
+            if r["state"] == "issued" and ed and r["issued_at"]:
+                try:
+                    exp = time.mktime(time.strptime(
+                        r["issued_at"], "%Y-%m-%dT%H:%M:%S"))                         + int(ed) * 86400
+                    if time.time() > exp:
+                        return "expired"
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            return r["state"]
         return {"total": total, "tickets": [{
             "canonical": r["canonical"], "vn16": r["vn16"],
-            "state": r["state"], "amountMc": r["amount_mc"],
+            "state": _row_state(r), "amountMc": r["amount_mc"],
             "origin": r["origin"], "address": r["address"],
             "ticketNumber": r["ticket_number"], "mintedAt": r["minted_at"],
             "issuedAt": r["issued_at"], "redeemedAt": r["redeemed_at"],
