@@ -1,12 +1,12 @@
 # CabiNet Slot Machine Compatibility Matrix
 
-Which slot machines can talk **direct G2S over IP** to CabiNet, and which need the **SMIB hardware bridge** running SAS over RS-232. The whole point of the tester program is machines we haven't seen — use this file to figure out what YOUR machine speaks, then follow `deploy/TESTER_DEPLOY.md` § "Slot machines" for the exact settings (some fields are one-shot until a RAM clear — read that section before touching the operator menu).
+Which slot machines can talk **direct G2S over IP** to CabiNet, and which need the **SMIB hardware bridge** running SAS over RS-232. The machines we haven't seen are the whole point of sharing this — use this file to figure out what YOUR machine speaks, then follow `deploy/DEPLOY.md` § "Slot machines" for the exact settings (some fields are one-shot until a RAM clear — read that section before touching the operator menu).
 
 > **The two golden rules, wherever your machine came from:**
 > 1. **G2S machine, any brand:** host URL is `http://192.168.50.2:8081/G2S`, and if the machine offers a G2S **flavor/dialect selector, pick IGT** (IGT machines need neither — they pick everything up from DHCP).
 > 2. **SAS machine:** validation = **Secure Enhanced** if offered, otherwise **System** — both tie into the hub. Enable AFT and legacy bonusing if the menu has them.
 
-> **Status: PRELIMINARY**. Cutoffs below are compiled from vendor docs, GSA listings, and NLG / Slottech community knowledge. Bench results from real machines take precedence over any claim here — that's what the tester program is for. When in doubt: **test, then send a support bundle + your row for the bench log**.
+> **Status: PRELIMINARY**. Cutoffs below are compiled from vendor docs, GSA listings, and NLG / Slottech community knowledge. Bench results from real machines take precedence over any claim here — that's where your machines come in. When in doubt: **test, then open an issue with a support bundle + your row for the bench log**.
 
 > Confidence labels: **[V]** verified by cited source · **[T]** training-data knowledge, not freshly cited · **[U]** uncertain, see Uncertainties section.
 
@@ -128,7 +128,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 
 ## Bench-test log (real iron)
 
-> Empirical findings from running CabiNet against actual hardware — the dev bench AND tester machines. **This section overrides anything above.** Format: machine + OS rev → result + any quirks/timeouts/workarounds. Testers: a row here (plus a support bundle if anything fought back) is the single most valuable thing you can send.
+> Empirical findings from running CabiNet against actual hardware — the dev bench AND community machines. **This section overrides anything above.** Format: machine + OS rev → result + any quirks/timeouts/workarounds. Running it on a machine not listed here? A row for this table (plus a support bundle if anything fought back) is the single most valuable thing you can send.
 
 | Date | Machine | OS / CPU rev | Result | Notes |
 |---|---|---|---|---|

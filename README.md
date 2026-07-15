@@ -33,7 +33,7 @@ whole casino *experience*, at home, for friends.
 
 ## Getting started
 
-**Read [`deploy/TESTER_DEPLOY.md`](deploy/TESTER_DEPLOY.md).** The short
+**Read [`deploy/DEPLOY.md`](deploy/DEPLOY.md).** The short
 version: the host + your machines + the companion Pis go on a **basic
 unmanaged Ethernet switch of their own** (the host runs the whole network),
 the host is any Linux box at static `192.168.50.2/24` on that segment, and
@@ -51,9 +51,12 @@ same doc.
 
 ## Status
 
-Early tester release. It runs a real two-machine floor daily (IGT AVP on
-direct G2S, WMS BB2E dual-protocol) — the tester program exists to prove it
-on *your* machines and brands. Expect rough edges; bring your debug logs.
+Early release. It runs a real two-machine floor daily (IGT AVP on direct
+G2S, WMS BB2E dual-protocol) — every other brand and OS rev still needs
+proving on real iron, and that's where you come in: run it on your machines
+and send back a `COMPATIBILITY.md` row (plus a support bundle when something
+fights back — see `deploy/DEPLOY.md`). Expect rough edges; bring your debug
+logs. Issues and PRs welcome.
 
 ## License
 

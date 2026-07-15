@@ -1,4 +1,4 @@
-# CabiNet tester deploy — host + companions on their own hub
+# CabiNet deploy — host + companions on their own hub
 
 > **The one-sentence version:** put the CabiNet host and your slot machines on
 > a **basic unmanaged Ethernet hub/switch of their own** — no router, no other
@@ -203,11 +203,10 @@ a powered-off cabinet just shows dark.
 
 ## Companion Pis (RFID readers / SAS SMIBs)
 
-Flash the golden image (provided out-of-band with your tester invite — it's
-just Raspberry Pi OS Lite with the setup script below already run; you can
-equally build your own from a fresh card via `deploy/SMIB_FRESH_IMAGE.md`),
-plug the Pi into the same switch, power it from the cabinet's USB. That's
-the whole install:
+Build the Pi from a fresh SD card — it's just Raspberry Pi OS Lite plus one
+setup script; `deploy/SMIB_FRESH_IMAGE.md` walks the whole card, and a
+prebuilt image may land in Releases later. Plug the Pi into the same switch,
+power it from the cabinet's USB. That's the whole install:
 
 - The Pi self-identifies by its hardware serial and finds the hub via its DHCP
   default gateway (the host) — **no per-device config, no flags**.
@@ -215,11 +214,13 @@ the whole install:
   that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to that
   SMIB's machine.
 
-## When something breaks — send me a support bundle
+## When something breaks — grab a support bundle
 
-One command gathers everything I need (service journals, CabiNet logs, state
-snapshots, network + system info) into a single `.tar.gz` — read-only, works
-even when the services are down:
+Open a GitHub issue with **what went wrong and roughly when** (clock time
+matters — the journals are timestamped). Then grab a support bundle: one
+command gathers everything needed to debug it (service journals, CabiNet
+logs, state snapshots, network + system info) into a single `.tar.gz` —
+read-only, works even when the services are down:
 
 ```sh
 # on the host box:
@@ -229,14 +230,14 @@ python3 deploy/support_bundle.py
 python3 ~/CasinoNet/deploy/support_bundle.py
 ```
 
-It prints the file it wrote — attach that to your report along with **what
-went wrong and roughly when** (clock time matters; the journals are
-timestamped). Run it with `sudo` if it says it couldn't read the unit
-journals. If the problem is at one machine, send bundles from **both** the
-host and that machine's Pi.
+It prints the file it wrote. Run it with `sudo` if it says it couldn't read
+the unit journals. If the problem is at one machine, grab bundles from
+**both** the host and that machine's Pi.
 
-The bundle contains your floor's data (machine ids, player names, fun-money
-balances, protocol traffic) — send it to me directly, don't post it publicly.
+⚠️ The bundle contains your floor's data (machine ids, player names,
+fun-money balances, protocol traffic) — **don't attach it to the public
+issue**. Say in the issue that you have one and we'll arrange a private
+hand-off.
 
 ## Ground rules (the things that break it)
 

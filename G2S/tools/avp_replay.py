@@ -130,7 +130,7 @@ def load_captured_requests():
         sys.exit(
             "ERROR: wire capture missing: " + str(CAPTURE) + "\n"
             "This gate replays a real IGT AVP's captured bytes; the captures "
-            "are not\nincluded in the tester distribution. The self-contained "
+            "are not\nincluded in the public distribution. The self-contained "
             "gates\n(G2S/tools/test_*.py and pytest SAS/) are the regression "
             "net for this repo.")
     text = CAPTURE.read_text(errors="replace")
@@ -599,12 +599,12 @@ def main():
         sys.exit(3)
 
     # Preflight: the gate depends on real-AVP wire-capture fixtures under
-    # G2S/debug-captures/. Those captures are NOT part of the tester
+    # G2S/debug-captures/. Those captures are NOT part of the public
     # distribution (they are one collector's machine traffic) — without them
     # this gate cannot run, and used to die mid-gate with a raw
     # FileNotFoundError deep inside first_light_reply(). Fail fast with an
     # actionable message instead. The other gates under G2S/tools/ and
-    # `pytest SAS/` are fully self-contained and are the tester-facing net.
+    # `pytest SAS/` are fully self-contained and are the public-facing net.
     missing = [n for n in FIRST_LIGHT_REQUIRED
                if not (FIRST_LIGHT / n).is_file()]
     if missing or not FIRST_LIGHT.is_dir():
@@ -615,7 +615,7 @@ def main():
             print(f"  missing: {n}")
         print("  note: the wire captures this gate replays are not included "
               "in the\n"
-              "  tester distribution. The self-contained gates (G2S/tools/"
+              "  public distribution. The self-contained gates (G2S/tools/"
               "test_*.py and\n"
               "  pytest SAS/) are the regression net for this repo.")
         sys.exit(2)

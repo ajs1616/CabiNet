@@ -314,7 +314,7 @@ urgent on the 424Mi board.
 ## 5. Networking cheat-sheet
 
 - **Host**: static **192.168.50.2** on the slot NIC = the slot segment.
-  Serves DHCP + G2S :8081 on the slot net (see `deploy/TESTER_DEPLOY.md`).
+  Serves DHCP + G2S :8081 on the slot net (see `deploy/DEPLOY.md`).
 - **Wired satellite (the ONLY supported path):** plug the Pi into the
   slot-segment switch (a 3B+ goes straight in; a Zero rides its USB-Ethernet
   HAT). The host serves DHCP there, so it comes up on
