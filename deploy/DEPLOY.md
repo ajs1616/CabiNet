@@ -153,14 +153,16 @@ menu, it's SAS — and SAS is the *normal* case for most hobbyist machines.
 
 Plug the machine's Ethernet into the slot switch.
 
-- **IGT (AVP Family 14 etc.) — plug-and-play:** Certificate Protocols
+- **IGT (AVP Family 14 etc.) — plug-and-play join:** Certificate Protocols
   **NO** (cert-less is the only supported path), "Override DHCP Configured
   Host" **NO**. The machine takes the host from DHCP option 43 and joins on
   its own — nothing to type. After changing any comm settings, **re-enable
-  G2S in the debug menu** or the machine's endpoint stays dark. For the
-  on-glass UI: enable the mediaDisplay content areas in the operator menu
-  and give them memory from the media pool (it's RAM-capped — enable the
-  ones that fit).
+  G2S in the debug menu** or the machine's endpoint stays dark.
+  The join is zero-config; the money features are not: **WAT (wallet
+  transfers) and TITO need their permissions enabled in the operator menu,
+  which takes your eKey.** For the on-glass UI: enable the mediaDisplay
+  content areas in the operator menu and give them memory from the media
+  pool (it's RAM-capped — enable the ones that fit).
 - **Every other brand (or any machine with manual host entry):** point the
   machine's G2S host/server URL at
 

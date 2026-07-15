@@ -18,7 +18,7 @@ whole casino *experience*, at home, for friends.
 ## What works today (live-proven on real iron)
 
 - **Direct G2S over Ethernet** — plug-and-play join (the host is the DHCP
-  server and hands the machine its host URL; zero machine-side config on IGT
+  server and hands the machine its host URL; zero machine-side config to join on IGT
   AVP), live meters, events, remote enable/disable.
 - **SAS via a small Pi bridge** (a used Pi 3B+ is perfect — Ethernet built
   in) — meters, AFT credit transfers both directions, TITO, legacy
