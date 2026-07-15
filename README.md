@@ -53,5 +53,15 @@ Early tester release. It runs a real two-machine floor daily (IGT AVP on
 direct G2S, WMS BB2E dual-protocol) — the tester program exists to prove it
 on *your* machines and brands. Expect rough edges; bring your debug logs.
 
-License: free for personal/hobbyist use; a formal open-source license lands
-with the public release.
+## License
+
+CabiNet is free software: [GPL-3.0](LICENSE). Use it, modify it, share it —
+if you distribute a modified version, it stays under the GPL so the next
+collector gets the same freedoms you did.
+
+Copyright (C) 2026 AJ Sawaya.
+
+**Not for regulated gaming.** CabiNet is uncertified hobbyist software for
+home game rooms and machines you personally own. The GPL's no-warranty terms
+apply in full, and nothing here may be deployed in real-money or regulated
+gaming environments.
