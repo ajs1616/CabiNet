@@ -346,4 +346,4 @@ urgent on the 424Mi board.
 | Hub URL | **`http://192.168.50.2:8081` (wired slot segment — DEFAULT)** / `http://127.0.0.1:8081` (co-located) |
 | Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → assign in **Players ▸ Readers ▸ Assign** |
 | Companion (manual bind) | `deploy/companion_setup.sh <user>@<zero-host>.local --g2s-egm IGT_<egmId> --companion-id companion-avp` |
-| Fob cards | S50 1K "Mifare Classic" fobs/cards (the $10-a-bag kind) |
+| Fob cards | Any ISO14443-A tag with a **fixed UID**: S50 1K "Mifare Classic" or NTAG213/215/216 fobs/cards (the $10-a-bag kind). Blank/"empty" is fine — only the UID is used. Avoid "random UID" privacy tags (UID changes every read, often starts `08`). |
