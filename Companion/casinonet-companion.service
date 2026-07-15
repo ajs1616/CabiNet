@@ -21,8 +21,8 @@ WorkingDirectory=/home/aj/CasinoNet/Companion
 # card and self-configures — the daemon IDs itself by the Pi's hardware serial
 # (companion-<serial-tail>) and finds the hub at the DHCP default gateway (the
 # host is the gateway + DHCP server on the wired slot segment; satellites are
-# wired-only). The machine binding is then ASSIGNED FROM THE HUB UI (Players ▸ Readers ▸
-# Assign) — the hub routes taps by companionId, so no --g2s-egm here and a
+# wired-only). The machine binding is then ASSIGNED FROM THE HUB UI (the machine's
+# ⚙️ Options) — the hub routes taps by companionId, so no --g2s-egm here and a
 # re-assign takes effect live with no restart. companion_setup.sh can still
 # inject explicit flags (--hub / --companion-id / --g2s-egm / --sas-*) for a
 # co-located or manual override; a bare flag-free start is the collector path.

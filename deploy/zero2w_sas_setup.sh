@@ -130,6 +130,9 @@ python3 -m venv ~/venvs/casinonet 2>/dev/null || true
 say "rsync SAS tree (data excluded)"
 rsync -a -e "$RSYNC_SSH" --exclude '/data' --exclude '__pycache__' \
       --exclude '.pytest_cache' "$REPO/SAS/" "$HOST:CasinoNet/SAS/"
+# support_bundle.py rides along so "grab a bundle on the satellite" works
+"${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet/deploy'
+rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CasinoNet/deploy/"
 
 say "gate: pytest SAS/ on the Zero"
 "${SSH[@]}" "$HOST" 'cd ~/CasinoNet && ~/venvs/casinonet/bin/python -m pytest SAS/ -q 2>&1 | tail -1'

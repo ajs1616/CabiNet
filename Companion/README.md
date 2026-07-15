@@ -31,7 +31,7 @@ for the whole fleet, HAT or no HAT:
 
 1. Set the board's DIP switches to **I2C** mode (it answers at `0x24`).
 2. `/boot/firmware/config.txt`:
-   `dtoverlay=i2c-gpio,i2c_gpio_sda=23,i2c_gpio_scl=24,bus=11`
+   `dtoverlay=i2c-gpio,i2c_gpio_sda=23,i2c_gpio_scl=24,bus=11,i2c_gpio_delay_us=2`
 3. Make sure the `i2c-dev` module loads (add `i2c-dev` to `/etc/modules`
    if `/dev/i2c-11` doesn't appear after reboot).
 4. Sanity check: `i2cdetect -y 11` shows `0x24`.
@@ -55,7 +55,7 @@ journalctl -u casinonet-companion -f     # expect: PN532 ready, then 💳 taps
 
 Stdlib-only — the Pi's system `python3` is enough, no venv. With zero-config
 onboarding the reader self-IDs to the host and you bind it to a machine from
-the web UI (**Players ▸ Readers ▸ Assign**); `--g2s-egm` / `--sas-smib`
-flags on the `ExecStart` line are the manual-bind fallback.
+the web UI (**the machine's ⚙️ Options on The Floor**); `--g2s-egm` /
+`--sas-smib` flags on the `ExecStart` line are the manual-bind fallback.
 
 No-hardware smoke test: `python3 companion_host.py http://127.0.0.1:8081 --mock`.

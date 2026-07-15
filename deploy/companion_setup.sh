@@ -49,8 +49,8 @@ G2S_EGM="" ; COMPANION_ID="" ; SAS_SMIB="" ; SAS_ADDRESS="" ; I2C_MODE="gpio"
 
 # ZERO-CONFIG (v11): every binding flag is OPTIONAL. With none passed, the unit
 # installs FLAGLESS and the daemon self-configures — id from the Pi serial, hub
-# from the default gateway — and the collector assigns the machine from the hub
-# UI (Players ▸ Readers ▸ Assign). Pass flags only for a co-located/manual
+# from the default gateway — and the collector binds the machine from the hub
+# UI (the machine's ⚙️ Options). Pass flags only for a co-located/manual
 # override; a bare `companion_setup.sh aj@host` is the normal path.
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -112,9 +112,11 @@ sudo usermod -aG i2c \"\$USER\" 2>/dev/null || true
 echo "$I2C_OUT"
 
 say "rsync Companion/ (stdlib-only, no venv)"
-"${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet'
+"${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet/deploy'
 rsync -a -e "$RSYNC_SSH" --exclude '__pycache__' --exclude '.pytest_cache' \
       "$REPO/Companion/" "$HOST:CasinoNet/Companion/"
+# support_bundle.py rides along so "grab a bundle on the satellite" works
+rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CasinoNet/deploy/"
 
 say "import check (proves stdlib deps resolve on the Pi)"
 "${SSH[@]}" "$HOST" 'cd ~/CasinoNet/Companion && python3 -c "import companion_host, reader; print(\"companion import OK\")"'

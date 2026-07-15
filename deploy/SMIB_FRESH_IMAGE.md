@@ -136,11 +136,12 @@ every card and self-configure — no per-device file to edit:
    serial** (`companion-<serial-tail>`) and finds the hub at the **DHCP default gateway**
    (the host is the gateway + DHCP server on the slot segment — no host IP
    to configure).
-3. **It appears** in the hub UI under **The Players ▸ Readers** as `New Companion
-   (<serial-tail>)`, `unassigned`.
-4. **Assign it**: click **Assign ▾** on its row, give it a friendly name, and pick the
-   machine it *serves*. The hub owns the binding from then on — routing is live, **no
-   restart**, and re-assigning to a different machine takes effect on the next tap.
+3. **It appears** in the hub UI under **The Players ▸ Cards & readers** as
+   `New Companion (<serial-tail>)`, `unassigned`.
+4. **Bind it**: open the machine's ⚙️ **Options** on The Floor and pick it under
+   **🎴 Card reader** (the Players row is where you *rename* it). The hub owns the
+   binding from then on — routing is live, **no restart**, and re-assigning to a
+   different machine takes effect on the next tap.
 
 That's it. Wire the PN532 (below), tap a fob, done. `hostname` at flash time no longer
 matters for identity — use anything (or nothing); the reader is found by serial + named in
@@ -173,7 +174,8 @@ deploy/companion_setup.sh <user>@<zero-host>.local \
 - **Bindings** (override only — normally assigned in the UI): `--g2s-egm <egmId>` makes
   taps G2S `setIdValidation` carded sessions on that machine; `--sas-smib <id>
   --sas-address <n>` routes reset-tier fobs to a SAS handpay reset. Zero-config leaves
-  both to the hub UI (Players ▸ Readers ▸ Assign → machine + optional reset-fob leg).
+  the binding to the hub UI (the machine's ⚙️ Options); the reset-fob SAS leg is
+  derived automatically from the bound machine's live SAS link.
 
 Then set the PN532 DIP switches to I2C (answers at `0x24`), wire it, tap a fob → watch
 the HUB journal (`journalctl -u casinonet-g2s -f` on the hub) for `💳 card IN`. A board
@@ -299,10 +301,11 @@ urgent on the 424Mi board.
 - The SAS SMIB auto-appears as a floor tile once it reports (the hub's `/api/sas/report`
   registry) — name it and, for a dual-protocol cabinet, link its SAS leg, in the tile's
   Options.
-- A **Companion** auto-appears under **The Players ▸ Readers** the moment it reports
-  (zero-config: serial id + gateway hub, no flags). Click **Assign ▾** on its row to name
-  it and bind the machine it serves — the hub owns the binding from then on (live, no
-  restart). This replaces baking `--g2s-egm`/`--sas-*` into the unit.
+- A **Companion** auto-appears under **The Players ▸ Cards & readers** the moment it
+  reports (zero-config: serial id + gateway hub, no flags). Bind it from the machine's
+  ⚙️ **Options** on The Floor — rename it from its Players row — and the hub owns the
+  binding from then on (live, no restart). This replaces baking `--g2s-egm`/`--sas-*`
+  into the unit.
 - Register fobs and link them to players in the Home UI → **The Players ▸ Cards &
   readers** (or the Wallet tab's Players card). An unknown fob tap shows a register-me
   prompt.
@@ -346,6 +349,6 @@ urgent on the 424Mi board.
 | Player-screen unit | `casinonet-smibui.service` (HDMI-panel SMIBs, e.g. the BB2) |
 | Kiosk engine | `cog` (WPE WebKit, DRM/KMS — no X/Wayland); `apt-get install -y cog` |
 | Hub URL | **`http://192.168.50.2:8081` (wired slot segment — DEFAULT)** / `http://127.0.0.1:8081` (co-located) |
-| Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → assign in **Players ▸ Readers ▸ Assign** |
+| Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → bind from the machine's ⚙️ **Options** |
 | Companion (manual bind) | `deploy/companion_setup.sh <user>@<zero-host>.local --g2s-egm IGT_<egmId> --companion-id companion-avp` |
 | Fob cards | Any ISO14443-A tag with a **fixed UID**: S50 1K "Mifare Classic" or NTAG213/215/216 fobs/cards (the $10-a-bag kind). Blank/"empty" is fine — only the UID is used. Avoid "random UID" privacy tags (UID changes every read, often starts `08`). |
