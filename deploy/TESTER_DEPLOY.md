@@ -29,6 +29,12 @@ host runs the whole segment:
 - A second NIC (or the host's Wi-Fi toward your HOME network) is fine for
   reaching the web UI from elsewhere in the house; the slot segment doesn't
   route through it.
+- **Advanced users with managed gear:** a dedicated VLAN works exactly the
+  same as the dumb switch — that's how the dev floor runs. The requirements
+  don't change: an isolated L2 segment, **no other DHCP server on it** (turn
+  yours off for that VLAN), and the host's NIC or tagged subinterface static
+  at `192.168.50.2/24`. If you know how to do that, you don't need the
+  separate switch; if you're not sure, the $15 dumb switch is the path.
 
 ## Host hardware — any Linux box
 
