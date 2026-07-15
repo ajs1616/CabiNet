@@ -101,6 +101,7 @@ It is idempotent and does, over SSH:
 **Wire the RS-232 level shifter** to the machine's SAS port: TX→RX, RX→TX, GND↔GND.
 (Any "MAX3232 RS232 to TTL" converter board works — ~$5; wire its TTL side to the
 Pi's GPIO14/15 + 3.3V/GND, the DB9/screw-terminal side to the SAS harness.)
+Double-check pinouts before powering anything — it's your machine, your risk.
 Set the SAS **address** (default 1) and **enable the SAS channel** in the machine's
 operator menu.
 

@@ -11,7 +11,9 @@ whole casino *experience*, at home, for friends.
 > **For home game rooms only.** CabiNet is a free hobbyist project for
 > personal, non-commercial use with machines you own. It is not certified for
 > — and must never be used in — real-money or regulated gaming of any kind.
-> The money is fun-money: your bank, your rules, no limits.
+> The money is fun-money: your bank, your rules, no limits. You wire it into
+> your own machines at your own risk — double-check pinouts before powering
+> anything; no warranty of any kind (see [LICENSE](LICENSE)).
 
 ## What works today (live-proven on real iron)
 
