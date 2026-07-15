@@ -1,8 +1,12 @@
 # CabiNet Slot Machine Compatibility Matrix
 
-Which slot machines can talk **direct G2S over IP** to CabiNet, and which need the **SMIB hardware bridge** running SAS over RS-232.
+Which slot machines can talk **direct G2S over IP** to CabiNet, and which need the **SMIB hardware bridge** running SAS over RS-232. The whole point of the tester program is machines we haven't seen — use this file to figure out what YOUR machine speaks, then follow `deploy/TESTER_DEPLOY.md` § "Slot machines" for the exact settings (some fields are one-shot until a RAM clear — read that section before touching the operator menu).
 
-> **Status: PRELIMINARY**. Cutoffs below are compiled from vendor docs, GSA listings, and NLG / Slottech community knowledge. Bench-verification on AJ's hardware (10+ BB2E units, multiple OS versions, IGT AVP, BB1 pair) takes precedence over any claim here. When in doubt: **test, then update this file**.
+> **The two golden rules, wherever your machine came from:**
+> 1. **G2S machine, any brand:** host URL is `http://192.168.50.2:8081/G2S`, and if the machine offers a G2S **flavor/dialect selector, pick IGT** (IGT machines need neither — they pick everything up from DHCP).
+> 2. **SAS machine:** validation = **Secure Enhanced** if offered, otherwise **System** — both tie into the hub. Enable AFT and legacy bonusing if the menu has them.
+
+> **Status: PRELIMINARY**. Cutoffs below are compiled from vendor docs, GSA listings, and NLG / Slottech community knowledge. Bench results from real machines take precedence over any claim here — that's what the tester program is for. When in doubt: **test, then send a support bundle + your row for the bench log**.
 
 > Confidence labels: **[V]** verified by cited source · **[T]** training-data knowledge, not freshly cited · **[U]** uncertain, see Uncertainties section.
 
@@ -28,7 +32,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 | **AVP 3.0 (Family 14, OS 014-00305+)** | **Direct G2S** [V/T] | Family 14 quick-reference and IGT sbX training material confirm G2S in this OS family. AVP 3.0 / Crystal Curve / CrystalView ship with this. |
 | AVP 4.x / Axxis / CrystalDual | Direct G2S [T] | Modern IGT cabinets, factory G2S. |
 
-**Cutoff for the AJ AVP:** look for OS **Family 014** (`AVP014-00xxx`). Family 12/13 = SAS-era; Family 14 = G2S-capable.
+**Cutoff for IGT AVP:** look for OS **Family 014** (`AVP014-00xxx`). Family 12/13 = SAS-era; Family 14 = G2S-capable.
 
 ---
 
@@ -43,7 +47,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 | Helios / Bluebird 3 (BB3) | Direct G2S [V] | Ships with CPU-NXT3.2 by default. |
 | Gamefield xD, Twinstar, Kascada | Direct G2S [T] | Modern L&W cabinets, factory G2S. |
 
-**Cutoff for AJ's BB2E fleet:** open the CPU cage. Stamped **`A-017999-xx`** = NXT2, SAS only, SMIB required. Stamped **`A-026352-xx`** = NXT3.2, G2S possible. Confirm in operator menu by looking for the **G2S Diagnostics Menu** entry — its presence means G2S stack is live in that OS.
+**Cutoff for WMS BB2/BB2E:** open the CPU cage. Stamped **`A-017999-xx`** = NXT2, SAS only, SMIB required. Stamped **`A-026352-xx`** = NXT3.2, G2S possible. Confirm in operator menu by looking for the **G2S Diagnostics Menu** entry — its presence means G2S stack is live in that OS.
 
 > "Sentinel" in WMS context = the iVIEW-style player tracking display, **not** a protocol. Don't confuse it.
 
@@ -101,7 +105,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 ## Uncertainties (verify on bench before publishing)
 
 1. **Earliest AVP Family 014 OS rev with production G2S stack.** The `00305` lower bound is from the OS quick-reference; the very earliest builds may have G2S disabled or jurisdiction-locked.
-2. **BB2 NXT2 → NXT3.2 upgrade reality.** Strong evidence points to a **board swap** (different part numbers) being required, not a re-flash. Worth confirming on AJ's BB2E fleet — if any of his came with NXT3.2 from factory, that's a useful data point.
+2. **BB2 NXT2 → NXT3.2 upgrade reality.** Strong evidence points to a **board swap** (different part numbers) being required, not a re-flash. If your BB2/BB2E came with NXT3.2 from the factory, that's a useful data point — report it.
 3. **Bally Alpha 2 G2S firmware revision.** "Phase 2 CMS" is from a 2010 Bally G2E announcement; the specific Alpha 2 OS build that exposes G2S is not nailed down in public docs.
 4. **Aristocrat MK7/Viridian G2S.** The 2020 Slottech consensus is "G2S barely used"; whether the MK7 OS even has a G2S stack to enable is unclear.
 5. **Konami KP3 retrofit path.** Whether KP3 cabinets ever got a field-upgradable G2S package, or whether you must move to KP3+ hardware, is unclear.
@@ -110,7 +114,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 
 ## SAS validation modes — CabiNet host support
 
-> Live-proven on the WMS BB2 (SAS 6.02) via the Zero 2W SMIB. Host-side code: `SAS/core/sas_tito_host.py`; ticket ledger: the hub TitoAuthority (`/api/tito`, backed by `G2S/hub_store.py`). See `SAS/spec/README.md` for the spec-claim-vs-bench-proof table.
+> Live-proven on the WMS BB2 (SAS 6.02) via the Zero 2W SMIB. Host-side code: `SAS/core/sas_tito_host.py`; ticket ledger: the hub TitoAuthority (`/api/tito`, backed by `G2S/hub_store.py`).
 
 | Mode | Host support | Bench status |
 |---|---|---|
@@ -122,9 +126,9 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 
 ---
 
-## Bench-test log (AJ's lab)
+## Bench-test log (real iron)
 
-> Empirical findings from running CabiNet against actual hardware. **This section overrides anything above.** Format: machine + OS rev → result + any quirks/timeouts/workarounds.
+> Empirical findings from running CabiNet against actual hardware — the dev bench AND tester machines. **This section overrides anything above.** Format: machine + OS rev → result + any quirks/timeouts/workarounds. Testers: a row here (plus a support bundle if anything fought back) is the single most valuable thing you can send.
 
 | Date | Machine | OS / CPU rev | Result | Notes |
 |---|---|---|---|---|

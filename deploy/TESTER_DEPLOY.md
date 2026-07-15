@@ -89,19 +89,64 @@ Requirements:
 
 ## Slot machines
 
-Plug each machine's Ethernet into the switch. Machine-side setup is per-brand:
+First question: **is your machine G2S or SAS?** `COMPATIBILITY.md` has the
+per-vendor cutoffs, the stickers to look for, and the operator-menu screens
+that prove G2S is actually present. If the machine doesn't expose a G2S
+menu, it's SAS — and SAS is the *normal* case for most hobbyist machines.
 
-- **IGT AVP (direct G2S):** cert-less plug-and-play — Certificate Protocols
-  **NO**, "Override DHCP Configured Host" **NO**; the machine takes the host
-  from DHCP option 43 and joins on its own. After changing comm settings,
-  re-enable G2S in the debug menu. For on-glass UI: enable the mediaDisplay
-  content areas in the operator menu and give them memory from the media pool
-  (it's RAM-capped — enable the ones that fit).
-- **WMS BB2E (and most G2S-capable cabinets):** set the machine's **G2S flavor
-  selector to IGT** — the base G2S classes are standard and that flavor is the
-  one CabiNet speaks. The config window on a BB2E is the post-RAM-clear boot.
-- **SAS-only machines / SAS-only titles:** use a SAS SMIB Pi (the second golden
-  image) wired between the machine's SAS port and the switch.
+> ⚠️ **Read this before touching the operator menu.** On many machines the
+> comms/validation fields are **one-shot: once set, they lock until a RAM
+> clear** — and a RAM clear wipes your machine's books. Have the right
+> values in hand *before* you start. They're all below.
+
+### G2S machines (any brand)
+
+Plug the machine's Ethernet into the slot switch.
+
+- **IGT (AVP Family 14 etc.) — plug-and-play:** Certificate Protocols
+  **NO** (cert-less is the only supported path), "Override DHCP Configured
+  Host" **NO**. The machine takes the host from DHCP option 43 and joins on
+  its own — nothing to type. After changing any comm settings, **re-enable
+  G2S in the debug menu** or the machine's endpoint stays dark. For the
+  on-glass UI: enable the mediaDisplay content areas in the operator menu
+  and give them memory from the media pool (it's RAM-capped — enable the
+  ones that fit).
+- **Every other brand (or any machine with manual host entry):** point the
+  machine's G2S host/server URL at
+
+  ```
+  http://192.168.50.2:8081/G2S
+  ```
+
+  and if the machine offers a **G2S flavor / dialect selector, choose IGT**
+  — the base G2S classes are standard and the IGT flavor is the one CabiNet
+  speaks (live-proven on a WMS BB2E this way). Heads-up: some machines only
+  open the comms config window at specific moments — on a BB2E it's the
+  **post-RAM-clear boot** — so plan the settings before you're standing in
+  that window.
+
+### SAS machines (the SMIB path)
+
+Wire a SAS SMIB Pi (golden image or `deploy/zero2w_sas_setup.sh`) between
+the machine's SAS port and the switch. Then set these in the operator menu
+— **these are the one-shot fields**:
+
+| Field | Set it to | Why |
+|---|---|---|
+| Validation mode | **Secure Enhanced** if offered; otherwise **System** | Enhanced is the primary path (machine self-mints ticket numbers, host records them). No Enhanced? System mode still ties into the hub — the host answers the machine's cash-out requests in real time. Machine-only/"Standard" validation is the last resort: tickets will print but won't be in the hub ledger. |
+| SAS address | **1** | The SMIB polls address 1 by default (`--address` changes it if you must). |
+| SAS channel / port | **Enabled**, **19200** baud | SAS standard rate. |
+| AFT / cashless transfers | **Enabled** (if offered) | This is how credits move between the wallet and the machine. |
+| Legacy bonusing | **Enabled** (if present) | On pre-AFT machines this is the credit-push path; harmless to have on otherwise. |
+
+Host-side: in the web UI **Settings**, leave **System-validation fallback ON**
+(it ships on) — that's what answers System-mode cash-outs.
+
+**After any RAM clear:** the machine silently **disables in-house AFT** —
+re-enable it in the operator menu (validation re-seeds automatically; just
+re-check the validation-mode field survived).
+
+### Both kinds
 
 Machines appear on the floor as they join: **Connecting…** (amber) while the
 handshake runs, **LIVE** once joined. Registered machines never disappear —
