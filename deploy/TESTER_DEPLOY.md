@@ -3,7 +3,9 @@
 > **The one-sentence version:** put the CabiNet host and your slot machines on
 > a **basic unmanaged Ethernet hub/switch of their own** — no router, no other
 > DHCP — because the host IS the network stack (DHCP + DNS + NTP + TFTP + G2S).
-> Everything is **wired**. There is no Wi-Fi in this deployment, on purpose.
+> Everything on it is **wired**. The only Wi-Fi anywhere is the host's own
+> optional leg onto your home network so you can browse the UI from the couch
+> — walkthrough below.
 
 ## Why a dumb hub, not a router
 
@@ -28,13 +30,55 @@ host runs the whole segment:
   transfers, stalled command channels) — v1 is Ethernet, full stop.
 - A second NIC (or the host's Wi-Fi toward your HOME network) is fine for
   reaching the web UI from elsewhere in the house; the slot segment doesn't
-  route through it.
+  route through it. See "Browsing from the couch" below for the setup.
 - **Advanced users with managed gear:** a dedicated VLAN works exactly the
   same as the dumb switch — that's how the dev floor runs. The requirements
   don't change: an isolated L2 segment, **no other DHCP server on it** (turn
   yours off for that VLAN), and the host's NIC or tagged subinterface static
   at `192.168.50.2/24`. If you know how to do that, you don't need the
   separate switch; if you're not sure, the $15 dumb switch is the path.
+
+## Browsing from the couch
+
+No managed gear needed for this — the host just gets a second leg: Ethernet
+stays on the slot switch, and its built-in Wi-Fi joins your home network like
+any laptop would. Nothing routes between the two, so the slot segment stays
+isolated. On a Pi host:
+
+1. **Join your home Wi-Fi:**
+
+   ```bash
+   sudo nmtui        # → "Activate a connection" → pick your network → password
+   ```
+
+   (or in one line: `sudo nmcli device wifi connect "YourNetwork" password "YourPassword"`)
+
+2. **Find the address your home network gave the host:**
+
+   ```bash
+   hostname -I       # the one NOT starting with 192.168.50. is the home-side IP
+   ```
+
+3. **From a phone or laptop on your home Wi-Fi, open:**
+
+   ```
+   http://<that address>:8081
+   ```
+
+   On most devices `http://<the host's hostname>.local:8081` works too. Some
+   Android browsers don't resolve `.local` — use the IP there, and give the
+   host a DHCP reservation in your router so it doesn't move.
+
+That's it. The machines and companion Pis don't change at all — they never see
+your home network. Two things to know:
+
+- The **wired-only rule is about the slot segment.** The host's home-side leg
+  being Wi-Fi is fine — the dev floor runs exactly this shape.
+- The page has **no login** — anyone on your home Wi-Fi can open it and play
+  banker. In a house full of friends that's a feature; just know it's there.
+
+Non-Pi hosts: join your home network however that box usually does; steps 2–3
+are the same.
 
 ## Host hardware — any Linux box
 
