@@ -141,7 +141,6 @@ the machine's SAS port and the switch. Then set these in the operator menu
 |---|---|---|
 | Validation mode | **Secure Enhanced** if offered; otherwise **System** | Enhanced is the primary path (machine self-mints ticket numbers, host records them). No Enhanced? System mode still ties into the hub — the host answers the machine's cash-out requests in real time. Machine-only/"Standard" validation is the last resort: tickets will print but won't be in the hub ledger. |
 | SAS address | **1** | The SMIB polls address 1 by default (`--address` changes it if you must). |
-| SAS channel / port | **Enabled**, **19200** baud | SAS standard rate. |
 | AFT / cashless transfers | **Enabled** (if offered) | This is how credits move between the wallet and the machine. |
 | Legacy bonusing | **Enabled** (if present) | On pre-AFT machines this is the credit-push path; harmless to have on otherwise. |
 
