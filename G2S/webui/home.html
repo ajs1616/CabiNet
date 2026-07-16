@@ -270,8 +270,13 @@
   .dchips{display:flex;gap:6px;flex-wrap:wrap}
   .theme{margin:0 0 16px}
   .theme>h3{margin:0 0 8px;font:700 18px var(--display);color:var(--ivory);
-    display:flex;gap:10px;align-items:baseline}
+    display:flex;gap:10px;align-items:baseline;cursor:pointer;
+    -webkit-user-select:none;user-select:none}
+  .theme>h3 .chev{font:12px var(--mono);color:var(--faint);flex:none;
+    width:12px;transform:translateY(-1px)}
+  .theme>h3:hover .chev{color:var(--gold)}
   .theme>h3 small{font:11px var(--mono);color:var(--faint)}
+  .theme .offnote{font:11px var(--mono);color:var(--faint);margin:2px 0 0 22px}
   .theme>h3 .gpen{appearance:none;border:0;background:none;cursor:pointer;
     font-size:13px;color:var(--faint);padding:2px 8px}
   .theme>h3 .gpen:hover{color:var(--gold)}
@@ -853,6 +858,15 @@ function gameRtp(g){
       || (g.paytableId||"?").replace(/^[A-Z]{2,6}_/,"");
   const lo=Math.min(...pcts), hi=Math.max(...pcts);
   return lo===hi ? pctFmt(lo) : (pctFmt(lo).replace("%","")+"–"+pctFmt(hi));
+}
+// One paytable's payback as a NUMBER (for the collapsed-theme min–max
+// summary): profile basis points first, else the self-describing WMS id.
+function gameRtpNum(g){
+  const wc=(g.profile&&g.profile.wagerCategories)||[];
+  const pcts=wc.map(c=>Number(c.theoPaybackPct)).filter(n=>isFinite(n)&&n>0);
+  if(pcts.length) return Math.min(...pcts)/100;
+  const p=paytableIdRtp(g.paytableId);
+  return p?Number(p.replace("%","")):null;
 }
 /* Machine naming — a cabinet is NEVER named after a game title (one AVP
    carries 119 titles; a theme is what's playing, not what the machine is).
@@ -2345,10 +2359,10 @@ function keyOffCheck(j){
    cabinet, not the site). Drill-down from the Floor tile's 🎰 button;
    the Floor tab stays lit underneath, ← Floor (or any tab) closes it.
    ====================================================================== */
-const GM={egm:null, q:"", denom:null};
+const GM={egm:null, q:"", denom:null, showOff:false, open:{}};
 function openGames(egm){
   disarm();
-  GM.egm=egm; GM.q=""; GM.denom=null;
+  GM.egm=egm; GM.q=""; GM.denom=null; GM.showOff=false; GM.open={};
   const q=$("gm-q"); if(q) q.value="";
   for(const el of document.querySelectorAll(".page"))
     el.classList.toggle("on", el.id==="pg-games");
@@ -2360,6 +2374,8 @@ function closeGames(){
 }
 function gmSearch(){GM.q=($("gm-q").value||"").trim().toLowerCase(); renderGames();}
 function gmDenom(d){GM.denom = GM.denom===d?null:d; renderGames();}
+function gmTheme(th,cur){GM.open[th]=!cur; renderGames();}
+function gmShowOff(){GM.showOff=!GM.showOff; renderGames();}
 async function gmSweep(btn){
   // scoped rescan: re-harvests this cabinet's device inventory FIRST (so
   // titles installed at the machine appear without waiting for the next
@@ -2396,9 +2412,17 @@ function renderGames(){
   for(const d of devIds) for(const dn of gameDenoms(gp[d])) all.add(Number(dn.denomId));
   const denoms=[...all].filter(n=>isFinite(n)&&n>0).sort((a,b)=>a-b);
   if(GM.denom!=null && !denoms.includes(GM.denom)) GM.denom=null;
+  /* + the machine-off visibility chip: paytables the MACHINE has disabled
+     can't be host-enabled, so they hide by default — the chip brings them
+     back for the full installed catalog. Only offered when some exist. */
+  const egmOffTotal=devIds.filter(d=>String(gp[d].egmEnabled)==="false").length;
   setHTML($("gm-denoms"), denoms.map(d=>
     `<button class="fchip ${GM.denom===d?"on":""}" aria-pressed="${GM.denom===d}"
-       onclick="gmDenom(${d})">${esc(fmtDenom(d))}</button>`).join(""));
+       onclick="gmDenom(${d})">${esc(fmtDenom(d))}</button>`).join("")
+    +(egmOffTotal?`<button class="fchip ${GM.showOff?"on":""}"
+       aria-pressed="${GM.showOff}" onclick="gmShowOff()"
+       title="Paytables switched off at the machine itself — the host can't enable those">
+       ${GM.showOff?"hide":"show"} ${egmOffTotal} machine-off</button>`:""));
 
   /* group this machine's devices by pretty theme name */
   const groups={};
@@ -2412,13 +2436,26 @@ function renderGames(){
   }
   const sections=[];
   const names=Object.keys(groups).sort((a,b)=>a.localeCompare(b));
+  const filtering=!!GM.q||GM.denom!=null;   // searching = show your matches
   for(const th of names){
     // the ✎ rename key = the EXACT key prettyTheme consulted for this
     // group, derived from a member device's themeId (all paytables of a
     // game share it). A themeId with no derivable family6+code3 key gets
     // NO ✎ — writing under a guessed key would corrupt the override map.
     const gk=themeKey((groups[th][0][1]||{}).themeId);
-    const cards=groups[th].map(([d,g])=>{
+    const liveN=groups[th].filter(([,g])=>String(g.hostEnabled)!=="false"
+      &&String(g.egmEnabled)!=="false").length;
+    const offPairs=groups[th].filter(([,g])=>String(g.egmEnabled)==="false");
+    const visPairs=GM.showOff?groups[th]
+      :groups[th].filter(([,g])=>String(g.egmEnabled)!=="false");
+    // collapsed by default; a single-title cabinet starts open; searching
+    // or a denom filter opens everything (you asked to see matches).
+    const isOpen=filtering||(th in GM.open?GM.open[th]:names.length===1);
+    const rtps=groups[th].map(([,g])=>gameRtpNum(g)).filter(n=>n!=null);
+    const range=rtps.length?
+      (Math.min(...rtps)===Math.max(...rtps)?Math.min(...rtps)+"%"
+       :Math.min(...rtps)+"–"+Math.max(...rtps)+"%"):"";
+    const cards=visPairs.map(([d,g])=>{
       const active=gameDenoms(g).filter(x=>String(x.active)==="true");
       const shown=(active.length?active:gameDenoms(g)).slice(0,6);
       const denomTxt=shown.map(x=>fmtDenom(x.denomId)).join(" ")+
@@ -2438,11 +2475,22 @@ function renderGames(){
         <div class="gb">${state}${tog}</div>
       </div>`;
     }).join("");
-    sections.push(`<div class="theme"><h3>${esc(th)}
-      <small>${groups[th].length} paytable${groups[th].length>1?"s":""}</small>
-      ${gk?`<button class="gpen" onclick="gameNameOpen('${jsq(gk)}','${jsq(th)}')"
+    const hiddenNote=(!GM.showOff&&offPairs.length)
+      ?` · ${offPairs.length} machine-off hidden`:"";
+    const body=!isOpen?"":(cards
+      ?`<div class="ggrid">${cards}</div>`
+      :`<p class="offnote">all ${offPairs.length} paytables are switched off
+         at the machine — the "show machine-off" chip lists them.</p>`);
+    sections.push(`<div class="theme">
+      <h3 onclick="gmTheme('${jsq(th)}',${isOpen})" role="button"
+        aria-expanded="${isOpen}"><span class="chev">${isOpen?"▾":"▸"}</span>
+      ${esc(th)}
+      <small>${groups[th].length} paytable${groups[th].length>1?"s":""} ·
+        ${liveN} live${range?` · ${esc(range)}`:""}${hiddenNote}</small>
+      ${gk?`<button class="gpen"
+        onclick="event.stopPropagation();gameNameOpen('${jsq(gk)}','${jsq(th)}')"
         title="Rename this game" aria-label="Rename this game">✎</button>`:""}</h3>
-      <div class="ggrid">${cards}</div></div>`);
+      ${body}</div>`);
   }
   setHTML($("gm-list"), sections.join("")||
     `<p class="none">${GM.q||GM.denom!=null?"No games match — clear the search or denom filter.":
