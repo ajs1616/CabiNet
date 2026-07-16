@@ -19,7 +19,8 @@ whole casino *experience*, at home, for friends.
 
 - **Direct G2S over Ethernet** — plug-and-play join (the host is the DHCP
   server and hands the machine its host URL; zero machine-side config to join on IGT
-  AVP), live meters, events, remote enable/disable.
+  AVP), live meters, events, remote enable/disable — down to individual game
+  titles: turn any machine-enabled title on or off from the host.
 - **SAS via a small Pi bridge** (a used Pi 3B+ is perfect — Ethernet built
   in) — meters, AFT credit transfers both directions, TITO, legacy
   bonusing, handpay reset.
