@@ -6556,9 +6556,17 @@ def main():
             f'g2s:deviceId="1" g2s:eventCode="{code}" g2s:eventId="{eid}" '
             f'g2s:eventDateTime="{hook_dt}" g2s:transactionId="{txn}"/>',
             str(480 + int(eid)), sid, "G2S_request")))
-    acks = drain_host_posts(len(burst))
-    check("all 6 synthetic eventReports eventAck'd (hooks ride the existing "
-          "path)", acks == ["eventAck"] * len(burst), f"got {acks}")
+    acks = drain_host_posts(len(burst) + 2)
+    check("all 6 synthetic eventReports eventAck'd + each gamePlay event "
+          "drew a scoped getGamePlayStatus re-read (GR-31: gamePlay events "
+          "drive games-list freshness for KNOWN devices; the hook enqueues "
+          "the read before the ack, so it rides first in the FIFO)",
+          acks == ["eventAck",                        # JPE101
+                   "getGamePlayStatus", "eventAck",   # GPE103 (GR-31 read)
+                   "getGamePlayStatus", "eventAck",   # GPE112 (GR-31 read)
+                   "eventAck", "eventAck",            # CBE309 / CBE313
+                   "eventAck"],                       # VCE103
+          f"got {acks}")
     time.sleep(0.3)
     with urllib.request.urlopen(STATUS_URL, timeout=5) as resp:
         snap_act2 = json.loads(resp.read())

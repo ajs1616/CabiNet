@@ -303,6 +303,13 @@ SPOKEN_CLASSES = frozenset((
 GP_SWEEP_BATCH = 8
 GP_SWEEP_DELAY_SEC = 0.5
 GP_SWEEP_DRAIN_WAIT_SEC = 15
+# GR-30 rescan: how long the on-demand refresh waits for the fresh
+# descriptorList to land before sweeping with whatever inventory it has.
+GP_RESCAN_DESC_WAIT_SEC = 15
+# GR-31: a gamePlay event from a device the store has never seen triggers an
+# automatic rescan — at most one per this window (an install narrates dozens
+# of GPE events over minutes; one rescan catches them all).
+GP_EVENT_RESCAN_DEBOUNCE_SEC = 120
 
 # On-demand gamePlay STATUS refresh (GR-30). The join sweep (G2S-21) reads
 # status/profile/denoms ONCE per epoch; absent a re-handshake the enabled-state
@@ -315,8 +322,9 @@ GP_SWEEP_DRAIN_WAIT_SEC = 15
 # "refresh" button that fires refresh_game_play_status: a one-shot re-read of
 # ONLY gamePlayStatus (hostEnabled/egmEnabled) for every device, paced in the
 # SAME batches as the join sweep. Profile (RTP/wagerCategories) and denoms are
-# static per theme+paytable and left alone — the status response merges IN
-# PLACE (gp.update, GR-28), so a status-only refresh never wipes them.
+# static per theme+paytable — known devices stay status-only (the response
+# merges IN PLACE, gp.update, GR-28, so it never wipes them); the GR-30 rescan
+# re-harvests the inventory first and reads the full trio for NEW devices.
 
 # gamePlay inventory persistence debounce (GR-28). The sweep lands ~357
 # status/profile/denoms parses in bursts; persisting (tmp+fsync+rename+dir
@@ -983,6 +991,8 @@ class EgmAssociation:
         self.gamesweep_started = False  # staggered gamePlay sweep this epoch
         self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
         self.descriptors = []           # harvest: device inventory (getDescriptor)
+        self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
+        self.gp_event_rescan_at = 0.0   # last GR-31 auto-rescan (debounce)
         # eventHandler: the AVP's real data stream. supported_events populated
         # by supportedEvents; subscribed flips true on setEventSubAck; events is
         # a bounded ring of the most recent eventReports for the status API /
@@ -7564,26 +7574,53 @@ class G2SHost:
         threading.Thread(target=loop, daemon=True).start()
 
     def refresh_game_play_status(self, assoc):
-        """GR-30: ONE-SHOT gamePlayStatus re-read so the games list's
-        enabled-state can be refreshed ON DEMAND (the UI "refresh games"
-        button). The join sweep reads status once per epoch; a game
-        enabled/disabled at the EGM's own operator/e-key menu fires no
-        host-visible update, so the list can freeze at the last sweep
-        (LIVE-observed: Da Vinci played while the store showed it disabled
-        from a 6-day-old sweep). Re-reads ONLY status (profile/denoms are
-        static per theme+paytable; the status response merges in place so they
-        survive), paced in GP_SWEEP_BATCH batches like the join sweep and
-        yielding to interactive sends the same way — but a SINGLE pass, no
-        timer. Epoch-gated: a re-handshake/offline mid-refresh abandons it.
-        Returns {devices: N} so the caller can report the scope."""
+        """GR-30 v2: ON-DEMAND game RESCAN (the UI "refresh games" button).
+        Re-harvests the device inventory FIRST (getDescriptor), so titles
+        installed at the machine after the join sweep get discovered —
+        v1 re-read status for the already-known ids only, which made a
+        freshly installed game invisible to the button (live-caught by AJ
+        2026-07-16 after an AVP game install: only the next re-handshake's
+        join sweep revealed it). The sweep pass then reads status for
+        EVERY device, plus the full profile/denoms trio for devices the
+        store has never profiled (the new installs; profile/denoms are
+        static per theme+paytable, so known devices stay status-only —
+        the cheap common case of a game toggled at the EGM's own
+        operator/e-key menu). Same GP_SWEEP_BATCH trickle + epoch gate as
+        the join sweep; a SINGLE pass, no timer. Returns {devices: N} for
+        the caller's report (the count is the pre-rescan inventory — the
+        fresh descriptorList may grow it before the sweep runs)."""
         with assoc.lock:
             epoch = assoc.epoch
             online = assoc.comms_state == "onLine"
-        ids = self.game_play_device_ids(assoc)
+            rx_before = assoc.descriptors_rx
+        ids_before = self.game_play_device_ids(assoc)
         if not online:
             return {"ok": False, "error": "machine offline", "devices": 0}
+        self.enqueue_get_descriptor(assoc, epoch=epoch)
 
         def pass_once():
+            # Bounded wait for the fresh descriptorList so the id list
+            # below includes newly installed titles; on timeout the sweep
+            # still runs with the known inventory (a v1-grade refresh).
+            deadline = time.time() + GP_RESCAN_DESC_WAIT_SEC
+            while time.time() < deadline:
+                with assoc.lock:
+                    if epoch != assoc.epoch or \
+                            assoc.comms_state != "onLine":
+                        return  # superseded / offline — abandon
+                    if assoc.descriptors_rx != rx_before:
+                        break
+                time.sleep(0.2)
+            ids = self.game_play_device_ids(assoc)
+            with assoc.lock:
+                profiled = {d for d, g in assoc.game_play.items()
+                            if g.get("profile")}
+            new_ids = [i for i in ids if i not in profiled]
+            if new_ids:
+                log.info("[%s] 🎮 rescan revealed %d unprofiled gamePlay "
+                         "device(s): %s", assoc.egm_id, len(new_ids),
+                         ", ".join(new_ids[:12]) +
+                         ("…" if len(new_ids) > 12 else ""))
             for i in range(0, len(ids), GP_SWEEP_BATCH):
                 if i:
                     # Same trickle discipline as the join sweep: wait for the
@@ -7599,11 +7636,55 @@ class G2SHost:
                         return  # superseded / offline — abandon the refresh
                 for gp_id in ids[i:i + GP_SWEEP_BATCH]:
                     self.enqueue_get_game_play_status(assoc, gp_id)
+                    if gp_id not in profiled:
+                        self.enqueue_get_game_play_profile(assoc, gp_id)
+                        self.enqueue_get_game_denoms(assoc, gp_id)
 
-        log.info("[%s] 🔄 gamePlay status refresh — %d device(s) (on-demand)",
-                 assoc.egm_id, len(ids))
+        log.info("[%s] 🔄 gamePlay rescan — inventory re-harvest + status "
+                 "sweep (%d known device(s), on-demand)",
+                 assoc.egm_id, len(ids_before))
         threading.Thread(target=pass_once, daemon=True).start()
-        return {"devices": len(ids)}
+        return {"devices": len(ids_before)}
+
+    def _game_play_event_refresh(self, assoc, ev):
+        """GR-31: event-driven games-list freshness (AJ, 2026-07-16 — "if
+        we overcame the reason the list wasn't updating on its own we can
+        make the refresh happen on its own"). The machine narrates game
+        config as gamePlay-class eventReports — live capture from the AVP
+        install session: G2S_GPE004 per touched device, INCLUDING deviceIds
+        outside the join-sweep inventory (gamePlay/129 on a 119-device
+        harvest). So the events themselves are the refresh trigger:
+          * event from a KNOWN device  -> one scoped getGamePlayStatus
+            re-read (the toggled-at-the-machine case; single cheap read).
+          * event from an UNKNOWN device -> automatic full rescan
+            (refresh_game_play_status: descriptor re-harvest + the trio
+            for new titles — the install case), debounced to one per
+            GP_EVENT_RESCAN_DEBOUNCE_SEC (an install narrates dozens of
+            GPE events over minutes; one rescan catches them all).
+        No timers — the "no timer" GR-30 doctrine holds; the machine tells
+        us when. Fires only for LIVE deduped events (the caller's gate),
+        so backfill merges never trigger reads. Runs outside assoc.lock."""
+        if ev.get("deviceClass") != "G2S_gamePlay":
+            return
+        dev = str(ev.get("deviceId") or "")
+        if not dev or dev == "0":
+            return
+        with assoc.lock:
+            known = dev in assoc.game_play
+            online = assoc.comms_state == "onLine"
+        if not online:
+            return
+        if known:
+            self.enqueue_get_game_play_status(assoc, dev)
+            return
+        now = time.time()
+        with assoc.lock:
+            if now - assoc.gp_event_rescan_at < GP_EVENT_RESCAN_DEBOUNCE_SEC:
+                return
+            assoc.gp_event_rescan_at = now
+        log.info("[%s] 🎮 gamePlay event from device %s — not in the store, "
+                 "auto-rescan (GR-31)", assoc.egm_id, dev)
+        self.refresh_game_play_status(assoc)
 
     def enqueue_get_game_play_status(self, assoc, device_id="1"):
         """gamePlay.getGamePlayStatus (spec §6.10) — empty request element;
@@ -8940,7 +9021,7 @@ class G2SHost:
 
     def id_reader_probe(self, assoc, device_id=None):
         """/api/command idReaderProbe — on-demand bench read (the GR-30
-        refreshGameStatus posture: status-only, on a button, never a
+        refreshGameStatus posture: read-only, on a button, never a
         timer): getIdReaderStatus + getIdReaderProfile for the owned
         idReader device, so egmPhysicallyControls is visible BEFORE the
         first live tap. Explicit deviceId overrides; the default is the
@@ -11305,6 +11386,7 @@ class G2SHost:
                 "active": attr(d, "deviceActive") or attr(d, "active"),
             } for d in el]
             assoc.descriptors = descs
+            assoc.descriptors_rx += 1  # GR-30 rescan waits on this bump
             # Cabinet IDENTITY (2026-07-07, AJ): the G2S_cabinet descriptor
             # carries the machine's real make/model — vendorName="IGT"
             # productName="AVP" releaseNum="AVP014 R2" serialNum=... — and we
@@ -11535,6 +11617,9 @@ class G2SHost:
                 # only (never for backfill merges or retried persisted
                 # events) — the activity tape is what happened, once.
                 self.fire_event_hooks(assoc, ev, bill)
+                # GR-31: gamePlay events keep the games list fresh on
+                # their own — see _game_play_event_refresh.
+                self._game_play_event_refresh(assoc, ev)
                 log.info("🔔 [%s] EVENT #%d %s [%s] from %s/%s (eventId=%s "
                          "txn=%s)%s%s",
                          assoc.egm_id, total, code, ev["label"],
@@ -15052,7 +15137,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                              setWatCashOut so the machine's own cash-out
                              mirrors to the player's wallet. Moves no money.
           clearHandpay    — ADMIN only: reset the pending lockup to credits.
-          refreshGames    — ADMIN only: status-only gamePlay refresh.
+          refreshGames    — ADMIN only: gamePlay rescan (inventory + status).
         Anything outside a session's band answers an honest 403 — NEVER a
         500."""
         engine = self.host_engine
@@ -15170,7 +15255,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 payload = dict(res) if isinstance(res, dict) else {}
                 payload["ok"] = ok
                 return done(200, payload)   # honest ok:false at 200
-            # refreshGames — status-only gamePlay refresh
+            # refreshGames — gamePlay rescan (inventory re-harvest + status)
             res = engine.refresh_game_play_status(assoc)
             ok = not (isinstance(res, dict) and res.get("ok") is False)
             payload = dict(res) if isinstance(res, dict) else {}

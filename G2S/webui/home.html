@@ -2348,10 +2348,12 @@ function closeGames(){
 function gmSearch(){GM.q=($("gm-q").value||"").trim().toLowerCase(); renderGames();}
 function gmDenom(d){GM.denom = GM.denom===d?null:d; renderGames();}
 async function gmSweep(btn){
-  // scoped: re-read ONLY this cabinet's live on/off state (status-only —
-  // ~1/3 the traffic of a full profile+denom sweep). Pulls games toggled at
-  // the machine's OWN operator/e-key menu into the list; the reads trickle in
-  // and the tiles flip to "live" over the next couple of poll ticks.
+  // scoped rescan: re-harvests this cabinet's device inventory FIRST (so
+  // titles installed at the machine appear without waiting for the next
+  // re-handshake), then re-reads live on/off state — status-only for known
+  // games, full profile+denoms only for newly discovered ones. Pulls games
+  // toggled at the machine's OWN operator/e-key menu into the list; the reads
+  // trickle in and the tiles flip to "live" over the next several poll ticks.
   if(!GM.egm) return;
   const r=await cmd({action:"refreshGameStatus", egmId:GM.egm},
     "Refresh games · "+machineName(snap(GM.egm), GM.egm));
