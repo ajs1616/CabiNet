@@ -833,11 +833,24 @@ function pctFmt(raw){
 }
 // A paytable's collector-legible label = its payback %, from the profile the
 // machine already reports. Multi-category (bet-dependent RTP) -> a range.
-// Falls back to the raw AVV paytable code if the machine reports no %.
+// Machines with partial G2S (the BB2E never answers getGamePlayProfile)
+// often self-describe instead: WMS paytable ids carry lines+RTP in the name
+// ("WizardOfOzII-25-86-SA" = 25 lines, 86%) — parse that before giving up.
+// Falls back to the raw paytable code when neither source yields a %.
+function paytableIdRtp(id){
+  // conservative: dash-separated numeric tokens, the LAST one in the
+  // plausible-RTP band (70–99) is the nominal payback (WMS order is
+  // <theme>-<lines>-<rtp>-<suffix>; lines can reach 80, so take the last).
+  const nums=String(id||"").split("-").filter(t=>/^\d{2}$/.test(t))
+    .map(Number).filter(n=>n>=70&&n<=99);
+  return nums.length ? nums[nums.length-1]+"%" : "";
+}
 function gameRtp(g){
   const wc=(g.profile&&g.profile.wagerCategories)||[];
   const pcts=wc.map(c=>Number(c.theoPaybackPct)).filter(n=>isFinite(n)&&n>0);
-  if(!pcts.length) return (g.paytableId||"?").replace(/^[A-Z]{2,6}_/,"");
+  if(!pcts.length)
+    return paytableIdRtp(g.paytableId)
+      || (g.paytableId||"?").replace(/^[A-Z]{2,6}_/,"");
   const lo=Math.min(...pcts), hi=Math.max(...pcts);
   return lo===hi ? pctFmt(lo) : (pctFmt(lo).replace("%","")+"–"+pctFmt(hi));
 }
