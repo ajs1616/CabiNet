@@ -163,6 +163,7 @@ Plug the machine's Ethernet into the slot switch.
   which takes your eKey.** For the on-glass UI: enable the mediaDisplay
   content areas in the operator menu and give them memory from the media
   pool (it's RAM-capped — enable the ones that fit).
+  **Step-by-step with operator-menu photos: [`AVP_SETUP.md`](AVP_SETUP.md).**
 - **Every other brand (or any machine with manual host entry):** point the
   machine's G2S host/server URL at
 

@@ -38,6 +38,10 @@ required for fetch or display, only for a page that wants to talk back to the ca
 
 ## Two enables, and a RAM ceiling
 
+> **Setting up a machine?** CabiNet uses only the **left Service Window
+> (dev 1)** — enable that one, leave the rest off. The step-by-step is in
+> [`deploy/AVP_SETUP.md`](../../deploy/AVP_SETUP.md).
+
 - **Play-enable ≠ media-enable.** A cabinet can be fully playable (credits, ready-to-play,
   `hostEnabled=true`) while its media windows are disabled.
 - Each window has its own `egmEnabled`, a **cabinet operator-menu** switch the host
