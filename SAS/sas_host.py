@@ -537,9 +537,25 @@ class HubReporter:
         self.stop = False
         self.pending_commands = collections.deque(maxlen=self.MAX_PENDING)
         self.command_results = collections.deque(maxlen=20)
+        # Event-driven verdict return (2026-07-22): the POLL thread sets this
+        # when it deposits a fresh command result, so the report thread fires
+        # the verdict the INSTANT it exists instead of waiting out the flat
+        # REPORT_SEC. Shaves up to ~1s off every command round-trip and every
+        # tournament stage handoff. Safe by the threading contract above —
+        # the report thread is HTTP-only and never touches the SAS transport,
+        # so no single-writer/tcdrain/never-flush-mid-frame rule is in play.
+        self.result_ready = threading.Event()
         # Dedupe: the hub re-sends a command until it sees its result echoed
         # back, so remember recently-seen ids (bounded).
         self._seen_cmd_ids = collections.deque(maxlen=64)
+
+    def record_result(self, result):
+        """Deposit a command result (poll thread) and wake the report thread
+        so the verdict rides the NEXT snapshot immediately, not at the next
+        flat 1s tick. The single seam every result path uses — add new ones
+        here, never a bare command_results.appendleft."""
+        self.command_results.appendleft(result)
+        self.result_ready.set()
 
     def snapshot(self):
         st = self.poller.state
@@ -635,6 +651,13 @@ class HubReporter:
 
     def run(self):
         while not self.stop:
+            # Clear BEFORE the snapshot: a result already in command_results
+            # rides THIS report and its stale set is cleared; a result the
+            # poll thread deposits during/after the POST re-sets the event and
+            # cuts the wait short — so no verdict is ever missed or double-
+            # waited. Idle cycles still time out at REPORT_SEC (normal cadence,
+            # dormancy law holds — nothing fires without real pending work).
+            self.result_ready.clear()
             try:
                 body = json.dumps(self.snapshot()).encode()
                 req = urllib.request.Request(
@@ -651,7 +674,7 @@ class HubReporter:
                     logger.warning("hub report failed ({}: {}) — will keep "
                                    "retrying quietly every {}s",
                                    self.url, e, REPORT_SEC)
-            time.sleep(REPORT_SEC)
+            self.result_ready.wait(REPORT_SEC)
 
 
 class RxWedgeWatchdog:
@@ -1529,7 +1552,7 @@ def main():
                 cmd = reporter.pending_commands.popleft()
             except IndexError:
                 break
-            reporter.command_results.appendleft(run_hub_command(cmd))
+            reporter.record_result(run_hub_command(cmd))
 
     def handle_cashout_if_pending():
         """Answer a machine-initiated host-cashout request (exception 0x6A)
@@ -1616,7 +1639,7 @@ def main():
                        detail=f"{type(e).__name__}: {e}", result="error")
             logger.warning("🏦 host-cashout failed: {}", e)
         if reporter is not None:
-            reporter.command_results.appendleft(rec)
+            reporter.record_result(rec)
 
     def heartbeat_if_due(now):
         if now - hb["last"] >= HEARTBEAT_SEC:
