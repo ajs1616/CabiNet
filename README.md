@@ -31,6 +31,17 @@ whole casino *experience*, at home, for friends.
   both showing *your* game room's name in lights.
 - **Dual-protocol cabinets** — a machine that speaks both G2S and SAS is
   linked into one tile with SAS as the money authority.
+- **The Gameroom Board** — a wall-TV spectator page at `/board` off the host:
+  your game room's name in lights, an attract rotation (now playing,
+  standings, record to beat), moment call-outs written as sentences, and
+  fireworks on the big hits.
+- **Tournament night** — arm the floor and every machine becomes a seat:
+  credits funded from the House, one countdown, a wins-only leaderboard
+  racing on the board, winner ceremony, leftovers swept back to the House.
+  Uncarded players get funny names from an editable roster. See
+  [`deploy/TOURNAMENT.md`](deploy/TOURNAMENT.md).
+- **Floor lock** — one switch in Settings locks or unlocks every machine on
+  the floor at once.
 
 ## Getting started
 

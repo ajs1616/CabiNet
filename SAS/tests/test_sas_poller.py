@@ -129,6 +129,38 @@ class TestSASPoller:
         assert [c for _, c, _ in events] == [0x81]
         assert poller.state.nacks == 0
 
+    def test_documented_exception_at_own_address_dispatched(self):
+        # PORTABILITY (2026-07-21): 0x80|addr collides with a REAL documented
+        # exception on a larger multidrop floor. A spec-compliant machine at
+        # address 6 raising 0x86 "game out of service" (= 0x80|6) must have
+        # that GAME event DISPATCHED, not swallowed as a busy/NACK chirp.
+        machine = ScriptedMachine(address=6)
+        machine.queue(0x86)                    # 0x80|6 — a documented exception
+        port = MockSASSerialPort(machine)
+        events = []
+        poller = SASPoller(port, address=6,
+                           on_event=lambda a, c, n: events.append((a, c, n)))
+        poller.poll_once()
+        assert [c for _, c, _ in events] == [0x86]
+        assert exception_name(0x86) == "game out of service"
+        assert poller.state.nacks == 0         # NOT counted as a chirp
+
+    def test_chirp_still_folded_when_not_a_documented_exception(self):
+        # The disambiguation only rescues DOCUMENTED codes: an undocumented
+        # 0x80|addr byte is still a busy/NACK chirp. At address 12 that is
+        # 0x8C "game selected" (documented -> dispatched), but at address 3
+        # the chirp 0x83 has no EXCEPTIONS entry and must still fold.
+        machine = ScriptedMachine(address=3)
+        machine.queue(0x83, 0x83)              # 0x80|3, not in the guide table
+        port = MockSASSerialPort(machine)
+        events = []
+        poller = SASPoller(port, address=3,
+                           on_event=lambda a, c, n: events.append((a, c, n)))
+        for _ in range(2):
+            poller.poll_once()
+        assert events == []
+        assert poller.state.nacks == 2
+
     def test_implied_ack_no_duplicate_events(self):
         """Against a machine that re-sends until ACKed (real semantics), the
         ACK-aware drain must dispatch each exception exactly once — a naive

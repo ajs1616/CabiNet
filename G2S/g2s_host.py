@@ -75,6 +75,23 @@ except ImportError:
         u = uid.replace(":", "").replace("-", "").replace(" ", "").upper()
         return u if re.fullmatch(r"[0-9A-F]{2,32}", u) else None
 
+# Tournament roster tenant (board v2, dev tier): the funny-name roster rides
+# the host_settings shelf as ONE JSON-array value under 'tournament_names'.
+# hub_store's whitelist + value bound are the shared store's spam guards for
+# the unauthenticated /api/settings wire; the tournament tier extends them
+# HERE (module-side, additive — the dev tier does not edit the shared store)
+# rather than growing hub_store for a dev-only feature. Safe because the
+# guards' JOB is unchanged: _handle_settings validates the roster strictly
+# (list of str, 1..24 chars each, max 64 entries) BEFORE any write, exactly
+# like every other tenant, and the widened value ceiling only ever admits
+# that already-validated JSON (64 names × worst-case JSON escaping < 4096).
+import hub_store as _hub_store_mod  # noqa: E402  (sibling module, above)
+if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
+    _hub_store_mod.HOST_SETTING_KEYS = (
+        _hub_store_mod.HOST_SETTING_KEYS + ("tournament_names",))
+    _hub_store_mod.MAX_SETTING_VAL_LEN = max(
+        _hub_store_mod.MAX_SETTING_VAL_LEN, 4096)
+
 # ----------------------------------------------------------------------------
 # Namespaces / constants
 # ----------------------------------------------------------------------------
@@ -181,6 +198,40 @@ ASSOC_REAP_SEC = 300
 # Bounded so it fits the 256px glass attract line — the client steps the font
 # down for long names (the credits-display idiom); "" = unset -> neutral fallback.
 MAX_GAMEROOM_NAME_LEN = 28
+# Tournament mode (board v2): the alias roster for seats whose player
+# "didn't care to card in for the sesh" (AJ 2026-07-20) — the shipped
+# default; Settings ▸ tournamentNames overrides it via the
+# 'tournament_names' host_setting (one JSON array). Aliases draw shuffled-
+# without-repeats per arm; an exhausted roster falls back to numbered
+# Mystery Guests so the board never shows a blank seat.
+TOURNAMENT_NAME_DEFAULTS = (
+    "The Mystery Whale", "Witness Protection", "High Roller Incognito",
+    "The Masked Bandit", "Lucky Stranger", "John Doe Money",
+    "The Phantom Spinner", "Anonymous Shark", "Chip Whisperer",
+    "No-Card Ned", "The Unknown Legend", "Slot Machine Enjoyer")
+# Roster bounds (the /api/settings 400 edge): a name must fit a seat card
+# on the wall TV, and the roster is a hand-typed list, not a database.
+TOURNAMENT_NAME_MAX_LEN = 24
+TOURNAMENT_ROSTER_MAX = 64
+# What a tournament-locked machine says on its own glass (setCabinetState
+# disableText — player-facing, so it narrates the show, not the protocol).
+TOURNAMENT_ARM_TEXT = "TOURNAMENT — take your seats"
+TOURNAMENT_OVER_TEXT = "TOURNAMENT OVER"
+# The wins meter a plain-G2S seat is scored on — the live-proven fold key
+# (avp_replay asserts this exact key lands from the meter subscriptions;
+# values are RAW STRINGS in millicents). GPE112 game_end events carry no
+# amount on this AVP, so meter deltas ARE the win stream.
+#: The REAL per-game win meters the AVP emits (2026-07-21 live tournament:
+#: there is NO G2S_wonAmt on the wire — that was a replay-fixture name; the
+#: machine reports egmPaid/handPaid Game/Prog WonAmt per gamePlay DEVICE,
+#: and the win lands on the PLAYED game's device, not device 1). The g2s
+#: score is the summed delta of these four across EVERY gamePlay device.
+#: secWonAmt (gamble/double-up) is deliberately excluded — its overlap with
+#: egmPaidGameWonAmt is unverified and a double-count would inflate a race.
+TOURNAMENT_G2S_WON_METERS = ("G2S_egmPaidGameWonAmt",
+                             "G2S_egmPaidProgWonAmt",
+                             "G2S_handPaidGameWonAmt",
+                             "G2S_handPaidProgWonAmt")
 # The action gate for POST /api/glass/action (glass destub v1). The v1
 # NAVIGATION-only tier allowlist is retired: buttons are now REAL, gated by
 # the LIVE-resolved backend access (_session_is_admin), never a client-
@@ -993,6 +1044,8 @@ class EgmAssociation:
         self.descriptors = []           # harvest: device inventory (getDescriptor)
         self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
         self.gp_event_rescan_at = 0.0   # last GR-31 auto-rescan (debounce)
+        self.cab_theme_probe_at = 0.0   # last GR-32 now-playing cabinet re-read (debounce)
+        self.printer = {}               # G2S-24: status/profile/templates/lastPrint (wholesale-replaced)
         # eventHandler: the AVP's real data stream. supported_events populated
         # by supportedEvents; subscribed flips true on setEventSubAck; events is
         # a bounded ring of the most recent eventReports for the status API /
@@ -1066,6 +1119,16 @@ class EgmAssociation:
         # meters map ("class/id/meterName" -> value). Live telemetry surface.
         self.cabinet = {}
         self.meters = {}
+        # freshness stamps (wall clock) for the two folds above — the
+        # tournament pipeline's staleness discipline: meters_at flips on
+        # every landed meterInfo (the CLEAR stage refuses to settle a $0
+        # glass off a fold older than its own post-arm read — a bill fed
+        # in during the 60 s standing-sub window is invisible to the cold
+        # mirror), cabinet_at on every cabinetStatus (the lock restage
+        # only trusts a hostEnabled report FRESHER than its own last
+        # send). 0.0 = never reported.
+        self.meters_at = 0.0
+        self.cabinet_at = 0.0
         # gamePlay read state (G2S-21): per-deviceId dict keyed by the string
         # deviceId (a multi-game cabinet exposes several gamePlay devices, one
         # per theme+paytable, §6.1). Each holds themeId/paytableId/enabled/
@@ -1542,6 +1605,9 @@ class EgmAssociation:
             "lastMeterReport": self.last_meter_report,
             "lastMeterReportType": self.last_meter_report_type,
             "gamePlay": game_play,
+            # G2S-24 printer recon + last host print (records are wholesale-
+            # replaced by their handlers, so sharing by reference is safe)
+            "printer": self.printer,
             # GR-28: freshness stamp for the (possibly store-seeded)
             # inventory above — last-known view, the sweep refreshes.
             "gamePlayAsOf": self.game_play_as_of,
@@ -2552,16 +2618,21 @@ class WatStore:
             return dict(rec) if rec else None
 
     def new_request(self, egm_id, device_id, account_id, pay_method,
-                    cashable, promo, non_cash):
+                    cashable, promo, non_cash, direction="G2S_toEgm"):
         """Allocate the next non-zero requestId + a 'requested' record for a
-        host-initiated push (initiateRequest, §22.25)."""
+        host-initiated transfer (initiateRequest, §22.25). direction
+        G2S_toEgm = the credit push; G2S_fromEgm = the HOST-INITIATED PULL
+        (2026-07-21: the wat profile reads interfaceMode=G2S_hostControl,
+        so the host owns initiation BOTH ways — the tournament sweep is
+        the same choreography with the direction flipped, credits landing
+        at commitTransfer like any fromEgm cash-out)."""
         with self.lock:
             self.state["requestIdSeq"] += 1
             rid = self.state["requestIdSeq"]
             rec = {
                 "requestId": rid, "transactionId": "0",
                 "egmId": egm_id, "deviceId": str(device_id),
-                "state": "requested", "watDirection": "G2S_toEgm",
+                "state": "requested", "watDirection": str(direction),
                 "payMethod": pay_method, "accountId": account_id,
                 "reqCashableAmt": int(cashable), "reqPromoAmt": int(promo),
                 "reqNonCashAmt": int(non_cash), "commitSeen": False,
@@ -3414,6 +3485,29 @@ class G2SHost:
         # is never taken while holding companion_lock/assoc.lock.
         self._glass_cash_out_pin = {}
         self._glass_pin_lock = threading.Lock()
+        # Tournament mode (board v2): the phase machine's state + its LEAF
+        # lock (see the "tournament mode" section for the full law: nothing
+        # — no _enqueue, no sas_enqueue_command, no store, no other engine
+        # lock — is ever called while holding tournament_lock; copy out,
+        # drop, act, re-take to publish). State is IN-MEMORY ONLY: a hub
+        # restart mid-tournament loses the PHASE (seats/scores/countdown)
+        # deliberately — the MONEY is safe regardless because every fund/
+        # sweep leg settles through the existing once=True-ref'd paths.
+        # _tournament_thread is the run-scoped runner (None until an arm —
+        # the dormancy law: a fresh host runs no tournament thread and
+        # emits zero tournament bytes). _tournament_sweep_pins is the
+        # SAS-leg sweep destination map ({sasLegKey: {"acct", "ts"}}) that
+        # _sas_cashout_pin consults FIRST — a sweep's destination is
+        # immutable while its pull is outstanding (a player arming
+        # cashOutToWallet in the pull→settle window must not capture the
+        # House sweep). Lock-free reads; entries are CONSUMED at their
+        # settle, dropped at arm for legs being re-seated, and expire by
+        # TOURNAMENT_SWEEP_PIN_TTL_SEC — a pin can never outlive its run
+        # into somebody else's cash-out.
+        self.tournament = self._tournament_idle_state()
+        self.tournament_lock = threading.Lock()
+        self._tournament_thread = None
+        self._tournament_sweep_pins = {}
         # private id sequence for fob-triggered satellite commands (the
         # _aft_seq dialect — the queue entry shape is _handle_sas_command's)
         self._fob_seq = itertools.count(1)
@@ -3738,6 +3832,26 @@ class G2SHost:
             self._ticket_cache = (val, now)
         return val
 
+    def tournament_names(self):
+        """The tournament alias roster: host_setting 'tournament_names' as a
+        JSON array of names, falling back to the shipped defaults when the
+        row is unset, unparseable, or empties out after cleaning (a hand-
+        edited hub.db must degrade to the show going on, never a crash).
+        Returns a FRESH list — the arm shuffles and pops it. Read straight
+        (arm-time + the 2 s hostOptions poll — the gameroom_name cadence,
+        no per-second hot loop, so no TTL cache needed)."""
+        raw = self.hub_store.host_setting("tournament_names", "")
+        try:
+            val = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            val = None
+        if isinstance(val, list):
+            names = [str(x).strip() for x in val
+                     if isinstance(x, str) and str(x).strip()]
+            if names:
+                return names[:TOURNAMENT_ROSTER_MAX]
+        return list(TOURNAMENT_NAME_DEFAULTS)
+
     def sas_report(self, payload, peer):
         """Ingest one sas_host.py report (POST /api/sas/report). The
         reporter owns the shape; the hub stores it verbatim (bounded) and
@@ -3881,6 +3995,14 @@ class G2SHost:
         prefs = self.hub_store.machine_prefs(key) or {}
         entry["nickname"] = prefs.get("nickname")
         entry["denomCents"] = prefs.get("denomCents")
+        # denomAssumed: True when denomCents is unset and the money layer will
+        # value RAW 0x1A credits at the 1¢/credit fallback (see
+        # _sas_denom_cents). Rides /api/status so the tile / glass / tournament
+        # board can degrade honestly — a non-penny SAS cabinet (the wider SAS
+        # crowd AJ never bench-tested) is otherwise silently valued 5x/100x low.
+        # AJ's penny BB2 is correctly valued at 1¢ either way; setting its denom
+        # in Options clears the flag.
+        entry["denomAssumed"] = self._sas_denom_cents(entry)[1]
         # sasEnabled: hub.db is the truth (C4) — absent row/NULL = enabled,
         # so pre-v5 machines stay live. Rides the entry for /api/status
         # (the UI hides disabled tiles) AND the C2 reply below, which is
@@ -3978,6 +4100,14 @@ class G2SHost:
         # the push settle: after admission, outside sas_lock, idempotent on
         # txnId, raw commandResults.
         self._settle_aft_cashouts(cr, key)
+        # Tournament-pin reaper: an answered NON-crediting tournament pull
+        # (lock_failed / no_credits on a cancel sweep whose runner already
+        # stood down) must retire its House pin HERE — no observer tick
+        # will ever run again for it, and a stale house pin outranks every
+        # glass pin for the full TTL (a guest's own cash-out would settle
+        # to the House). Matched by the pin's own cmdId; crediting answers
+        # were already consumed by the settle above.
+        self._retire_tournament_pins(cr, key)
         # BOOT DISARM (finding #2a): the FIRST report from each machine after a
         # hub (re)start clears any cash-out arm that outlived the restart — the
         # hub lost every in-memory pin, so a still-armed satellite must be
@@ -4218,19 +4348,101 @@ class G2SHost:
 
     def _sas_cashout_pin(self, key):
         """The hub's OWN armed cash-out destination for a reporting SAS machine
-        (the credit authority for the RETURN leg), or None. Resolves the G2S
-        egm_id(s) LINKED to this SAS leg (sas_links value == key) plus the leg
-        key itself, and returns the first live _glass_cash_out_pin. NEVER
-        consults the wire's echoed accountId — the hub credits only what it
-        pinned (finding #4). Lock-free reads (the sas_links / pin snapshot
-        idiom — a nanosecond-stale pin is harmless; once=True is the hard
-        guarantee)."""
+        (the credit authority for the RETURN leg), or None. A LIVE tournament
+        sweep pin outranks the glass pins: while a tournament pull is
+        outstanding its destination is IMMUTABLE — a player toggling
+        cashOutToWallet in the pull→settle window overwrites the per-EGM
+        glass pin, and resolving that at settle would credit the player's
+        wallet the entire House sweep. The tournament pin is short-lived by
+        construction (consumed at its settle, expired by
+        TOURNAMENT_SWEEP_PIN_TTL_SEC), so it can never shadow a later
+        player's arm. Then the G2S egm_id(s) LINKED to this SAS leg
+        (sas_links value == key) plus the leg key itself, first live
+        _glass_cash_out_pin wins. NEVER consults the wire's echoed
+        accountId — the hub credits only what it pinned (finding #4).
+        Lock-free reads (the sas_links / pin snapshot idiom — a
+        nanosecond-stale pin is harmless; once=True is the hard guarantee).
+        getattr, not attribute access: __new__-built harness engines that
+        predate the tournament attrs must keep settling cash-outs."""
+        pins = getattr(self, "_tournament_sweep_pins", None) or {}
+        ent = pins.get(key)
+        if isinstance(ent, dict) and ent.get("acct") \
+                and time.time() - (ent.get("ts") or 0) \
+                <= self.TOURNAMENT_SWEEP_PIN_TTL_SEC:
+            return ent["acct"]
         for owner in [m for m, sk in self.sas_links.items()
                       if sk == key] + [key]:
             acct = self._glass_cash_out_pin.get(owner)
             if acct:
                 return acct
         return None
+
+    def _tournament_pin_consumed(self, key):
+        """A tournament sweep pull for this SAS leg just credited the House
+        — CONSUME the pins that homed it, so the arm dies WITH the money
+        leg: a "house" pin outliving its pull would let _sas_cashout_pin
+        bank a LATER cash-out (a guest's own money) to the bank. Pops the
+        leg's tournament pin plus any owner/leg glass pin, glass pins ONLY
+        while they still read "house" — a player's fresh arm is never
+        touched. Never raises (rides the settle)."""
+        try:
+            pins = getattr(self, "_tournament_sweep_pins", None)
+            if isinstance(pins, dict):
+                pins.pop(key, None)
+            owners = [m for m, sk in self.sas_links.items()
+                      if sk == key] + [key]
+            with self._glass_pin_lock:
+                for owner in owners:
+                    if self._glass_cash_out_pin.get(owner) == "house":
+                        self._glass_cash_out_pin.pop(owner, None)
+        except Exception:  # noqa: BLE001 — best-effort consume, never fatal
+            log.exception("tournament pin consume (%s) failed (ignored)",
+                          key)
+
+    def _retire_tournament_pins(self, command_results, key):
+        """Retire this leg's tournament House pin when ITS OWN pull
+        answers non-crediting with nobody left to observe it. The only
+        other place an answered-but-unsettling pull pops the pin is
+        _tournament_observe_pull — which rides the runner tick, and the
+        runner exits the moment a cancel claims phase=idle (a
+        tournamentReset during a still-pulling finish sweep is the same
+        shape). Without this, a cancel sweep answering lock_failed /
+        no_credits left {"acct": "house"} outranking every glass pin for
+        the full 600 s TTL — a guest's own later cash-out on that leg
+        settled to the House, silently and (once=True) unhealably.
+
+        Ingest-side: rides every /api/sas/report next to
+        _settle_aft_cashouts, AFTER it — a crediting answer settles and
+        consumes the pin there; this only reaps the answers nothing will
+        settle. Matched by the pin's OWN cmdId (recorded at pull issue)
+        so a foreign/forged result can never retire a live pin. getattr
+        posture: __new__-built engines predating the tournament attrs
+        keep settling. Never raises (rides the report ingest)."""
+        try:
+            pins = getattr(self, "_tournament_sweep_pins", None)
+            if not isinstance(pins, dict) \
+                    or not isinstance(command_results, list):
+                return
+            ent = pins.get(key)
+            if not isinstance(ent, dict) or not ent.get("cmdId"):
+                return
+            for r in command_results:
+                if not isinstance(r, dict) \
+                        or r.get("type") != "aft_cashout" \
+                        or r.get("id") != ent.get("cmdId"):
+                    continue
+                if r.get("ok") and r.get("outcome") in ("completed",
+                                                        "partial"):
+                    return    # it settles — the settle consumes the pin
+                pins.pop(key, None)
+                log.info("🏆 [sas:%s] tournament pull %s answered "
+                         "non-crediting (%s) with no run left to observe "
+                         "it — House pin retired", key, ent.get("cmdId"),
+                         r.get("outcome") or r.get("detail") or "?")
+                return
+        except Exception:  # noqa: BLE001 — best-effort reap, never fatal
+            log.exception("tournament pin retire (%s) failed (ignored)",
+                          key)
 
     def _disarm_sas_leg(self, key):
         """Enqueue a hub-side cash-out disarm (aft_set_host_cashout
@@ -4305,9 +4517,14 @@ class G2SHost:
         unwritten ref keeps once=True airtight: at most ONE movement can
         ever land for this txn (a post-restart re-report retries the credit
         and either heals into the restored wallet or re-flags the hold).
-        Idempotent two ways: a bounded seen-set skips the ~every-second
-        re-report, and AccountStore.adjust(once=True, ref=aftcashout:<txn>) is
-        the HARD guarantee across a hub restart. Never raises."""
+        Idempotent three ways: a bounded seen-set skips the ~every-second
+        re-report; the durable LEDGER is consulted before treating a result
+        as new (the satellite outlives a hub restart and re-reports settled
+        txns from its commandResults ring — without this consult every
+        restart after a cash-out re-flagged a false loud HOLD + disarm for
+        money the ledger proves was already credited); and AccountStore.
+        adjust(once=True, ref=aftcashout:<txn>) is the HARD guarantee
+        across a hub restart. Never raises."""
         if not isinstance(command_results, list):
             return
         for r in command_results:
@@ -4322,6 +4539,21 @@ class G2SHost:
                 continue
             ref = f"aftcashout:{txn}"
             if ref in self._aft_cashouts_settled:
+                continue
+            # RESTART-PROOF dedupe: the seen-set died with the last hub
+            # restart but the satellite (its own Pi) did not — its
+            # commandResults ring re-reports settled cash-outs in the first
+            # post-restart report. If the durable ledger already carries a
+            # movement under this ref, the money HAS a home: re-arm the
+            # in-memory guard and stay silent instead of firing the false
+            # "unhomed" HOLD + satellite disarm (the pins are in-memory too,
+            # so post-restart _sas_cashout_pin is None for a settled txn).
+            # Genuinely unhomed money wrote NO ledger row, so it still
+            # re-flags loudly — only proven-settled results are absorbed.
+            if any(self.account_store.ref_totals(ref)):
+                self._aft_cashouts_settled.add(ref)
+                if len(self._aft_cashouts_settled) > 2048:
+                    self._aft_cashouts_settled = {ref}
                 continue
             if (isinstance(cents, bool) or not isinstance(cents, int)
                     or cents <= 0):
@@ -4383,6 +4615,12 @@ class G2SHost:
                 log.info("💵 [sas:%s] AFT CASH-OUT CONFIRMED — credited %s "
                          "$%.2f (txn %s); cashable now $%.2f",
                          key, acct_id, cents / 100, txn, bal / 100000)
+                if acct_id == "house":
+                    # only a tournament sweep ever pins the House — this
+                    # settle IS that sweep landing, so consume its pins:
+                    # the one sanctioned House-destination cash-out is
+                    # exactly one, never a standing route.
+                    self._tournament_pin_consumed(key)
 
     def _flag_unhomed_cashout(self, machine, txn, millicents, acct_id, err,
                               path):
@@ -6079,6 +6317,30 @@ class G2SHost:
             return 200, self._glass_data_settings(egm_id, assoc, rec)
         return 400, {"ok": False, "error": "unknown view", "egmId": egm_id}
 
+    @staticmethod
+    def _sas_denom_cents(entry):
+        """The money-scale for a linked SAS leg: CENTS per RAW 0x1A credit
+        unit, plus whether that scale is an ASSUMPTION rather than a known
+        value. Returns (denom_cents:int>=1, assumed:bool).
+
+        The only source of truth is the operator-set denomination
+        (hub_store.set_denom, echoed onto the entry as denomCents). A
+        SAS-only machine carries its own denomination in the 0x1F frame
+        (SAS/core/sas_machine_info.py, denomination_code), but the
+        code->cents table lives in the FULL SAS spec — not the on-disk guide
+        — so it is deliberately NOT decoded: guessing another vendor's denom
+        table would trade a VISIBLE assumption for a SILENT misread, which is
+        worse. When denomCents is unset we fall back to 1¢/credit — CORRECT
+        for AJ's penny BB2, but only an ASSUMPTION for any non-penny cabinet
+        (a $1/nickel/quarter box, common across the wider SAS crowd) — and
+        return assumed=True so callers can degrade honestly (flag it) instead
+        of presenting a confident wrong dollar figure. The operator clears the
+        assumption by setting the denomination in the machine's Options."""
+        denom = entry.get("denomCents")
+        if isinstance(denom, bool) or not isinstance(denom, int) or denom < 1:
+            return 1, True
+        return denom, False
+
     def _machine_credits_mc(self, assoc):
         """The cabinet's current cashable credits (millicents). 0 when
         unmetered/disconnected. Never raises (best-effort read).
@@ -6113,10 +6375,7 @@ class G2SHost:
                         except (TypeError, ValueError):
                             credits = -1
                         if credits >= 0:
-                            denom = entry.get("denomCents")
-                            if isinstance(denom, bool) \
-                                    or not isinstance(denom, int) or denom < 1:
-                                denom = 1
+                            denom, _assumed = self._sas_denom_cents(entry)
                             return credits * denom * 1000
         except Exception:  # noqa: BLE001 — never-500; fall back to the G2S meter
             pass
@@ -6611,6 +6870,2113 @@ class G2SHost:
                      "pending": True, "account": account_id,
                      "note": "cashing out this machine's credits to your "
                              "wallet — your balance updates when it completes"}
+
+    # -------------------------------------- tournament mode (board v2, 07-21)
+    #
+    # The federated-tournament headline feature's hub-orchestration slice:
+    # arm (per-seat pipeline CLEAR -> FUND -> LOCK, driven by the runner
+    # tick) -> countdown -> running (wins-only scoring) -> finished (sweep
+    # the leftovers home FIRST, then "TOURNAMENT OVER" locks as each pull
+    # settles). EVERY wire send rides an EXISTING primitive —
+    # setCabinetState, the WAT credit push/pull, SAS aft_transfer /
+    # aft_cashout_pull / sas_disable / sas_enable — and every ledger
+    # movement settles through the existing once=True-ref'd paths. No new
+    # money primitives, no free-running timers: the only tournament thread
+    # is the run-scoped runner, spawned by an explicit /api/command
+    # arm/start and dead again at idle / settled-finished (the replay
+    # dormancy law — a fresh host emits zero tournament bytes).
+    #
+    # ⚖️ THE 07-21 BENCH LAW (AJ's resolution directive — the whole reason
+    # this choreography looks the way it does): TRANSFERS NEVER RUN
+    # AGAINST A LOCKED MACHINE. Wire-proven twice on the AVP — a
+    # setCabinetState-disabled EGM parks a WAT push at requestPending
+    # INDEFINITELY and resumes within ~1 s of enable=true (txns 1341/1344,
+    # 113 s / 109 s frozen = exactly the time until cancel's unlock) —
+    # and once on the BB2: a SAS 0x01-shut-down machine hard-refuses the
+    # AFT 0x74 game-lock (aftStatus=0xFF, availXfers=0). The full-flag
+    # setCabinetState builder's enableMoneyIn="true" does NOT exempt
+    # money moves from the disable. Corollaries baked in below: the arm
+    # locks LAST, the finish locks only AFTER its pull settles, cancel
+    # unlocks FIRST — and WAT transfers run strictly one at a time per
+    # EGM (G2S_WTX008 "Unacknowledged Transaction In Log": a pending txn
+    # poisons EVERY new initiateRequest, bench-proven by the rejected
+    # $521k sweep of req 55).
+    #
+    # LOCK LAW — tournament_lock is a LEAF: while holding it, NOTHING else
+    # is ever called or taken (no _enqueue, no sas_enqueue_command, no
+    # store access, no assoc/sas/companion lock). Every method copies state
+    # out under it, drops it, acts on the copies, then re-takes it to
+    # publish — re-validating the run id so a cancel/re-arm landing in the
+    # gap wins over a stale write-back.
+    #
+    # SCORING is pure observation (the design doc's twist): the leaderboard
+    # never counts losses — it accumulates the machines' own win counters
+    # (G2S wonAmt millicents; SAS coinOut+jackpot credit counters × denom),
+    # so money stays in the ledger where it already balances and a mid-run
+    # ticket/handpay can't corrupt the standings.
+
+    #: default pre-start countdown (seconds) when tournamentConfigure
+    #: doesn't set one; the configure edge bounds overrides to 3..60.
+    TOURNAMENT_COUNTDOWN_DEFAULT = 10
+    #: g2s wonAmt poll cadence while RUNNING — the standing meter sub is a
+    #: 60 s cadence (useless for a race), so the tick re-reads the gamePlay
+    #: meters this often. On-demand only: zero reads outside a run.
+    SCORE_POLL_SEC = 4.0
+    #: how early the countdown stages SAS unlocks: hub->satellite commands
+    #: are PULL-only at the ~1 s report cadence, so an unlock queued at
+    #: T-1.2 s reaches the machine at ≈T0 — right when the direct-POST G2S
+    #: unlocks fire. Countdown floor is 3 s, so the stage always fits.
+    TOURNAMENT_SAS_UNLOCK_LEAD_SEC = 1.2
+    #: how long a sweep pin stays credible (seconds). The pull it homes
+    #: normally settles in ~1-2 s; the TTL only exists so a pin whose pull
+    #: was LOST (satellite dark, 30 s queue expiry) cannot sit in the map
+    #: forever outranking a later player's own glass arm. A settle landing
+    #: after expiry draws the LOUD unhomed HOLD — the safe direction —
+    #: instead of a silent House credit of somebody's money.
+    TOURNAMENT_SWEEP_PIN_TTL_SEC = 600
+    #: per-seat throttle on lock/unlock RE-issues (seconds). Lock delivery
+    #: is fire-and-forget on both channels (epoch-dropped G2S jobs,
+    #: refused SAS queues), so the tick re-sends until the face can be
+    #: believed — this just keeps a stuck seat from spamming every 0.5 s.
+    TOURNAMENT_RESTAGE_SEC = 2.0
+    #: how long the FINISHED phase waits for a seat's sweep pull to settle
+    #: before closing the book (seconds). Healthy settles are seconds (WAT
+    #: create->commit ≈ 2 s on the bench, satellite pulls ~2-8 s); the
+    #: 30 s SAS queue expiry is the slowest honest path. Past this, a SAS
+    #: seat locks anyway (a late 0x01 is harmless) but a g2s seat with a
+    #: WAT still open is LEFT UNLOCKED on purpose — the bench law: a
+    #: disable freezes the open transfer until the next enable — with the
+    #: timeout said honestly on the seat.
+    TOURNAMENT_FINISH_SETTLE_TIMEOUT_SEC = 60.0
+    #: how long the ARM pipeline waits for a SAS-leg verdict before the
+    #: seat parks at failed (seconds). The satellite queue silently drops
+    #: >30 s-stale commands UNEXECUTED (no commandResult is ever
+    #: synthesized), so a verdict past 30 s + report margin can never
+    #: arrive — without this the seat sat "pulling"/"pending" forever
+    #: with a stageDetail claiming progress and cancel as the only
+    #: (undiscoverable) exit. 45 = the 30 s queue expiry + a fat margin
+    #: for a slow fetch-execute-report cycle.
+    TOURNAMENT_SAS_VERDICT_TIMEOUT_SEC = 45.0
+    #: the ARM pipeline's g2s twin: a WAT the EGM never even ANSWERED
+    #: (no requestPending, so no transactionId — the machine is dark or
+    #: the wat device wedged) fails the stage after this long, cancelled
+    #: LOCALLY (the cancel_local path: no txn = no wire cancel possible,
+    #: and a dead record must not wedge one-at-a-time forever). A record
+    #: WITH a txn keeps waiting — the transfer is genuinely moving and
+    #: its commit/abort verdict WILL land (the bench's 15-min delayed
+    #: commit); timing those out would race real money.
+    TOURNAMENT_WAT_VERDICT_TIMEOUT_SEC = 60.0
+
+    def _tournament_idle_state(self):
+        """A fresh idle tournament dict — the resting state (the board's
+        attract gate). Keys are the /api/status contract; '_'-prefixed
+        keys are runner bookkeeping tournament_snapshot strips."""
+        return {"phase": "idle", "id": None, "creditsCents": 0,
+                "durationSec": 0,
+                "countdownSec": self.TOURNAMENT_COUNTDOWN_DEFAULT,
+                "configuredAt": None, "armedAt": None, "startsAt": None,
+                "endsAt": None, "seats": {}, "winner": None, "note": ""}
+
+    def tournament_configure(self, credits_cents, duration_sec,
+                             countdown_sec=None):
+        """tournamentConfigure — set the per-seat credits + the clocks.
+        Allowed in idle AND armed, but a reconfigure RE-ARMS NOTHING: an
+        armed floor was already funded with the old amount (creditsCents
+        edits only reach the NEXT arm — the arm claim froze this run's
+        stake into t["runCreditsCents"], so even a seat whose fund stage
+        is still in flight rides the ORIGINAL amount, never this edit;
+        duration/countdown land at start).
+        Type junk drew 400 at the HTTP edge; this refuses only on phase
+        (the addCredits errors-at-200 precedent)."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") not in ("idle", "armed"):
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "wait for it to finish (or cancel) before "
+                                 "reconfiguring"}
+            t["creditsCents"] = int(credits_cents)
+            t["durationSec"] = int(duration_sec)
+            if countdown_sec is not None:
+                t["countdownSec"] = int(countdown_sec)
+            t["configuredAt"] = time.time()
+            out = {"phase": t["phase"], "creditsCents": t["creditsCents"],
+                   "durationSec": t["durationSec"],
+                   "countdownSec": t["countdownSec"]}
+        log.info("🏆 tournament configured — $%.2f a seat, %ds run, "
+                 "%ds countdown", out["creditsCents"] / 100,
+                 out["durationSec"], out["countdownSec"])
+        return out
+
+    def _tournament_enumerate_seats(self):
+        """Build the seat map for an ARM — a pure read pass (no wire, no
+        state writes; the arm publishes the result). Returns (seats,
+        skipped): every machine that sat out is named WITH its reason —
+        the 2026-07-21 bench lesson: AJ's arm refused because both
+        machines held a few bucks and the toast faded before he could
+        read why. skipped rides the arm reply AND t["lastArm"] so the
+        Settings card can show it until the next attempt.
+
+        CREDITS ON THE GLASS ARE NEVER A BLOCKER (AJ, same bench session:
+        collectors deliberately park credits to silence attract-mode
+        callouts — a floor where that fails to arm is a broken feature).
+        A credit-holding machine seats normally; the ARM PIPELINE's CLEAR
+        stage then pulls the glass home to the House and records the
+        SETTLED ACTUALS as seat["absorbedMc"] (no meter guessing —
+        enumeration records nothing), and _tournament_absorb_refunds
+        sends a CARDED seat's cleared balance home to that player's
+        wallet at finish/cancel — anti-attract pennies on an uncarded
+        machine are floor money and stay with the House. Offline,
+        handpay-locked, and dark/parked/stale-leg machines still sit
+        out.
+
+        Seats, in floor order
+        (dict insertion order IS the earliest-seated tie-break the winner
+        pick uses):
+
+          * every onLine G2S association — kind "linked" when a SAS leg is
+            bound (money+score ride the leg), else "g2s"; a LINKED seat's
+            leg must itself pass the same live/enabled/fresh gates the
+            unlinked seats do — the leg IS the seat's money and score
+            channel, and seating a parked/stale leg would queue a fund
+            nobody fetches (a zombie seat the addCredits path would have
+            refused with an honest 409);
+          * every UNLINKED live SAS machine (fresh report, online,
+            Settings-enabled) — kind "sas", seatKey "sas:"+legKey;
+          * machines holding a handpay lockup are SKIPPED on either leg —
+            a lockup is somebody's jackpot moment, never a seat to
+            conscript.
+
+        Names: a carded player owns their seat's label; everyone else
+        draws an alias from the shuffled roster without repeats (roster
+        exhausted -> numbered Mystery Guests)."""
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        with self.sas_lock:
+            sas_entries = {k: dict(e) for k, e in self.sas_machines.items()}
+        cards = self.card_sessions_snapshot()
+        with self.companion_lock:
+            card_accts = {egm: str(s.get("accountId") or "").strip() or None
+                          for egm, s in self.card_sessions.items()}
+        nicks = self.hub_store.names()
+        now = time.time()
+        aliases = self.tournament_names()
+        random.shuffle(aliases)
+        _mystery = itertools.count(1)
+
+        def draw_alias():
+            return aliases.pop() if aliases \
+                else f"Mystery Guest {next(_mystery)}"
+
+        seats = {}
+        skipped = []
+        claimed_legs = set(self.sas_links.values())
+
+        def sit_out(machine, seat_key, reason, credits_mc=None):
+            rec = {"machine": machine, "seatKey": seat_key,
+                   "reason": reason}
+            if credits_mc:
+                rec["creditsMc"] = int(credits_mc)
+            skipped.append(rec)
+
+        for a in assocs:
+            with a.lock:
+                online = a.comms_state == "onLine"
+                lockup = bool(a.handpays_pending)
+            nick = nicks.get(a.egm_id) or a.egm_id
+            if not online:
+                sit_out(nick, a.egm_id, "offline")
+                continue
+            leg = self.sas_links.get(a.egm_id)
+            entry = sas_entries.get(leg) if leg else None
+            if lockup or (entry and entry.get("pendingHandpay")):
+                sit_out(nick, a.egm_id,
+                        "handpay lockup — somebody's jackpot moment")
+                continue
+            if leg and (entry is None
+                        or entry.get("online") is False
+                        or entry.get("sasEnabled") is False
+                        or now - (entry.get("receivedAt") or 0)
+                        > self.SAS_STALE_SEC):
+                sit_out(nick, a.egm_id, "linked SAS leg dark/parked/stale")
+                continue    # linked leg dark/parked/stale — not a seat
+            alias = draw_alias()
+            carded = cards.get(a.egm_id) or {}
+            seats[a.egm_id] = {
+                "name": carded.get("name") or alias,
+                "alias": alias,
+                "accountId": card_accts.get(a.egm_id),
+                "machine": nicks.get(a.egm_id) or a.egm_id,
+                "kind": "linked" if leg else "g2s",
+                "smib": ((entry or {}).get("smibId")
+                         or str(leg).split("/", 1)[0]) if leg else None,
+                "sasKey": leg,
+                "armStage": "clear", "stageDetail": "clearing the glass",
+                "clear": None,
+                "funded": "pending", "fundDetail": "",
+                "locked": False, "baseScore": None, "scoreMc": 0,
+                "absorbedMc": 0,
+                "sweep": None}
+        for key, entry in sas_entries.items():
+            if key in claimed_legs:
+                continue    # a linked leg rides its G2S owner's seat
+            nick = entry.get("nickname") or key
+            if entry.get("online") is False \
+                    or entry.get("sasEnabled") is False:
+                sit_out(nick, "sas:" + key, "dark or Settings-parked")
+                continue    # dark or Settings-parked — not a seat
+            if now - (entry.get("receivedAt") or 0) > self.SAS_STALE_SEC:
+                sit_out(nick, "sas:" + key, "satellite gone quiet")
+                continue    # a satellite gone quiet is not a seat
+            if entry.get("pendingHandpay"):
+                sit_out(nick, "sas:" + key,
+                        "handpay lockup — somebody's jackpot moment")
+                continue
+            alias = draw_alias()
+            seats["sas:" + key] = {
+                "name": alias, "alias": alias, "accountId": None,
+                "machine": entry.get("nickname") or key,
+                "kind": "sas",
+                "smib": entry.get("smibId") or key.split("/", 1)[0],
+                "sasKey": key,
+                "armStage": "clear", "stageDetail": "clearing the glass",
+                "clear": None,
+                "funded": "pending", "fundDetail": "",
+                "locked": False, "baseScore": None, "scoreMc": 0,
+                "absorbedMc": 0,
+                "sweep": None}
+        return seats, skipped
+
+    def _tournament_lock_seat(self, seat_key, seat, enable, text="",
+                              channels=("g2s", "sas")):
+        """Lock (enable=False) or restore (enable=True) ONE seat's machine,
+        recording the COMMANDED face in seat['locked'] (the SAS lockState
+        posture — 0x01/0x02 send no authoritative echo, and the G2S
+        cabinetStatus confirm rides its own dispatch). Mutates the
+        caller's LOCAL seat copy only.
+
+        ⭐ A LINKED seat's WHOLE-MACHINE lock rides SAS ONLY — never the
+        G2S setCabinetState (AJ 2026-07-21, the regression that stranded a
+        BB2 in G2S_hostDisabled). One lock, one owner: SAS already owns a
+        linked cabinet's accounting, so it owns the whole-machine
+        enable/disable too. The earlier belief that the BB2 "ignores
+        setCabinetState" was WRONG — it HONORS it (egmState went
+        G2S_hostDisabled on the wire), so a G2S whole-cabinet disable
+        creates a SECOND, independent host-disable latch the SAS enable
+        can't clear → "disabled by host" forever.
+        SCOPE: this is ONLY the whole-machine cabinet lock. A linked
+        cabinet's OTHER G2S features are untouched and still ride G2S —
+        per-title enable/disable (setGamePlayState / GameChest games
+        on-off), meters, events, the join. G2S is not "dead" on a linked
+        cabinet; only its whole-cabinet host-disable is ceded to SAS so
+        the two locks can't fight.
+
+        THE BUILDER STAYS FULL-FLAG — but know what it does NOT buy: the
+        enqueue_set_cabinet_state builder always sends the FULL Table 3.2
+        flag set (enable="false" WITH explicit enableGamePlay/
+        enableMoneyIn/enableMoneyOut="true") because the RESTORE PATH IS
+        SACRED — a partial state silently resets omitted flags. The 07-21
+        bench DISPROVED the old assumption that those money flags let
+        transfers land on a locked machine: a host-disabled AVP parks a
+        WAT transfer at requestPending until the next enable, and the
+        shut-down BB2 refuses the AFT game-lock outright. That is why the
+        choreography orders every transfer BEFORE this lock (arm pipeline
+        locks last, finish locks after its pull settles, cancel unlocks
+        first) — never lean on the flags."""
+        kind = seat.get("kind")
+        # PURE-G2S only over the G2S leg — a linked cabinet is SAS-only
+        # control (see the ⭐ note): sending setCabinetState to it strands
+        # a G2S_hostDisabled latch the SAS enable can never clear.
+        if kind == "g2s" and "g2s" in channels:
+            with self.assoc_lock:
+                assoc = self.associations.get(seat_key)
+            if assoc is None:
+                seat["locked"] = False
+            else:
+                self.enqueue_set_cabinet_state(assoc, enable=enable,
+                                               disable_text=text)
+                seat["locked"] = not enable
+                # the epoch this send was queued under: the FIFO worker
+                # silently drops jobs whose epoch a rejoin superseded, so
+                # the restage pass re-issues whenever the live epoch has
+                # moved past this marker (recon: "a tournament sequencer
+                # must expect queued sends to be dropped on rejoin and
+                # re-enqueue")
+                seat["lockEpoch"] = getattr(assoc, "epoch", None)
+                # wall-clock stamp of this send: the restage pass trusts
+                # a reported cabinet hostEnabled only when the report is
+                # YOUNGER than this (the FIFO worker also drops a job
+                # whose POST fails — counted, no epoch bump — and only
+                # the EGM's own getCabinetStatus confirm can reveal it)
+                seat["lockSentAt"] = time.time()
+        if kind in ("sas", "linked") and "sas" in channels:
+            reply = self.sas_enqueue_command(seat.get("smib"), {
+                "id": f"tour{next(self._fob_seq)}-{int(time.time())}",
+                "type": "sas_enable" if enable else "sas_disable"})
+            if reply.get("ok"):
+                # SAS is the ONLY control leg for both sas and linked
+                # seats now, so it owns BOTH faces: sasLocked (the per-leg
+                # tracker the restage watches) AND the main 'locked' face
+                # (a linked seat no longer has a G2S control leg to stamp
+                # it). They move together — one lock, one owner.
+                seat["sasLocked"] = not enable
+                seat["locked"] = not enable
+            # a refused queue leaves the last commanded faces standing —
+            # honest: the machine really is still in that state
+
+    def _tournament_fund_seat(self, seat_key, seat, credits_cents):
+        """House-fund ONE seat over its native money leg — the existing
+        push primitives verbatim: g2s = the WAT credit push (MILLICENTS;
+        the wat:…:escrow/commit/refund refs make it exactly-once),
+        linked/sas = the satellite aft_transfer (CENTS; the aftpush:<txn>
+        settle debits House on the machine's confirm). Runs against a
+        LIVE machine by construction — the arm pipeline funds BEFORE it
+        locks (the 07-21 bench law). 'funded' stays "pending" until the
+        async verdict lands — the tick's observer reads what ALREADY
+        arrives in wat_store / commandResults, no new confirmation
+        channel. Mutates the LOCAL seat copy only."""
+        if seat.get("kind") == "g2s":
+            with self.assoc_lock:
+                assoc = self.associations.get(seat_key)
+            if assoc is None:
+                seat["funded"] = "failed"
+                seat["fundDetail"] = "machine vanished before funding"
+                return
+            res = self.start_wat_credit_push(
+                assoc, device_id=self.default_wat_device(assoc),
+                account_id="house", cashable=credits_cents * 1000)
+            if isinstance(res, dict) and res.get("ok") is False:
+                seat["funded"] = "failed"
+                seat["fundDetail"] = str(res.get("error")
+                                         or "WAT push refused")
+            else:
+                seat["fundRequestId"] = (res or {}).get("requestId")
+        else:
+            cmd = {"id": f"tour{next(self._fob_seq)}-{int(time.time())}",
+                   "type": "aft_transfer", "cents": int(credits_cents),
+                   "accountId": "house"}
+            reply = self.sas_enqueue_command(seat.get("smib"), cmd)
+            if reply.get("ok"):
+                seat["fundCmdId"] = cmd["id"]
+            else:
+                seat["funded"] = "failed"
+                seat["fundDetail"] = str(reply.get("error")
+                                         or "command queue refused")
+
+    def tournament_arm(self):
+        """tournamentArm — idle -> armed: seat the floor and START the
+        per-seat ARM PIPELINE (the armStage state machine): CLEAR (pull
+        whatever sits on the glass home to the House; an empty glass
+        skips the stage) -> FUND (the House's tournament credits) ->
+        LOCK ("take your seats"). AJ's 07-21 resolution directive
+        verbatim: "prior to the shutdown command to lock the machines,
+        pull whatever's in them back to the House wallet, send the AFT
+        back in with the tournament credits, followed by the shutdown."
+        The lock comes LAST because the bench proved transfers freeze or
+        fail against a locked machine (the section-header law).
+
+        THE ARM ITSELF SENDS NOTHING: it claims the phase, publishes the
+        seats (every one at armStage="clear"), and spawns the runner —
+        the RUNNER TICK is the single driver of every stage
+        (_tournament_arm_step), one verdict at a time per seat: one WAT
+        at a time per EGM (G2S_WTX008), one satellite command per stage
+        (the satellite queue is order-chained, NOT success-chained — a
+        burst would fund a machine whose clear had failed).
+        tournamentStart refuses until every seat rests at "ready".
+
+        ORDER IS THE RACE FIX (kept from the first build): seats are
+        enumerated FIRST (a pure read pass) and PUBLISHED WITH the phase
+        claim in one leaf-lock hold — a cancel landing at ANY later
+        moment always finds the real seat map to act on."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") != "idle":
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "reset/cancel first"}
+            if not (t.get("creditsCents") and t.get("durationSec")):
+                return {"ok": False,
+                        "error": "configure first (tournamentConfigure: "
+                                 "creditsCents + durationSec)"}
+        seats, skipped = self._tournament_enumerate_seats()
+        if not seats:
+            # nothing was claimed — a plain refusal, no rollback needed.
+            # The refusal PERSISTS on t["lastArm"] (the toast-faded-too-
+            # fast lesson): the Settings card renders it until the next
+            # attempt clears it.
+            err = ("no seatable machines — need an onLine G2S cabinet or "
+                   "a live SAS machine (handpay lockups and dark legs "
+                   "sit out)")
+            with self.tournament_lock:
+                self.tournament["lastArm"] = {
+                    "at": now_iso(), "ok": False,
+                    "error": err, "skipped": skipped}
+            return {"ok": False, "error": err, "skipped": skipped}
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") != "idle":
+                # an arm raced us between the check and the claim — one
+                # floor, one run; the first claim won.
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "reset/cancel first"}
+            if not (t.get("creditsCents") and t.get("durationSec")):
+                return {"ok": False,
+                        "error": "configure first (tournamentConfigure: "
+                                 "creditsCents + durationSec)"}
+            now = time.time()
+            # the run id carries a hub-wide sequence past the 1-second
+            # wall-clock resolution: a cancel + re-arm inside the same
+            # second must NEVER mint the same id, or every
+            # `t.get("id") == run_id` stale-write gate (cancel/finish/
+            # countdown write-backs, the funding observer) would pass for
+            # the wrong run and stamp a dead run's faces onto this one.
+            run_id = f"t{int(now)}-{next(self._fob_seq)}"
+            credits_cents = int(t["creditsCents"])
+            # the OUTGOING run's still-pulling legs (a cancel/finish sweep
+            # whose satellite hasn't confirmed yet): their pins must
+            # survive the prune below EVEN when the leg is re-seated —
+            # dropping one turned the House's own confirmed sweep into a
+            # LOUD unhomed HOLD when the old pull's answer landed after a
+            # quick cancel→re-arm (the new clear reads the already-emptied
+            # 0x1A as 0 and never re-pins). Consumption-at-settle plus the
+            # TTL already bound these pins' lifetime.
+            inflight_legs = {
+                s.get("sasKey") for s in (t.get("seats") or {}).values()
+                if s.get("sasKey")
+                and ((s.get("sweep") or {}).get("state") == "pulling"
+                     or (s.get("clear") or {}).get("state") == "pulling")}
+            t.update({"phase": "armed", "id": run_id, "armedAt": now,
+                      "startsAt": None, "endsAt": None, "winner": None,
+                      "note": "", "seats": seats, "lastArm": None,
+                      # the stake is FROZEN into the run at the claim —
+                      # tournament_configure stays legal while armed (for
+                      # the NEXT round's numbers) but the pipeline reads
+                      # only this snapshot, so a mid-arm reconfigure can
+                      # never fund two seats at different amounts (the
+                      # configure docstring's promise, made true)
+                      "runCreditsCents": credits_cents,
+                      "sasUnlockStaged": False, "g2sUnlockStaged": False})
+        # Sweep-pin housekeeping — PRUNE, never swap: an in-flight settle
+        # from the PREVIOUS run must keep its home (a whole-map swap here
+        # once turned the House's own confirmed sweep into an unhomed
+        # HOLD when a re-arm landed inside the ~1-2 s settle round-trip).
+        # Dropped: entries for legs being seated in THIS run (each gets
+        # re-pinned at its own sweep; a stale one must not outrank a
+        # mid-run player arm) — UNLESS the old run's pull on that leg is
+        # still in flight (inflight_legs above) — and entries past the
+        # TTL.
+        cutoff = time.time() - self.TOURNAMENT_SWEEP_PIN_TTL_SEC
+        seated_legs = {s.get("sasKey") for s in seats.values()
+                       if s.get("sasKey")}
+        self._tournament_sweep_pins = {
+            k: v for k, v in list(self._tournament_sweep_pins.items())
+            if (k not in seated_legs or k in inflight_legs)
+            and isinstance(v, dict)
+            and (v.get("ts") or 0) >= cutoff}
+        # A stale "house" glass pin from a previous run's finish (reset
+        # tears these down; belt-and-suspenders here): pop it for every
+        # seated machine so a mid-run CASH OUT can't quietly bank the
+        # seat's tournament credits. Pop-only, no wire — with the pin
+        # gone a blank fromEgm cash-out is DENIED (reject → ticket), the
+        # always-safe direction.
+        with self._glass_pin_lock:
+            for seat_key, seat in seats.items():
+                if seat.get("kind") != "sas" and \
+                        self._glass_cash_out_pin.get(seat_key) == "house":
+                    self._glass_cash_out_pin.pop(seat_key, None)
+        # No wire here — the runner tick drives the pipeline (its first
+        # tick, ≤0.5 s out, issues the CLEAR pulls; the arm stays the
+        # explicit action that woke it, so the dormancy law holds).
+        self._tournament_spawn_runner(run_id)
+        log.info("🏆 tournament %s ARMED — %d seat(s); the pipeline "
+                 "clears each glass, funds $%.2f from the House, then "
+                 "locks", run_id, len(seats), credits_cents / 100)
+        return {"phase": "armed", "tournamentId": run_id,
+                "seats": len(seats), "skipped": skipped}
+
+    def tournament_start(self):
+        """tournamentStart — armed -> countdown, REFUSED until the whole
+        floor is ready: every seat must rest at armStage="ready" (its
+        CLEAR settled, its FUND confirmed, its LOCK commanded) with the
+        lock face actually holding. The refusal is HONEST — it names
+        every seat that isn't there yet, with its stage, and the same
+        stages ride the snapshot for the Settings card. Then stamp the
+        clocks (startsAt = now + countdownSec, endsAt = startsAt +
+        durationSec) and make sure the runner is alive. The runner's
+        tick does the rest: staged unlocks, the running flip, scoring,
+        the finish — countdown-end needs ONLY the startup/enable (the
+        directive's payoff: nothing else is left to do)."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") != "armed":
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "arm first"}
+            stages = {}
+            not_ready = []
+            for k, s in (t.get("seats") or {}).items():
+                stages[k] = {"machine": s.get("machine"),
+                             "armStage": s.get("armStage"),
+                             "locked": bool(s.get("locked")),
+                             "detail": s.get("stageDetail") or ""}
+                if s.get("armStage") == "ready" and s.get("locked"):
+                    continue
+                why = str(s.get("armStage"))
+                if s.get("stageDetail"):
+                    why += f" — {s.get('stageDetail')}"
+                if s.get("armStage") == "ready" and not s.get("locked"):
+                    why = "lock not confirmed yet (re-issuing)"
+                not_ready.append(f"{s.get('machine') or k}: {why}")
+            if not_ready:
+                return {"ok": False,
+                        "error": "not every seat is ready — "
+                                 + "; ".join(not_ready),
+                        "seats": stages}
+            now = time.time()
+            t["startsAt"] = now + int(t.get("countdownSec")
+                                      or self.TOURNAMENT_COUNTDOWN_DEFAULT)
+            t["endsAt"] = t["startsAt"] + int(t.get("durationSec") or 0)
+            t["phase"] = "countdown"
+            run_id = t.get("id")
+            out = {"phase": "countdown", "startsAt": t["startsAt"],
+                   "endsAt": t["endsAt"]}
+            g2s_seats = [k for k, s in (t.get("seats") or {}).items()
+                         if s.get("kind") == "g2s"]
+        # Prime the race counters BEFORE the T0 baseline: the baseline
+        # reads assoc.meters, which the standing subscription refreshes
+        # only every 60 s (the SCORE_POLL_SEC comment calls that cadence
+        # useless for a race) and the on-demand poll starts only in the
+        # RUNNING phase — so a win landing just before the arm would ride
+        # into the race as a phantom lead at T0. One scoped on-demand
+        # gamePlay read per g2s seat NOW lets fresh counters land inside
+        # the ≥3 s countdown floor before the baseline is captured (SAS
+        # legs are already fresh at the ~1 s report cadence). Explicit-
+        # action wire — rides the START click, never a timer, so the
+        # dormancy law holds.
+        for seat_key in g2s_seats:
+            with self.assoc_lock:
+                assoc = self.associations.get(seat_key)
+            if assoc is not None:
+                self.enqueue_get_meter_info(
+                    assoc, device_class="G2S_gamePlay", device_id="-1")
+        self._tournament_spawn_runner(run_id)
+        log.info("🏆 tournament %s COUNTDOWN — machines unlock in %.0fs, "
+                 "the horn at +%.0fs", run_id, out["startsAt"] - time.time(),
+                 out["endsAt"] - out["startsAt"])
+        return out
+
+    def tournament_end(self):
+        """tournamentEnd — running -> finished NOW. The runner fires the
+        same finish at endsAt; the phase claim inside makes whichever
+        lands first the only one that acts."""
+        return self._tournament_finish(note="ended early")
+
+    # (tournament_end above and the score step both funnel into
+    # _tournament_finish — the only two finish triggers)
+
+    def tournament_cancel(self):
+        """tournamentCancel — abort from armed/countdown/running: UNLOCK
+        FIRST, THEN pull the House's money home, and LEAVE the floor
+        unlocked (AJ's 07-21 resolution directive — the exact reverse of
+        the bench-day order, and the one the wire evidence demands: both
+        observed "frozen" WAT transfers resumed within ~1 s of cancel's
+        enable=true, and the old sweep-while-locked order got its OWN
+        pull rejected class-level G2S_WTX008 because the frozen fund
+        still sat pending — sweep-before-unlock is structurally broken).
+        The pulls queue BEHIND the unlocks on both channels (the
+        per-assoc FIFO; the per-smib deque + in-order satellite
+        execution), so machine order is enable -> pull everywhere and
+        every pull runs against a LIVE machine.
+
+        A seat whose glass was never CLEARED (clear None/failed/skipped)
+        also skips the pull — nothing House-owned is on that glass, so
+        the credits stay with the floor (a carded friend's parked money
+        must not become House take). A seat whose arm-CLEAR pull is
+        still in flight SKIPS the cancel
+        pull — the clear IS the sweep (it banks to the House when it
+        settles), and a second pull would only draw WTX008. A g2s seat
+        with any OTHER WAT still open (a cancel racing the fund) is
+        skipped by _tournament_pull_seat's one-at-a-time guard: the
+        in-flight transfer settles on the reopened floor (once=True
+        ledger legs hold), and the NEXT arm's clear stage fetches
+        whatever it left on the glass. Rests at idle with
+        note="cancelled"; the seat map (with its sweep outcomes) is KEPT
+        on the idle dict for post-mortem visibility — the next arm
+        replaces it, and tournamentReset clears it."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") not in ("armed", "countdown", "running"):
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "nothing to cancel"}
+            t["phase"] = "idle"    # the claim: runner + ticks stand down
+            t["note"] = "cancelled"
+            run_id = t.get("id")
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        # 1) UNLOCK FIRST — the full-flag restore / 0x02, idempotent on a
+        #    floor that was already open (cancel from countdown/running).
+        for seat_key, seat in seats.items():
+            self._tournament_lock_seat(seat_key, seat, enable=True)
+        # 2) THEN pull the leftovers home, against live machines — but
+        #    ONLY off a glass the pipeline actually CLEARED (clear=="done"):
+        #    the fund only ever rides a settled clear, so anything on a
+        #    never-cleared glass is the PLAYER's/floor's own parked money.
+        #    Sweeping it (cancel inside the first 0.5 s tick leaves
+        #    clear=None; a lock_failed clear leaves it "failed") banked a
+        #    carded friend's credits to the House with absorbedMc still 0
+        #    — no refund leg, no warning, the exact loss the module's own
+        #    contract forbids. Those seats keep their glass.
+        for seat_key, seat in seats.items():
+            if (seat.get("clear") or {}).get("state") == "pulling":
+                seat["sweep"] = {
+                    "state": "skipped",
+                    "detail": "arm's clear pull still in flight — it banks "
+                              "the leftovers itself when it settles"}
+                if seat.get("accountId"):
+                    # the clear's settled amount lands with the House with
+                    # nobody left to fold it into absorbedMc — the carded
+                    # refund for THIS seat needs a manual Players ▸ Fund
+                    log.warning("🏆 %s cancel raced %s's clear pull on %s — "
+                                "the settled amount stays with the House "
+                                "without a refund leg; square it from "
+                                "Players ▸ Fund if it was theirs",
+                                run_id, seat.get("accountId"), seat_key)
+                continue
+            if (seat.get("clear") or {}).get("state") != "done":
+                seat["sweep"] = {
+                    "state": "skipped",
+                    "detail": "glass was never cleared — the credits are "
+                              "not House money and stay with the floor"}
+                log.info("🏆 %s cancel skips the sweep on %s — its clear "
+                         "never settled, so the glass keeps its own money",
+                         run_id, seat_key)
+                continue
+            if seat.get("kind") in ("sas", "linked") and \
+                    bool(seat.get("sasLocked") if "sasLocked" in seat
+                         else seat.get("locked")):
+                # the unlock above was REFUSED (queue at cap / satellite
+                # dark) and the machine is still 0x01-shut-down — a pull
+                # queued behind a known-failed unlock hard-fails
+                # lock_failed 0xFF (the exact bench-day failure this
+                # rebuild exists to prevent) and strands the credits on a
+                # LOCKED machine with the runner already dead. Skip the
+                # pull and say it LOUDLY; the operator re-enables from
+                # Settings and the next arm's clear fetches the glass.
+                seat["sweep"] = {
+                    "state": "skipped",
+                    "detail": "unlock refused — the machine is still shut "
+                              "down and a pull would hard-fail; re-enable "
+                              "from Settings (credits stay on the glass)"}
+                log.warning("🏆 %s cancel could NOT unlock %s (%s) — the "
+                            "sweep pull is skipped so it can't lock_failed "
+                            "against a shut-down machine; re-enable it "
+                            "from Settings", run_id,
+                            seat.get("machine") or seat_key, seat_key)
+                continue
+            self._tournament_pull_seat(seat_key, seat, slot="sweep")
+        self._tournament_absorb_refunds(run_id, seats)
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") == run_id:
+                for seat_key, seat in seats.items():
+                    live = (t.get("seats") or {}).get(seat_key)
+                    if live is not None:
+                        live["locked"] = seat.get("locked")
+                        live["sweep"] = seat.get("sweep")
+                        if "sasLocked" in seat:
+                            live["sasLocked"] = seat.get("sasLocked")
+        log.info("🏆 tournament %s CANCELLED — %d seat(s) unlocked, then "
+                 "swept", run_id, len(seats))
+        return {"phase": "idle", "note": "cancelled", "seats": len(seats)}
+
+    def tournament_reset(self):
+        """tournamentReset — finished (or an already-idle post-cancel
+        rest, so a cleanup click is never refused) -> a fresh idle dict.
+        Keeps NOTHING: config, seats, winner all clear, NO wire — the
+        sweeps are host-initiated pulls already in flight on both
+        protocols (2026-07-21: the g2s WAT pull replaced the button arm,
+        so there is no standing arm to tear down). The machines stay as
+        they are — a finished floor stays locked until the operator
+        unlocks it or the next arm re-locks it anyway. The SAS sweep pins
+        are NOT touched: their pulls settle on their own clock and
+        popping a pin would turn the House's own confirmed sweep into an
+        unhomed HOLD."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") not in ("finished", "idle"):
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "cancel first"}
+            self.tournament = self._tournament_idle_state()
+        log.info("🏆 tournament reset — board back to attract")
+        return {"phase": "idle"}
+
+    def floor_set_locked(self, lock):
+        """floorLock / floorUnlock — the whole floor at once (AJ
+        2026-07-21: "lock/unlock all machines… the tournament already
+        does it"). EXACTLY the tournament's per-seat lock rules, minus
+        the tournament: pure-G2S cabinets over setCabinetState (full-flag
+        builder, disable persists across an EGM restart), LINKED cabinets
+        over their SAS leg ONLY (one lock one owner — never a G2S
+        setCabinetState that would strand a second host-disable latch,
+        [[the ⭐ note in _tournament_lock_seat]]), unlinked live SAS
+        machines over sas_disable/enable. Refused while a tournament is
+        anywhere but idle — the tournament owns the floor's locks then,
+        and two owners re-fighting each other is exactly the class of bug
+        this day was spent killing. Per-machine outcomes in the reply
+        (queued ≠ confirmed: SAS verdicts ride the next report into the
+        hub-remembered lockState; the G2S confirm rides getCabinetStatus).
+        Machines that can't take the command are SKIPPED with the reason,
+        never silently."""
+        with self.tournament_lock:
+            ph = self.tournament.get("phase")
+        if ph != "idle":
+            return {"ok": False,
+                    "error": f"tournament is {ph!r} — it owns the floor "
+                             "locks; finish/cancel/reset it first"}
+        with self.assoc_lock:
+            assocs = list(self.associations.values())
+        with self.sas_lock:
+            sas_entries = {k: dict(e) for k, e in self.sas_machines.items()}
+        claimed = set(self.sas_links.values())
+        nicks = self.hub_store.names()
+        now = time.time()
+        results = []
+
+        def sas_leg_ok(entry):
+            return (entry and entry.get("online") is not False
+                    and entry.get("sasEnabled") is not False
+                    and now - (entry.get("receivedAt") or 0)
+                    <= self.SAS_STALE_SEC)
+
+        def queue_sas(machine, smib):
+            reply = self.sas_enqueue_command(smib, {
+                "id": f"floor{next(self._fob_seq)}-{int(now)}",
+                "type": "sas_disable" if lock else "sas_enable"})
+            results.append({"machine": machine, "ok": bool(reply.get("ok")),
+                            "via": "sas",
+                            "detail": ("queued" if reply.get("ok")
+                                       else str(reply.get("error") or
+                                                "queue refused"))})
+
+        for a in assocs:
+            with a.lock:
+                online = a.comms_state == "onLine"
+            nick = nicks.get(a.egm_id) or a.egm_id
+            leg = self.sas_links.get(a.egm_id)
+            if leg:
+                entry = sas_entries.get(leg)
+                if not sas_leg_ok(entry):
+                    results.append({"machine": nick, "ok": False,
+                                    "via": "sas",
+                                    "detail": "linked SAS leg "
+                                              "dark/parked/stale"})
+                    continue
+                queue_sas(nick, entry.get("smibId")
+                          or leg.split("/", 1)[0])
+                continue
+            if not online:
+                results.append({"machine": nick, "ok": False,
+                                "via": "g2s", "detail": "offline"})
+                continue
+            self.enqueue_set_cabinet_state(
+                a, enable=not lock,
+                disable_text="Floor locked from CabiNet" if lock else "")
+            results.append({"machine": nick, "ok": True, "via": "g2s",
+                            "detail": "queued"})
+        for key, entry in sas_entries.items():
+            if key in claimed:
+                continue    # a linked leg was handled with its owner
+            nick = entry.get("nickname") or nicks.get(key) or key
+            if not sas_leg_ok(entry):
+                results.append({"machine": nick, "ok": False, "via": "sas",
+                                "detail": "dark/parked/stale"})
+                continue
+            queue_sas(nick, entry.get("smibId") or key.split("/", 1)[0])
+        sent = sum(1 for r in results if r["ok"])
+        log.info("🔐 floor %s — %d/%d machine(s) queued",
+                 "LOCK" if lock else "UNLOCK", sent, len(results))
+        return {"locked": lock, "sent": sent, "results": results}
+
+    def _tournament_consume_wat_sweep(self, assoc):
+        """Pop the tournament sweep's "house" glass pin for this EGM and
+        turn the WAT cash-out mirror back off — fired from the commit
+        dispatch when the sweep's CASH OUT press has settled (the House
+        credit landed). House-guarded under _glass_pin_lock: a player's
+        own pin is never touched; the wire disarm runs outside the pin
+        lock (the no-nesting rule — _enqueue takes assoc.lock). Never
+        raises (rides the commit handler)."""
+        try:
+            with self._glass_pin_lock:
+                armed = self._glass_cash_out_pin.get(assoc.egm_id) == "house"
+                if armed:
+                    self._glass_cash_out_pin.pop(assoc.egm_id, None)
+            if armed:
+                self.enqueue_set_wat_cash_out(
+                    assoc, enable=False,
+                    device_id=self.default_wat_device(assoc))
+                log.info("🏆 [%s] tournament sweep consumed — CASH OUT "
+                         "banked the leftovers; mirror disarmed",
+                         assoc.egm_id)
+        except Exception:  # noqa: BLE001 — best-effort consume, never fatal
+            log.exception("tournament WAT sweep consume (%s) failed "
+                          "(ignored)", getattr(assoc, "egm_id", "?"))
+
+    # ---------------------------------------- tournament runner + tick
+
+    def _tournament_spawn_runner(self, run_id):
+        """Start THE runner — one daemon thread while any run is live —
+        unless one is already alive (arm spawns it for the funding
+        observer; start re-calls harmlessly). The is_alive skip is
+        CORRECT ONLY because the runner is run-agnostic (below): a
+        surviving thread from a just-cancelled run ADOPTS the new one —
+        with the old born-for-one-run exit, a cancel → re-arm landing
+        inside the dying thread's 0.5 s sleep left the fresh run with NO
+        runner at all (funding verdicts never folded, a countdown with
+        nobody to tick it). Check-and-start under the leaf lock so two
+        racing spawns can't both start a thread (Thread.start() runs no
+        engine code in THIS thread — the newborn blocks on the lock until
+        we release, so starting inside the lock is safe). Dormancy law:
+        this is the ONLY place the thread starts, and only the explicit
+        arm/start actions call it."""
+        with self.tournament_lock:
+            th = self._tournament_thread
+            if th is not None and th.is_alive():
+                return
+            th = threading.Thread(target=self._tournament_runner,
+                                  args=(run_id,), name="tournament",
+                                  daemon=True)
+            self._tournament_thread = th
+            th.start()
+
+    def _tournament_runner(self, run_id):
+        """THE tournament clock: tick every 0.5 s while ANY run is
+        armed/counting/running; exit only when the floor rests
+        (idle/finished). RUN-AGNOSTIC by design: a runner that outlives
+        its birth run ADOPTS the live one — every tick step re-reads and
+        re-validates the CURRENT run id before acting, so ticking a
+        successor is safe, and the spawn's is_alive skip therefore never
+        strands a run without a clock (the old id-mismatch exit did:
+        cancel → re-arm inside this thread's 0.5 s sleep made the spawn
+        skip AND the old thread exit). run_id is a birth label for logs
+        only. ALL transition logic lives in _tournament_tick — tests
+        drive the tick directly with injected clocks and never spawn
+        this thread (the sweep_card_sessions clock-injection
+        pattern)."""
+        del run_id    # adoption contract: exit is phase-driven only
+        while True:
+            with self.tournament_lock:
+                t = self.tournament
+                phase = t.get("phase")
+                # FINISHED no longer rests immediately: the finish step
+                # keeps ticking until every sweep settled and every seat
+                # got its OVER lock (_finishDone). A finished dict WITHOUT
+                # the flag (a hand-poked phase, a pre-directive state)
+                # rests at once — the old law, preserved as the default.
+                if phase == "idle" or (phase == "finished"
+                                       and t.get("_finishDone", True)):
+                    # commit the exit UNDER the lock the spawn checks:
+                    # is_alive() stays True until the thread fully
+                    # unwinds, so a re-arm landing in that window saw a
+                    # "live" runner, skipped the spawn, and left the
+                    # fresh run with no clock at all (no clear pulls, no
+                    # countdown — a silent wedge). Clearing the slot here
+                    # makes the states mutually visible: the spawn either
+                    # sees None (starts fresh) or a thread that has NOT
+                    # yet committed to exit and will ADOPT the new run.
+                    if self._tournament_thread is threading.current_thread():
+                        self._tournament_thread = None
+                    return
+            try:
+                self._tournament_tick(now=time.time())
+            except Exception:  # noqa: BLE001 — never take the runner down
+                log.exception("tournament tick failed (runner continues)")
+            time.sleep(0.5)
+
+    def _tournament_tick(self, now=None):
+        """ONE tournament heartbeat — every phase transition, pipeline
+        stage, staged unlock and score update lives here (the runner
+        calls it at 0.5 s; tests call it directly with an injected clock).
+        Leaf-lock discipline throughout: copy out, act, re-take to
+        publish, re-validating the run id each time."""
+        now = time.time() if now is None else now
+        with self.tournament_lock:
+            t = self.tournament
+            phase = t.get("phase")
+            run_id = t.get("id")
+        if phase == "armed":
+            # the ARM pipeline: clear -> fund -> lock per seat, one
+            # verdict at a time (the stage verdicts land async ~1-2 s:
+            # WAT records / satellite commandResults)
+            self._tournament_arm_step(run_id, now)
+            self._tournament_refresh_names(run_id)
+        elif phase == "countdown":
+            self._tournament_refresh_names(run_id)
+            self._tournament_countdown_step(run_id, now)
+        elif phase == "running":
+            self._tournament_refresh_names(run_id)
+            self._tournament_score_step(run_id, now)
+        elif phase == "finished":
+            # sweep settles -> per-seat OVER locks -> _finishDone
+            self._tournament_finish_step(run_id, now)
+        if phase in ("armed", "countdown", "running"):
+            # lock delivery is fire-and-forget on both channels — keep
+            # re-issuing until the commanded faces can be believed
+            self._tournament_restage_locks(run_id, now)
+
+    def _tournament_countdown_step(self, run_id, now):
+        """Countdown duties: stage the SAS unlocks once at T-1.2 s (the
+        pull-only ~1 s report channel needs the head start — see
+        TOURNAMENT_SAS_UNLOCK_LEAD_SEC), stage the direct-POST G2S unlocks
+        once at T0, and flip to running at T0 with the score baselines
+        captured from the freshest counter readings."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "countdown":
+                return
+            starts_at = t.get("startsAt") or 0
+            stage_sas = (now >= starts_at
+                         - self.TOURNAMENT_SAS_UNLOCK_LEAD_SEC) \
+                and not t.get("sasUnlockStaged")
+            stage_g2s = now >= starts_at and not t.get("g2sUnlockStaged")
+            go = now >= starts_at
+            if stage_sas:
+                t["sasUnlockStaged"] = True
+            if stage_g2s:
+                t["g2sUnlockStaged"] = True
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        if not (stage_sas or stage_g2s or go):
+            return
+        if stage_sas:
+            # the SAS legs of BOTH sas and linked seats unlock at T-1.2s
+            # (the ~1s pull latency); the BB2 bench catch means the SAS
+            # leg IS the linked seat's real lock
+            for seat_key, seat in seats.items():
+                if seat.get("kind") in ("sas", "linked"):
+                    self._tournament_lock_seat(seat_key, seat, enable=True,
+                                               channels=("sas",))
+        if stage_g2s:
+            # ONLY pure-g2s seats unlock over G2S at T0 — a linked seat's
+            # whole-machine lock is SAS (staged above at T-1.2s); it has
+            # no G2S cabinet lock to open.
+            for seat_key, seat in seats.items():
+                if seat.get("kind") == "g2s":
+                    self._tournament_lock_seat(seat_key, seat, enable=True,
+                                               channels=("g2s",))
+        readings = self._tournament_read_meters(seats) if go else {}
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "countdown":
+                return
+            for seat_key, seat in (t.get("seats") or {}).items():
+                if seat_key in seats:
+                    seat["locked"] = seats[seat_key]["locked"]
+                    for fld in ("lockEpoch", "sasLocked", "lockSentAt"):
+                        if fld in seats[seat_key]:
+                            seat[fld] = seats[seat_key][fld]
+                if go and readings.get(seat_key) is not None \
+                        and seat.get("baseScore") is None:
+                    # baseline = the freshest pre-start counters; a seat
+                    # whose counters haven't shown yet baselines on its
+                    # first real read mid-run (first non-None wins)
+                    seat["baseScore"] = readings[seat_key]
+            if go:
+                t["phase"] = "running"
+        if go:
+            log.info("🏆 tournament %s RUNNING — the horn at endsAt", run_id)
+
+    def _tournament_restage_locks(self, run_id, now):
+        """Lock/unlock delivery is fire-and-forget on BOTH channels — the
+        G2S FIFO silently drops queued jobs when a rejoin bumps the epoch,
+        a failed POST is counted-and-dropped, and the SAS queue refuses at
+        its cap — so a one-shot stage could leave a seat locked for the
+        whole race (or playable before the start). Every tick, any seat
+        whose commanded face disagrees with the phase's INTENT (a refused
+        SAS enqueue left the old face standing, a vanished assoc read as
+        unlocked), or whose assoc epoch has moved past the one its last
+        send was queued under (that send was dropped at rejoin), or whose
+        EGM-reported cabinet state (a getCabinetStatus confirm YOUNGER
+        than our last send) contradicts the intent (the counted-and-
+        dropped failed POST — no epoch bump, invisible otherwise), gets
+        its lock/unlock RE-ISSUED, throttled per seat
+        (TOURNAMENT_RESTAGE_SEC). A LINKED seat additionally tracks its
+        SAS leg's own commanded face (seat.sasLocked — on the BB2 the
+        0x01/0x02 is the only lock that bites) and re-delivers that leg
+        ALONE when it disagrees with the leg's intent.
+        Idempotent by construction — a repeat setCabinetState/0x01/0x02 is
+        the same full state again. Intent: ARMED = locked ONLY once the
+        seat's pipeline reached "ready" (a re-lock over a seat still
+        clearing/funding would recreate the 07-21 freeze — the pipeline
+        owns the lock timing, this pass owns re-DELIVERY); pre-stage
+        countdown = locked (the arm text); staged countdown / running =
+        unlocked. Quiet when nothing drifts — the replay's
+        expect_no_host_post law (a settled ARMED tournament emits nothing
+        on its own)."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id:
+                return
+            phase = t.get("phase")
+            if phase not in ("armed", "countdown", "running"):
+                return
+            sas_open = bool(t.get("sasUnlockStaged")) or phase == "running"
+            g2s_open = bool(t.get("g2sUnlockStaged")) or phase == "running"
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        resent = {}
+        for seat_key, seat in seats.items():
+            if phase == "armed":
+                # the pipeline locks LAST — until a seat rests at
+                # "ready" its intent is UNLOCKED (transfers in flight)
+                want_locked = seat.get("armStage") == "ready"
+            else:
+                # a linked seat's whole-machine lock is SAS, so it tracks
+                # the SAS unlock stage (T-1.2s) like a pure sas seat; only
+                # a pure-g2s seat waits for the T0 g2s stage
+                want_locked = not (
+                    sas_open if seat.get("kind") in ("sas", "linked")
+                    else g2s_open)
+            if now - (seat.get("lockRetryTs") or 0) \
+                    < self.TOURNAMENT_RESTAGE_SEC:
+                continue
+            drift = bool(seat.get("locked")) is not want_locked
+            # The epoch + getCabinetStatus-confirm G2S re-delivery checks
+            # are for a PURE-G2S seat only. A LINKED cabinet's whole-machine
+            # lock is SAS (one lock one owner — the ⭐ note in
+            # _tournament_lock_seat), so there is no G2S cabinet lock to
+            # re-deliver and no G2S report to read as lock truth: its lock
+            # truth is the SAS face (seat.sasLocked, the sas_drift path
+            # below). Reading the linked cabinet's hostEnabled here drifted
+            # every tick and flooded the SAS leg with sas_disable (07-21
+            # bench).
+            if not drift and seat.get("kind") == "g2s":
+                with self.assoc_lock:
+                    assoc = self.associations.get(seat_key)
+                live_epoch = getattr(assoc, "epoch", None) \
+                    if assoc is not None else None
+                drift = "lockEpoch" in seat \
+                    and seat.get("lockEpoch") != live_epoch
+                if not drift and assoc is not None:
+                    # the EGM's OWN report is the delivery truth for the
+                    # G2S leg: a job the FIFO worker counted-and-dropped
+                    # (failed POST) bumps no epoch and leaves face==intent
+                    # above — invisible — but the getCabinetStatus that
+                    # tails every setCabinetState reports hostEnabled.
+                    # Only a report YOUNGER than our last send counts (a
+                    # stale one would flap the restage forever); each
+                    # re-issue tails a fresh status read, so this
+                    # converges.
+                    sent_at = seat.get("lockSentAt")
+                    cab_at = getattr(assoc, "cabinet_at", 0)
+                    if sent_at and cab_at and cab_at > sent_at:
+                        with assoc.lock:
+                            host_en = (getattr(assoc, "cabinet", None)
+                                       or {}).get("hostEnabled")
+                        if host_en in ("true", "false"):
+                            drift = (host_en == "false") is not want_locked
+            if not drift:
+                continue
+            # One re-delivery per drift: a linked/sas seat re-issues over
+            # SAS (the g2s branch of _tournament_lock_seat skips non-g2s),
+            # a pure-g2s seat over G2S. The linked seat's single 'locked'
+            # face IS its SAS face now (they move together), so no separate
+            # per-leg pass is needed.
+            self._tournament_lock_seat(
+                seat_key, seat, enable=not want_locked,
+                text=TOURNAMENT_ARM_TEXT if want_locked else "")
+            seat["lockRetryTs"] = now
+            resent[seat_key] = seat
+        if not resent:
+            return
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id:
+                return
+            for seat_key, seat in resent.items():
+                live = (t.get("seats") or {}).get(seat_key)
+                if live is None:
+                    continue
+                for fld in ("locked", "lockEpoch", "lockRetryTs",
+                            "sasLocked", "lockSentAt"):
+                    if fld in seat:
+                        live[fld] = seat[fld]
+
+    def _tournament_score_step(self, run_id, now):
+        """RUNNING duties: keep the g2s wonAmt fresh (an on-demand gamePlay
+        meter read every SCORE_POLL_SEC — the standing sub's 60 s cadence
+        can't feed a race), fold every seat's counter deltas into scoreMc,
+        and hand off to the finish at endsAt."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "running":
+                return
+            ends_at = t.get("endsAt") or 0
+            poll_due = now - (t.get("_meterPollTs") or 0) \
+                >= self.SCORE_POLL_SEC
+            if poll_due:
+                t["_meterPollTs"] = now
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        if poll_due:
+            for seat_key, seat in seats.items():
+                if seat.get("kind") != "g2s":
+                    continue    # linked/sas score off the ~1 s SAS reports
+                with self.assoc_lock:
+                    assoc = self.associations.get(seat_key)
+                if assoc is not None:
+                    # the meter-subscription read builder, scoped to the
+                    # gamePlay class so the race isn't paying for a full
+                    # wildcard sweep every 4 s
+                    self.enqueue_get_meter_info(
+                        assoc, device_class="G2S_gamePlay", device_id="-1")
+        readings = self._tournament_read_meters(seats)
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "running":
+                return
+            for seat_key, seat in (t.get("seats") or {}).items():
+                self._tournament_fold_score(seat, readings.get(seat_key))
+        if now >= ends_at:
+            self._tournament_finish(now=now)
+
+    def _tournament_read_meters(self, seats):
+        """Read every seat's CURRENT win counters — folded state only, no
+        wire: g2s -> assoc.meters wonAmt (raw string, MILLICENTS); linked/
+        sas -> the leg's coinOut+jackpot (raw CREDIT counters) + denomCents
+        (entry echo, fallback machine_prefs, fallback 1¢ — the hub owns all
+        denom math). Returns {seatKey: reading|None}; None until the
+        counters actually show up (the baseline waits for a real read)."""
+        def _ctr(v):
+            # counters arrive as raw strings/ints off two attacker-typed
+            # wires — anything unparseable reads as "not reported yet"
+            try:
+                return int(str(v)) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        out = {}
+        for seat_key, seat in seats.items():
+            if seat.get("kind") == "g2s":
+                with self.assoc_lock:
+                    assoc = self.associations.get(seat_key)
+                won = {}
+                if assoc is not None:
+                    with assoc.lock:
+                        # every gamePlay device's four win meters — the
+                        # win lands on whatever game is being PLAYED, so
+                        # the score sums deltas across the whole map
+                        # (per-key baseline: a device whose meters show
+                        # up mid-run baselines itself on first sight)
+                        for key, raw in assoc.meters.items():
+                            if not key.startswith("G2S_gamePlay/"):
+                                continue
+                            name = key.rsplit("/", 1)[-1]
+                            if name not in TOURNAMENT_G2S_WON_METERS:
+                                continue
+                            v = _ctr(raw)
+                            if v is not None:
+                                won[key] = v
+                out[seat_key] = {"g2sWon": won} if won else None
+                continue
+            leg = seat.get("sasKey")
+            with self.sas_lock:
+                entry = dict(self.sas_machines.get(leg) or {})
+            meters = entry.get("meters") \
+                if isinstance(entry.get("meters"), dict) else {}
+            coin = _ctr(meters.get("coinOut"))
+            jack = _ctr(meters.get("jackpot"))
+            if coin is None and jack is None:
+                out[seat_key] = None
+                continue
+            denom = entry.get("denomCents")
+            if not denom:
+                denom = (self.hub_store.machine_prefs(leg) or {}) \
+                    .get("denomCents")
+            try:
+                denom = int(denom) if denom else 0
+            except (TypeError, ValueError):
+                denom = 0
+            # denom unset -> score the raw coinOut/jackpot CREDIT deltas at
+            # 1¢/credit (correct for a penny machine; an ASSUMPTION for a
+            # non-penny cabinet, which would then fold its wins 5x/100x low and
+            # never out-score a penny seat). We can't read the machine's own
+            # denom (0x1F code table is spec-only, not decoded — see
+            # _sas_denom_cents), so flag the assumption on the seat instead of
+            # silently mis-scoring the showpiece.
+            assumed = denom < 1
+            if assumed:
+                denom = 1
+            out[seat_key] = {"coinOut": coin, "jackpot": jack,
+                             "denomCents": denom, "denomAssumed": assumed}
+        return out
+
+    @staticmethod
+    def _tournament_fold_score(seat, reading):
+        """Fold one counter reading into seat['scoreMc']. baseScore is the
+        LAST-SEEN counter marker, not a fixed origin: the score
+        accumulates FORWARD deltas only, so a mid-run counter reset /
+        8-digit SAS BCD rollover / RAM clear shows as a negative delta and
+        silently RE-BASELINES — the score already banked is kept and the
+        score can never go negative. Pure dict math on state owned by
+        tournament_lock — the one helper that runs UNDER the leaf lock."""
+        if reading is None:
+            return
+        base = seat.get("baseScore")
+        if not isinstance(base, dict):
+            seat["baseScore"] = reading
+            return
+        if "g2sWon" in reading:
+            # per-key last-seen markers over the WHOLE gamePlay win-meter
+            # map (2026-07-21 live catch: the win lands on the PLAYED
+            # game's device — 131 devices on the AVP — and the real meter
+            # names are egmPaid/handPaid Game/Prog WonAmt; single-key
+            # G2S_gamePlay/1/G2S_wonAmt was a replay-fixture fiction that
+            # scored a real 150-credit win as 0). A device first seen
+            # mid-run baselines silently; per-key rollback re-baselines.
+            cur_map = reading.get("g2sWon") or {}
+            base_map = base.setdefault("g2sWon", {})
+            gained = 0
+            for key, cur in cur_map.items():
+                last = base_map.get(key)
+                if last is None or cur < last:
+                    base_map[key] = cur   # first sight / rollover
+                    continue
+                gained += cur - last
+                base_map[key] = cur
+            if gained > 0:
+                seat["scoreMc"] = int(seat.get("scoreMc") or 0) + gained
+            return
+        denom = reading.get("denomCents") or base.get("denomCents") or 1
+        base["denomCents"] = denom
+        # Ride the honest denom-unset flag onto the seat (tournament_snapshot
+        # copies the seat verbatim) so an operator can see a SAS seat that is
+        # being scored at the 1¢/credit assumption rather than its real denom.
+        if reading.get("denomAssumed"):
+            seat["denomAssumed"] = True
+        won_credits = 0
+        for ctr in ("coinOut", "jackpot"):
+            cur = reading.get(ctr)
+            last = base.get(ctr)
+            if cur is None:
+                continue
+            if last is None or cur < last:
+                base[ctr] = cur        # first sight / rollover: re-baseline
+                continue
+            won_credits += cur - last
+            base[ctr] = cur
+        if won_credits > 0:
+            seat["scoreMc"] = int(seat.get("scoreMc") or 0) \
+                + won_credits * int(denom) * 1000
+
+    def _tournament_refresh_names(self, run_id):
+        """Carded name wins over alias, LIVE: someone who cards in mid-run
+        takes over their seat's label on the next tick (the alias stays as
+        the board's subtitle; the SCORE stays with the seat), and a
+        card-out falls back to the alias. SAS seats keep their alias —
+        card sessions are a per-EGM (G2S) concept."""
+        cards = self.card_sessions_snapshot()
+        with self.companion_lock:
+            accts = {egm: str(s.get("accountId") or "").strip() or None
+                     for egm, s in self.card_sessions.items()}
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id:
+                return
+            for seat_key, seat in (t.get("seats") or {}).items():
+                if seat.get("kind") == "sas":
+                    continue
+                carded = (cards.get(seat_key) or {}).get("name")
+                seat["name"] = carded or seat.get("alias")
+                seat["accountId"] = accts.get(seat_key)
+
+    def _tournament_arm_step(self, run_id, now):
+        """The ARM PIPELINE driver — one tick of the per-seat armStage
+        state machine (CLEAR -> FUND -> LOCK -> ready), AJ's 07-21
+        resolution directive: "pull whatever's in them back to the House
+        wallet, send the AFT back in with the tournament credits,
+        followed by the shutdown." Every transfer runs against a LIVE
+        machine; the lock is the LAST act per seat.
+
+        SINGLE DRIVER: only the runner tick (and tests with injected
+        clocks) calls this — the arm action publishes the seats and
+        spawns the runner, never racing its own pipeline. Stages advance
+        one verdict at a time per seat: one WAT at a time per EGM
+        (G2S_WTX008), one satellite command per stage (the queue burst
+        is order-chained, NOT success-chained — the drain runs the next
+        command regardless of the last outcome, so success-chaining can
+        only live here). Copies out, acts, publishes field-wise
+        re-validating the run — with a slim unwind: a cancel racing this
+        pass wins, and any lock issued by the losing pass is re-opened
+        (idempotent full restore) so a cancelled floor can never end
+        locked with nobody left to fix it."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "armed":
+                return
+            # the FROZEN stake (the arm claim's snapshot) — never the
+            # live creditsCents, which configure may legally edit while
+            # armed for the NEXT round; falling back keeps a hand-poked
+            # pre-freeze dict (tests, an old snapshot) funding at all
+            credits_cents = int(t.get("runCreditsCents")
+                                or t.get("creditsCents") or 0)
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()
+                     if v.get("armStage") not in ("ready", "failed")}
+        if not seats:
+            return
+        locked_now = []
+        for seat_key, seat in seats.items():
+            with self.tournament_lock:
+                t = self.tournament
+                live = t.get("id") == run_id and t.get("phase") == "armed"
+            if not live:
+                break
+            before = seat.get("armStage")
+            self._tournament_advance_seat(seat_key, seat, credits_cents,
+                                          now)
+            if before != "ready" and seat.get("armStage") == "ready" \
+                    and seat.get("locked"):
+                locked_now.append(seat_key)
+        with self.tournament_lock:
+            t = self.tournament
+            ours = t.get("id") == run_id and t.get("phase") == "armed"
+            if ours:
+                for seat_key, seat in seats.items():
+                    live = (t.get("seats") or {}).get(seat_key)
+                    if live is None:
+                        continue
+                    for fld in ("armStage", "stageDetail", "clear",
+                                "absorbedMc", "absorbedBuckets",
+                                "refundAccountId", "clearAskedAt",
+                                "funded", "fundDetail", "fundRequestId",
+                                "fundCmdId", "fundIssuedAt", "locked",
+                                "lockEpoch", "sasLocked", "lockSentAt"):
+                        if fld in seat:
+                            live[fld] = seat[fld]
+        if not ours and locked_now:
+            log.warning("🏆 tournament %s arm pass superseded — re-opening "
+                        "%d seat(s) locked by the losing pass", run_id,
+                        len(locked_now))
+            for seat_key in locked_now:
+                self._tournament_lock_seat(seat_key, seats[seat_key],
+                                           enable=True)
+
+    def _tournament_advance_seat(self, seat_key, seat, credits_cents,
+                                 now=None):
+        """Advance ONE seat as far as its verdicts allow, mutating the
+        LOCAL copy (the caller publishes): CLEAR (confirm-then-issue /
+        observe; an empty glass settles the stage synchronously ONLY
+        after a fresh post-arm meter read for a g2s seat — the stale-
+        mirror law below) -> FUND (issue once / observe) -> LOCK (issue;
+        the restage pass owns re-delivery) -> ready. Any stage failing
+        parks the seat at armStage="failed" with the reason on
+        stageDetail — START then refuses, naming it, and the operator
+        cancels (unlock + pull) or waits. `now` is the tick clock: the
+        stage-verdict TIMEOUTS ride it (a queue-expired satellite
+        command produces no verdict record EVER — without a clock the
+        seat pended forever with a detail claiming progress)."""
+        now = time.time() if now is None else now
+        if seat.get("armStage") == "clear":
+            if seat.get("clear") is None:
+                if not self._tournament_clear_confirmed(seat_key, seat,
+                                                        now):
+                    return
+                if seat.get("clear") is None:    # the gate may have parked
+                    self._tournament_pull_seat(seat_key, seat,
+                                               slot="clear")
+                    tr0 = seat.get("clear")
+                    if isinstance(tr0, dict) \
+                            and tr0.get("state") == "pulling":
+                        tr0["issuedAt"] = now    # the verdict-timeout clock
+            if (seat.get("clear") or {}).get("state") == "pulling" and \
+                    not self._tournament_observe_pull(seat_key, seat,
+                                                      "clear", now=now):
+                return
+            tr = seat.get("clear") or {}
+            if tr.get("state") == "done":
+                # absorbedMc = the clear's SETTLED ACTUALS (the directive
+                # retired the meter guess) — the carded refund at
+                # finish/cancel is keyed to exactly this number
+                seat["absorbedMc"] = int(tr.get("actualMc") or 0)
+                # …and the per-bucket actuals ride along so the refund
+                # can pay promo back as promo (never launder it cashable)
+                if isinstance(tr.get("actualsMc"), (list, tuple)):
+                    seat["absorbedBuckets"] = list(tr["actualsMc"])
+                # the refund OWNER is stamped HERE — the moment the money
+                # actually moved — NEVER read live at finish/cancel: the
+                # name refresh tracks whoever is carded NOW, so a
+                # card-out before the horn would silently forfeit the
+                # refund and a different friend carding in mid-run would
+                # capture it
+                seat["refundAccountId"] = seat.get("accountId")
+                seat["armStage"] = "fund"
+                seat["stageDetail"] = "glass clear — funding"
+            else:
+                # failed OR skipped: the glass CANNOT be emptied (a leg
+                # that can't pull, an open WAT) — funding on top would
+                # mix somebody's parked money into the tournament pool,
+                # so the seat parks honestly instead
+                seat["armStage"] = "failed"
+                seat["stageDetail"] = \
+                    f"clear: {tr.get('detail') or tr.get('state')}"
+                return
+        if seat.get("armStage") == "fund":
+            if not (seat.get("fundRequestId") or seat.get("fundCmdId")):
+                self._tournament_fund_seat(seat_key, seat, credits_cents)
+                if seat.get("funded") == "failed":
+                    seat["armStage"] = "failed"
+                    seat["stageDetail"] = f"fund: {seat.get('fundDetail')}"
+                    return
+                seat["fundIssuedAt"] = now    # the verdict-timeout clock
+            verdict = self._tournament_fund_verdict(seat_key, seat,
+                                                    now=now)
+            if verdict is None:
+                return
+            state, detail = verdict
+            seat["funded"] = state
+            seat["fundDetail"] = detail
+            if state != "ok":
+                seat["armStage"] = "failed"
+                seat["stageDetail"] = f"fund: {detail}"
+                return
+            seat["armStage"] = "lock"
+            seat["stageDetail"] = "funded — locking"
+        if seat.get("armStage") == "lock":
+            # the LAST act (the 07-21 law — see the section header).
+            # Issue once; the restage pass re-delivers until the
+            # commanded face holds (refused SAS queue, epoch drop).
+            self._tournament_lock_seat(seat_key, seat, enable=False,
+                                       text=TOURNAMENT_ARM_TEXT)
+            seat["armStage"] = "ready"
+            seat["stageDetail"] = "cleared + funded + locked"
+
+    def _tournament_clear_confirmed(self, seat_key, seat, now):
+        """THE STALE-MIRROR LAW for a plain-g2s CLEAR: never settle a $0
+        clear off the cold playerCashableAmt fold alone. That mirror is
+        refreshed only by the 60 s standing subscription — a bill fed in
+        since the last report is INVISIBLE to it, so a cold-fold $0 would
+        skip the pull, fund the tournament stake ON TOP of the unseen
+        credits, and the finish sweep would then bank the whole mixed
+        glass to the House with absorbedMc still 0 (a carded friend's
+        money silently become House take — exactly the mixing the CLEAR
+        stage exists to prevent). A NONZERO fold keeps today's path
+        untouched (the ask is only a hint; commit ACTUALS are the ledger
+        truth either way — the $521k lesson), and SAS/linked legs are
+        already fresh at the ~1 s report cadence.
+
+        Returns True when the pull may issue (or the stage should read
+        its tracker — on the no-answer timeout this parks seat["clear"]
+        itself); False = not-yet, stay at armStage="clear". Mutates the
+        LOCAL seat copy only; the scoped read is one enqueue per arm,
+        confirmed by ANY meterInfo landing after the ask
+        (assoc.meters_at)."""
+        if seat.get("kind") != "g2s":
+            return True
+        with self.assoc_lock:
+            assoc = self.associations.get(seat_key)
+        if assoc is None:
+            return True    # the pull says "machine vanished" honestly
+        if self._machine_credits_mc(assoc) > 0:
+            return True    # credits showing: the pull rides regardless
+        asked = seat.get("clearAskedAt")
+        if asked is None:
+            # first look at a zero fold: ask the machine itself, scoped
+            # to the cabinet class (the race isn't paying for a wildcard
+            # sweep), and wait for the answer
+            self.enqueue_get_meter_info(assoc, device_class="G2S_cabinet",
+                                        device_id="-1")
+            seat["clearAskedAt"] = now
+            seat["stageDetail"] = ("confirming the empty glass — fresh "
+                                   "cabinet meter read")
+            return False
+        if getattr(assoc, "meters_at", 0) >= asked:
+            # a post-ask reading landed: the fold is now trustworthy —
+            # the pull path re-reads it (fresh credits pull, a confirmed
+            # empty settles $0)
+            return True
+        if now - asked >= self.TOURNAMENT_WAT_VERDICT_TIMEOUT_SEC:
+            # the machine never answered the read — park honestly rather
+            # than guess (a dark EGM can't be cleared OR safely funded)
+            seat["clear"] = {
+                "state": "failed",
+                "detail": "glass never confirmed — no meterInfo answered "
+                          "the post-arm read (machine dark?)"}
+            return True
+        return False
+
+    def _tournament_fund_verdict(self, seat_key, seat, now=None):
+        """The async funding verdict for ONE seat, read from what ALREADY
+        lands in the existing stores — no new confirmation channel: g2s =
+        the WatStore record's §22.7 state (matched by our fundRequestId;
+        abandoned/error:* count as failures — an EGM reset or a wat-class
+        error parks records there and the old observer waited on them
+        forever); linked+sas = the satellite's aft_transfer commandResult
+        (matched by our fundCmdId — the same records the aftpush settle
+        consumes). Returns ("ok"|"failed", detail), or None while still
+        in flight. `now` (the tick clock) arms the NO-VERDICT timeouts:
+        a queue-expired satellite command / a WAT the EGM never answered
+        produces no record EVER, and the old observer waited on that
+        forever (the stuck-armed 07-21 misery — the finish phase got its
+        settle timeout, the arm pipeline never did)."""
+        if seat.get("kind") == "g2s":
+            rid = seat.get("fundRequestId")
+            if not rid:
+                return None
+            rec = self.wat_store.find(seat_key, request_id=rid)
+            st = (rec or {}).get("state")
+            if st == "committed":
+                return "ok", "WAT committed"
+            if st in ("denied", "failed", "cancelled", "abandoned") \
+                    or str(st).startswith("error:"):
+                return "failed", f"WAT {st}"
+            issued = seat.get("fundIssuedAt")
+            if now is not None and issued and rec is not None \
+                    and st == "requested" \
+                    and str(rec.get("transactionId") or "0") == "0" \
+                    and now - issued \
+                    >= self.TOURNAMENT_WAT_VERDICT_TIMEOUT_SEC:
+                # the EGM never even answered requestPending — cancel the
+                # dead record LOCALLY (no txn = no wire cancel; leaving
+                # it would wedge one-at-a-time forever) and fail honestly.
+                # A record WITH a txn keeps waiting: real money is moving
+                # and its commit/abort verdict WILL land.
+                upd = self.wat_store.cancel_local(seat_key, rid)
+                if upd is not None:
+                    with self.assoc_lock:
+                        assoc = self.associations.get(seat_key)
+                    if assoc is not None:
+                        self._wat_mirror(assoc, upd)
+                return "failed", ("no verdict — the EGM never answered "
+                                  "the push (cancelled locally)")
+            return None
+        cid = seat.get("fundCmdId")
+        if not cid:
+            return None
+        with self.sas_lock:
+            entry = self.sas_machines.get(seat.get("sasKey")) or {}
+            results = [dict(r) for r
+                       in (entry.get("commandResults") or [])
+                       if isinstance(r, dict)]
+        for r in results:
+            if r.get("id") != cid or r.get("type") != "aft_transfer":
+                continue
+            if r.get("ok") and r.get("outcome") in ("completed", "partial"):
+                return "ok", f"AFT {r.get('outcome')}"
+            return "failed", str(r.get("detail") or r.get("outcome")
+                                 or "AFT refused")
+        issued = seat.get("fundIssuedAt")
+        if now is not None and issued and now - issued \
+                >= self.TOURNAMENT_SAS_VERDICT_TIMEOUT_SEC:
+            # the satellite queue drops >30 s-stale commands UNEXECUTED
+            # with no result record — past expiry + margin this verdict
+            # can never arrive
+            return "failed", ("no verdict — the queued command expired "
+                              "unexecuted (satellite dark?)")
+        return None
+
+    def _tournament_finish(self, note="", now=None):
+        """FINISH duties, exactly once — the running->finished claim under
+        the leaf lock is the once-guard (the endsAt tick and a
+        tournamentEnd click can race; one wins): pick the winner (max
+        scoreMc, strict > so the EARLIEST-seated takes a tie — seat
+        insertion order is arm order), then SWEEP the leftovers home
+        FIRST, while every machine is still LIVE (the running floor) —
+        the 07-21 directive's order: "pull the leftovers FIRST (machines
+        still live), THEN lock". The "TOURNAMENT OVER" locks are NOT
+        issued here: each seat locks in _tournament_finish_step only
+        AFTER its own pull settles (a lock over an open transfer freezes
+        it — the bench law), and the runner stays alive through
+        "finished" until every seat is settled + locked (_finishDone).
+
+        ⚖️ EXPLICIT DESIGN DECISION — the sweep's destination is HOUSE.
+        Every return-leg comment in this file says "the House is never the
+        destination of a player's cash-out", and that invariant STANDS:
+        it protects PLAYER money (a player's cash-out reaches their wallet
+        or a ticket, never the bank's books). Tournament leftovers are
+        different money — the HOUSE funded every seat at arm, the CLEAR
+        stage already banked pre-existing balances (with the carded
+        refund riding absorbedMc), and whatever is still on the glass
+        after the horn is House money returning home. This is the one
+        sanctioned House-destination cash-out; do not generalize it."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("phase") != "running":
+                return {"ok": False,
+                        "error": f"tournament is {t.get('phase')!r} — "
+                                 "nothing to end"}
+            t["phase"] = "finished"
+            if note:
+                t["note"] = note
+            # the settle-timeout clock — stamped from the CALLER's clock
+            # (the score step passes its injected now) so the tick tests
+            # stay clock-injectable; the HTTP end path uses wall time
+            t["_finishAt"] = time.time() if now is None else now
+            t["_finishDone"] = False
+            run_id = t.get("id")
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        winner = None
+        for seat_key, seat in seats.items():
+            if winner is None or int(seat.get("scoreMc") or 0) \
+                    > int(winner[1].get("scoreMc") or 0):
+                winner = (seat_key, seat)
+        winner_out = None
+        if winner is not None:
+            winner_out = {"seatKey": winner[0],
+                          "name": winner[1].get("name"),
+                          "scoreMc": int(winner[1].get("scoreMc") or 0)}
+        # SWEEP FIRST — the machines are still enabled (running floor),
+        # so every pull runs against a live machine; the OVER locks ride
+        # the finish step as each pull settles.
+        for seat_key, seat in seats.items():
+            self._tournament_pull_seat(seat_key, seat, slot="sweep")
+        self._tournament_absorb_refunds(run_id, seats)
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") == run_id:
+                for seat_key, seat in seats.items():
+                    live = (t.get("seats") or {}).get(seat_key)
+                    if live is not None:
+                        live["sweep"] = seat.get("sweep")
+                t["winner"] = winner_out
+        log.info("🏆 tournament %s FINISHED — winner %s ($%.2f in wins); "
+                 "leftovers sweeping home, locks follow each settle",
+                 run_id, (winner_out or {}).get("name") or "(no seats)",
+                 ((winner_out or {}).get("scoreMc") or 0) / 100000)
+        return {"phase": "finished", "winner": winner_out}
+
+    def _tournament_finish_step(self, run_id, now):
+        """FINISHED-phase duties: watch every seat's sweep pull settle,
+        and lock each seat ("TOURNAMENT OVER") only AFTER its pull
+        reached a terminal state — the 07-21 bench law again: a lock over
+        an open transfer freezes it at requestPending, and the pending
+        txn then poisons every later initiateRequest (G2S_WTX008). When
+        every seat is settled + locked the run book closes (_finishDone)
+        and the runner finally rests.
+
+        A pull that never settles hits
+        TOURNAMENT_FINISH_SETTLE_TIMEOUT_SEC: SAS seats lock anyway (a
+        late 0x01 is harmless and the ledger settles on its own clock if
+        the verdict ever lands), but a g2s seat with a WAT still OPEN is
+        LEFT UNLOCKED on purpose, said honestly on the seat — the money
+        reconciles at commitTransfer whenever the EGM proceeds, and a
+        finished floor's lock is ceremony, never worth freezing a
+        transfer for."""
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "finished" \
+                    or t.get("_finishDone"):
+                return
+            finish_at = t.get("_finishAt") or now
+            seats = {k: dict(v) for k, v in (t.get("seats") or {}).items()}
+        timed_out = now - finish_at \
+            >= self.TOURNAMENT_FINISH_SETTLE_TIMEOUT_SEC
+        changed = False
+        for seat_key, seat in seats.items():
+            if seat.get("overLocked"):
+                continue
+            sw = seat.get("sweep") or {"state": "done", "detail": ""}
+            if sw.get("state") == "pulling":
+                self._tournament_observe_pull(seat_key, seat, "sweep")
+                sw = seat.get("sweep") or {}
+            if sw.get("state") == "pulling":
+                if not timed_out:
+                    continue    # still settling — next tick
+                sw = dict(sw, state="timeout",
+                          detail="pull never settled — verify by meter")
+                seat["sweep"] = sw
+            # terminal (done/failed/skipped/timeout): the OVER lock —
+            # except a g2s seat whose WAT is still open (the timeout/skip
+            # cases): locking would freeze the transfer, so the seat is
+            # deliberately left open and says so.
+            if seat.get("kind") == "g2s" and \
+                    self.wat_store.newest_active(seat_key) is not None:
+                seat["sweep"] = dict(
+                    sw, detail=(sw.get("detail") or "") +
+                    " — machine LEFT UNLOCKED (a WAT transfer is still "
+                    "open; a lock would freeze it)")
+                seat["overLocked"] = True
+                changed = True
+                continue
+            self._tournament_lock_seat(seat_key, seat, enable=False,
+                                       text=TOURNAMENT_OVER_TEXT)
+            seat["overLocked"] = True
+            changed = True
+        with self.tournament_lock:
+            t = self.tournament
+            if t.get("id") != run_id or t.get("phase") != "finished":
+                return
+            live_seats = t.get("seats") or {}
+            if changed:
+                for seat_key, seat in seats.items():
+                    live = live_seats.get(seat_key)
+                    if live is None:
+                        continue
+                    for fld in ("sweep", "locked", "lockEpoch",
+                                "overLocked", "sasLocked", "lockSentAt"):
+                        if fld in seat:
+                            live[fld] = seat[fld]
+            # all-settled check runs EVERY tick (not only on a change) so
+            # a publish that once raced a re-arm can't strand the runner
+            # ticking a fully-closed book forever
+            if all(s.get("overLocked") for s in live_seats.values()):
+                t["_finishDone"] = True
+                log.info("🏆 tournament %s book closed — every sweep "
+                         "settled, every seat holds TOURNAMENT OVER",
+                         run_id)
+
+    def _tournament_absorb_refunds(self, run_id, seats):
+        """A CARDED seat's pre-existing balance comes home to that player's
+        wallet (AJ 2026-07-21: collectors park credits to silence
+        attract-mode callouts, so credits never block an arm — but a
+        carded friend's parked money must not become House take). The ARM
+        pipeline's CLEAR stage pulled that balance to the House and
+        recorded the SETTLED ACTUALS as absorbedMc (the directive retired
+        the meter guess — no more $521k phantom reads); this sends
+        exactly that number back House->player as a paired-leg transfer
+        under one once=True ref (player leg first, the player-fund
+        pattern), so a re-run — cancel racing finish, hub restart
+        replaying a phase — can never double-refund. Uncarded cleared
+        credits are floor money and stay with the House on purpose.
+        Fires at finish AND cancel.
+
+        THE OWNER IS THE STAMPED refundAccountId — captured at the clear
+        settle, the moment the money moved — never the live accountId
+        (that field tracks whoever is carded NOW: a card-out before the
+        horn must not forfeit the refund, and a different friend carding
+        onto the seat mid-run must not capture it). And the refund pays
+        PER BUCKET (absorbedBuckets, the WAT commit's per-bucket actuals)
+        so cleared promo comes back as promo — the House's cash bucket is
+        never drained to launder promo into cashable."""
+        for seat_key, seat in seats.items():
+            mc = int(seat.get("absorbedMc") or 0)
+            acct = str(seat.get("refundAccountId") or "").strip()
+            if mc <= 0 or not acct or acct == "house":
+                continue
+            if self.account_store.get(acct) is None:
+                log.warning("🏆 %s absorb refund skipped — account %s "
+                            "vanished (%s, $%.2f stays with the House)",
+                            run_id, acct, seat_key, mc / 100000)
+                continue
+            buckets = seat.get("absorbedBuckets")
+            if isinstance(buckets, (list, tuple)) and len(buckets) == 3 \
+                    and sum(int(b or 0) for b in buckets) == mc:
+                cash, promo, non = (int(b or 0) for b in buckets)
+            else:
+                # no bucket record (SAS legs report one cashable figure;
+                # older seats): total conservation outranks bucket purity
+                cash, promo, non = mc, 0, 0
+            # once=True is LEDGER-global — one shared ref would make the
+            # second leg a no-op (the first leg's write already "used"
+            # it). Distinct per-leg refs under one stem keep both legs
+            # idempotent AND conserving (the wat :escrow/:commit/:refund
+            # leg-naming pattern).
+            stem = f"tournament:{run_id}:absorbrf:{seat_key}"
+            _, err = self.account_store.adjust(
+                acct, d_cash=cash, d_promo=promo, d_non=non,
+                ref=stem + ":player", once=True,
+                note=f"tournament absorb refund ({seat.get('machine')})")
+            if err:
+                log.warning("🏆 %s absorb refund refused for %s: %s",
+                            run_id, acct, err)
+                continue
+            self.account_store.adjust(
+                "house", d_cash=-cash, d_promo=-promo, d_non=-non,
+                ref=stem + ":house", once=True,
+                note=f"tournament absorb refund to "
+                     f"{seat.get('name') or acct}")
+            log.info("🏆 %s absorbed $%.2f returned to %s (%s)",
+                     run_id, mc / 100000, seat.get("name") or acct,
+                     seat_key)
+
+    def _tournament_pull_seat(self, seat_key, seat, slot="sweep"):
+        """Pull ONE seat's cashable home to the House over its native
+        return leg, recording a tracker dict in seat[slot] (the LOCAL
+        copy — the caller publishes). The SAME primitive serves both
+        ends of the run: slot="clear" is the ARM pipeline's first stage
+        (empty the glass BEFORE the tournament fund — the directive),
+        slot="sweep" is the finish/cancel leftovers pull. Tracker
+        states: "pulling" (wire out; requestId/cmdId recorded for the
+        tick observer), "done" (settled — actualMc carries the amount,
+        including the synchronous $0 of an empty glass), "failed"
+        (refused at issue), "skipped" (this leg can't pull — said
+        honestly). MUST run against a LIVE machine (the section-header
+        law) — the callers guarantee it: the arm clears before it ever
+        locks, finish pulls before its locks, cancel unlocks first.
+
+          * sas / linked -> tournament pin THEN aft_cashout_pull (the
+            glass_cash_out_now internals against the raw leg, with OUR
+            command id so the tick observer can match the verdict). The
+            pin outranks any per-EGM glass pin at settle
+            (_sas_cashout_pin) and is consumed there — the destination
+            is immutable while the pull is outstanding, and no glass pin
+            is needed even for a linked seat. The leg's live 0x1A
+            settles zero-glass up front (no wire for an empty machine);
+            an UNREPORTED meter falls through to the 0x74 from-EGM gate
+            (never assume an unreporting leg is empty).
+          * g2s -> the HOST-INITIATED WAT pull (start_wat_credit_pull:
+            initiateRequest watDirection=G2S_fromEgm — hostControl owns
+            both directions). No button, no standing arm, no glass pin:
+            "house" rides the WAT record itself and the House is
+            credited at commitTransfer ACTUALS. The ask is the
+            playerCashableAmt fold — the 07-21 meter tracer PROVED that
+            meter genuine millicents (the AVP's own G2S_wat cumulative
+            meters reconcile to the hub ledger to the millicent), so
+            the ask is trustworthy; commit ACTUALS stay the ledger
+            truth regardless. ONE WAT AT A TIME (G2S_WTX008): an EGM
+            with ANY transfer still open is skipped honestly instead of
+            poisoned."""
+        if seat.get("kind") in ("sas", "linked"):
+            leg = seat.get("sasKey")
+            with self.sas_lock:
+                entry = dict(self.sas_machines.get(leg) or {})
+            meters = entry.get("meters") \
+                if isinstance(entry.get("meters"), dict) else {}
+            raw = meters.get("0x1A", meters.get("credits"))
+            try:
+                credits = int(str(raw)) if raw is not None else None
+            except (TypeError, ValueError):
+                credits = None
+            if credits is not None and credits <= 0:
+                seat[slot] = {"state": "done", "actualMc": 0,
+                              "detail": "nothing on the glass"}
+                return
+            # Pre-flight = STALENESS ONLY (07-21 bench): a leg that isn't
+            # reporting gets no blind pull. But NO cached-availXfers gate
+            # — that bit is a snapshot from the LAST 0x74 interrogate, and
+            # after a tournament lock/unlock cycle it honestly reads 0
+            # (captured while the machine was shut down), stranding the
+            # leftovers with "isn't menu-set" on a machine that IS. The
+            # satellite's own pull does a LIVE 0x74/FF read and refuses
+            # not-ready/no_credits itself — the wire adjudicates; a
+            # genuinely un-menu-set machine surfaces as an honest FAILED
+            # pull instead of a silent skip. (glass_cash_out_now keeps
+            # its cached gate — its UI button only renders when ready.)
+            if not entry or entry.get("online") is False \
+                    or time.time() - (entry.get("receivedAt") or 0) \
+                    > self.SAS_STALE_SEC:
+                seat[slot] = {
+                    "state": "skipped",
+                    "detail": "satellite not reporting — no blind pull"}
+                return
+            # Pin FIRST (pin-before-wire law): the settle must never see
+            # a confirmed pull it can't home immutably. Lock-free dict
+            # write — _sas_cashout_pin reads this map FIRST and consumes
+            # the entry when the pull settles. The pin carries ITS pull's
+            # cmdId so the report ingest can retire it when that exact
+            # pull answers non-crediting with no tournament observer left
+            # alive (a cancel sweep after the runner stood down).
+            cmd = {"id": f"tour{next(self._fob_seq)}-{int(time.time())}",
+                   "type": "aft_cashout_pull", "accountId": "house"}
+            self._tournament_sweep_pins[leg] = {"acct": "house",
+                                                "ts": time.time(),
+                                                "cmdId": cmd["id"]}
+            reply = self.sas_enqueue_command(seat.get("smib"), cmd)
+            if not reply.get("ok"):
+                # the pull won't fire — undo the pin (the
+                # glass_cash_out_now refusal idiom)
+                self._tournament_sweep_pins.pop(leg, None)
+                seat[slot] = {"state": "failed",
+                              "detail": str(reply.get("error")
+                                            or "command queue refused")}
+                return
+            seat[slot] = {"state": "pulling", "cmdId": cmd["id"],
+                          "detail": "host pull queued — banking the "
+                                    "credits"}
+            return
+        # plain g2s: the HOST-INITIATED WAT pull
+        with self.assoc_lock:
+            assoc = self.associations.get(seat_key)
+        if assoc is None:
+            seat[slot] = {"state": "failed", "detail": "machine vanished"}
+            return
+        active = self.wat_store.newest_active(seat_key)
+        if active is not None:
+            seat[slot] = {
+                "state": "skipped",
+                "detail": f"a WAT transfer is still open (req "
+                          f"{active.get('requestId')}, "
+                          f"{active.get('state')}) — one at a time "
+                          "(G2S_WTX008); credits stay on the glass"}
+            return
+        res = self.start_wat_credit_pull(assoc, account_id="house")
+        if isinstance(res, dict) and res.get("ok") is False:
+            empty = "nothing on the glass" in str(res.get("error"))
+            seat[slot] = ({"state": "done", "actualMc": 0,
+                           "detail": "nothing on the glass"} if empty
+                          else {"state": "failed",
+                                "detail": str(res.get("error"))})
+            return
+        seat[slot] = {"state": "pulling",
+                      "detail": "host pull queued — banking the credits",
+                      "requestId": res.get("requestId"),
+                      "askedMc": res.get("askedMc")}
+
+    def _tournament_observe_pull(self, seat_key, seat, slot, now=None):
+        """Fold the async verdict of an issued pull into seat[slot] —
+        reads ONLY what already lands in the existing stores (the
+        WatStore record / the satellite commandResults), no new
+        confirmation channel. Returns True once the tracker is terminal:
+        "done" with actualMc = the SETTLED ACTUALS (the ledger already
+        moved through the existing settles — WAT commit dispatch / SAS
+        aftcashout ref — this observer only advances the stage; the WAT
+        path also records actualsMc per bucket so the carded refund can
+        pay promo back as promo), or "failed" with the reason.
+
+        CRITICAL satellite quirk (the ordering trace's catch): the
+        aft_cashout_pull verdict record is REWRITTEN to type
+        "aft_cashout" (the settle keys on it) while keeping the
+        command's id — an observer matching "aft_cashout_pull" would
+        wait forever. And an ANSWERED non-crediting pull (no_credits /
+        lock_failed / error) never settles, so nothing would consume the
+        leg's House pin — it is popped HERE instead of outranking a
+        player's own glass arm for the full 600 s TTL.
+
+        `now` (the ARM pipeline passes its tick clock; the finish step
+        does not — it has its own settle timeout) arms the NO-VERDICT
+        timeout against the tracker's issuedAt: a queue-expired
+        satellite command / an EGM that never answered produces no
+        record ever, and the seat must park honestly instead of
+        pending forever."""
+        tr = dict(seat.get(slot) or {})
+        if tr.get("state") != "pulling":
+            return True
+        if seat.get("kind") == "g2s":
+            rid = tr.get("requestId")
+            rec = self.wat_store.find(seat_key, request_id=rid) \
+                if rid else None
+            st = (rec or {}).get("state")
+            if st == "committed":
+                parts = [int(rec.get(k) or 0)
+                         for k in ("transCashableAmt", "transPromoAmt",
+                                   "transNonCashAmt")]
+                actual = sum(parts)
+                seat[slot] = dict(
+                    tr, state="done", actualMc=actual, actualsMc=parts,
+                    detail=f"banked ${actual / 100000:,.2f} to the House")
+                return True
+            if st in ("denied", "failed", "cancelled", "abandoned") \
+                    or str(st).startswith("error:"):
+                seat[slot] = dict(tr, state="failed", detail=f"WAT {st}")
+                return True
+            issued = tr.get("issuedAt")
+            if now is not None and issued and rec is not None \
+                    and st == "requested" \
+                    and str(rec.get("transactionId") or "0") == "0" \
+                    and now - issued \
+                    >= self.TOURNAMENT_WAT_VERDICT_TIMEOUT_SEC:
+                # the EGM never answered requestPending — cancel the dead
+                # record LOCALLY (it would wedge one-at-a-time forever)
+                # and park honestly. A txn-bearing record keeps waiting:
+                # the money is genuinely moving (the bench's delayed
+                # commit) and its verdict WILL land.
+                upd = self.wat_store.cancel_local(seat_key, rid)
+                if upd is not None:
+                    with self.assoc_lock:
+                        assoc = self.associations.get(seat_key)
+                    if assoc is not None:
+                        self._wat_mirror(assoc, upd)
+                seat[slot] = dict(
+                    tr, state="failed",
+                    detail="no verdict — the EGM never answered the pull "
+                           "(cancelled locally)")
+                return True
+            return False
+        cid = tr.get("cmdId")
+        if not cid:
+            seat[slot] = dict(tr, state="failed",
+                              detail="no command id recorded")
+            return True
+        leg = seat.get("sasKey")
+        with self.sas_lock:
+            entry = self.sas_machines.get(leg) or {}
+            results = [dict(r) for r
+                       in (entry.get("commandResults") or [])
+                       if isinstance(r, dict)]
+        for r in results:
+            # the satellite REWRITES the pull's type to "aft_cashout"
+            if r.get("id") != cid or r.get("type") != "aft_cashout":
+                continue
+            if r.get("ok") and r.get("outcome") in ("completed",
+                                                    "partial"):
+                cents = r.get("amountCents")
+                cents = cents if isinstance(cents, int) \
+                    and not isinstance(cents, bool) and cents > 0 else 0
+                mc = cents * 1000
+                # the settle credits the House by this same confirmed
+                # amount (ref aftcashout:<txn>) and consumes the pin —
+                # here we only advance the stage
+                seat[slot] = dict(
+                    tr, state="done", actualMc=mc,
+                    detail=f"banked ${mc / 100000:,.2f} to the House")
+                return True
+            if r.get("outcome") == "no_credits":
+                seat[slot] = dict(tr, state="done", actualMc=0,
+                                  detail="nothing on the glass")
+            else:
+                seat[slot] = dict(tr, state="failed",
+                                  detail=str(r.get("detail")
+                                             or r.get("outcome")
+                                             or "pull refused"))
+            # answered but nothing will settle — retire the House pin now
+            if leg and isinstance(self._tournament_sweep_pins.get(leg),
+                                  dict) and \
+                    self._tournament_sweep_pins[leg].get("acct") == "house":
+                self._tournament_sweep_pins.pop(leg, None)
+            return True
+        issued = tr.get("issuedAt")
+        if now is not None and issued and now - issued \
+                >= self.TOURNAMENT_SAS_VERDICT_TIMEOUT_SEC:
+            # the satellite queue drops >30 s-stale commands UNEXECUTED
+            # with no result record — this verdict can never arrive. Park
+            # the stage AND retire the leg's House pin: the pull will
+            # never fire, and a settle that somehow lands later (a
+            # fetched-then-delayed report) draws the LOUD unhomed HOLD —
+            # the safe direction, same as the TTL's own philosophy.
+            seat[slot] = dict(
+                tr, state="failed",
+                detail="no verdict — the queued command expired "
+                       "unexecuted (satellite dark?)")
+            if leg and isinstance(self._tournament_sweep_pins.get(leg),
+                                  dict) and \
+                    self._tournament_sweep_pins[leg].get("acct") == "house":
+                self._tournament_sweep_pins.pop(leg, None)
+            return True
+        return False
+
+    def tournament_snapshot(self):
+        """The /api/status 'tournament' section — a JSON-safe copy (finite
+        numbers only, nested dicts copied so a concurrent tick can't
+        mutate mid-serialize, '_'-prefixed runner bookkeeping stripped)
+        plus serverNow, so the board computes countdown/clock deltas
+        against THE HUB'S clock instead of trusting the TV's."""
+        with self.tournament_lock:
+            t = self.tournament
+            snap = {k: v for k, v in t.items()
+                    if not str(k).startswith("_") and k != "seats"}
+            seats = {}
+            for seat_key, seat in (t.get("seats") or {}).items():
+                c = dict(seat)
+                for nested in ("baseScore", "sweep", "clear"):
+                    if isinstance(c.get(nested), dict):
+                        c[nested] = dict(c[nested])
+                # baseScore's g2sWon is TWO levels deep and the runner
+                # RESIZES it mid-run (first-sight keys land as each played
+                # game's win meter arrives — ~131 gamePlay devices on the
+                # AVP). The one-level copy above still shares that inner
+                # dict, and json.dumps on the HTTP thread runs OUTSIDE this
+                # lock — a concurrent key-add mid-iteration raises
+                # RuntimeError and kills the /api/status poll (law: status
+                # never 500s). Copy the inner map too, under the lock.
+                bs = c.get("baseScore")
+                if isinstance(bs, dict) and isinstance(bs.get("g2sWon"),
+                                                       dict):
+                    bs["g2sWon"] = dict(bs["g2sWon"])
+                if isinstance(c.get("absorbedBuckets"), (list, tuple)):
+                    c["absorbedBuckets"] = list(c["absorbedBuckets"])
+                seats[seat_key] = c
+            snap["seats"] = seats
+            if isinstance(t.get("winner"), dict):
+                snap["winner"] = dict(t["winner"])
+        snap["serverNow"] = time.time()
+        return snap
 
     def engine_meta(self):
         """The _engine block — shared verbatim by /api/status and
@@ -7676,6 +10042,26 @@ class G2SHost:
             return
         if known:
             self.enqueue_get_game_play_status(assoc, dev)
+            # GR-32: "now playing" truth (live-caught by AJ 2026-07-16 — the
+            # tile said Pharaoh's Fortune while he played Mystical Mermaid).
+            # cabinet.themeId is only read at join/state-change, so a game
+            # SWITCH on a multi-game cabinet goes stale. The spinning
+            # device's own theme is in the store — when it disagrees with
+            # the cabinet's claim, one scoped getCabinetStatus re-read
+            # (debounced) makes the tile honest again.
+            now = time.time()
+            with assoc.lock:
+                gp_theme = (assoc.game_play.get(dev) or {}).get("themeId")
+                cab_theme = (assoc.cabinet or {}).get("themeId")
+                stale = (gp_theme and cab_theme and gp_theme != cab_theme
+                         and now - assoc.cab_theme_probe_at > 10)
+                if stale:
+                    assoc.cab_theme_probe_at = now
+            if stale:
+                log.info("[%s] 🎮 gamePlay event from %s (%s) but cabinet "
+                         "says %s — now-playing re-read (GR-32)",
+                         assoc.egm_id, dev, gp_theme, cab_theme)
+                self.enqueue_get_cabinet_status(assoc)
             return
         now = time.time()
         with assoc.lock:
@@ -8199,7 +10585,8 @@ class G2SHost:
     def enqueue_initiate_request(self, assoc, rec):
         """wat.initiateRequest (spec §22.25) for a WatStore 'requested'
         record: non-zero requestId (Table 22.16 — the EGM echoes it in
-        requestPending, our pairing key), watDirection=G2S_toEgm,
+        requestPending, our pairing key), watDirection from the RECORD
+        (G2S_toEgm push / G2S_fromEgm host pull — hostControl owns both),
         payMethod=G2S_payCredit (credit meter or fail — no paper),
         reduceAmts=true so the EGM may cap at its credit limit. The final
         accountId/amounts land in authorizeTransfer, per the §22.10.2
@@ -8207,10 +10594,12 @@ class G2SHost:
         def build(a):
             sid = a.next_session_id()
             acct = html.escape(str(rec.get("accountId") or ""), quote=True)
+            direction = html.escape(
+                str(rec.get("watDirection") or "G2S_toEgm"), quote=True)
             cmd = ('<g2s:initiateRequest '
                    f'g2s:requestId="{rec["requestId"]}" '
                    f'g2s:accountId="{acct}" '
-                   'g2s:watDirection="G2S_toEgm" '
+                   f'g2s:watDirection="{direction}" '
                    f'g2s:payMethod="{rec.get("payMethod") or "G2S_payCredit"}" '
                    f'g2s:reqCashableAmt="{int(rec.get("reqCashableAmt") or 0)}" '
                    f'g2s:reqPromoAmt="{int(rec.get("reqPromoAmt") or 0)}" '
@@ -8325,6 +10714,40 @@ class G2SHost:
                  "authorizeTransfer (escrow) -> commitTransfer")
         log.info("=" * 64)
         return {"requestId": rid, "accountId": account_id,
+                "transferState": "requested"}
+
+    def start_wat_credit_pull(self, assoc, account_id="house"):
+        """HOST-INITIATED credit pull off a plain-G2S machine — the push
+        with the direction flipped (AJ 2026-07-21: "we want it to
+        automatically pull like it does over SAS"). The AVP's wat profile
+        reads interfaceMode=G2S_hostControl, so the host owns initiation
+        both ways: initiateRequest watDirection=G2S_fromEgm asking for the
+        machine's current cashable; the EGM answers requestPending ->
+        initiateTransfer with what it can actually move, the authorize
+        step accepts the EGM-stated amounts verbatim (the fromEgm branch
+        of _wat_decide_authorization — accountId rides the record, no
+        glass pin involved), and the account is credited at commitTransfer
+        with ACTUALS. Ask = the playerCashableAmt meter read; reduceAmts
+        lets the EGM trim, and a meter lagging LOW under-asks — the sweep
+        detail carries the asked amount so a remainder is visible, and
+        the record's commit actuals are the ledger truth either way.
+        Errors as dicts at 200 (the addCredits posture)."""
+        mc = self._machine_credits_mc(assoc)
+        if mc <= 0:
+            return {"ok": False, "error": "nothing on the glass — the "
+                                          "credit meter reads 0"}
+        acct = str(account_id or "").strip() or "house"
+        if self.account_store.get(acct) is None:
+            return {"ok": False, "error": f"no such account {acct!r}"}
+        rid, rec = self.wat_store.new_request(
+            assoc.egm_id, self.default_wat_device(assoc), acct,
+            "G2S_payCredit", mc, 0, 0, direction="G2S_fromEgm")
+        self._wat_mirror(assoc, rec)
+        self.enqueue_initiate_request(assoc, rec)
+        log.info("🏦 [%s] HOST PULL — asking %s off the glass to %r as "
+                 "requestId=%d (fromEgm; credits land at commitTransfer "
+                 "actuals)", assoc.egm_id, denom_dollars(mc), acct, rid)
+        return {"requestId": rid, "accountId": acct, "askedMc": mc,
                 "transferState": "requested"}
 
     def cancel_wat_request(self, assoc, request_id=None, txn_id=None):
@@ -9035,6 +11458,139 @@ class G2SHost:
                  assoc.egm_id, dev)
         return {"deviceId": dev,
                 "ownedIdReaders": sorted(self.owned_id_reader_devices(assoc))}
+
+    # -------------------- printer class (G2S-24 — jackpot certificates)
+    # Host-commanded prints on the EGM's OWN ticket printer (spec ch.16).
+    # printTicket carries free-form regionData strings — the spec's worked
+    # example (§16.22.1.1) prints "Hello/World/Goodbye"; owner AND guest
+    # hosts may send it (Table 16.1), and this AVP's descriptorList shows
+    # host 1 owns G2S_printer/1 ("Netplex Ticket Printer"). Everything here
+    # is VERIFY_ON_BENCH: no printer-class bytes have ever been exchanged
+    # with the live machine, and the burned-in template inventory is unknown
+    # until getPrinterTemplates answers. Recon reads are silence-tolerant
+    # one-shots (idReader posture); printTicket is a deliberate bench/
+    # certificate action, never auto-fired.
+
+    def owned_printer_devices(self, assoc):
+        """Printer deviceIds host 1 OWNS, from the commHostList owned list
+        (the owned_media_display_devices posture). MUST NOT be called
+        holding assoc.lock."""
+        owned = set()
+        with assoc.lock:
+            h = assoc.host_items.get(self.host_id) or {}
+            for dev in h.get("owned", []):
+                if str(dev).startswith("G2S_printer/"):
+                    owned.add(str(dev).split("/", 1)[1])
+        return owned
+
+    def default_printer_device(self, assoc):
+        owned = self.owned_printer_devices(assoc)
+        return min(owned, key=lambda d: (not d.isdigit(),
+                                         int(d) if d.isdigit() else d)) \
+            if owned else "1"
+
+    def enqueue_get_printer_status(self, assoc, device_id="1"):
+        """printer.getPrinterStatus (§16.7) — empty element; printerStatus
+        carries hostEnabled/egmEnabled + paper/chassis fault states."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "printer", str(device_id), "<g2s:getPrinterStatus/>",
+                str(sid), "30000")
+            return inner, f"getPrinterStatus(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_printer_profile(self, assoc, device_id="1"):
+        """printer.getPrinterProfile (§16.9) — site template/region config
+        detail (what the certificate template design must fit)."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "printer", str(device_id), "<g2s:getPrinterProfile/>",
+                str(sid), "30000")
+            return inner, f"getPrinterProfile(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def enqueue_get_printer_templates(self, assoc, device_id="1"):
+        """printer.getPrinterTemplates (§16.11) — the burned-in + site
+        template inventory; the answer decides which templateIndex a
+        certificate print can use."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "printer", str(device_id), "<g2s:getPrinterTemplates/>",
+                str(sid), "30000")
+            return inner, f"getPrinterTemplates(dev={device_id},cid={cid})"
+        self._enqueue(assoc, build)
+
+    def printer_probe(self, assoc, device_id=None):
+        """/api/command printerProbe — read-only recon trio (status +
+        templates + profile) for the owned printer device. Safe on a live
+        floor: three reads, no state change, refusals are honest silence."""
+        dev = str(device_id) if device_id is not None else \
+            self.default_printer_device(assoc)
+        self.enqueue_get_printer_status(assoc, dev)
+        self.enqueue_get_printer_templates(assoc, dev)
+        self.enqueue_get_printer_profile(assoc, dev)
+        log.info("[%s] 🎫 printer probe queued (dev=%s)", assoc.egm_id, dev)
+        return {"deviceId": dev,
+                "ownedPrinters": sorted(self.owned_printer_devices(assoc))}
+
+    def enqueue_print_ticket(self, assoc, device_id="1", template_index=0,
+                             regions=None):
+        """printer.printTicket (§16.13) — THE host-commanded print.
+        templateIndex picks a template; each printRegion carries regionIndex
+        + free-form regionData (spec cap 15555 chars; we bound well below).
+        Omitted region data falls back to the template's defaults. The EGM
+        answers printComplete (transferState 1 = success) and fires
+        G2S_PTE102; both land in assoc.printer for /api/status."""
+        regs = list(regions or [])
+        def build(a):
+            sid = a.next_session_id()
+            parts = "".join(
+                '<g2s:printRegion g2s:regionIndex="%d" g2s:regionData="%s"/>'
+                % (int(r["index"]),
+                   html.escape(str(r["data"])[:512], quote=True))
+                for r in regs)
+            cmd = ('<g2s:printTicket g2s:templateIndex="%d">%s'
+                   '</g2s:printTicket>' % (int(template_index), parts)) \
+                if parts else \
+                ('<g2s:printTicket g2s:templateIndex="%d"/>'
+                 % int(template_index))
+            inner, cid = self.build_inner_request(
+                a, "printer", str(device_id), cmd, str(sid), "30000")
+            # build() runs UNDER assoc.lock (the _enqueue contract, :7050) —
+            # taking a.lock here again deadlocked the whole association on
+            # the first live print (2026-07-16). Wholesale swap, no lock
+            # (the cabinet_state_change posture).
+            p = dict(a.printer)
+            p["lastPrint"] = {
+                "deviceId": str(device_id),
+                "templateIndex": int(template_index),
+                "regions": len(regs), "sessionId": str(sid),
+                "sentAt": now_iso(), "result": "sent"}
+            a.printer = p
+            log.info("🎫 [%s] printTicket template=%s regions=%d (dev=%s, "
+                     "sid=%s) — expecting printComplete",
+                     a.egm_id, template_index, len(regs), device_id, sid)
+            return inner, (f"printTicket(t={template_index},"
+                           f"r={len(regs)},cid={cid})")
+        self._enqueue(assoc, build)
+
+    def print_ticket_cmd(self, assoc, device_id=None, template_index=0,
+                         regions=None):
+        """/api/command printTicket — deliberate bench/certificate print.
+        Online-gated; ownership/refusals answer as honest EGM silence (the
+        recon posture), never a blind retry."""
+        with assoc.lock:
+            online = assoc.comms_state == "onLine"
+        if not online:
+            return {"ok": False, "error": "machine offline"}
+        dev = str(device_id) if device_id is not None else \
+            self.default_printer_device(assoc)
+        self.enqueue_print_ticket(assoc, dev, template_index, regions)
+        return {"deviceId": dev, "templateIndex": int(template_index),
+                "regions": len(regions or [])}
 
     # -------------------- mediaDisplay probe ladder (IGT extension, #18 P3)
     # The scaffold that converts the RECONSTRUCTED igtMediaDisplay
@@ -11436,6 +13992,66 @@ class G2SHost:
                 if start_sweep:
                     self._start_game_play_sweep(assoc)
 
+        elif cmd in ("printerStatus", "printerProfile",
+                     "printerTemplateList", "printComplete") \
+                and stype == "G2S_response":
+            # printer class (G2S-24). First-contact recon: no real payload
+            # has ever been captured, so parsing is deliberately GENERIC —
+            # every attribute (localnamed) plus a bounded child summary,
+            # wholesale-replaced into assoc.printer[<cmd>] so snapshot()
+            # sharing stays safe. printComplete additionally settles the
+            # pending lastPrint record (pair by sessionId when echoed).
+            el = req["commandEl"]
+            dev = req["deviceId"]
+            rec = {k.rsplit("}", 1)[-1]: v for k, v in el.attrib.items()}
+            rec["deviceId"] = dev
+            rec["at"] = now_iso()
+            kids = []
+            for c in list(el)[:200]:
+                kd = {"_tag": localname(c.tag)}
+                kd.update({k.rsplit("}", 1)[-1]: v
+                           for k, v in c.attrib.items()})
+                if (c.text or "").strip():
+                    kd["_text"] = c.text.strip()[:2000]
+                kids.append(kd)
+            if kids:
+                rec["items"] = kids
+            with assoc.lock:
+                p = dict(assoc.printer)
+                p[cmd] = rec
+                if cmd == "printComplete":
+                    last = dict(p.get("lastPrint") or {})
+                    tstate = rec.get("transferState", "")
+                    last.update({
+                        "result": "printed" if tstate in ("1", "true",
+                                                          "G2S_complete")
+                        or str(rec.get("printComplete", "")).lower()
+                        == "true" else f"transferState={tstate}",
+                        "transactionId": rec.get("transactionId", ""),
+                        "completedAt": rec["at"]})
+                    p["lastPrint"] = last
+                assoc.printer = p
+            if cmd == "printerTemplateList":
+                idxs = sorted({k["templateIndex"] for k in kids
+                               if k.get("templateIndex")},
+                              key=lambda x: (not str(x).isdigit(),
+                                             int(x) if str(x).isdigit()
+                                             else x))
+                log.info("🎫 [%s] printer templates revealed — %d entr%s%s",
+                         assoc.egm_id, len(kids),
+                         "y" if len(kids) == 1 else "ies",
+                         f" (indexes: {', '.join(map(str, idxs))[:200]})"
+                         if idxs else "")
+            elif cmd == "printComplete":
+                log.info("🎫 [%s] printComplete — transferState=%s "
+                         "complete=%s txn=%s", assoc.egm_id,
+                         rec.get("transferState", "?"),
+                         rec.get("printComplete", "?"),
+                         rec.get("transactionId", "?"))
+            else:
+                log.info("🎫 [%s] %s — %d attrs, %d child item(s)",
+                         assoc.egm_id, cmd, len(rec), len(kids))
+
         elif cmd == "commHostList":
             # THE ownership map (spec §8.13). Arrives as a G2S_response to
             # getCommHostList OR unsolicited (G2S_request) when the host list
@@ -12035,6 +14651,10 @@ class G2SHost:
             verdict = want = None
             with assoc.lock:
                 assoc.cabinet.update(data)
+                # freshness stamp for the tournament lock restage: only a
+                # report YOUNGER than the last commanded send is delivery
+                # evidence (a stale hostEnabled must never flap the restage)
+                assoc.cabinet_at = time.time()
                 csc = assoc.cabinet_state_change
                 if csc.get("result") in ("sent", "acked") and \
                         req["sessionId"] == csc.get("sessionId"):
@@ -12133,6 +14753,11 @@ class G2SHost:
             with assoc.lock:
                 assoc.last_meter_report = now_iso()
                 assoc.last_meter_report_type = info_type
+                # freshness stamp for the tournament CLEAR gate: ANY landed
+                # meterInfo (on-demand answer, periodic push, EOD) is a
+                # fresh reading — an empty delivery still proves the EGM
+                # answered after the ask
+                assoc.meters_at = time.time()
                 total_known = len(assoc.meters)
             # GR-02: DIGEST line — the 2,142-meter periodic push repeats
             # every 60s and its full body only reaches the wire log at
@@ -13471,6 +16096,17 @@ class G2SHost:
                         self._flag_unhomed_cashout(
                             assoc.egm_id, txn, total, account_id, aerr,
                             path="G2S WAT commit")
+                    elif account_id == "house":
+                        # the tournament sweep's CASH OUT press just
+                        # banked the leftovers (only the sweep ever pins
+                        # the House on a fromEgm) — CONSUME the arm, pin
+                        # pop + mirror disarm, so the one sanctioned
+                        # House-destination cash-out stays exactly ONE:
+                        # a machine back in open play must never bank a
+                        # guest's own cash-out to the bank. Idempotent —
+                        # the EGM's §22.31 commit retries find the pin
+                        # already gone and send nothing.
+                        self._tournament_consume_wat_sweep(assoc)
             elif sum(escrow) > 0:
                 refund = tuple(max(0, e - t)
                                for e, t in zip(escrow, trans_rec))
@@ -14322,6 +16958,16 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # hub.db phase 2: cross-machine TITO ledger counts (best-effort,
             # degrades to {} — bench/UI visibility). Reserved key.
             snap["tito"] = engine.hub_store.tito_counts()
+            # Tournament mode (board v2): the phase machine's live state —
+            # the board's takeover gate (+ serverNow so the TV computes
+            # countdowns against the hub's clock). Reserved key; guarded
+            # like the sas dumps fallback below — the poll the whole UI
+            # depends on must never 500 over a scoring hiccup.
+            try:
+                snap["tournament"] = engine.tournament_snapshot()
+            except Exception:  # noqa: BLE001 — status must never 500
+                snap["tournament"] = {"phase": "idle",
+                                      "error": "tournament snapshot failed"}
             # Companion RFID floor (phase 1): reader daemons + the active
             # carded sessions ({egmId: {uid, name, since}} — the UI's tile
             # badge). Two more reserved keys the EGM loop skips; both {}
@@ -14345,6 +16991,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # the collector's gameroom name (Settings ▸ prefill); "" unset.
                 "gameroomName": engine.hub_store.host_setting(
                     "gameroom_name", ""),
+                # Gameroom Board (wall TV at /board): ships ON; the toggle
+                # blanks the page render, the route always serves.
+                "boardEnabled": engine.hub_store.host_setting(
+                    "board_enabled", "1") == "1",
                 # Collector economy (2026-07-13, de-caged 07-15): the bank's
                 # current balance (so Options ▸ House Bankroll prefills) and
                 # whether it may run negative. The Bank is just bankroll
@@ -14353,6 +17003,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                         or {}).get("cashableMillicents", 0)
                                        or 0),
                 "houseAllowNegative": engine.house_allow_negative(),
+                # Tournament alias roster (board v2) — the EFFECTIVE list
+                # (defaults when unset), so the admin card's textarea can
+                # prefill; write path = /api/settings tournamentNames.
+                "tournamentNames": engine.tournament_names(),
                 "ticket": {"propName": _th.get("propName"),
                            "line1": _th.get("line1"),
                            "line2": _th.get("line2"),
@@ -14378,6 +17032,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 snap["smibStamp"] = int(os.path.getmtime(os.path.join(
                     os.path.dirname(os.path.abspath(__file__)),
                     "webui", "smib.html")))
+            except OSError:
+                pass
+            # board.html's OWN mtime (board v2): the wall TV is a kiosk too
+            # (nobody presses F5 on it), but it must never reload mid-show —
+            # the board watches this stamp and reloads ONLY while idle in
+            # attract (no tournament, no fireworks), the smibStamp posture.
+            # One extra stat per poll — negligible.
+            try:
+                snap["boardStamp"] = int(os.path.getmtime(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "webui", "board.html")))
             except OSError:
                 pass
             # allow_nan=False: a non-finite value must never reach the wire as
@@ -14582,6 +17247,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             self._serve_webui("index.html")
         elif path in ("/console", "/console.html"):
             self._serve_webui("console.html")
+        elif path in ("/board", "/board.html"):
+            # The Gameroom Board — a wall-TV spectator page (fun-menu "Big
+            # Board" v1): live Action feed + standings + fireworks on a
+            # handpay lockup. A dumb browser at http://<hub>:8081/board
+            # (the Pi 5's own HDMI is the reference display); the Settings ▸
+            # Gameroom board toggle gates the render, not the route.
+            self._serve_webui("board.html")
         elif path.startswith("/webui/"):
             self._serve_webui(path[len("/webui/"):])
         else:
@@ -14822,12 +17494,86 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             "getVoucherLogStatus": engine.enqueue_get_voucher_log_status,
             "getVoucherLog": engine.enqueue_get_voucher_log,
             "setVoucherState": engine.enqueue_set_voucher_state,
+            # printer class (G2S-24 — jackpot certificates). printerProbe =
+            # read-only recon trio (status/templates/profile); printTicket =
+            # deliberate host print: {"templateIndex": N, "regions":
+            # [{"index": N, "data": "..."}]} — VERIFY_ON_BENCH until the
+            # first printComplete lands.
+            "printerProbe": engine.printer_probe,
+            "printTicket": engine.print_ticket_cmd,
+            # tournament mode (board v2): the six phase actions. All are
+            # HUB-WIDE (the whole floor is the target, no egmId) — they are
+            # dispatched by the early-return block below, never through the
+            # per-assoc fn(assoc, **kwargs) path; listed here so unknown-
+            # action feature detection advertises them.
+            "tournamentConfigure": engine.tournament_configure,
+            "tournamentArm": engine.tournament_arm,
+            "tournamentStart": engine.tournament_start,
+            "tournamentEnd": engine.tournament_end,
+            "tournamentCancel": engine.tournament_cancel,
+            "tournamentReset": engine.tournament_reset,
+            # whole-floor lock/unlock (Settings) — hub-wide like the
+            # tournament actions; the same early-return block routes them
+            "floorLock": engine.floor_set_locked,
+            "floorUnlock": engine.floor_set_locked,
         }
         if action not in actions:
             return self._send(400, json.dumps({
                 "ok": False, "error": f"unknown action {action!r}",
                 "actions": sorted(actions)}),
                 "application/json", soap=False)
+        # 🏆 Tournament actions are hub-wide — early-return BEFORE the assoc
+        # lookup (the addCredits SAS-reroute slot below is the precedent):
+        # a tournament spans every machine, so per-assoc resolution/404
+        # never applies. The bonus split governs errors: TYPE junk draws
+        # HTTP 400 here; phase refusals answer ok:false at 200 from the
+        # engine. Bounds: creditsCents is the SAS 5-byte-BCD wire max (the
+        # only money cap post-de-cage), the clocks are sanity bounds for a
+        # home floor, not policy.
+        if action in ("floorLock", "floorUnlock"):
+            result = engine.floor_set_locked(action == "floorLock")
+            payload = {"ok": True, "action": action}
+            if isinstance(result, dict):
+                payload.update(result)
+            return self._send(200, json.dumps(payload),
+                              "application/json", soap=False)
+        if action.startswith("tournament"):
+            if action == "tournamentConfigure":
+                cc = req.get("creditsCents")
+                ds = req.get("durationSec")
+                cs = req.get("countdownSec")
+                if isinstance(cc, bool) or not isinstance(cc, int) or \
+                        not 1 <= cc <= engine.SAS_AFT_MAX_CENTS:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "creditsCents must be an integer "
+                                 f"1..{engine.SAS_AFT_MAX_CENTS} "
+                                 "(CENTS — $1 = 100)"}),
+                        "application/json", soap=False)
+                if isinstance(ds, bool) or not isinstance(ds, int) or \
+                        not 30 <= ds <= 7200:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "durationSec must be an integer 30..7200"}),
+                        "application/json", soap=False)
+                tkw = {"credits_cents": cc, "duration_sec": ds}
+                if cs is not None:
+                    if isinstance(cs, bool) or not isinstance(cs, int) or \
+                            not 3 <= cs <= 60:
+                        return self._send(400, json.dumps({
+                            "ok": False,
+                            "error": "countdownSec must be an integer "
+                                     "3..60"}),
+                            "application/json", soap=False)
+                    tkw["countdown_sec"] = cs
+                result = engine.tournament_configure(**tkw)
+            else:
+                result = actions[action]()
+            payload = {"ok": True, "action": action}
+            if isinstance(result, dict):
+                payload.update(result)
+            return self._send(200, json.dumps(payload),
+                              "application/json", soap=False)
         # 🪙 Linked-machine wallet routing (AJ 2026-07-11): while a SAS leg
         # is linked, SAS is the MONEY authority — the pair's G2S wat can be
         # a dead stub (the WMS BB2 is exactly that: APX007 + no options), so
@@ -14868,9 +17614,35 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                       "setWatCashOut", "getWatLog", "getWatLogStatus",
                       "addCredits", "getVoucherStatus", "getVoucherProfile",
                       "getVoucherLogStatus", "getVoucherLog",
-                      "setVoucherState", "idReaderProbe") \
+                      "setVoucherState", "idReaderProbe",
+                      "printerProbe", "printTicket") \
                 and req.get("deviceId") is not None:
             kwargs["device_id"] = str(req["deviceId"])
+        # printer printTicket (G2S-24): strict validation — junk draws 400
+        # here; templateIndex 0-999 (Table 16.5), regions a bounded list of
+        # {index, data} (data lands inside a wire XML attribute, escaped +
+        # clipped at build time).
+        if action == "printTicket":
+            ti = req.get("templateIndex", 0)
+            if not (isinstance(ti, int) and 0 <= ti <= 999):
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "templateIndex must be an integer 0..999"}),
+                    "application/json", soap=False)
+            kwargs["template_index"] = ti
+            regs = req.get("regions", [])
+            if not isinstance(regs, list) or len(regs) > 32 or any(
+                    not isinstance(r, dict)
+                    or not isinstance(r.get("index"), int)
+                    or not 0 <= r["index"] <= 999
+                    or not isinstance(r.get("data"), str)
+                    for r in regs):
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "regions must be a list (max 32) of "
+                             '{"index": 0..999, "data": "text"}'}),
+                    "application/json", soap=False)
+            kwargs["regions"] = regs
         # G2S-40 owner-device default: an owner-type wat action with NO
         # explicit deviceId targets the LOWEST owned wat device (not the
         # hardcoded "1" — which is the guest device on a cabinet where we
@@ -16279,6 +19051,51 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                      f"{MAX_GAMEROOM_NAME_LEN} characters")
                 engine.hub_store.set_host_setting("gameroom_name", gn)
                 out["gameroomName"] = gn or None      # cleared echoes null
+            if "boardEnabled" in req:
+                # Gameroom Board toggle (Settings ▸ Gameroom board). Strict
+                # boolean; stored "1"/"0"; the board page reads it live off
+                # hostOptions every poll — no restart, no push.
+                be = req.get("boardEnabled")
+                if not isinstance(be, bool):
+                    raise ValueError("boardEnabled must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "board_enabled", "1" if be else "0")
+                out["boardEnabled"] = be
+            if "tournamentNames" in req:
+                # Tournament alias roster (board v2) — the funny names for
+                # seats whose player didn't card in. STRICT list of strings
+                # (this endpoint is unauthenticated — the same no-junk
+                # posture as every tenant): each stripped, 1..24 chars (a
+                # seat card on the wall TV), max 64 entries; [] CLEARS back
+                # to the shipped defaults (stored "" — the unset-is-default
+                # read in tournament_names). Stored as ONE compact JSON
+                # array under 'tournament_names'; the echo is the EFFECTIVE
+                # roster (defaults after a clear) so the admin card repaints
+                # what the next arm will actually draw from.
+                tn = req.get("tournamentNames")
+                if not isinstance(tn, list) or \
+                        any(not isinstance(x, str) for x in tn):
+                    raise ValueError(
+                        "tournamentNames must be a list of strings")
+                if len(tn) > TOURNAMENT_ROSTER_MAX:
+                    raise ValueError(f"tournamentNames: max "
+                                     f"{TOURNAMENT_ROSTER_MAX} names")
+                clean_tn = []
+                for x in tn:
+                    x = x.strip()
+                    if not x:
+                        raise ValueError("tournamentNames: blank name — "
+                                         "delete the empty line")
+                    if len(x) > TOURNAMENT_NAME_MAX_LEN:
+                        raise ValueError(
+                            f"tournamentNames: {x[:16]!r}… is over "
+                            f"{TOURNAMENT_NAME_MAX_LEN} characters")
+                    clean_tn.append(x)
+                engine.hub_store.set_host_setting(
+                    "tournament_names",
+                    json.dumps(clean_tn, separators=(",", ":"))
+                    if clean_tn else "")
+                out["tournamentNames"] = engine.tournament_names()
             tf_map = (("ticketPropName", "ticket_prop_name"),
                       ("ticketLine1", "ticket_line1"),
                       ("ticketLine2", "ticket_line2"),
@@ -16431,7 +19248,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                  "machineKey + sasCashoutReady, "
                                  "companionId + g2sEgmId (assign a Companion), "
                                  "sysvalFallback, houseAllowNegative, "
-                                 "houseBankrollMc, gameroomName and/or the "
+                                 "houseBankrollMc, gameroomName, "
+                                 "tournamentNames and/or the "
                                  "ticket-header fields (ticketPropName/"
                                  "ticketLine1/ticketLine2/ticketTitleCash)")
         except Exception as e:  # noqa: BLE001 — never 500 a settings write

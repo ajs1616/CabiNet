@@ -9,7 +9,7 @@ SCEP/SSL era is dead and is not coming back.
 - `g2s_host.py` — **the** canonical G2S host (stdlib-only, cert-less). Everything else that
   looks like a server in this tree is historical.
 - `tools/test_*.py` — the self-contained regression gates (hub store, TITO, machine
-  linking, link demotion, companion/RFID); each must end **"N passed, 0 failed"**.
+  linking, link demotion, companion/RFID, tournament); each must end **"N passed, 0 failed"**.
   (`tools/avp_replay.py` is the dev-rig gate — it replays real-AVP wire captures that
   are not included in this distribution, and says so if you run it.)
 - `webui/index.html` — the Test Panel web UI, served by the host at `/`.

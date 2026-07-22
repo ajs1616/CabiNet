@@ -41,7 +41,7 @@ from .sas_protocol import SASProtocol, SAS_MAX_ADDRESS
 # p.9) now lives in core/sas_exceptions.py with categories + typed event
 # tokens; EXCEPTION_NAMES / exception_name are re-exported for back-compat.
 from .sas_exceptions import (           # noqa: F401 (re-exports)
-    EXCEPTION_NAMES, SASExceptionInfo, exception_name, lookup,
+    EXCEPTIONS, EXCEPTION_NAMES, SASExceptionInfo, exception_name, lookup,
 )
 
 # Idle general-poll responses (spec §12.6): $00 = no activity, $1F = no
@@ -234,17 +234,25 @@ class SASPoller:
             self._handle_long_poll_result(resp)
             return 0x00                  # no exception came off the FIFO
         code = resp[0]
-        if code == (0x80 | self.address):
+        if code == (0x80 | self.address) and code not in EXCEPTIONS:
             # Busy/NACK chirp, NOT an exception: a machine answers with its
             # address ORed with 0x80 (spec Table 7.4b) when it can't service
             # the poll right now. Live-seen 2026-07-10 on the WMS BB2 (addr 1
             # -> 0x81): a ~1 s run of these at poll cadence, then a 2 s
             # silence, then normal — an internal-busy blip that our dispatch
             # spammed onto the floor UI as 21 phantom "exception 0x81" events.
-            # AMBIGUITY, accepted: for addr 1 this byte equals the full-spec
-            # A-1 "hopper level low" exception. On hopperless collector
-            # cabinets the NACK reading is the correct one; we count every
-            # occurrence (state.nacks, edge-logged) so nothing goes silent.
+            # AMBIGUITY, disambiguated (portability, 2026-07-21): 0x80|addr
+            # collides with a REAL documented exception at two addresses on a
+            # larger multidrop floor — 0x86 "game out of service" (addr 6) and
+            # 0x8C "game selected" (addr 12) are both in EXCEPTIONS. We fold
+            # the byte as a busy chirp ONLY when it is NOT a documented
+            # exception code, so a spec-compliant machine at addr 6/12 has its
+            # GAME event DISPATCHED instead of silently swallowed. AJ's addr-1
+            # BB2 is unaffected: its chirp 0x81 is the full-spec A-1 "hopper
+            # level low" code, absent from the guide table, so it still folds
+            # (a hopperless collector cabinet — the NACK reading is correct).
+            # We count every occurrence (state.nacks, edge-logged) so nothing
+            # goes silent.
             self.state.nacks += 1
             if self.state.nacks == 1 or self.state.last_exception != code:
                 logging.getLogger("sas.poller").info(

@@ -3,7 +3,7 @@
 CabiNet can push HTML to an IGT AVP's **own screen** over G2S: the host sends a URL,
 the cabinet's built-in browser HTTP-GETs it from the hub, and it renders on one of the
 cabinet's media windows. No pixels ride G2S — it's just HTML served by the hub. This
-was proven live on a real AVP: `hello.html` rendered on the left
+was proven live on AJ's AVP (`IGT_00012E492815`): `hello.html` rendered on the left
 Service Window.
 
 This is the collector payoff for task #18: a G2S cabinet needs only an RFID Companion

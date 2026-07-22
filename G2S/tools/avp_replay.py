@@ -547,6 +547,7 @@ def expect_no_host_post(label, timeout=1.5):
 
 def main():
     global HOST_URL, STATUS_URL, DATA_DIR
+    global CMD_URL, ACCT_URL, DEBUG_LOG_URL, VOUCHERS_URL
     ap = argparse.ArgumentParser(
         description="AVP replay gate for g2s_host.py — LOCAL host only "
                     "(mutates voucher state + associations, see GR-04)")
@@ -568,6 +569,14 @@ def main():
     base = args.host_url.rstrip("/")
     HOST_URL = base + "/G2S"
     STATUS_URL = base + "/api/status"
+    # the API endpoints ride the SAME base — these four were hardcoded
+    # to :8081 for a year, so a fresh host on any other port passed the
+    # live-guard and then died mid-gate at the first post_command with a
+    # raw ECONNREFUSED (looked like a host wedge, wasted a debug cycle)
+    CMD_URL = base + "/api/command"
+    ACCT_URL = base + "/api/accounts"
+    DEBUG_LOG_URL = base + "/api/debug/log"
+    VOUCHERS_URL = base + "/api/vouchers"
     DATA_DIR = Path(args.data_dir)
 
     # GR-04 live-host guard: a replay run against the production Pi injected
@@ -9501,6 +9510,305 @@ def main():
     companion_tap(17, uid="0FF1CE0B01")     # card OUT
     expect_host_post("admin card-OUT setIdValidation")
     expect_host_post("follow-card hideMediaDisplay (admin card-OUT)")
+
+    # ================================================ tournament — board v2
+    # The tournament controller's WIRE story against the real bench EGM:
+    # dormancy first (a fresh host must have emitted ZERO tournament bytes
+    # across the entire session so far), then the smallest real run under
+    # AJ's 07-21 resolution directive — configure -> arm (the pipeline:
+    # CLEAR the glass, FUND from the House over the live WAT choreography,
+    # LOCK only after the fund commits — transfers never run against a
+    # locked machine) -> cancel (unlock FIRST, then pull, leave unlocked)
+    # -> reset. The full phase machine (countdown/running/scoring/winner)
+    # and the loaded-glass CLEAR pull in anger are test_tournament.py's
+    # in-process territory; here the replay proves what actually rides
+    # the FIFO.
+    print("— Step 15: tournament (dormancy + arm/cancel on the live bench "
+          "EGM)")
+    drain_host_posts(2, timeout=1)      # absorb any admin-step straggler
+    # the ticket-header step's fixture SAS leg (smib-test/3) can still look
+    # live if the run got here inside SAS_STALE_SEC — forget it so the arm
+    # seats exactly ONE machine (the AVP). Non-destructive by contract.
+    raw_post("/api/sas/forget", json.dumps({"key": "smib-test/3"}))
+    check("DORMANCY: zero tournament bytes anywhere on the wire before the "
+          "first tournament action (whole-session tape scan)",
+          not any("TOURNAMENT" in b for b in list(WIRE_TAPE)),
+          "found tournament bytes in pre-arm wire traffic")
+    snap_t0 = get_json(STATUS_URL)
+    tour0 = snap_t0.get("tournament") or {}
+    check("status: tournament section rests idle with serverNow (the "
+          "board's takeover gate + countdown clock authority)",
+          tour0.get("phase") == "idle" and not tour0.get("seats")
+          and isinstance(tour0.get("serverNow"), (int, float)),
+          f"got {json.dumps(tour0)[:200]}")
+    # the bonus split governs errors: TYPE junk draws 400 at the HTTP edge,
+    # PHASE junk answers ok:false at 200 — both wire-silent.
+    cs, cbody = post_command_err({"action": "tournamentConfigure",
+                                  "creditsCents": "500",
+                                  "durationSec": 60})
+    check("tournamentConfigure with string creditsCents -> 400 (type junk)",
+          cs == 400 and cbody.get("ok") is False, f"got {cs}/{cbody}")
+    cs, cbody = post_command({"action": "tournamentEnd"})
+    check("tournamentEnd while idle -> honest ok:false at 200 (phase "
+          "refusal, never a 4xx)",
+          cs == 200 and cbody.get("ok") is False
+          and "idle" in str(cbody.get("error", "")), f"got {cs}/{cbody}")
+    cs, cbody = post_command({"action": "tournamentConfigure",
+                              "creditsCents": 500, "durationSec": 60})
+    check("tournamentConfigure $5-a-seat / 60 s accepted, config echoed",
+          cs == 200 and bool(cbody.get("ok"))
+          and cbody.get("creditsCents") == 500
+          and cbody.get("durationSec") == 60
+          and cbody.get("phase") == "idle", f"got {cbody}")
+    expect_no_host_post("configure alone never touches the wire")
+    # ---- ARM: idle -> armed. The arm action itself sends NOTHING — it
+    # publishes every seat at armStage="clear" and wakes the runner; the
+    # RUNNER TICK is the pipeline's single driver: CLEAR -> FUND -> LOCK
+    # per seat, every transfer strictly BEFORE the lock (the 07-21 bench
+    # law: a host-disabled AVP parks a WAT push at requestPending, a
+    # shut-down BB2 hard-fails AFT lock_failed 0xFF). The CLEAR is
+    # decided by the machine's credit fold — but a ZERO fold is never
+    # trusted cold (the stale-mirror law: the standing sub refreshes it
+    # only every 60 s, so a just-fed bill is invisible): the pipeline's
+    # FIRST bytes are a scoped G2S_cabinet getMeterInfo, and only the
+    # post-arm answer lets the $0 clear settle — then the FUND's
+    # initiateRequest rides. This bench EGM carries no playerCashableAmt
+    # meter at this point in the capture, so the fold reads EMPTY and
+    # our synthesized answer confirms it.
+    mtr_t0 = (snap_t0.get(EGM_ID) or {}).get("meters") or {}
+    cash_keys = [k for k in mtr_t0 if k.endswith("playerCashableAmt")]
+    check("precondition: the bench EGM's credit fold reads EMPTY — the "
+          "meter decides pull vs skip, and this run's clear must SKIP",
+          not cash_keys, f"got {cash_keys}")
+    h_t0 = house_cashable()
+    cs, cbody = post_command({"action": "tournamentArm"})
+    check("tournamentArm: armed with exactly ONE seat (the bench AVP); "
+          "sat-out machines (the restart-ghost assoc) are NAMED in "
+          "skipped with a reason — the toast-faded-too-fast lesson",
+          cs == 200 and bool(cbody.get("ok"))
+          and cbody.get("phase") == "armed" and cbody.get("seats") == 1
+          and all(s.get("seatKey") != EGM_ID and s.get("reason")
+                  for s in (cbody.get("skipped") or []))
+          and str(cbody.get("tournamentId") or "").startswith("t"),
+          f"got {cbody}")
+    # START refuses while the pipeline is mid-flight — the seat cannot
+    # reach "ready" before OUR commitTransfer below, so this races
+    # nothing; the refusal names the laggard's stage (wire-silent).
+    cs, cbody = post_command({"action": "tournamentStart"})
+    st_seat = (cbody.get("seats") or {}).get(EGM_ID) or {}
+    check("tournamentStart mid-pipeline: honest refusal naming the "
+          "laggard's stage (clear/fund — never ready before the verdict)",
+          cs == 200 and cbody.get("ok") is False
+          and "not every seat is ready" in str(cbody.get("error", ""))
+          and st_seat.get("armStage") in ("clear", "fund"),
+          f"got {cs}/{json.dumps(cbody)[:300]}")
+    # pipeline first bytes: the CLEAR's confirm read — the $0 settle is
+    # gated on a FRESH post-arm cabinet reading, never the cold fold.
+    m = expect_host_post("tournament clear confirm getMeterInfo (the "
+                         "stale-mirror law: a zero fold is asked, not "
+                         "trusted)")
+    if m:
+        # NOTE: the inner document rides the wsdl wrapper as escaped text
+        # and the attribute quotes arrive as &quot; — match the class
+        # NAME, not a quoting form
+        check("clear confirm: meters.getMeterInfo scoped to G2S_cabinet "
+              "(one device class, not a wildcard sweep) — and neither a "
+              "lock nor a pull preceded it",
+              m["class"] == "meters" and m["command"] == "getMeterInfo"
+              and "G2S_cabinet" in m["raw"]
+              and "G2S_all" not in m["raw"],
+              f"got {m.get('class')}.{m.get('command')}")
+    # EGM answers the scoped read: cabinet meters with an EMPTY glass —
+    # the fold is now trustworthy and the $0 clear settles with no wire
+    post_to_host(avp_wrap(avp_class_command(
+        "meters",
+        '<g2s:meterInfo g2s:meterInfoType="G2S_onDemand" '
+        f'g2s:meterDateTime="{now_iso()}">'
+        '<g2s:deviceMeters g2s:deviceClass="G2S_cabinet" g2s:deviceId="1">'
+        '<g2s:simpleMeter g2s:meterName="G2S_playerCashableAmt" '
+        'g2s:meterValue="0"/>'
+        '</g2s:deviceMeters></g2s:meterInfo>',
+        "929", m["sessionId"] if m else "1", "G2S_response")))
+    # …then the FUND initiateRequest — the EXACT addCredits WAT push,
+    # house-funded. Strict FIFO IS the ordering proof: no setCabinetState
+    # and no fromEgm pull precede it.
+    m = expect_host_post("tournament fund initiateRequest (the confirmed "
+                         "$0 clear settled — no lock, no pull before it)")
+    tr_sid = m["sessionId"] if m else "1001"
+    tr_rid = str((m.get("commandAttrs", {}) if m else {})
+                 .get("requestId") or "0")
+    if m:
+        a = m.get("commandAttrs", {})
+        check("fund: wat.initiateRequest dev 1 toEgm from the HOUSE — 500 "
+              "cents configured = 500000 mc on the wire (the per-leg "
+              "cents->millicents conversion)",
+              m["class"] == "wat" and m["command"] == "initiateRequest"
+              and m["deviceId"] == "1" and a.get("accountId") == "house"
+              and a.get("watDirection") == "G2S_toEgm"
+              and a.get("reqCashableAmt") == "500000"
+              and int(tr_rid) > 0, f"got {a}")
+    # EGM-side close of the fund — the walletFund choreography verbatim:
+    # requestPending assigns the txn, initiateTransfer draws the escrow
+    # authorize, commitTransfer draws the ack (wt_base idiom: per-run-
+    # unique txn so the once=True refs never collide across gate runs).
+    tr_txn = str(wt_base + 40)
+    post_to_host(avp_wrap(avp_class_command(
+        "wat",
+        f'<g2s:requestPending g2s:transactionId="{tr_txn}" '
+        f'g2s:requestId="{tr_rid}"/>',
+        "930", tr_sid, "G2S_response")))
+    post_to_host(avp_wrap(avp_class_command(
+        "wat",
+        f'<g2s:initiateTransfer g2s:transactionId="{tr_txn}" '
+        f'g2s:requestId="{tr_rid}" g2s:accountId="house" '
+        'g2s:watDirection="G2S_toEgm" g2s:payMethod="G2S_payCredit" '
+        'g2s:reqCashableAmt="500000" g2s:reqPromoAmt="0" '
+        'g2s:reqNonCashAmt="0" g2s:reduceAmts="true" g2s:maxAmt="500000"/>',
+        "931", "930", "G2S_request")))
+    m = expect_host_post("tournament fund authorizeTransfer (escrow)")
+    if m:
+        a = m.get("commandAttrs", {})
+        check("authorizeTransfer in full from the House (hostException=0)",
+              a.get("transactionId") == tr_txn
+              and a.get("accountId") == "house"
+              and a.get("authCashableAmt") == "500000"
+              and a.get("hostException") == "0", f"got {a}")
+    check("ESCROW: the House bankroll funded the seat (-500000 mc)",
+          house_cashable() == h_t0 - 500000,
+          f"got {house_cashable()} want {h_t0 - 500000}")
+    post_to_host(avp_wrap(avp_class_command(
+        "wat",
+        f'<g2s:commitTransfer g2s:transactionId="{tr_txn}" '
+        f'g2s:requestId="{tr_rid}" g2s:accountId="house" '
+        'g2s:watDirection="G2S_toEgm" g2s:payMethod="G2S_payCredit" '
+        'g2s:transCashableAmt="500000" g2s:transPromoAmt="0" '
+        f'g2s:transNonCashAmt="0" g2s:transDateTime="{now_iso()}" '
+        'g2s:egmException="0"/>',
+        "932", "931", "G2S_request")))
+    expect_host_post("tournament fund commitTransferAck (close-out)")
+    # ---- LOCK LAST: the runner's next tick folds the committed WAT
+    # record into funded=ok and only THEN locks the seat — the commitAck
+    # was already consumed above, so this FIFO position IS the proof the
+    # lock never preceded the fund (the exact inversion the 07-21 bench
+    # demanded).
+    m = expect_host_post("tournament lock setCabinetState (after the "
+                         "commit, never before)")
+    if m:
+        a = m.get("commandAttrs", {})
+        check("lock: cabinet.setCabinetState enable=false with the "
+              "TOURNAMENT marquee text, full-flag builder (the restore "
+              "path is sacred)",
+              m["class"] == "cabinet" and m["command"] == "setCabinetState"
+              and a.get("enable") == "false"
+              and "TOURNAMENT" in str(a.get("disableText", ""))
+              and a.get("enableMoneyIn") == "true",
+              f"got {m.get('command')}/{a}")
+    m = expect_host_post("getCabinetStatus (the lock's tailing refresh)")
+    if m:
+        check("the standing getCabinetStatus refresh rides behind the lock",
+              m["command"] == "getCabinetStatus", f"got {m.get('command')}")
+    # the seat's book: poll until the pipeline rests at ready (the stage
+    # publish rides the same tick that issued the lock — quick, but the
+    # verdict is async by design; poll, don't sleep-and-pray).
+    tour1, seat = {}, {}
+    tr_deadline = time.time() + 5
+    while time.time() < tr_deadline:
+        tour1 = get_json(STATUS_URL).get("tournament") or {}
+        seat = (tour1.get("seats") or {}).get(EGM_ID) or {}
+        if seat.get("armStage") == "ready":
+            break
+        time.sleep(0.25)
+    check("status: phase armed, ONE seat at armStage=ready — clear done "
+          "at $0 settled actuals (absorbedMc rests 0, no meter guess), "
+          "funded ok off the WAT commit, locked, score 0",
+          tour1.get("phase") == "armed"
+          and len(tour1.get("seats") or {}) == 1
+          and seat.get("kind") == "g2s" and seat.get("locked") is True
+          and seat.get("armStage") == "ready"
+          and seat.get("funded") == "ok" and seat.get("scoreMc") == 0
+          and (seat.get("clear") or {}).get("state") == "done"
+          and (seat.get("clear") or {}).get("actualMc") == 0
+          and seat.get("absorbedMc") == 0,
+          f"got {json.dumps(tour1)[:400]}")
+    tr_roster = snap_t0.get("hostOptions", {}).get("tournamentNames") or []
+    check("seat name: nobody is carded, so the seat drew an alias from the "
+          "advertised roster (hostOptions.tournamentNames)",
+          seat.get("name") == seat.get("alias")
+          and seat.get("name") in tr_roster,
+          f"got name={seat.get('name')!r} roster[:3]={tr_roster[:3]}")
+    expect_no_host_post("a READY armed floor emits nothing on its own — "
+                        "the runner observes and restages only on drift, "
+                        "never free-runs")
+    # ---- CANCEL from armed: UNLOCK FIRST, then pull, leave unlocked
+    # (the directive's exact reverse of the bench-day order — the wire
+    # evidence showed a "frozen" WAT resumes within ~1 s of an enable,
+    # so every pull must run against a LIVE machine; the pulls queue
+    # BEHIND the unlocks on the same FIFO). On this bench EGM the glass
+    # still reads empty (the pushed tournament credits latched on the
+    # EGM side, never the meter fold), so the cancel's HOST-INITIATED
+    # WAT pull (fromEgm — no button, no standing arm) settles
+    # synchronously at $0 and the ONLY wire is the unlock pair; the
+    # loaded-glass pull in anger is test_tournament's territory.
+    cs, cbody = post_command({"action": "tournamentCancel"})
+    check("tournamentCancel from armed: 200, rests idle, note=cancelled, "
+          "one seat swept",
+          cs == 200 and bool(cbody.get("ok"))
+          and cbody.get("phase") == "idle"
+          and cbody.get("note") == "cancelled"
+          and cbody.get("seats") == 1, f"got {cbody}")
+    m = expect_host_post("cancel restore setCabinetState (the unlock is "
+                         "the FIRST bytes — before any pull)")
+    if m:
+        a = m.get("commandAttrs", {})
+        check("cancel restores the cabinet: setCabinetState enable=true "
+              "(full restore, all flags true)",
+              m["command"] == "setCabinetState"
+              and a.get("enable") == "true"
+              and a.get("enableGamePlay") == "true",
+              f"got {m.get('command')}/{a}")
+    m = expect_host_post("getCabinetStatus (the restore's tailing refresh)")
+    if m:
+        check("the refresh rides behind the restore too",
+              m["command"] == "getCabinetStatus", f"got {m.get('command')}")
+    expect_no_host_post("the cancel pull never hit the wire — the empty "
+                        "glass settled it synchronously at $0 behind the "
+                        "unlock")
+    check("MONEY: the House stays debited the seat's $5.00 — the credits "
+          "rode the committed WAT onto the machine and the $0 pull moved "
+          "nothing (ledger consistent, the bench-day posture)",
+          house_cashable() == h_t0 - 500000,
+          f"got {house_cashable()} want {h_t0 - 500000}")
+    tour2 = get_json(STATUS_URL).get("tournament") or {}
+    seat2 = (tour2.get("seats") or {}).get(EGM_ID) or {}
+    check("status: idle + note=cancelled, the seat KEPT for post-mortem, "
+          "unlocked, sweep done at $0 (nothing on the glass)",
+          tour2.get("phase") == "idle" and tour2.get("note") == "cancelled"
+          and seat2.get("locked") is False
+          and (seat2.get("sweep") or {}).get("state") == "done"
+          and (seat2.get("sweep") or {}).get("actualMc") == 0,
+          f"got {json.dumps(tour2)[:400]}")
+    snap_t3 = get_json(STATUS_URL)
+    check("boardStamp rides /api/status (board.html's self-reload "
+          "watermark — the smibStamp posture)",
+          isinstance(snap_t3.get("boardStamp"), int)
+          and snap_t3.get("boardStamp") > 0,
+          f"got {snap_t3.get('boardStamp')!r}")
+    # slice cleanup: reset the post-cancel rest to a FRESH idle so the
+    # board (and any later slice) sees plain attract — reset accepts idle
+    # exactly so this cleanup click is never refused.
+    cs, cbody = post_command({"action": "tournamentReset"})
+    check("tournamentReset clears the cancelled run to a fresh idle",
+          cs == 200 and bool(cbody.get("ok"))
+          and cbody.get("phase") == "idle", f"got {cbody}")
+    tour3 = get_json(STATUS_URL).get("tournament") or {}
+    check("status: tournament back to attract — no seats, no note",
+          tour3.get("phase") == "idle" and not tour3.get("seats")
+          and not tour3.get("note"), f"got {json.dumps(tour3)[:200]}")
+    expect_no_host_post("reset touches no machine — the sweep already "
+                        "settled at cancel ($0 host pull) and there is "
+                        "no standing arm to tear down; a floor restores "
+                        "by the next arm or the operator, never a timer")
+
     # cleanup: the carded-out player account + all three destub fobs
     raw_post("/api/players", json.dumps({"action": "remove",
                                          "accountId": gp_id}))

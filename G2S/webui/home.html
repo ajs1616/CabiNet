@@ -170,10 +170,11 @@
     font:600 12px var(--sans);padding:8px 14px;min-height:40px}
   .fchip.on{color:var(--gold-hi);border-color:var(--gold-deep);
     background:linear-gradient(180deg,#2e2211,#271c0e)}
-  input[type=text],input[type=search],input[type=number],select{
+  input[type=text],input[type=search],input[type=number],select,textarea{
     background:var(--inset);border:1px solid var(--line);color:var(--ivory);
     border-radius:9px;font:14px var(--mono);padding:10px 12px;min-height:44px}
-  input::placeholder{color:var(--faint);font-family:var(--sans)}
+  textarea{resize:vertical;line-height:1.5}
+  input::placeholder,textarea::placeholder{color:var(--faint);font-family:var(--sans)}
   /* unknown-fob callout — a tap the hub couldn't match; click to register */
   .fobnew{appearance:none;width:100%;text-align:left;cursor:pointer;
     border:1px dashed var(--gold);border-radius:9px;background:#2b2013;
@@ -436,10 +437,27 @@
   .mrowset input{flex:1;min-width:110px}
   /* Settings · Ticket header — labeled stacked inputs (the nick-modal input
      look, plus the .kd label idiom) */
-  .tkf{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+  .tkf{display:flex;flex-direction:column;gap:4px;margin:7px 0}
   .tkf label{font:10px var(--mono);color:var(--faint);letter-spacing:.08em;
     text-transform:uppercase}
-  .tkf input{width:100%}
+  .tkf input,.tkf textarea{width:100%}
+  /* Settings host options — the sub-blocks (gameroom / board / bankroll /
+     sysval / ticket) pack into MASONRY columns so tiles of very different
+     heights (a tall Ticket header next to a short toggle) don't strand a
+     grid row with empty space. CSS multi-column = vertical fill, then next
+     column; ~260px columns give 3-across on a TV, 1 on a phone. */
+  .hgrid{column-width:260px;column-gap:10px}
+  .hblk{border:1px solid var(--line2);border-radius:10px;padding:11px 12px;
+    background:var(--inset);break-inside:avoid;margin-bottom:10px}
+  .ht{font:600 13px var(--sans);color:var(--ivory);letter-spacing:.01em;
+    display:flex;align-items:center;gap:7px}
+  .hblk .none{margin:2px 0 7px}
+  /* the ? that reveals a block's explanation — tiles stay compact until
+     you ask. Toggles the .none paragraph; gold while open. */
+  .hint{appearance:none;flex:none;width:16px;height:16px;padding:0;
+    border:1px solid var(--line);border-radius:50%;background:var(--card2);
+    color:var(--faint);font:700 10px var(--sans);line-height:14px;cursor:pointer}
+  .hint:hover,.hint.on{color:var(--gold);border-color:var(--gold-deep)}
   #toasts{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:60;
     display:flex;flex-direction:column;gap:8px;align-items:center;width:max-content;
     max-width:92vw;pointer-events:none}
@@ -608,10 +626,20 @@
     <div class="phead"><h1>The Switchboard</h1>
       <p>Host options and per-machine switches.</p></div>
     <div class="wgrid">
-      <div class="card"><h2>Host options</h2>
+      <div class="card wide"><h2>Host options</h2>
         <div class="body" id="st-host"></div></div>
       <div class="card"><h2>Machines</h2>
         <div class="body" id="st-mach"></div></div>
+      <!-- Tournament night — hidden until the hub's /api/status carries the
+           tournament key (feature-detected like everything else). -->
+      <div class="card" id="card-tour" style="display:none">
+        <h2>Tournament <span class="hn" id="st-tour-n"></span></h2>
+        <div class="body" id="st-tour"></div></div>
+      <!-- Whole-floor lock — feature-detected alongside the tournament key
+           (same hub build ships both). -->
+      <div class="card" id="card-floorlock" style="display:none">
+        <h2>Floor lock</h2>
+        <div class="body" id="st-floorlock"></div></div>
       <p class="none" style="grid-column:1/-1;margin:0">Cards, fobs and readers
         now live in 💳 The Players.</p>
     </div>
@@ -820,7 +848,12 @@ async function cardOutFire(btn){
 let GAMES={}, GAMES_OVR={};
 function themeKey(t){
   const m=String(t||"").match(/(\d{6})([0-9A-Z]{3})/i);
-  return m?(m[1]+m[2].toUpperCase()):"";
+  if(m) return m[1]+m[2].toUpperCase();
+  // non-IGT ids (WMS "SD16-000-1050" etc.) carry no family6+code3 to mine —
+  // the FULL id is its own stable override key (hub caps keys at 64 chars),
+  // so the ✎ rename works on every vendor, not just IGT.
+  const raw=String(t||"").trim();
+  return raw&&raw.length<=64?raw:"";
 }
 function prettyTheme(t){
   if(!t) return "";
@@ -1303,7 +1336,25 @@ function renderFloor(){
       </div></div>`);
     return;
   }
-  setHTML($("fl-list"), egms.map(e=>floorTile(snap(e))).join("")
+  /* 🏁 finished-tournament strip (AJ 2026-07-21): after a race the board
+     holds the ceremony until someone resets it, and the RESET shouldn't
+     live buried in Settings — one tap here clears the leaderboard and the
+     wall TV goes back to attract. Feature-detected; renders only while a
+     FINISHED tournament is holding the board (armed/running keep their
+     controls on the Settings card where the whole panel lives). */
+  const tour=(S.status||{}).tournament;
+  const tourStrip=(tour&&tour.phase==="finished")?`
+    <div class="card" style="grid-column:1/-1"><div class="body"
+      style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <span style="font:700 16px var(--display)">🏁 ${esc((tour.winner||{}).name||"Tournament")}
+        ${tour.winner?"took the tournament":"— tournament over"}</span>
+      <span class="none">the board is holding the ceremony</span>
+      <button class="btn slim gold" onclick="tourCmd(this,'tournamentReset','','Tournament reset')">
+        <span class="bl">Clear the board</span>
+        <span class="ba">back to the attract show</span></button>
+    </div></div>`:"";
+  setHTML($("fl-list"), tourStrip
+                        + egms.map(e=>floorTile(snap(e))).join("")
                         + sas.map(([k,m])=>sasTile(k,m)).join(""));
 }
 /* per-card ⚙️ Options expander — open-state per machine key in a plain JS
@@ -1515,6 +1566,53 @@ async function aftRegSend(key,btn){
   }catch(e){ toast("Send failed — retry",false); }
   finally{ if(btn) setTimeout(()=>{btn.disabled=false;},1500); }
 }
+/* Linked-cabinet ENABLE — opens the SAS leg (the lock's owner) and, when
+   the tile detected a stray G2S hostDisabled latch, clears that too in
+   the same tap. One button, every latch — the anti-rage guarantee. */
+async function linkedEnableSend(egm,legKey,btn){
+  if(btn.disabled) return;
+  btn.disabled=true;
+  try{
+    const m=((S.status||{}).sas||{})[legKey];
+    /* honest failure (the anti-rage guarantee cuts both ways): the SAS
+       leg OWNS the lock — if its entry is missing or carries no smibId
+       (leg forgotten, stale snapshot) nothing gets queued, so okSas must
+       NOT default to true: a green "Enable queued" over a machine that
+       stays dark is the exact silent failure this button exists to end. */
+    const legUp=!!(m&&m.smibId);
+    let okSas=legUp;
+    if(legUp){
+      const r=await fetch("/api/sas/command",{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({smibId:m.smibId,type:"sas_enable"})});
+      okSas=!!(await r.json().catch(()=>({}))).ok;
+      if(okSas) SASLOCK[legKey]={locked:false, at:Date.now()};
+    }
+    const cab=((snap(egm)||{}).cabinet)||{};
+    let okG2s=true, cleared=false;
+    if(String(cab.hostEnabled)==="false"){
+      const r=await cmd({action:"setCabinetState", egmId:egm, enable:true},
+                        "Clear G2S host latch");
+      okG2s=r.ok===true; cleared=okG2s;
+    }
+    toast(!legUp
+      ?"SAS leg not reporting — cannot enable"
+        +(cleared?" (G2S latch cleared)":"")
+      :okSas&&okG2s
+        ?("Enable queued"+(cleared?" — G2S host latch cleared too":""))
+        :"Enable partly failed — check the tile", okSas&&okG2s);
+    if(S.tab==="floor"&&!GM.egm) renderFloor();
+    // the G2S stack's egmDisabled echo outlives the SAS startup by a few
+    // seconds — a delayed quiet status re-read clears the stale chip
+    // without anyone touching anything (fires after the ~1s SAS pull
+    // has actually re-enabled the machine)
+    setTimeout(()=>{fetch("/api/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action:"getCabinetStatus",egmId:egm})})
+      .catch(()=>{});},5000);
+  }catch(e){ toast("Send failed — retry",false); }
+  finally{ setTimeout(()=>{btn.disabled=false;},1500); }
+}
 /* Single cabinet toggle (the G2S mcState pattern): two-step armCheck on
    the way OFF, instant back ON. POST-ok only means QUEUED — the face
    flips optimistically (SASLOCK) and the hub's remembered m.lockState
@@ -1633,17 +1731,55 @@ function floorTile(s){
     const raw=leg.meters["0x1A"];
     const n=(raw==null)?null:Number(raw);
     if(n!=null && isFinite(n) && n>=0){
-      let dn=Number(leg.denomCents); if(!isFinite(dn)||dn<1) dn=1;
+      let dn=Number(leg.denomCents); const denomAssumed=(!isFinite(dn)||dn<1);
+      if(denomAssumed) dn=1;
       cash=n*dn*1000;
+      /* PORTABILITY (2026-07-21): denom unset -> valuing raw 0x1A credits at
+         1¢/credit. Correct for a penny cabinet, but a NON-penny SAS machine
+         (a $1/nickel/quarter box — the wider SAS crowd) reads low by the denom
+         factor. We can't decode the machine's own 0x1F denom code (its
+         code->cents table is in the full SAS spec, not the on-disk guide;
+         guessing it would swap a visible assumption for a silent misread), so
+         degrade honestly: annotate the CREDITS line inline instead of showing a
+         confident wrong dollar figure. Tap the name ▸ Denomination to clear it.
+         (leg.denomAssumed is the backend's own verdict; recompute locally too
+         so the note still shows against an older hub.) */
+      if((denomAssumed||leg.denomAssumed) && n>0)
+        extra.push("denom unset · 1¢/credit assumed");
     }
   }
 
   /* state chips: play-state + doors + tilts */
   const st=[];
-  st.push(chip(egmStateLabel(cab.egmState),
-    cab.egmState==="G2S_enabled"?"ok":""));
-  if(String(cab.hostEnabled)==="false") st.push(chip("host disabled","bad"));
-  else if(String(cab.egmEnabled)==="false") st.push(chip("machine-side disabled","warn"));
+  if(leg){
+    /* LINKED cabinet — read BOTH stacks, CODE them correctly (AJ
+       2026-07-21: "it was miscoding it"). The dual-stack tell: when the
+       SAS host disables the machine (0x01), its G2S stack reports
+       egmState=G2S_egmDisabled / egmEnabled=false — that is NOT a
+       machine-side (operator menu) disable, it's the SAS lock seen
+       through G2S eyes, and it labels as such. A G2S-side egmEnabled=
+       false WITHOUT the SAS lock is a real machine-side disable and
+       still shows. A G2S hostDisabled latch shows too — hiding it is
+       how a stranded latch stays stranded. Other egmStates (audit menu,
+       machine lock, demo) stay informative. */
+    const sasLocked=leg.lockState==="locked";
+    const g2sHostOff=String(cab.hostEnabled)==="false";
+    const egmOff=String(cab.egmEnabled)==="false"
+      ||cab.egmState==="G2S_egmDisabled";
+    if(!sasLocked&&!g2sHostOff&&!egmOff) st.push(chip("enabled","ok"));
+    if(sasLocked) st.push(chip("disabled by SAS host","warn"));
+    if(g2sHostOff) st.push(chip("disabled by G2S host","bad"));
+    if(egmOff&&!sasLocked) st.push(chip("machine-side disabled","warn"));
+    if(cab.egmState&&cab.egmState!=="G2S_enabled"
+        &&cab.egmState!=="G2S_egmDisabled"
+        &&cab.egmState!=="G2S_hostDisabled")
+      st.push(chip(egmStateLabel(cab.egmState),""));
+  }else{
+    st.push(chip(egmStateLabel(cab.egmState),
+      cab.egmState==="G2S_enabled"?"ok":""));
+    if(String(cab.hostEnabled)==="false") st.push(chip("host disabled","bad"));
+    else if(String(cab.egmEnabled)==="false") st.push(chip("machine-side disabled","warn"));
+  }
   for(const k in cab){
     if(/doorOpen$/i.test(k) && String(cab[k])==="true")
       st.push(chip(k.replace(/DoorOpen$/i," door open").replace(/^cabinet/,"main"),"warn"));
@@ -1728,13 +1864,45 @@ function floorTile(s){
      refused/expired reset would be invisible) */
   +(leg?sasJackBanner(linked,leg,sasHp&&gPend.length?hpAmt(gPend[0]):0):"");
 
-  /* enable/disable machine — two-step on the way off, instant back on */
-  const hostOff=String(cab.hostEnabled)==="false";
-  const stateBtn=hostOff
-    ? `<button class="btn" data-egm="${esc(egm)}" data-en="1" onclick="mcState(this)">
-         <span class="bl">Enable machine</span><span class="ba">bring it back to the floor</span></button>`
-    : `<button class="btn danger" data-egm="${esc(egm)}" data-en="0" onclick="mcState(this)">
-         <span class="bl">Disable machine</span><span class="ba">takes effect immediately</span></button>`;
+  /* enable/disable machine — two-step on the way off, instant back on.
+     ONE-LEG-ONE-OWNER (AJ 2026-07-21, the regression fix): while a cabinet
+     is LINKED, SAS is the control authority (it already owns accounting),
+     so this button drives the SAS leg (sas_disable/sas_enable), NOT G2S
+     setCabinetState. The linked BB2 was shut down over SAS — and it HONORS
+     setCabinetState (egmState went G2S_hostDisabled on the wire), so a G2S
+     whole-cabinet disable creates a SECOND host-disable latch a SAS enable
+     can never clear; the card looked dead. That is exactly why this button
+     drives the SAS leg and (below) clears any stray G2S latch in the same
+     tap. The face follows the leg's remembered lockState (the sasTile
+     rule), with the same optimistic SASLOCK flip. A PLAIN-G2S cabinet
+     keeps the G2S toggle. */
+  let stateBtn;
+  if(linked && leg){
+    const hubLk=leg.lockState==="locked";
+    const ov=SASLOCK[linked];
+    if(ov&&(ov.locked===hubLk||Date.now()-ov.at>15000)) delete SASLOCK[linked];
+    const lk=SASLOCK[linked]?SASLOCK[linked].locked:hubLk;
+    /* the stray-G2S-latch tell (AJ: nobody should slam Unlock screaming
+       at a machine they collect): a linked cabinet can carry a G2S
+       hostDisabled latch (pre-fix runs, a bench experiment) that a SAS
+       enable can never clear. Enable detects it and clears BOTH. */
+    const g2sLatch=String(cab.hostEnabled)==="false";
+    const showEnable=lk||g2sLatch;
+    stateBtn=showEnable
+      ? `<button class="btn" data-en="1"
+           onclick="linkedEnableSend('${jsq(egm)}','${jsq(linked)}',this)">
+           <span class="bl">Enable machine</span>
+           <span class="ba">${g2sLatch?"opens SAS + clears the G2S host latch":"bring it back to the floor (SAS)"}</span></button>`
+      : `<button class="btn danger" data-en="0" onclick="sasToggleSend('${jsq(linked)}',this)">
+           <span class="bl">Disable machine</span><span class="ba">takes effect immediately (SAS)</span></button>`;
+  }else{
+    const hostOff=String(cab.hostEnabled)==="false";
+    stateBtn=hostOff
+      ? `<button class="btn" data-egm="${esc(egm)}" data-en="1" onclick="mcState(this)">
+           <span class="bl">Enable machine</span><span class="ba">bring it back to the floor</span></button>`
+      : `<button class="btn danger" data-egm="${esc(egm)}" data-en="0" onclick="mcState(this)">
+           <span class="bl">Disable machine</span><span class="ba">takes effect immediately</span></button>`;
+  }
 
   /* live theme = real-time state, shown as a secondary line — never the name */
   const nowPlaying=(cab.themeId && cab.themeId!=="G2S_none")?prettyTheme(cab.themeId):"";
@@ -1919,15 +2087,23 @@ async function g2sKeyOff(btn){
    report inHouseEnabled must not hide a healthy machine) — exclusion is on
    knowledge only. Reasons double as button sub-copy on the tiles. */
 function creditBlock(egm){
-  const sm=((S.status||{}).sas||{})[egm];
-  if(sm){                                        // SAS machine
+  const status=S.status||{};
+  // A LINKED G2S cabinet is judged on its SAS LEG, never the G2S egmState:
+  // SAS owns a linked cabinet's money/control, and the G2S egmState is a
+  // dual-stack artifact (the BB2 reads egmEnabled=false while live over
+  // SAS) that would falsely block credits (AJ 2026-07-21). Resolve the leg.
+  const g2s=status[egm];
+  const legKey=(g2s&&typeof g2s.commsState==="string"
+                &&typeof g2s.sasLink==="string"&&g2s.sasLink)?g2s.sasLink:egm;
+  const sm=(status.sas||{})[legKey];
+  if(sm){                                        // SAS machine or linked leg
     if(sm.sasEnabled===false) return "SAS is off in Settings";
     if(!sm.online||sm.stale)  return "machine offline";
     if(((sm.aft)||{}).inHouseEnabled===false)    // the RAM-clear state
       return "AFT transfers off on the game (operator menu)";
     return null;
   }
-  const s=snap(egm);                             // G2S machine
+  const s=snap(egm);                             // pure-G2S machine
   if(s.offline||!/onLine$/i.test(String(s.commsState||"")))
     return "machine offline";
   const st=((s.cabinet)||{}).egmState;
@@ -1964,11 +2140,15 @@ function renderNickModal(egm){
         placeholder="${esc(fallbackName(egm, snap(egm)))}" aria-label="Machine nickname">
     </div>
     ${sm?`<p class="none" style="margin:10px 0 6px">Denomination — cents per
-      credit for the CREDITS display (1..10000; blank = raw credit count).</p>
+      credit (1..10000). Sets the CREDITS value AND the tournament score scale.
+      ${sm.denomCents?"":"<b>Blank assumes 1¢/credit</b> — fine for a penny "+
+        "machine, but SET it for a $1 / nickel / quarter cabinet or its "+
+        "credits and race score read low."}</p>
     <div class="mrowset">
       <input type="text" id="m-denom" inputmode="numeric" maxlength="5"
         value="${sm.denomCents?esc(String(sm.denomCents)):""}"
-        placeholder="e.g. 25" aria-label="Denomination in cents">
+        placeholder="${sm.denomAssumed?"unset → 1¢/credit":"e.g. 25"}"
+        aria-label="Denomination in cents">
     </div>`:""}
     <div class="btnrow">
       <button class="btn slim gold" onclick="nickSave('${jsq(egm)}')">
@@ -3731,6 +3911,14 @@ async function ticketSave(){
   const ok=await settingsPost(body,"Ticket header");
   if(ok) tickStatus();
 }
+async function boardToggle(btn){
+  /* Gameroom board on/off — reversible display toggle, no arm. The board
+     page reads hostOptions.boardEnabled every poll and blanks itself. */
+  const cur=!!(((S.status||{}).hostOptions||{}).boardEnabled);
+  const ok=await settingsPost({boardEnabled:!cur},
+    !cur?"Gameroom board enabled":"Gameroom board disabled");
+  flash(btn,ok);
+}
 async function gameroomSave(){
   /* Gameroom name save — reversible personalization, no arm. Posts only when
      it differs from the hub face ("" clears it back to the neutral default).
@@ -3744,6 +3932,19 @@ async function gameroomSave(){
     v?("Gameroom name set to "+v):"Gameroom name cleared");
   if(ok) tickStatus();
 }
+/* ? explanation toggles — persist across the 2s repaint (the OPTSOPEN
+   pattern). htLine() builds a block title with a ? button; the caller
+   gates its explanation paragraph on HINTS[id]. Default hidden = compact
+   tiles; one tap reveals the "there's a lot of explaining" text. */
+const HINTS={};
+function htLine(id,title){
+  return `<div class="ht">${title}<button class="hint${HINTS[id]?" on":""}"
+    title="What's this?" aria-label="Explain" onclick="hintToggle('${id}')">?</button></div>`;
+}
+function hintToggle(id){
+  if(HINTS[id]) delete HINTS[id]; else HINTS[id]=true;
+  renderSettings();   // re-renders host options, tournament and floor lock
+}
 function renderSettings(){
   // Hold the repaint while a two-step confirm is armed (the SAS-off
   // toggle): setHTML would replace the armed node and silently disarm it.
@@ -3751,10 +3952,11 @@ function renderSettings(){
   // …and while a Ticket-header input has focus: this tab repaints every 2s
   // and setHTML would clobber half-typed text. (The nick modal dodges the
   // same hazard by living outside the repaint tree; these inputs can't.)
+  // TEXTAREA is admitted for the tournament roster box — same hazard.
   const ae=document.activeElement;
-  if(ae && ae.tagName==="INPUT" &&
+  if(ae && (ae.tagName==="INPUT" || ae.tagName==="TEXTAREA") &&
      (String(ae.id).indexOf("st-ticket-")===0 || ae.id==="st-bankroll" ||
-      ae.id==="st-gameroom")) return;
+      ae.id==="st-gameroom" || String(ae.id).indexOf("st-tour-")===0)) return;
   /* Host options — hostOptions is feature-detected: an old hub omits it
      from /api/status and gets the pending chip until the update lands. */
   const ho=(S.status||{}).hostOptions;
@@ -3771,18 +3973,33 @@ function renderSettings(){
     const hasGameroom=ho.gameroomName!==undefined;
     const grName=hasGameroom?String(ho.gameroomName||""):"";
     const gameroomHtml=!hasGameroom?"":`
-      <div style="margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line2)">
-        <div class="nm" style="font:600 14.5px var(--sans)">✨ Gameroom name</div>
-        <p class="none" style="margin:4px 0 8px">Your name for your room — it
-          shows in lights on every machine's screen (attract + footer). Blank =
-          a neutral “GAME ROOM”. Up to 28 characters.</p>
-        <div class="tkf"><label for="st-gameroom">Name in lights</label>
+      <div class="hblk">
+        ${htLine("gameroom","✨ Gameroom name")}
+        ${HINTS.gameroom?`<p class="none">In lights on every machine's screen. Blank = “GAME ROOM”.</p>`:""}
+        <div class="tkf"><label for="st-gameroom">Name in lights (28 max)</label>
           <input type="text" id="st-gameroom" maxlength="28"
             value="${esc(grName)}" placeholder="e.g. AJ’s Casino"></div>
-        <div class="btnrow" style="margin-top:10px">
+        <div class="btnrow" style="margin-top:8px">
           <button class="btn slim gold" onclick="gameroomSave()">
-            <span class="bl">Save gameroom name</span>
-            <span class="ba">${grName?esc(grName):"not set"}</span></button>
+            <span class="bl">Save name</span></button>
+        </div>
+      </div>`;
+    /* Gameroom Board — the wall-TV spectator page at /board (live Action
+       feed, standings, fireworks on a handpay). Feature-detected like the
+       rest; the toggle gates the page's render, the URL always serves. */
+    const hasBoard=ho.boardEnabled!==undefined;
+    const boardOn=!!ho.boardEnabled;
+    const boardUrl=location.protocol+"//"+location.host+"/board";
+    const boardHtml=!hasBoard?"":`
+      <div class="hblk">
+        ${htLine("board","📺 Gameroom board")}
+        ${HINTS.board?`<p class="none">Big-screen spectator view — action, standings, jackpot
+          fireworks. Point a TV browser at
+          <span style="font-family:var(--mono);color:var(--gold)">${esc(boardUrl)}</span></p>`:""}
+        <div class="btnrow" style="margin-top:8px">
+          <button class="btn slim ${boardOn?"":"gold"}" onclick="boardToggle(this)">
+            <span class="bl">${boardOn?"Disable board":"Enable board"}</span>
+            <span class="ba">${boardOn?"live":"off"}</span></button>
         </div>
       </div>`;
     // Collector economy — House Bankroll + the allow-negative switch.
@@ -3792,22 +4009,21 @@ function renderSettings(){
     const bankMc=Number(ho.houseBankrollMc)||0;
     const bankDollars=hasHouse?String(bankMc/100000):"";
     const houseHtml=!hasHouse?"":`
-      <div style="margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line2)">
-        <div class="nm" style="font:600 14.5px var(--sans)">🏦 House Bankroll</div>
-        <p class="none" style="margin:4px 0 8px">What your casino starts with —
-          stack friend cards and it draws down from here. It's your game room; set
-          it to whatever you like.</p>
+      <div class="hblk">
+        ${htLine("house","🏦 House Bankroll")}
+        ${HINTS.house?`<p class="none">What your casino starts with; friend cards draw it down.
+          Set it to whatever you like.</p>`:""}
         <div class="tkf"><label for="st-bankroll">Bankroll ($)</label>
           <input type="number" id="st-bankroll" min="0" step="1" inputmode="numeric"
             value="${esc(bankDollars)}" placeholder="e.g. 100000"></div>
-        <div class="btnrow" style="margin-top:10px">
+        <div class="btnrow" style="margin-top:8px">
           <button class="btn slim gold" onclick="bankrollSet()">
             <span class="bl">Set the bank</span>
             <span class="ba">now ${amtHtml(bankMc)}</span></button>
         </div>
-        <div class="acct" style="margin-top:14px">
+        <div class="acct" style="margin-top:11px">
           <div class="an"><div class="nm">Let the bank go negative</div>
-            <div class="kd">${allowNeg?"ON — THE BANK ALWAYS COVERS A FRIEND":"OFF — FLOORS AT $0 (FRIENDLY 'TOP UP')"}</div></div>
+            <div class="kd">${allowNeg?"ON — always covers a friend":"OFF — floors at $0 (friendly 'top up')"}</div></div>
           <button class="btn slim ${allowNeg?"":"gold"}" onclick="houseNegToggle(this)">
             <span class="bl">${allowNeg?"Turn off":"Turn on"}</span></button>
         </div>
@@ -3821,11 +4037,10 @@ function renderSettings(){
     const tk=(ho.ticket&&typeof ho.ticket==="object")?ho.ticket:null;
     const tv=k=>(tk&&tk[k]!=null)?String(tk[k]):"";
     const tkHtml=!tk?"":`
-      <div style="margin-top:14px;border-top:1px solid var(--line2);padding-top:12px">
-        <div class="nm" style="font:600 14.5px var(--sans)">Ticket header</div>
-        <p class="none" style="margin:4px 0 2px">Printed at the top of every
-          machine's tickets, both protocols — set once here, pushed to the
-          whole floor on save. All blank = each machine keeps its own header.</p>
+      <div class="hblk">
+        ${htLine("ticket","🎫 Ticket header")}
+        ${HINTS.ticket?`<p class="none">Top of every machine's tickets, both protocols —
+          set once, pushed floor-wide. All blank = each keeps its own.</p>`:""}
         <div class="tkf"><label for="st-ticket-name">Casino name</label>
           <input type="text" id="st-ticket-name" maxlength="64"
             value="${esc(tv("propName"))}" placeholder="YOUR ESTABLISHMENT"></div>
@@ -3847,18 +4062,21 @@ function renderSettings(){
             <span class="ba">posts only what changed</span></button>
         </div>
       </div>`;
-    setHTML($("st-host"), `
+    setHTML($("st-host"), `<div class="hgrid">
       ${gameroomHtml}
+      ${boardHtml}
       ${houseHtml}
-      <div class="acct">
-        <div class="an"><div class="nm">System-validation fallback</div>
-          <div class="kd">${on?"HUB ANSWERS LEGACY 0X57 CASH-OUTS":"OFF — MACHINES SELF-VALIDATE ONLY"}</div></div>
-        <button class="btn slim ${on?"":"gold"}" onclick="sysvalToggle(this)">
-          <span class="bl">${on?"Turn off":"Turn on"}</span></button>
+      <div class="hblk">
+        ${htLine("sysval","🎟️ System-validation fallback")}
+        ${HINTS.sysval?`<p class="none">Answers legacy 0x57 cash-outs when a machine falls
+          back to system mode.</p>`:""}
+        <div class="acct" style="padding:0;margin-top:2px">
+          <div class="an"><div class="kd">${on?"hub answers legacy cash-outs":"off — machines self-validate only"}</div></div>
+          <button class="btn slim ${on?"":"gold"}" onclick="sysvalToggle(this)">
+            <span class="bl">${on?"Turn off":"Turn on"}</span></button>
+        </div>
       </div>
-      <p class="none" style="margin:10px 0 0">Answers legacy system-validation
-        cash-outs (0x57) when a machine falls back to system mode.</p>
-      ${tkHtml}`);
+      ${tkHtml}</div>`);
   }
   /* Machines — every machine the hub knows, G2S + SAS; the SAS rows carry
      the on/off switch (this is where a hidden machine gets re-enabled). */
@@ -3895,6 +4113,237 @@ function renderSettings(){
   }
   setHTML($("st-mach"), rows.join("")
     ||'<p class="none">No machine on the floor yet.</p>');
+  renderTournament();
+  renderFloorLock();
+}
+/* 🔐 whole-floor lock (AJ 2026-07-21) — the tournament's per-machine lock
+   routing without a tournament: g2s cabinets over setCabinetState, linked
+   + sas over the SAS leg (one lock one owner). Buttons refuse honestly
+   while a tournament holds the floor; the last reply's per-machine
+   outcomes render inline so a skipped machine is never silent. */
+let FLOORLK=null;   // last floorLock/floorUnlock reply {locked, results, at}
+async function floorLockSend(btn,lock){
+  if(lock && !armCheck(btn,"lock every machine on the floor")) return;
+  const r=await cmd({action:lock?"floorLock":"floorUnlock"},
+                    lock?"Floor lock":"Floor unlock");
+  if(r.ok) FLOORLK={...(r.data||{}), at:Date.now()};
+  flash(btn, r.ok===true);
+  renderFloorLock();
+}
+function renderFloorLock(){
+  const cardEl=$("card-floorlock"); if(!cardEl) return;
+  // ships with the tournament build — same feature-detection key
+  if(((S.status||{}).tournament)===undefined){cardEl.style.display="none"; return;}
+  cardEl.style.display="";
+  const tourBusy=String(((S.status||{}).tournament||{}).phase||"idle")!=="idle";
+  const rows=FLOORLK?(FLOORLK.results||[]).map(x=>
+    `<div class="kd">${x.ok?"•":"⚠️"} ${esc(x.machine)} — ${esc(x.detail)}`
+    +` <span style="color:var(--faint)">(${esc(x.via)})</span></div>`).join(""):"";
+  setHTML($("st-floorlock"), `
+    ${htLine("floorlock","Every machine at once")}
+    ${HINTS.floorlock?`<p class="none">Same per-machine routing the tournament
+      uses — linked cabinets lock over their SAS leg.</p>`:""}
+    ${tourBusy?`<p class="none" style="color:var(--gold);margin-top:6px">Tournament holds the floor right now.</p>`:""}
+    <div class="btnrow" style="margin-top:8px">
+      <button class="btn slim danger ${tourBusy?"off":""}" onclick="floorLockSend(this,true)">
+        <span class="bl">🔒 Lock all</span><span class="ba">every machine, right now</span></button>
+      <button class="btn slim gold ${tourBusy?"off":""}" onclick="floorLockSend(this,false)">
+        <span class="bl">🔓 Unlock all</span><span class="ba">open the floor back up</span></button>
+    </div>
+    ${rows?`<div style="margin-top:8px">${rows}</div>`:""}`);
+}
+
+/* ======================================================================
+   TOURNAMENT — the admin card for tournament night (Settings tab).
+   Hub truth = /api/status.tournament (the engine's snapshot, refreshed by
+   the 2s poll); the key is feature-detected — an old hub omits it and the
+   whole card stays hidden (display:none in the markup is the default, so
+   nothing flashes before the first poll). Buttons ride cmd()
+   (tournament* actions; "unknown action" degrades to the pending toast)
+   and the funny-name roster rides /api/settings {tournamentNames},
+   echoed back through hostOptions.tournamentNames for the prefill.
+   Inputs take HUMAN units — dollars + minutes — converted to the wire's
+   cents + seconds on send. The config inputs and roster only render in
+   idle/armed (the phases where configure is legal hub-side), which also
+   keeps the html hub-state-stable while someone types — the clock phases
+   repaint every poll by design (serverNow moves), and that's fine because
+   they carry no inputs. Repaint safety inherits renderSettings' guards:
+   the ARM hold, the st-tour-* focus hold, and setHTML's signature check.
+   ====================================================================== */
+function tourClock(sec){
+  // m:ss for the phase strip — fmtDur rounds whole minutes, too coarse
+  // for a race clock someone is actually watching
+  sec=Math.max(0,Math.round(sec));
+  return Math.floor(sec/60)+":"+String(sec%60).padStart(2,"0");
+}
+async function tourArm(btn){
+  /* ARM IT = configure + arm in one tap. Two-step armed: it locks every
+     machine on the floor and pushes House money to every seat. Client
+     validation is courtesy only — the hub's 400 is the real gate. */
+  const mcPer=parseDollars((($("st-tour-credits")||{}).value)||"");
+  if(!mcPer){toast("Enter credits per seat ($)",false); return;}
+  const mins=Number((($("st-tour-mins")||{}).value)||0);
+  if(!isFinite(mins)||mins<0.5||mins>120){
+    toast("Duration must be 0.5–120 minutes",false); return;}
+  const cntRaw=String((($("st-tour-count")||{}).value)||"").trim();
+  const countdownSec=cntRaw===""?10:Math.round(Number(cntRaw));
+  if(!isFinite(countdownSec)||countdownSec<3||countdownSec>60){
+    toast("Countdown must be 3–60 seconds",false); return;}
+  if(!armCheck(btn,"lock the floor and fund every seat — credits already "
+      +"on a machine join the pot (carded players get theirs back at the "
+      +"end; the rest sweeps to the House)")) return;
+  const c=await cmd({action:"tournamentConfigure",
+    creditsCents:Math.round(mcPer/1000), durationSec:Math.round(mins*60),
+    countdownSec:countdownSec}, "Tournament config");
+  if(!c.ok){flash(btn,false); return;}
+  const r=await cmd({action:"tournamentArm"},"Tournament armed");
+  flash(btn,r.ok===true);
+  tickStatus();  // success flips the phase; a refusal paints t.lastArm —
+                 // either way the card, not a fading toast, tells the story
+}
+async function tourCmd(btn, action, warn, label){
+  /* shared sender for the phase buttons — armCheck on everything except
+     RESET (warn="" skips the two-step: reset only clears a finished board,
+     the money already went home in the sweep) */
+  if(warn && !armCheck(btn,warn)) return;
+  const r=await cmd({action:action}, label);
+  flash(btn, r.ok===true);
+  if(r.ok) tickStatus();
+}
+async function tourNamesSave(){
+  /* roster save — one funny name per line, drawn at random for uncarded
+     seats. Hub validates too (1..24 chars, max 64); an empty box clears
+     back to the built-in house list. */
+  const el=$("st-tour-names"); if(!el) return;
+  const names=String(el.value||"").split("\n").map(s=>s.trim()).filter(Boolean);
+  if(names.length>64){toast("Roster caps at 64 names",false); return;}
+  const long=names.find(n=>n.length>24);
+  if(long){toast("Names cap at 24 characters — trim “"+long.slice(0,24)+"…”",false); return;}
+  const ok=await settingsPost({tournamentNames:names},
+    names.length?("Roster saved · "+names.length+" name"+(names.length===1?"":"s"))
+                :"Roster cleared — house list is back");
+  if(ok) tickStatus();
+}
+function renderTournament(){
+  const cardEl=$("card-tour"); if(!cardEl) return;
+  const t=(S.status||{}).tournament;
+  if(!t||typeof t!=="object"){cardEl.style.display="none"; return;}
+  cardEl.style.display="";
+  const ph=String(t.phase||"idle");
+  const now=Number(t.serverNow)||0;   // hub clock — never trust the browser's
+  const canCfg=(ph==="idle"||ph==="armed");
+  /* --- phase strip: chip + the one number that matters right now -------- */
+  const PHCHIP={idle:chip("IDLE",""), armed:chip("ARMED","warn"),
+    countdown:chip("COUNTDOWN","warn"), running:chip("RUNNING","ok"),
+    finished:chip("FINISHED","gold")};
+  let phLine="";
+  if(ph==="idle") phLine="No tournament — set it up and ARM IT.";
+  else if(ph==="armed") phLine="Seats locked & funding — START when everyone's sat down.";
+  else if(ph==="countdown") phLine="Starts in "
+    +Math.max(0,Math.ceil((Number(t.startsAt)||0)-now))+"s…";
+  else if(ph==="running") phLine=tourClock((Number(t.endsAt)||0)-now)+" on the clock";
+  else if(ph==="finished") phLine=t.winner
+    ?(String(t.winner.name||"?")+" takes it — "+fmtAmt(t.winner.scoreMc))
+    :"Over — no winner recorded.";
+  /* --- seats mini-list: name/alias · machine · funded/locked · score ---- */
+  const FUND={pending:chip("funding…","warn"), ok:chip("funded","ok"),
+    failed:chip("fund failed","bad")};
+  const seats=Object.entries(t.seats||{})
+    .sort((a,b)=>((b[1]||{}).scoreMc||0)-((a[1]||{}).scoreMc||0)
+      || String(a[0]).localeCompare(String(b[0])));
+  setHTML($("st-tour-n"), seats.length?(seats.length+" seats · "+ph):"");
+  const seatRows=seats.map(([k,s])=>{
+    s=s||{};
+    const sub=(s.alias&&s.alias!==s.name)?(" · “"+s.alias+"”"):"";
+    return `<div class="acct">
+      <div class="an"><div class="nm">${esc(s.name||s.alias||"?")}</div>
+        <div class="kd">${esc((s.machine||k)+sub)}</div>
+        ${(s.funded==="failed"&&s.fundDetail)?`<div class="kd" style="color:var(--dim)">${esc(s.fundDetail)}</div>`:""}
+        ${(s.sweep&&s.sweep.detail)?`<div class="kd" style="color:var(--dim)">${esc(s.sweep.detail)}</div>`:""}</div>
+      ${FUND[s.funded]||""}
+      ${(s.absorbedMc>0)?chip("absorbs "+fmtAmt(s.absorbedMc),"warn"):""}
+      ${s.locked?chip("🔒 locked",""):""}
+      <div class="bal"><div class="b1">${esc(fmtAmt(s.scoreMc||0))}</div>
+        <div class="b2">WON</div></div>
+    </div>`;
+  }).join("");
+  /* --- config inputs — idle/armed only (see the header comment) --------- */
+  const cfg=!canCfg?"":`
+    <div class="tkf"><label for="st-tour-credits">Credits per seat ($)</label>
+      <input type="number" id="st-tour-credits" min="0.01" step="0.01" inputmode="decimal"
+        value="${esc(t.creditsCents?String(t.creditsCents/100):"")}" placeholder="e.g. 20"></div>
+    <div class="tkf"><label for="st-tour-mins">Duration (minutes)</label>
+      <input type="number" id="st-tour-mins" min="0.5" max="120" step="0.5" inputmode="decimal"
+        value="${esc(t.durationSec?String(t.durationSec/60):"")}" placeholder="e.g. 5"></div>
+    <div class="tkf"><label for="st-tour-count">Countdown (seconds)</label>
+      <input type="number" id="st-tour-count" min="3" max="60" step="1" inputmode="numeric"
+        value="${esc(t.countdownSec?String(t.countdownSec):"")}" placeholder="10"></div>`;
+  /* --- phase-aware buttons --------------------------------------------- */
+  const cancelBtn=`
+    <button class="btn slim danger"
+      onclick="tourCmd(this,'tournamentCancel','cancel and sweep the credits home','Tournament cancel')">
+      <span class="bl">CANCEL</span><span class="ba">unlock + sweep back</span></button>`;
+  let btns="";
+  if(ph==="idle") btns=`
+    <button class="btn slim gold" onclick="tourArm(this)">
+      <span class="bl">ARM IT</span><span class="ba">lock + fund every seat</span></button>`;
+  else if(ph==="armed") btns=`
+    <button class="btn slim gold"
+      onclick="tourCmd(this,'tournamentStart','start the countdown','Tournament start')">
+      <span class="bl">START</span><span class="ba">countdown, then GO</span></button>`
+    +cancelBtn;
+  else if(ph==="countdown") btns=cancelBtn;
+  else if(ph==="running") btns=`
+    <button class="btn slim danger"
+      onclick="tourCmd(this,'tournamentEnd','end the tournament right now','Tournament end')">
+      <span class="bl">END NOW</span><span class="ba">call it early</span></button>`
+    +cancelBtn;
+  else if(ph==="finished") btns=`
+    <button class="btn slim gold"
+      onclick="tourCmd(this,'tournamentReset','','Tournament reset')">
+      <span class="bl">RESET</span><span class="ba">clear the board</span></button>`;
+  /* --- last arm refusal — persists on the card until the next attempt
+     (the toast-faded-too-fast lesson, 2026-07-21): every machine that sat
+     out is named with its reason. Credits never appear here — they're a
+     seat, not a blocker. ------------------------------------------------ */
+  let lastArmHtml="";
+  const la=(ph==="idle")?t.lastArm:null;
+  if(la&&la.error){
+    const rows=(Array.isArray(la.skipped)?la.skipped:[]).map(s=>
+      `<div class="kd">• ${esc(s.machine||s.seatKey||"?")} — ${esc(s.reason||"")}</div>`).join("");
+    lastArmHtml=`
+      <div style="margin-top:10px;border:1px solid var(--warn,#a67c00);border-radius:8px;padding:8px 10px">
+        <div class="kd" style="color:var(--warn,#e0b34d)">Last arm refused: ${esc(la.error.split(" — ")[0])}</div>
+        ${rows}
+      </div>`;
+  }
+  /* --- roster — idle/armed only, prefilled from the hostOptions echo ---- */
+  const roster=((S.status||{}).hostOptions||{}).tournamentNames;
+  const rosterNames=Array.isArray(roster)?roster:[];
+  const rosterHtml=!canCfg?"":`
+    <div class="hblk" style="margin-top:12px">
+      ${htLine("roster","🎭 Funny-name roster")}
+      ${HINTS.roster?`<p class="none">Aliases for uncarded seats — one per line, drawn at
+        random. Empty = the house list.</p>`:""}
+      <div class="tkf"><label for="st-tour-names">One name per line</label>
+        <textarea id="st-tour-names" rows="3"
+          placeholder="The Mystery Whale&#10;Witness Protection&#10;…">${esc(rosterNames.join("\n"))}</textarea></div>
+      <div class="btnrow" style="margin-top:8px">
+        <button class="btn slim gold" onclick="tourNamesSave()">
+          <span class="bl">Save roster</span>
+          <span class="ba">${rosterNames.length?rosterNames.length+" names":"house list"}</span></button>
+      </div>
+    </div>`;
+  setHTML($("st-tour"), `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+      ${PHCHIP[ph]||chip(ph.toUpperCase(),"")}
+      <span style="font:12.5px var(--sans);color:var(--faint)">${esc(phLine)}</span>
+    </div>
+    ${cfg}
+    ${lastArmHtml}
+    <div class="btnrow" style="margin-top:10px">${btns}</div>
+    ${seatRows?`<div style="margin-top:12px;border-top:1px solid var(--line2)">${seatRows}</div>`:""}
+    ${rosterHtml}`);
 }
 
 /* ---- Cards & readers (💳 The Players tab) --------------------------------

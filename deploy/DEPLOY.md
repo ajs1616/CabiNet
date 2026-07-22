@@ -135,7 +135,10 @@ Requirements:
    curl -s http://192.168.50.2:8081/api/status | head -5
    ```
 
-   Then open **http://192.168.50.2:8081/** — the CabiNet House Floor.
+   Then open **http://192.168.50.2:8081/** — the CabiNet House Floor. Any TV
+   with a browser can be the spectator board — point it at
+   **http://192.168.50.2:8081/board** (the attract show and tournament
+   nights: see [`TOURNAMENT.md`](TOURNAMENT.md)).
 
 ## Slot machines
 
@@ -180,8 +183,9 @@ Plug the machine's Ethernet into the slot switch.
 
 ### SAS machines (the SMIB path)
 
-Wire a SAS SMIB Pi (golden image or `deploy/zero2w_sas_setup.sh`) between
-the machine's SAS port and the switch. Then set these in the operator menu
+Wire a SAS SMIB Pi (flash it per [`deploy/SMIB_FRESH_IMAGE.md`](SMIB_FRESH_IMAGE.md),
+or run `deploy/zero2w_sas_setup.sh`) between the machine's SAS port and the
+switch. Then set these in the operator menu
 — **these are the one-shot fields**:
 
 | Field | Set it to | Why |
@@ -190,6 +194,7 @@ the machine's SAS port and the switch. Then set these in the operator menu
 | SAS address | **1** | The SMIB polls address 1 by default (`--address` changes it if you must). |
 | AFT / cashless transfers | **Enabled** (if offered) | This is how credits move between the wallet and the machine. |
 | Legacy bonusing | **Enabled** (if present) | On pre-AFT machines this is the credit-push path; harmless to have on otherwise. |
+| Handpay receipts | **Enabled** if desired | The machine prints a receipt when a handpay is keyed off — pure showmanship, your call. |
 
 Host-side: in the web UI **Settings**, leave **System-validation fallback ON**
 (it ships on) — that's what answers System-mode cash-outs.

@@ -308,10 +308,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #se-rows { position: absolute; left: 12px; top: 100px; width: 232px; }
 
 /* --- money confirm (reuses the logout-confirm layout) ------------------ */
-#cf-q   { position: absolute; left: 12px; top: 300px; width: 232px;
+/* cf-q WRAPS on long questions ("CLEAR HANDPAY?" is two lines at 26px in
+   the 232px lane) — explicit line-height + cf-sub pushed below the 2-line
+   extent (292 + 2x32 = 356 < 364), still clear of the CONFIRM slot at 430.
+   Live-caught 2026-07-16: the sub text rendered UNDER the wrapped second
+   line instead of below it. */
+#cf-q   { position: absolute; left: 12px; top: 292px; width: 232px;
           text-align: center; font-size: 26px; font-weight: bold;
-          letter-spacing: 2px; color: #f0f4f8; }
-#cf-sub { position: absolute; left: 24px; top: 348px; width: 208px;
+          letter-spacing: 2px; color: #f0f4f8; line-height: 32px; }
+#cf-sub { position: absolute; left: 24px; top: 364px; width: 208px;
           text-align: center; font-size: 14px; line-height: 20px;
           color: #9fb2c8; }
 #cf-note{ position: absolute; left: 12px; top: 650px; width: 232px;
