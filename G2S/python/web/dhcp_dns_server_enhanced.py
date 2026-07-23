@@ -32,6 +32,10 @@ class EnhancedDHCPServer:
         self.sock = None
         self.leases = {}
         self.config = self.load_config()
+        # Persisted leases survive a restart (no reshuffle/collision); expired
+        # ones are pruned on load. Must come AFTER load_config (needs the paths).
+        self.lease_file = self.config.get('lease_file', 'data/dhcp_leases.json')
+        self._load_leases()
         
         # Auto-detect interface ONLY when explicitly asked ('auto'). A real
         # interface name (eth0, wlan0, eno1) is an explicit pin and must never be
@@ -143,6 +147,15 @@ class EnhancedDHCPServer:
             'start_ip': 100,
             'end_ip': 200,
             'lease_time': 3600,
+            # Lease PERSISTENCE + EXPIRY (2026-07-23): leases are saved to
+            # lease_file and reloaded on start so a service restart no longer
+            # wipes the table and reshuffles the fleet into IP collisions (the
+            # bug that DISCOVER-looped the AVP). A lease whose MAC hasn't been
+            # seen within lease_retention is pruned — its IP returns to the pool
+            # so a sold/swapped machine ages out on its own. 7d default: a
+            # machine off for the weekend keeps its IP; one gone for good frees.
+            'lease_retention': 7 * 24 * 3600,
+            'lease_file': 'data/dhcp_leases.json',
             'dns_servers': [],  # Will be auto-populated with server IP
             'domain': 'casinonet.local',
             'g2s_host': self.get_local_ip(),
@@ -270,8 +283,95 @@ class EnhancedDHCPServer:
         and port (URI segments 1 & 3).  Earlier builds appended extra
         sub-options (port / path / 'SOAP' / auto-discovery / config URL); those
         made the payload malformed to the AVP's parser, so it discarded the
-        whole option and kept its 127.0.0.1 default."""
-        return b'\x01\x04' + socket.inet_aton(self.config['g2s_host'])
+        whole option and kept its 127.0.0.1 default.
+
+        BENCH TEST HOOK (2026-07-23, JaxFlorida fresh-G20 host-unset probe):
+        a fresh unit with NO persisted URI segments falls back to
+        127.0.0.1:<default port> even if the IP delivered, so it may need the
+        full host in opt43. ⚠️ NO format has ever been SEEN accepted on the wire
+        (2026-07-23 audit): every working host so far came from manual segments
+        or fallback-to-last-valid. Format is chosen by data/igt_opt43_fmt
+        (absent -> 'ip' = the minimal default):
+          segments     01 07 "http://" 02 <len> "<dotted-ip>" 03 <len> ":<port>/G2S"
+                       (sub-option code == the AVP's own URI segment number)
+          segments_bin same, but segment 2 = 4-byte binary IPv4
+          ip           01 04 <ip>                        (fills segment 2 only)
+          url          01 <len> "http://<ip>:<port>/G2S" (rejected 2026-07-23:
+                       AVP fell back to last valid config, Override=NO)
+          ip_port      01 04 <ip> 02 02 <port>
+        Flip: echo segments > data/igt_opt43_fmt on the Pi + restart
+        casinonet-dhcp. Revert: rm data/igt_opt43_fmt."""
+        host = self.config['g2s_host']
+        port = int(self.get_g2s_port())
+        fmt = 'ip'
+        try:
+            with open('data/igt_opt43_fmt') as _f:
+                fmt = _f.read().strip() or 'ip'
+        except (OSError, ValueError):
+            pass  # unreadable/undecodable flag file -> default, never drop the offer
+        # any format + '_ff' suffix appends the RFC 2132 0xFF end-marker inside
+        # the option (e.g. 'ip_ff', 'segments_ff')
+        end_marker = fmt.endswith('_ff')
+        if end_marker:
+            fmt = fmt[:-3]
+        if fmt == 'segments':
+            # 1:1 with the AVP's OWN host model — the manual screen stores the
+            # host as THREE URI segments, so send THREE sub-options whose codes
+            # match the segment numbers: 01=protocol, 02=address (dotted string,
+            # exactly as typed in the UI), 03=path (:port/G2S). Every earlier
+            # format crammed the whole host into sub-option 01 alone.
+            seg1 = b'http://'
+            seg2 = host.encode('ascii')
+            seg3 = f":{port}/G2S".encode('ascii')
+            payload = (b'\x01' + bytes([len(seg1)]) + seg1
+                       + b'\x02' + bytes([len(seg2)]) + seg2
+                       + b'\x03' + bytes([len(seg3)]) + seg3)
+        elif fmt == 'segments_bin':
+            # same 3-segment mapping, but segment 2 as the 4-byte binary IPv4
+            seg1 = b'http://'
+            seg3 = f":{port}/G2S".encode('ascii')
+            payload = (b'\x01' + bytes([len(seg1)]) + seg1
+                       + b'\x02\x04' + socket.inet_aton(host)
+                       + b'\x03' + bytes([len(seg3)]) + seg3)
+        elif fmt == 'bare_ip':
+            # NAKED 4-byte IPv4 — no TLV, no sub-option, nothing (2026-07-23):
+            # the exact sibling of opt42 NTP, the only other option IGT added
+            # to QNX's request list — and NTP's bare-IP payload is consumed
+            # perfectly. Never tried before because every guess assumed
+            # sub-option framing. Segment 2 is labeled "IP ADDRESS": DHCP
+            # fills the IP; segments 1/3 come from firmware defaults.
+            payload = socket.inet_aton(host)
+        elif fmt == 'raw':
+            # BARE ASCII URI, NO sub-option wrapper (2026-07-23 mechanism dig):
+            # QNX dhcp.client hands opt43 to IGT's /etc/dhcp/dhcp-up hook as an
+            # OPTION43 env var after a "format as readable" pass — TLV framing
+            # (01 <len>...) becomes control bytes there, but a plain printable
+            # string survives intact, and IGT's own manual-entry model is these
+            # exact 3 segments concatenated. opt42 NTP proves this env-var
+            # delivery chain works.
+            payload = f"http://{host}:{port}/G2S".encode('ascii')
+        elif fmt == 'url':
+            url = f"http://{host}:{port}/G2S".encode('utf-8')
+            payload = b'\x01' + bytes([len(url)]) + url
+        elif fmt == 'url0a':
+            # full URL in sub-option 0x0A (alternate IGT host sub-code)
+            url = f"http://{host}:{port}/G2S".encode('utf-8')
+            payload = b'\x0a' + bytes([len(url)]) + url
+        elif fmt == 'url_lc':
+            # full URL with lowercase /g2s path variant
+            url = f"http://{host}:{port}/g2s".encode('utf-8')
+            payload = b'\x01' + bytes([len(url)]) + url
+        elif fmt == 'ip_port':
+            payload = (b'\x01\x04' + socket.inet_aton(host)
+                       + b'\x02\x02' + port.to_bytes(2, 'big'))
+        else:  # 'ip' — the minimal default (NOT wire-proven; never seen accepted)
+            payload = b'\x01\x04' + socket.inet_aton(host)
+        if end_marker:
+            # RFC 2132 end-marker INSIDE the encapsulated option — some
+            # embedded parsers require the 0xFF terminator to accept opt43.
+            payload += b'\xff'
+        print(f"[DHCP] IGT opt43 fmt={fmt}{'+ff' if end_marker else ''} -> {payload.hex()}")
+        return payload
     
     def encode_wms_bluebird_options(self):
         """Encode WMS BlueBird 2 specific vendor options"""
@@ -458,6 +558,7 @@ class EnhancedDHCPServer:
             'file': b'',
             'options': {}
         }
+
         
         # Standard DHCP options
         packet['options'][53] = b'\x02'  # DHCP Offer
@@ -485,6 +586,18 @@ class EnhancedDHCPServer:
         else:
             # Use server as NTP
             packet['options'][42] = socket.inet_aton(self.config['network']['server_ip'])
+
+        # ANSWER THE FULL PARAMETER REQUEST (2026-07-23): the IGT AVP's opt55
+        # asks for 1,6,12,15,3,28,42,43 and we previously answered only 6 of
+        # the 8 — Hostname (12) and Broadcast (28) were missing. An embedded
+        # client that validates its reply can treat an incomplete answer as
+        # unusable and skip applying vendor config, so answer everything.
+        base = self.config['network']['base']
+        packet['options'][28] = socket.inet_aton(f"{base}.255")   # broadcast
+        # Hostname (12): derive a stable per-machine name from the MAC tail
+        mac_str = request.get('mac') or ''
+        mac_tail = ''.join(mac_str.split(':')[-3:]) or 'egm'
+        packet['options'][12] = f"egm-{mac_tail}".encode('ascii')
         
         # Add vendor-specific options
         
@@ -550,7 +663,8 @@ class EnhancedDHCPServer:
             # Update lease state
             self.leases[mac]['state'] = 'acked'
             self.leases[mac]['timestamp'] = time.time()
-            
+            self._save_leases()
+
             print(f"[DHCP] REQUEST from {mac} - Sending ACK for {lease_ip}")
             
             # Create ACK packet (similar to offer but msg type 5)
@@ -563,6 +677,27 @@ class EnhancedDHCPServer:
             print(f"[DHCP] REQUEST from unknown MAC {mac}")
             return None
     
+    def _handle_decline(self, packet):
+        """Client ARP-probed its offered IP, found it already in use, and
+        declined. Drop that lease so the next DISCOVER picks a DIFFERENT free
+        address instead of re-offering the same conflicting one (the decline
+        loop). This is how a stray collision self-heals within a run."""
+        mac = packet.get('mac')
+        l = self.leases.get(mac)
+        if l:
+            print(f"[DHCP] DECLINE from {mac} for {l.get('ip')} — dropping it so "
+                  "the next offer picks a free address")
+            del self.leases[mac]
+            self._save_leases()
+
+    def _handle_release(self, packet):
+        """Client released its lease — free the IP immediately for reuse."""
+        mac = packet.get('mac')
+        if mac in self.leases:
+            print(f"[DHCP] RELEASE from {mac} for {self.leases[mac].get('ip')}")
+            del self.leases[mac]
+            self._save_leases()
+
     def handle_dhcp_discover(self, packet):
         """Handle DHCP DISCOVER with vendor detection"""
         mac = packet['mac']
@@ -583,6 +718,9 @@ class EnhancedDHCPServer:
             'state': 'offered',
             'timestamp': time.time()
         }
+        # NOT persisted here — only an ACK commits a lease to disk. Persisting an
+        # OFFER would let a declined/incomplete offer survive a restart (a
+        # decline loop couldn't self-heal), and it doubles the packet-path I/O.
         
         return self.create_dhcp_offer(packet, offered_ip, vendor)
     
@@ -663,35 +801,117 @@ class EnhancedDHCPServer:
             import traceback
             traceback.print_exc()
     
+    # A clock below this (2023-11) is NOT trusted for expiry math: the Pi has no
+    # battery RTC and casinonet-ntp starts AFTER dhcp, so a boot can read
+    # fake-hwclock's stale value. Expiring against an untrusted clock could
+    # mass-prune LIVE leases and re-hand their in-use IPs — the exact collision
+    # this whole change exists to kill. So expiry requires BOTH the clock and
+    # the lease stamp past this floor.
+    SANE_EPOCH = 1_700_000_000
+
+    def _lease_retention(self):
+        return self.config.get('lease_retention', 7 * 24 * 3600)
+
+    def _is_expired(self, lease, now):
+        """Expired only when BOTH the current clock and the lease stamp are past
+        the sane-epoch floor AND the gap exceeds retention. A pre-NTP / RTC-less
+        / clock-stepped boot (either side below the floor, or a null/garbage
+        stamp) reads as NOT expired — we never prune a possibly-live lease just
+        because the clock looks wrong."""
+        ts = lease.get('timestamp')
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            ts = 0.0
+        if now < self.SANE_EPOCH or ts < self.SANE_EPOCH:
+            return False
+        return (now - ts) > self._lease_retention()
+
+    def _load_leases(self):
+        """Load persisted leases so a restart doesn't wipe the table (that wipe
+        is what reshuffled the fleet into IP collisions). We do NOT prune on
+        load — a stale entry costs at most one pool slot, and on a home floor
+        the pool never exhausts; reclaiming happens lazily and clock-guarded only
+        when the pool is actually full (see find_available_ip). A missing /
+        corrupt / wrong-shaped / bad-timestamp file is NEVER fatal — start
+        empty or keep only well-formed entries; either way the server comes up."""
+        path = getattr(self, 'lease_file', 'data/dhcp_leases.json')
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            self.leases = {}
+            return
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            print(f"[DHCP] lease file {path} unreadable ({e}) — starting empty")
+            self.leases = {}
+            return
+        kept = {}
+        if isinstance(raw, dict):
+            for mac, l in raw.items():
+                if isinstance(l, dict) and 'ip' in l:
+                    kept[mac] = l   # no timestamp math here -> null ts can't crash
+        self.leases = kept
+        print(f"[DHCP] loaded {len(kept)} lease(s) from {path}")
+
+    def _save_leases(self):
+        """Persist the lease table atomically (temp file + os.replace). Any
+        failure is caught and logged — persistence is best-effort and must NEVER
+        drop a DHCP response, so the catch is broad: a slow/full/read-only disk,
+        or a future non-JSON lease field, cannot take the floor's bootstrap
+        down."""
+        path = getattr(self, 'lease_file', 'data/dhcp_leases.json')
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, 'w') as f:
+                json.dump(self.leases, f)
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[DHCP] could not persist leases to {path} ({e})")
+
+    def _prune_expired(self):
+        """Drop leases past retention (clock-jump-guarded via _is_expired) so
+        their IPs return to the pool. Called ONLY when the pool is exhausted, so
+        a live machine's IP is never reclaimed on a floor with addresses to
+        spare. Returns the freed MAC list."""
+        now = time.time()
+        gone = [m for m, l in self.leases.items() if self._is_expired(l, now)]
+        for m in gone:
+            del self.leases[m]
+        return gone
+
+    def _scan_free_ip(self):
+        """First pool IP not currently held by any lease (None if exhausted)."""
+        base = self.config['network']['base']
+        held = {l['ip'] for l in self.leases.values()
+                if isinstance(l, dict) and 'ip' in l}
+        for i in range(self.config['start_ip'], self.config['end_ip'] + 1):
+            ip = f"{base}.{i}"
+            if ip not in held:
+                return ip
+        return None
+
     def find_available_ip(self, mac):
-        """Find available IP address"""
-        # Check if MAC already has a lease
-        if mac in self.leases:
-            return self.leases[mac]['ip']
-        
-        # Check reservations
+        """Find an IP for a MAC.
+
+        Order: a RESERVATION wins over everything (an operator re-pinning a MAC
+        must override a stale persisted lease); else the MAC keeps its own
+        persisted lease (stability across restarts); else a free pool IP.
+        Expired leases are reclaimed ONLY when the pool is genuinely exhausted —
+        never eagerly — so a clock that makes a live lease look old can't cost
+        that machine its in-use address on a floor with room to spare."""
         for reservation in self.config.get('reservations', []):
             if reservation['mac'].lower() == mac.lower():
                 return reservation['ip']
-        
-        # Find available IP in range
-        network = self.config['network']
-        base = network['base']
-        
-        for i in range(self.config['start_ip'], self.config['end_ip'] + 1):
-            ip = f"{base}.{i}"
-            
-            # Check if IP is already leased
-            ip_used = False
-            for lease in self.leases.values():
-                if lease['ip'] == ip:
-                    ip_used = True
-                    break
-            
-            if not ip_used:
-                return ip
-        
-        return None
+        if mac in self.leases:
+            return self.leases[mac]['ip']
+        ip = self._scan_free_ip()
+        if ip:
+            return ip
+        # Pool full -> reclaim expired (clock-guarded) and try once more.
+        self._prune_expired()
+        return self._scan_free_ip()
     
     def save_config(self, config=None):
         """Save configuration"""
@@ -919,6 +1139,10 @@ class EnhancedDHCPServer:
                 response = self.handle_dhcp_request(packet)
                 if response:
                     self.send_dhcp_response(response, addr)
+            elif msg_type == 4:  # DHCP DECLINE — offered IP found in use
+                self._handle_decline(packet)
+            elif msg_type == 7:  # DHCP RELEASE — client giving up its lease
+                self._handle_release(packet)
                 
         except Exception as e:
             print(f"[DHCP] Error handling packet: {e}")
