@@ -9,11 +9,12 @@
 
 ## Why a dumb hub, not a router
 
-The CabiNet host hands every machine its IP address **and** its G2S host URL
-(DHCP option 43 — that's how an IGT AVP finds the host with zero machine-side
-config). A router's own DHCP server would race ours and machines would join the
-wrong network. An unmanaged switch/hub has no opinions — plug things in and the
-host runs the whole segment:
+The CabiNet host hands every machine its IP address and network settings over
+DHCP. (Handing the machine its G2S **host URL** over DHCP too — a true zero-tap
+join — is a work in progress; for now you set the host URL once per machine, see
+`AVP_SETUP.md`.) A router's own DHCP server would race ours and machines would
+join the wrong network. An unmanaged switch/hub has no opinions — plug things in
+and the host runs the whole segment:
 
 ```
    slot machine ─┐

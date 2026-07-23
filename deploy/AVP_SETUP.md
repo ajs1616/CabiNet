@@ -1,28 +1,45 @@
 # IGT AVP machine setup — step by step
 
 Everything the machine side needs, with photos from a real AVP (Family 14).
-The network join is zero-config (the host hands the machine its URL over
-DHCP) — these steps turn on the *features*: G2S, money permissions, and the
-on-glass UI.
+DHCP gives the machine its IP and network settings automatically. Pointing it
+at the CabiNet host — the G2S **host URL** — is a **one-time manual entry per
+machine** right now (step 1, a few taps). **Automatic host delivery over DHCP
+is a work in progress** (see the note at the end). The rest of these steps turn
+on the *features*: money permissions and the on-glass UI.
 
 **You need your eKey inserted to change the protocol settings, and the
 credit meter must be at zero** — the machine refuses protocol changes while
 credits are on it (cash out first).
 
-## 1. Enable G2S
+## 1. Enable G2S and point it at the host
 
 Operator menu: **Setup > Communication > Protocol**.
 
 ![Protocol Setup list](img/avp-protocol-list.jpg)
 
 Tap **Advanced** next to **G2STransportG2S 6** (the name may be numbered
-differently on your cabinet) and set **Protocol enabled = YES**:
+differently on your cabinet). On this screen set, **in this order**:
+
+1. **Override DHCP Configured Host = YES** — this unlocks the host URL fields
+   so you can type them.
+2. The **three G2S host URI segments** — this is what actually points the
+   machine at CabiNet:
+
+   | Segment | Value |
+   |---|---|
+   | 1 — protocol | `http://` |
+   | 2 — G2S host address | your hub's IP (**`192.168.50.2`** on a standard CabiNet slot VLAN) |
+   | 3 — path (port + endpoint) | `:8081/G2S` |
+
+3. **Protocol enabled = YES**
 
 ![G2S Transport Advanced Options](img/avp-g2s-transport-advanced-redacted.jpg)
 
-The other fields on this screen lock while the protocol is enabled (the red
-banner) — to change them, disable the protocol first, change, re-enable.
-The defaults are fine.
+The URI fields **lock while the protocol is enabled** (the red banner), so set
+the host **before** you flip Protocol enabled — or if it's already on, disable
+it, edit, re-enable. The factory default host is `127.0.0.1` (the "unset"
+placeholder); the machine sits dark and dials itself until you replace it with
+the hub address above. Everything else on this screen can stay default.
 
 ## 2. Protocol permissions
 
@@ -78,9 +95,18 @@ That's the one window CabiNet uses — leave the other five alone.
 
 ## Done
 
-Exit the operator menu, **remove the eKey, and close the logic door**. The
-machine finds the host and joins on its own either way — watch its tile go
+Exit the operator menu, **remove the eKey, and close the logic door**. With the
+host URL set in step 1, the machine connects and joins — watch its tile go
 **Connecting…** then **LIVE** on the floor view — but it stays in **tilt**
 until the key is out and the door is shut, so it'll look like nothing's
 working even though it already joined. If the endpoint stays dark after you
 changed comm settings, re-enable G2S in the debug menu (see `DEPLOY.md`).
+
+## Automatic host setup (DHCP) — work in progress
+
+The goal is plug-and-play: the machine gets its host URL from DHCP with **zero**
+taps. DHCP already hands out the IP and network settings that way — but the
+host-URL half isn't landing reliably on Family 14 AVP firmware yet (it's under
+active development), so **set the host manually per step 1 for now**. It's a
+one-time, per-machine step. Progress is tracked in the repo issues; when it's
+solid, step 1 collapses to "just enable G2S."
