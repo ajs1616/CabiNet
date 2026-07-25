@@ -35,12 +35,19 @@ Covers:
     ack-rejection wording; 'was not accepted' is never hardcoded.
   * GR-27 — the setKeepAliveAck line no longer promises an EGM-originated
     pulse.
+  * GR-31/GPE201 (D10) — the event-driven denom freshness hook
+    (_game_play_event_refresh) is comms-gated: a GPE201 while OFFLINE
+    enqueues nothing; back onLine it draws getGamePlayStatus + the scoped
+    getGameDenoms, and a non-201 gamePlay event never re-reads denoms.
+    (Self-contained twin of avp_replay Step 100 — the replay needs the
+    private wire captures, this file is the public-repo net.)
 
 Run from G2S/:
     python3 tools/test_link_demotion.py
 Exits 0 if all checks pass. No network beyond 127.0.0.1; no host process.
 """
 
+import html
 import logging
 import socket
 import sys
@@ -116,10 +123,16 @@ def comms_inner(child_xml, cid, stype="G2S_request", sid=None):
 
 
 class AckingEgm(BaseHTTPRequestHandler):
-    """Minimal fake EGM endpoint: clean message-level g2sAck to any POST."""
+    """Minimal fake EGM endpoint: clean message-level g2sAck to any POST.
+    Records every received body (class attr, arrival order) so slices can
+    assert WHICH commands the host sent — the GR-31/GPE201 checks grep it."""
+
+    seen = []  # raw decoded POST bodies, in arrival order
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        body_in = self.rfile.read(
+            int(self.headers.get("Content-Length", 0) or 0))
+        AckingEgm.seen.append(body_in.decode("utf-8", "replace"))
         body = (f'<g2s:g2sMessage xmlns:g2s="{gh.SCHEMA_NS}">'
                 f'<g2s:g2sAck g2s:egmId="{EGM_ID}"/></g2s:g2sMessage>')
         data = body.encode()
@@ -217,6 +230,28 @@ def main():
     check("offlineSince surfaced", bool(snap["offlineSince"]))
     check("offlineSuppressed surfaced", snap["offlineSuppressed"] == 2)
 
+    print("— GR-31/GPE201 (D10): the freshness hook is comms-gated — "
+          "offline enqueues NOTHING")
+    # Seed a known gamePlay device (the hook keys on store membership). A
+    # LIVE GPE201 for it while the link is DOWN must enqueue no reads: the
+    # rejoin's own sweep refreshes state, and wire jobs must never pile up
+    # against a dead EGM (dormancy). A regressed hook would either leave a
+    # job queued (qsize) or drain it against the dead endpoint and bump
+    # the offline-suppressed counter — both sides are pinned.
+    assoc.game_play["77"] = {"themeId": "IGT_testTheme"}
+    q_before = assoc.send_queue.qsize()
+    sup_before = assoc.offline_suppressed
+    engine._game_play_event_refresh(assoc, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "77",
+        "eventCode": "G2S_GPE201"})
+    time.sleep(0.3)
+    check("offline GPE201 enqueued no reads (queue + suppressed counter "
+          "both unchanged)",
+          assoc.send_queue.qsize() == q_before
+          and assoc.offline_suppressed == sup_before,
+          f"qsize {assoc.send_queue.qsize()} suppressed "
+          f"{assoc.offline_suppressed}")
+
     print("— GR-01/GR-14/GR-15: a commsOnLine while OFFLINE still joins")
     assoc.meter_subs = {"G2S_onPeriodic": {"active": True}}  # re-seed stale
     epoch_before = assoc.epoch
@@ -274,6 +309,122 @@ def main():
           cap.count("LINK RESTORED — keepAlive probe answered",
                     logging.INFO) == 1)
     check("offline bookkeeping cleared", assoc.offline_since == 0)
+
+    print("— GR-31/GPE201 (D10): back onLine the hook re-reads — status + "
+          "SCOPED getGameDenoms; non-201 events never re-read denoms")
+    # Same seeded dev 77 as the offline slice. Extra traffic (keepAlive
+    # pings, the re-armed setMeterSub) may interleave — the checks grep
+    # the recorded bodies rather than pinning exact counts.
+    seen_mark = len(AckingEgm.seen)
+    engine._game_play_event_refresh(assoc, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "77",
+        "eventCode": "G2S_GPE201"})
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if any("getGameDenoms" in b for b in AckingEgm.seen[seen_mark:]):
+            break
+        time.sleep(0.05)
+    time.sleep(0.2)  # let the read pair finish draining
+    # the host-originated wrap html-escapes the inner g2sMessage (quotes
+    # included) — unescape before substring-matching attributes
+    bodies = [html.unescape(b) for b in AckingEgm.seen[seen_mark:]]
+    i_status = next((i for i, b in enumerate(bodies)
+                     if "getGamePlayStatus" in b), None)
+    i_denoms = next((i for i, b in enumerate(bodies)
+                     if "getGameDenoms" in b), None)
+    check("GPE201 for a known device drew the SCOPED getGameDenoms "
+          "re-read (dev 77)",
+          i_denoms is not None
+          and 'g2s:deviceId="77"' in bodies[i_denoms],
+          f"got {len(bodies)} POST(s), no dev-77 getGameDenoms")
+    check("GR-31 getGamePlayStatus rode AHEAD of the denom re-read "
+          "(hook enqueue order)",
+          i_status is not None and i_denoms is not None
+          and i_status < i_denoms,
+          f"status@{i_status} denoms@{i_denoms}")
+    # A non-201 gamePlay event (GPE103 game-start) re-reads STATUS only —
+    # the denom re-read is GPE201-conditional, not a blanket ride-along.
+    seen_mark = len(AckingEgm.seen)
+    engine._game_play_event_refresh(assoc, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "77",
+        "eventCode": "G2S_GPE103"})
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if any("getGamePlayStatus" in b
+               for b in AckingEgm.seen[seen_mark:]):
+            break
+        time.sleep(0.05)
+    time.sleep(0.3)  # a wrongly-enqueued denom read would drain right behind
+    bodies = AckingEgm.seen[seen_mark:]
+    check("non-201 gamePlay event re-read status WITHOUT touching denoms",
+          any("getGamePlayStatus" in b for b in bodies)
+          and not any("getGameDenoms" in b for b in bodies),
+          f"got {len(bodies)} POST(s)")
+
+    print("— linked-leg census nudge: a G2S denom change (GPE201 / the "
+          "accept fold) queues ONE read_machine_info to the LINKED SAS "
+          "satellite — SAS is the denom authority on a linked cabinet")
+    # Deterministic link state: whatever the dev hub.db seeded, this slice
+    # owns the in-memory map (the sas_links idiom — no db write).
+    engine.sas_links.clear()
+    engine.__dict__.setdefault("_linked_census_asked", {}).clear()
+    check("unlinked cabinet: the GPE201s above queued nothing SAS-side",
+          not engine.sas_commands.get("smib-lk"),
+          dict(engine.sas_commands))
+    engine.sas_links[EGM_ID] = "smib-lk/1"
+    with engine.sas_lock:
+        engine.sas_machines["smib-lk/1"] = {"smibId": "smib-lk",
+                                            "receivedAt": time.time()}
+    engine._game_play_event_refresh(assoc, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "77",
+        "eventCode": "G2S_GPE201"})
+    q = list(engine.sas_commands.get("smib-lk") or [])
+    check("GPE201 on a linked cabinet queued EXACTLY ONE read_machine_info "
+          "for the SAS leg's satellite",
+          len(q) == 1 and q[0].get("type") == "read_machine_info", q)
+    engine._game_play_event_refresh(assoc, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "77",
+        "eventCode": "G2S_GPE201"})
+    q = list(engine.sas_commands.get("smib-lk") or [])
+    check("a second GPE201 inside LINKED_CENSUS_DEBOUNCE_SEC does NOT "
+          "double-fire", len(q) == 1, q)
+    # the ACCEPT fold path: a sessionId-paired gameDenomList answering a
+    # pending setActiveDenoms must nudge the leg too (debounce cleared so
+    # the wiring — not the shared debounce — is what's under test). The
+    # GR-28 persist is stubbed: this is a wiring pin, and the flusher
+    # would write the REAL dev config inventory from a test.
+    with assoc.lock:
+        assoc.game_play["77"]["denomChange"] = {
+            "denoms": ["1000"], "sessionId": "888", "sentAt": now_iso(),
+            "sentTs": time.time(), "result": "sent"}
+    engine._linked_census_asked.clear()
+    _persist_real = engine._schedule_game_play_persist
+    engine._schedule_game_play_persist = lambda a: None
+    try:
+        engine.handle_g2s_message(
+            f'<g2s:g2sMessage xmlns:g2s="{gh.SCHEMA_NS}">\n'
+            f' <g2s:g2sBody g2s:egmId="{EGM_ID}" '
+            f'g2s:dateTimeSent="{now_iso()}">\n'
+            f'  <g2s:gamePlay g2s:deviceId="77" g2s:commandId="600" '
+            f'g2s:sessionType="G2S_response" g2s:sessionId="888" '
+            f'g2s:timeToLive="30000" g2s:dateTime="{now_iso()}">\n'
+            f'   <g2s:gameDenomList><g2s:gameDenom g2s:denomId="1000" '
+            f'g2s:active="true"/></g2s:gameDenomList>\n'
+            f"  </g2s:gamePlay>\n"
+            f" </g2s:g2sBody>\n"
+            f"</g2s:g2sMessage>", EGM_ID)
+    finally:
+        engine._schedule_game_play_persist = _persist_real
+    with assoc.lock:
+        dc_res = assoc.game_play["77"]["denomChange"]["result"]
+    q = list(engine.sas_commands.get("smib-lk") or [])
+    check("the fold advanced the verdict to accepted",
+          dc_res == "accepted", dc_res)
+    check("the ACCEPT fold nudged the linked leg too (a second "
+          "read_machine_info queued)",
+          len(q) == 2 and q[1].get("type") == "read_machine_info", q)
+    engine.sas_links.pop(EGM_ID, None)     # leave the map as found
+
     time.sleep(0.3)  # let the re-armed setMeterSub drain against the fake EGM
     egm_srv.shutdown()
 

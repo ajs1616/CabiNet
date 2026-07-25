@@ -331,7 +331,12 @@ function nightSave(r){try{localStorage.setItem(nightKey(),JSON.stringify(r));}
 /* ---- polling ------------------------------------------------------------ */
 async function tick(){
   try{
-    const r=await fetch("/api/status",{cache:"no-store"});
+    /* D13: the board is a pure spectator — it never reads the gamePlay/
+       meters/config whales, so it polls the SLIM view. cache:"no-cache"
+       (revalidate, NOT no-store) so the browser echoes the hub's ETag
+       and gets a 304 on a quiet floor — the body stays off the wire; an
+       old hub ignores ?slim=1 and serves full. */
+    const r=await fetch("/api/status?slim=1",{cache:"no-cache"});
     S.status=await r.json();
     $("hdr-live").classList.remove("err");
     $("hdr-t").textContent="live · "+new Date().toLocaleTimeString([],
@@ -642,6 +647,27 @@ function renderTourn(t){
   }
 }
 
+/* A seat whose FROZEN scoring denom matches the machine's OWN wire report
+   (SAS 0x1F verified code) is NOT really "assumed" — the machine confirms
+   it, so the fair-race warning would be crying wolf (the same de-nag as the
+   home card: silent when the wire agrees with the value in use). The frozen
+   denom comes from the SAS leg, but a LINKED cabinet is seated under its
+   G2S egm id (the BB2), so resolve the leg two ways: a pure-SAS seat is
+   keyed "sas:<leg>"; a linked-G2S seat carries sasLink on its egm entry.
+   Cross-check the live sas section (rides the slim poll) against the seat's
+   frozen lockDenomCents. Unknown/offline/absent wire -> assumed (honest). */
+function seatDenomWireOk(s){
+  if(!s||!s.lockDenomAssumed) return true;   // not flagged anyway
+  const st=S.status||{}, sasAll=st.sas||{};
+  const key=String(s.key||"");
+  let leg=null;
+  if(key.startsWith("sas:")) leg=key.slice(4);      // pure-SAS seat
+  else{ const g=st[key]; leg=g&&g.sasLink; }        // linked cabinet's leg
+  const m=leg?sasAll[leg]:null;
+  const ds=m&&m.denomSuggest;
+  const inUse=Number(s.lockDenomCents)>=1?Number(s.lockDenomCents):1;
+  return !!(ds&&(ds.state==="match"||ds.state==="confirm")&&ds.cents===inUse);
+}
 function seatCards(t){
   const cc=t.runCreditsCents||t.creditsCents; // frozen run stake first
   const cards=seatList(t).map(s=>{
@@ -651,8 +677,14 @@ function seatCards(t){
       :["pend","funding…"];
     const al=(s.alias&&s.alias!==s.name)
       ?`<div class="s-al">a.k.a. ${esc(s.alias)}</div>`:"";
+    /* D9 honesty badge: the seat's scoring denom was FROZEN at arm from
+       the assumed 1¢ fallback (lockDenomAssumed rides tournament_snapshot)
+       — a non-penny cabinet would race at the wrong scale. Show it while
+       the operator can still fix it in the machine's ✎ Options. */
+    const da=(s.lockDenomAssumed&&!seatDenomWireOk(s))
+      ?'<div class="s-m" style="color:var(--gold)">denom assumed 1¢ — set it for a fair race</div>':"";
     return `<div class="seat"><div class="s-nm">${esc(s.name||"?")}</div>${al}
-      <div class="s-m">${esc(s.machine||"")}</div>
+      <div class="s-m">${esc(s.machine||"")}</div>${da}
       <div class="s-f ${f[0]}">${f[1]}</div></div>`;
   });
   // phase-honest empty state: the hub publishes the seat map WITH the
@@ -694,8 +726,11 @@ function renderRace(t){
     row.querySelector(".r-rank").textContent="#"+(i+1);
     const sub=(s.alias&&s.alias!==s.name)
       ?` <span class="r-al">${esc(s.alias)}</span>`:"";
+    /* D9: the assumed-denom honesty badge rides the race row too — the
+       score column is scaled by the frozen (possibly assumed-1¢) denom. */
+    const da=(s.lockDenomAssumed&&!seatDenomWireOk(s))?" · assumed 1¢":"";
     row.querySelector(".r-nm").innerHTML=
-      `${esc(s.name||"?")}${sub} <span class="r-mach">· ${esc(s.machine||"")}</span>`;
+      `${esc(s.name||"?")}${sub} <span class="r-mach">· ${esc(s.machine||"")}${esc(da)}</span>`;
     row.querySelector(".r-bar").style.width=
       Math.max(2,100*(s.scoreMc||0)/max)+"%";
     row.querySelector(".r-sc").textContent=money(s.scoreMc||0);

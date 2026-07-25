@@ -165,6 +165,13 @@
   .btn.off{opacity:.45;pointer-events:none}
   .btn.slim{min-height:44px;min-width:0;padding:7px 12px}
   .btnrow{display:flex;flex-wrap:wrap;gap:8px}
+  .updbar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+    z-index:9000;background:var(--card2);border:1px solid var(--gold-deep);
+    border-radius:10px;padding:9px 14px;color:var(--ivory);
+    font:600 13px var(--sans);box-shadow:0 6px 22px rgba(0,0,0,.5)}
+  .updbar button{margin:0 3px;background:var(--gold-deep);color:#1a1206;
+    border:none;border-radius:6px;padding:4px 10px;font:700 13px var(--sans);
+    cursor:pointer}
   .fchip{appearance:none;border:1px solid var(--line);border-radius:18px;
     background:var(--card2);color:var(--dim);cursor:pointer;
     font:600 12px var(--sans);padding:8px 14px;min-height:40px}
@@ -288,8 +295,19 @@
   .game .gh .pt{font:600 12.5px var(--mono);color:var(--ivory);overflow:hidden;
     text-overflow:ellipsis}
   .game .gh .dv{font:11px var(--mono);color:var(--gold);white-space:nowrap}
-  .game .gd{font:10.5px var(--mono);color:var(--faint);overflow:hidden;
-    text-overflow:ellipsis;white-space:nowrap}
+  .game .gd{font:10.5px var(--mono);color:var(--faint);display:flex;
+    flex-wrap:wrap;gap:5px;align-items:center}
+  .game .gd .gdl{color:var(--dim);font:600 10px var(--sans);
+    letter-spacing:.04em;text-transform:uppercase;margin-right:2px}
+  /* compact denom-toggle chip (many per card) — distinct from the tall
+     40px filter .fchip. Lit = the denom is/will be active. */
+  .dchip{appearance:none;border:1px solid var(--line);border-radius:12px;
+    background:var(--card2);color:var(--faint);cursor:pointer;
+    font:600 10.5px var(--mono);padding:3px 8px;min-height:26px}
+  .dchip.on{color:var(--gold-hi);border-color:var(--gold-deep);
+    background:linear-gradient(180deg,#2e2211,#271c0e)}
+  .dchip.apply{color:var(--felt);border-color:#2a4d38}
+  .dchip.x{color:var(--dim)}
   .game .gb{display:flex;gap:6px;align-items:center;justify-content:space-between}
   .game .btn{min-width:0;flex:none}
 
@@ -448,7 +466,7 @@
      column; ~260px columns give 3-across on a TV, 1 on a phone. */
   .hgrid{column-width:260px;column-gap:10px}
   .hblk{border:1px solid var(--line2);border-radius:10px;padding:11px 12px;
-    background:var(--inset);break-inside:avoid;margin-bottom:10px}
+    background:var(--card2);break-inside:avoid;margin-bottom:10px}
   .ht{font:600 13px var(--sans);color:var(--ivory);letter-spacing:.01em;
     display:flex;align-items:center;gap:7px}
   .hblk .none{margin:2px 0 7px}
@@ -942,14 +960,26 @@ function bumpNames(egm, v){
     if(v) S.status.names[egm]=v; else delete S.status.names[egm];
   }
 }
-async function saveNickServer(egm, v, denomCents){
+async function saveNickServer(egm, v, denomCents, denomKey){
   try{
     const body={machineKey:egm, name:v};
-    if(denomCents!=null) body.denomCents=denomCents;   // SAS only (R2)
+    // The denom pref lives on the SAS key. Same key -> one POST as ever;
+    // a LINKED cabinet edits its leg's denom from the G2S card, so the
+    // denom rides a second POST against the leg (name field omitted — the
+    // handler is presence-checked, the leg's own name stays untouched).
+    const legDenom=(denomCents!=null&&denomKey&&denomKey!==egm);
+    if(denomCents!=null&&!legDenom) body.denomCents=denomCents;
     const r=await fetch("/api/names",{method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(body)});
-    return r.ok;
+    let ok=r.ok;
+    if(legDenom){
+      const r2=await fetch("/api/names",{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({machineKey:denomKey, denomCents:denomCents})});
+      ok=ok&&r2.ok;
+    }
+    return ok;
   }catch(e){return false;}
 }
 function identityName(s){
@@ -1007,12 +1037,24 @@ function toast(msg, ok){
 async function cmd(body, label){
   label=label||body.action;
   try{
+    /* stale-client fence (D7): every command echoes the uiStamp of the JS
+       actually RUNNING — uiStamp0, first-seen by uiStampCheck — never the
+       latest polled value (that is the NEW deploy's stamp; echoing it would
+       let a stale tab impersonate fresh JS). The hub 409s a mismatch and
+       this tab reloads itself into the new UI. Stampless callers (curl,
+       Test Panel, pre-first-poll) stay first-class hub-side. */
+    if(uiStamp0!==null) body=Object.assign({uiStamp:uiStamp0}, body);
     const r=await fetch("/api/command",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const text=await r.text();
     let j={}; try{j=JSON.parse(text);}catch(e){}
     if(j.ok===true){toast(label+" ✓", true); return {ok:true,data:j};}
     const err=String(j.error||text||("HTTP "+r.status));
+    if(r.status===409&&/stale UI/i.test(err)){
+      toast("This page is outdated — reloading for the new version", false);
+      setTimeout(function(){location.reload();},600);
+      return {ok:false,error:err};
+    }
     if(/unknown action/i.test(err)){
       toast(label+" — awaiting host update", false);
       return {ok:false,pending:true};
@@ -1114,11 +1156,23 @@ function tabBadges(){
    (uiStamp). When a webui deploy changes it, the DSI kiosk (?kiosk=1 —
    nobody ever presses F5 on that screen) reloads itself and picks up the
    new UI. Phones/laptops are left alone — they can pull-to-refresh. */
-let uiStamp0=null;
+let uiStamp0=null, updateBannerShown=false;
 function uiStampCheck(s){
   if(typeof s!=="number") return;
   if(uiStamp0===null){ uiStamp0=s; return; }
-  if(s!==uiStamp0 && QS.get("kiosk")==="1") location.reload();
+  if(s===uiStamp0) return;
+  // the kiosk (nobody presses F5 on the wall TV) reloads itself; a phone or
+  // laptop tab is NEVER force-reloaded mid-action — instead a one-tap banner
+  // makes the stale-tab state visible (the trap: a tab left open across a UI
+  // deploy silently runs old JS, so a new feature "isn't there").
+  if(QS.get("kiosk")==="1"){ location.reload(); return; }
+  if(updateBannerShown) return;
+  updateBannerShown=true;
+  const b=document.createElement("div");
+  b.className="updbar";
+  b.innerHTML='✨ CabiNet was updated — '
+    +'<button onclick="location.reload()">reload</button> for the new version';
+  document.body.appendChild(b);
 }
 let statusInFlight=false, statusSeq=0;
 async function tickStatus(){
@@ -1129,7 +1183,19 @@ async function tickStatus(){
   const ac=(typeof AbortController!=="undefined")?new AbortController():null;
   const to=ac?setTimeout(()=>ac.abort(), POLL_MS*5):null;
   try{
-    const r=await fetch("/api/status",{cache:"no-store", signal:ac?ac.signal:undefined});
+    /* D13: the 2s heartbeat polls the SLIM view (the hub drops the
+       meterSubs/configOptions/configDevices whales, filters meters to the
+       cabinet class and micro-summarizes gamePlay — tiles stay fully
+       live: credits, counts, tilts, machineInfo, denomSuggest). The FULL
+       view is fetched on demand: while the per-machine games page is open
+       (GM.egm), renderGames + the D15 denomChange chips need the real
+       gamePlay shape live. cache:"no-cache" (revalidate, NOT no-store)
+       so the browser echoes the hub's ETag and gets a 304 on an
+       unchanged floor — the multi-MB body stays off the wire, while a
+       real data change still returns a fresh 200. An old hub ignores
+       ?slim=1 and serves full. */
+    const r=await fetch(GM.egm?"/api/status":"/api/status?slim=1",
+      {cache:"no-cache", signal:ac?ac.signal:undefined});
     const j=await r.json();
     if(mySeq!==statusSeq) return; // a newer poll superseded this one — drop the stale reply
     S.status=j;
@@ -1152,13 +1218,35 @@ async function tickStatus(){
 }
 function renderActive(){
   if(!S.status) return;
-  if(S.tab==="floor"){ if(GM.egm) renderGames(); else renderFloor(); }
+  if(S.tab==="floor") { if(GM.egm) renderGames(); else renderFloor(); }
   else if(S.tab==="wallet") renderWallet();
   else if(S.tab==="players") renderPlayersPage();
   else if(S.tab==="tickets") renderTickets();
   else if(S.tab==="activity") renderActivity();
   else if(S.tab==="settings") renderSettings();
   else if(S.tab==="debug") renderDebug();
+  // SAS games modal repaints per poll, but the report carries the CACHED
+  // census — the content actually refreshes on session start / LP09
+  // verify / 0x3C-0x8C machine events / a read_machine_info re-read (the
+  // modal's ↻ button; censusAt/readAt date the data). Opened from the
+  // floor tile — a SEPARATE statement, never wedged into the tab else-if
+  // chain (that froze other tabs' repaints while it was open). Skipped
+  // while a Disable is armed so the two-step confirm holds.
+  if(S.modal && S.modal.kind==="sasgames" && !ARM)
+    renderSasGamesModal(S.modal.id);
+  // ✎ nick modal: ONLY the denom-suggest row tracks the hub live — a 0x1F
+  // suggest landing/flipping while the modal is open used to stay invisible
+  // until close/reopen (the modal is an open-time snapshot). Never repaint
+  // the whole modal: the name/denom inputs are mid-edit and a full setHTML
+  // would clobber them (why "nick" is absent from the fetch re-render set).
+  if(S.modal && S.modal.kind==="nick" && !ARM){
+    const dsEl=$("m-denom-suggest");
+    if(dsEl){
+      const dk=nickDenomKey(S.modal.id);
+      setHTML(dsEl, denomSuggestRow(S.modal.id,
+        dk?(((S.status||{}).sas||{})[dk]):null));
+    }
+  }
 }
 
 /* aux fetches per tab — same 2s heartbeat, throttled per endpoint */
@@ -1462,6 +1550,11 @@ function sasTile(key,m){
         <button class="btn slim" onclick="nickOpen('${jsq(key)}')">
           <span class="bl">✎ Name &amp; denomination</span>
           <span class="ba">what the tile shows</span></button>
+        ${m.machineInfo?`
+        <button class="btn slim ${online?"":"off"}" onclick="sasGamesOpen('${jsq(key)}')">
+          <span class="bl">🎲 Games</span>
+          <span class="ba">${online?"enable · disable games on this machine"
+                                   :"machine offline"}</span></button>`:""}
         <button class="btn slim danger" onclick="sasForgetSend('${jsq(key)}',this)">
           <span class="bl">🗑️ Remove</span>
           <span class="ba">${m.stale?"gone — clear this stale tile"
@@ -1491,6 +1584,7 @@ function sasTile(key,m){
         ${chip(`events ${m.events??0}`, m.events?"warn":"")}
         ${t.total?chip(`tickets ${t.total}`,"ok"):""}
         ${sasAftChip(m)}
+        ${denomMismatchChip(m,key)}
         ${ev?chip(`${ev.code} ${ev.label||""}`.trim(),"warn"):""}
         ${sasCmdChip(lb)}
       </div>
@@ -1511,6 +1605,43 @@ function sasTile(key,m){
       ${opts}
     </div>
   </article>`;
+}
+/* Amber flag when the machine's OWN 0x1F denom report disagrees with the
+   operator-set denomination (denomSuggest.state === "mismatch"). Money is
+   being mis-scaled one way or the other, so that one earns tile real
+   estate. A PERSISTENT "confirm" (denom unset, the machine has reported
+   its denom, nobody confirmed for 10+ min) gets a quieter neutral nudge —
+   the only confirm affordance is the ✎ modal's suggest row, which nothing
+   else points at, so the money scale kept running on an assumption AJ was
+   never prompted to bless. match/unverified stay quiet here and live in
+   the ✎ Name & denomination modal. */
+const DSCONFIRM={};        // machine key -> first-seen ms of a pending confirm
+const DSCONFIRM_MS=600000; // 10 min of silence before the nudge shows
+function denomMismatchChip(m, key){
+  const ds=m&&m.denomSuggest;
+  if(key&&(!ds||ds.state!=="confirm")) delete DSCONFIRM[key];
+  /* stale gate: a dark satellite's entry is frozen at its last report, so a
+     state the operator has since FIXED would wave the flag forever —
+     the tile-wide stale lamp already owns "this data is old". (The confirm
+     latch keeps ticking through stale; only the render is held.) */
+  if(!ds||m.stale) return "";
+  if(ds.state==="mismatch"&&ds.cents)
+    return chip("denom mismatch · machine says "+fmtDenom(ds.cents*1000),"warn");
+  // confirm = the machine reported a verified denom, the operator hasn't set
+  // one, so credits value at the assumed 1¢. Only nudge when the machine's
+  // report DISAGREES with that 1¢ (a non-penny box reading low). When it
+  // AGREES (0x01 = 1¢, the penny fleet), the machine has already confirmed
+  // the value in use — there is nothing to confirm, so no chip.
+  const inUse=(Number(m.denomCents)>=1)?Number(m.denomCents):1;
+  if(ds.state==="confirm"&&ds.cents&&ds.cents!==inUse&&key){
+    if(!DSCONFIRM[key]) DSCONFIRM[key]=Date.now();
+    // hub-side suggest `since` (epoch s — survives page loads) beats the
+    // local first-seen latch; feature-detected, absent on today's hub.
+    const at=(Number(ds.since)>0)?Number(ds.since)*1000:DSCONFIRM[key];
+    if(Date.now()-at>DSCONFIRM_MS)
+      return chip("machine reports "+fmtDenom(ds.cents*1000)+" · set the denom","warn");
+  }
+  return "";
 }
 /* SAS tile chips: AFT registration state + the last hub-command verdict.
    m.aft = {registered, statusCode, asset, posId, keyFp} from /api/status. */
@@ -1744,8 +1875,26 @@ function floorTile(s){
          confident wrong dollar figure. Tap the name ▸ Denomination to clear it.
          (leg.denomAssumed is the backend's own verdict; recompute locally too
          so the note still shows against an older hub.) */
-      if((denomAssumed||leg.denomAssumed) && n>0)
-        extra.push("denom unset · 1¢/credit assumed");
+      if((denomAssumed||leg.denomAssumed) && n>0){
+        // display-only; the math above values credits at the assumed 1¢
+        // (suggest never feeds money). Only speak up when that 1¢ MIGHT be
+        // wrong. A machine whose own 0x1F report names a denom that AGREES
+        // with the 1¢ in use (the whole penny fleet — code 0x01 = 1¢) has
+        // nothing to confirm: the machine already confirms it, so stay
+        // silent instead of nagging to "confirm" a value it just reported.
+        // A report that DISAGREES (a non-penny box valued low) earns a
+        // flag; a machine that reported no denom at all keeps the honest
+        // "assumed" note.
+        const dsug=leg.denomSuggest;
+        if(dsug&&dsug.state==="confirm"&&dsug.cents){
+          if(dsug.cents!==dn)
+            extra.push("machine reports "+fmtDenom(dsug.cents*1000)+
+                       "/credit — credits may read low, set it in ✎");
+          // else: the machine's report matches the 1¢ in use → no note
+        }else{
+          extra.push("denom unset · 1¢/credit assumed");
+        }
+      }
     }
   }
 
@@ -1774,6 +1923,11 @@ function floorTile(s){
         &&cab.egmState!=="G2S_egmDisabled"
         &&cab.egmState!=="G2S_hostDisabled")
       st.push(chip(egmStateLabel(cab.egmState),""));
+    /* the SAS leg's own 0x1F denom report vs the operator setting —
+       mismatch flags loud (money is mis-scaled one way or the other), a
+       long-unconfirmed suggest nudges quietly; details live in the ✎
+       modal. Keyed by the LEG (the sas entry that carries denomSuggest). */
+    const dmc=denomMismatchChip(leg,linked); if(dmc) st.push(dmc);
   }else{
     st.push(chip(egmStateLabel(cab.egmState),
       cab.egmState==="G2S_enabled"?"ok":""));
@@ -1973,11 +2127,15 @@ function floorTile(s){
           <span class="bl">🔑 Reset handpay</span>
           <span class="ba">fallback — the banner is the normal path</span></button>
         <button class="btn slim" onclick="nickOpen('${jsq(egm)}')">
-          <span class="bl">✎ Name</span>
-          <span class="ba">what the tile shows</span></button>
+          <span class="bl">✎ Name${leg?" &amp; denomination":""}</span>
+          <span class="ba">${leg?"tile name · SAS-leg denom":"what the tile shows"}</span></button>
         <button class="btn slim danger" onclick="g2sForgetSend('${jsq(egm)}',this)">
           <span class="bl">🗑️ Remove</span>
           <span class="ba">drop this tile (kept if the machine rejoins)</span></button>
+        ${(online&&s.mediaCapable)?`<button class="btn slim" data-egm="${esc(egm)}" data-vis="${s.glassVisible?"1":"0"}"
+          onclick="glassToggle(this)">
+          <span class="bl">🖥️ ${s.glassVisible?"Hide glass":"Show glass"}</span>
+          <span class="ba">media display test · same show/hide as the service button</span></button>`:""}
       </div>${linkOpts}${machineReaderOpts(egm)}`:"";
 
   /* CONNECTING = a join IN PROGRESS: the hub flags s.joining when a machine
@@ -2033,6 +2191,19 @@ function floorTile(s){
       ${opts}
     </div>
   </article>`;
+}
+/* Glass toggle (media display test) — the SAME show/hide mechanism the
+   physical service button and card-IN use, so it rules out service-button
+   (CBE301) compatibility: hidden -> glassShow (a bare showMediaDisplay that
+   reveals a resident glass, or a full push if nothing's resident yet, exactly
+   like the service button's recovery), shown -> glassHide. Points off the
+   hub's glassVisible belief; the 2s poll relabels the button when it flips. */
+async function glassToggle(btn){
+  const egm=btn.dataset.egm, vis=btn.dataset.vis==="1";
+  const action=vis?"glassHide":"glassShow";
+  btn.disabled=true;
+  await cmd({action, egmId:egm}, vis?"Hide glass":"Show glass");
+  btn.disabled=false;
 }
 async function hpClear(btn){
   // the enthusiast headline move — safe path, no confirm (the EGM enforces
@@ -2128,10 +2299,22 @@ function nickOpen(egm){
   renderNickModal(egm);
   $("modal").classList.add("on");
 }
+/* The denom section edits the SAS entry — which for a LINKED cabinet is the
+   claimed leg (no tile of its own; the G2S card is the only door in). Resolve
+   egm -> the entry that actually carries denomCents, and remember WHOSE key
+   the denom write must target (nickDenomKey — the name still saves against
+   egm itself). Unlinked SAS keys resolve to themselves; pure-G2S to null. */
+function nickDenomKey(egm){
+  const sasAll=((S.status||{}).sas||{});
+  if(sasAll[egm]) return egm;
+  const leg=sasLinkFace(egm, snap(egm));
+  return (leg&&sasAll[leg])?leg:null;
+}
 function renderNickModal(egm){
   $("m-title").textContent="Name this machine";
   const cur=getNick(egm);
-  const sm=((S.status||{}).sas||{})[egm];
+  const dk=nickDenomKey(egm);
+  const sm=dk?(((S.status||{}).sas||{})[dk]):null;
   setHTML($("m-body"),`
     <p class="none" style="margin:0 0 10px">${esc(egm)} — without a name it shows
       as “${esc(fallbackName(egm, snap(egm)))}”.</p>
@@ -2141,21 +2324,67 @@ function renderNickModal(egm){
     </div>
     ${sm?`<p class="none" style="margin:10px 0 6px">Denomination — cents per
       credit (1..10000). Sets the CREDITS value AND the tournament score scale.
-      ${sm.denomCents?"":"<b>Blank assumes 1¢/credit</b> — fine for a penny "+
-        "machine, but SET it for a $1 / nickel / quarter cabinet or its "+
-        "credits and race score read low."}</p>
+      Match the machine's accounting denom: a multi-denom setup accounts at
+      1¢; a single-denom setup accounts at its set denom.
+      ${sm.denomCents?"":"<b>Blank assumes 1¢/credit</b> — right for "+
+        "multi-denom, but a single-denom nickel / quarter / $1 setup reads "+
+        "low until set."}</p>
     <div class="mrowset">
       <input type="text" id="m-denom" inputmode="numeric" maxlength="5"
         value="${sm.denomCents?esc(String(sm.denomCents)):""}"
         placeholder="${sm.denomAssumed?"unset → 1¢/credit":"e.g. 25"}"
         aria-label="Denomination in cents">
-    </div>`:""}
+    </div><div id="m-denom-suggest">${denomSuggestRow(egm, sm)}</div>`:""}
     <div class="btnrow">
       <button class="btn slim gold" onclick="nickSave('${jsq(egm)}')">
         <span class="bl">Save name</span></button>
       <button class="btn slim" onclick="nickClear('${jsq(egm)}')">
         <span class="bl">Use default</span></button>
     </div>`);
+}
+// The machine's OWN denomination report (SAS 0x1F), held up against the
+// operator setting by the hub (denomSuggest: {code, cents, state}). A
+// suggestion row only — the operator's Save stays the single write path
+// (denomUse just fills the field and saves). Absent field (older hub or
+// older satellite) renders nothing.
+function denomSuggestRow(egm, sm){
+  const ds=sm&&sm.denomSuggest;
+  if(!ds||typeof ds!=="object") return "";
+  const codeTxt="0x1F code "+esc(String(ds.code));
+  if(ds.state==="match")
+    return `<p class="none" style="margin:6px 0 0">✓ Matches the machine's own
+      report (${codeTxt}).</p>`;
+  if(ds.state==="confirm"&&ds.cents){
+    const inUse=(Number(sm.denomCents)>=1)?Number(sm.denomCents):1;
+    if(ds.cents===inUse)
+      // the machine's report already matches the value credits run on —
+      // nothing to confirm, just say so (no "Use" nag).
+      return `<p class="none" style="margin:6px 0 0">✓ Running at the machine's
+        reported <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}).</p>`;
+    return `<p class="none" style="margin:6px 0 0">📖 The machine reports
+      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}) but credits are
+      valued at ${esc(fmtDenom(inUse*1000))} —
+      <button class="fchip on" onclick="denomUse('${jsq(egm)}',${+ds.cents})">Use
+      ${esc(fmtDenom(ds.cents*1000))}</button></p>`;
+  }
+  if(ds.state==="mismatch"&&ds.cents)
+    return `<p class="none" style="margin:6px 0 0;color:var(--gold);
+      font-style:normal">⚠ The machine reports
+      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}) but the
+      setting says ${esc(fmtDenom(Number(sm.denomCents)*1000))} — one of them
+      is wrong. <button class="fchip on"
+      onclick="denomUse('${jsq(egm)}',${+ds.cents})">Use
+      ${esc(fmtDenom(ds.cents*1000))}</button></p>`;
+  return `<p class="none" style="margin:6px 0 0">The machine reports denom
+    code ${esc(String(ds.code))} — no verified value for this code yet, so set
+    the denomination by hand. (A support bundle from this machine teaches the
+    hub the code.)</p>`;
+}
+function denomUse(egm, cents){
+  const dEl=$("m-denom");
+  if(!dEl||!(cents>=1&&cents<=10000)) return;
+  dEl.value=String(cents);
+  nickSave(egm);          // the one true save path — validation and all
 }
 function nickSave(egm){
   const v=(($("m-nick")||{}).value||"").trim();
@@ -2176,7 +2405,7 @@ function nickSave(egm){
   closeModal();
   toast(v?("Machine named “"+v+"”"):("Back to "+fallbackName(egm, snap(egm))), true);
   renderActive();
-  saveNickServer(egm, v, denom).then(ok=>{  // durable, cross-device (hub.db)
+  saveNickServer(egm, v, denom, nickDenomKey(egm)).then(ok=>{  // hub.db
     if(!ok) toast("Hub unreachable — NOT saved, it will revert", false);
     else tickStatus();                   // pull the server names back
   });
@@ -2542,14 +2771,21 @@ function keyOffCheck(j){
 const GM={egm:null, q:"", denom:null, showOff:false, open:{}};
 function openGames(egm){
   disarm();
+  // clear any in-progress denom edit — it belongs to a device on whatever
+  // machine was open before; carrying it here would apply one machine's
+  // selection to another's game card.
   GM.egm=egm; GM.q=""; GM.denom=null; GM.showOff=false; GM.open={};
+  GM.denomEdit=null;
   const q=$("gm-q"); if(q) q.value="";
   for(const el of document.querySelectorAll(".page"))
     el.classList.toggle("on", el.id==="pg-games");
   renderGames();
+  tickStatus();   // D13: the 2s poll rides slim — pull the FULL view now
+                  // (denoms/profiles) instead of waiting for the next tick
 }
 function closeGames(){
   GM.egm=null;
+  GM.denomEdit=null;
   goTab("floor");
 }
 function gmSearch(){GM.q=($("gm-q").value||"").trim().toLowerCase(); renderGames();}
@@ -2648,10 +2884,70 @@ function renderGames(){
              <span class="bl">Enable</span></button>`
         : `<button class="btn slim danger" ${da} data-en="0" onclick="gpState(this)">
              <span class="bl">Disable</span></button>`;
+      /* DENOMS — every supported denom is an always-visible toggle chip;
+         lit = active (a player can pick it). Tapping enters edit mode for
+         THIS device (GM.denomEdit, module-level so the 2s repaint keeps
+         it) and shows Apply / ✕. setActiveDenoms is a REPLACEMENT set
+         (§6.15) so Apply sends the whole lit selection. The pending/refused
+         verdict rides g.denomChange (hub-stamped, sessionId-paired). */
+      const dc=g.denomChange||{};
+      const pk=e+"/"+d;
+      const pend=denomPendFace(pk,dc);
+      if(dc.result!=="applied") delete DENDONE[pk];  // re-arm the ✓ flash
+      let dcChip="";
+      if(pend) dcChip=pendChip("denoms applying");  // optimistic window —
+        // also mutes a stale terminal verdict from an EARLIER change
+      else if(dc.result==="sent") dcChip=pendChip("denoms applying");
+      else if(dc.result==="accepted")   // §6.15: acceptance ≠ physical apply
+        dcChip=chip("denoms set · applies at idle","ok");
+      else if(dc.result==="applied"){
+        // terminal (GPE201-confirmed re-read): flash success briefly, then
+        // get out of the way — steady state needs no chip.
+        if(!DENDONE[pk]) DENDONE[pk]=Date.now();
+        if(Date.now()-DENDONE[pk]<8000) dcChip=chip("denoms applied ✓","ok");
+      }
+      else if(dc.result==="timeout") dcChip=chip("no denom reply","warn");
+      else if(dc.result==="error"&&dc.errorCode==="G2S_APX999")
+        /* structural, not actionable: a progressive-linked device refuses
+           every host denom set by design (bench-proven refusal taxonomy).
+           A red "refused" here reads as a fault — it's a property. */
+        dcChip=chip("progressive-linked · denoms locked");
+      else if(dc.result==="error"&&dc.errorCode==="G2S_GPX002")
+        /* the theme's machine-side config verification refuses host denom
+           sets (even a no-op replacement) — semi-permanent, same calm
+           treatment; the code stays visible for the bench notebook. */
+        dcChip=chip("theme locks denoms · G2S_GPX002");
+      else if(dc.result==="error")
+        dcChip=chip("denoms refused · "+(dc.errorCode||"error"),"bad");
+      else if(dc.result==="disagree") dcChip=chip("denoms differ","warn");
+      const editing=GM.denomEdit&&GM.denomEdit.dev===d;
+      const litSet=editing?new Set(GM.denomEdit.set)
+                  :pend?new Set(pend.set)   // the ASKED set until the hub answers
+                       :new Set(active.map(x=>String(x.denomId)));
+      const supported=gameDenoms(g);
+      const dchips=supported.map(x=>{
+        const id=String(x.denomId);
+        // read-only chips when the push is disabled (DENOM_PUSH_ENABLED):
+        // no onclick -> no edit -> no Apply -> no setActiveDenoms.
+        return DENOM_PUSH_ENABLED
+          ? `<button class="dchip ${litSet.has(id)?"on":""}"
+              onclick="gmDenomTap('${jsq(d)}','${jsq(id)}')"
+              title="tap to enable/disable this denomination">${esc(fmtDenom(id))}</button>`
+          : `<span class="dchip ${litSet.has(id)?"on":""}"
+              title="active denomination">${esc(fmtDenom(id))}</span>`;
+      }).join("");
+      const applyRow=editing
+        ? `<button class="dchip apply" onclick="gmDenomApply('${jsq(e)}','${jsq(d)}')">✔ Apply</button>
+           <button class="dchip x" onclick="gmDenomCancel()">✕ Cancel</button>`
+        : "";
+      const denomLine=supported.length
+        ? `<span class="gdl">Denoms${editing?" · tap, then Apply":
+             (active.length?"":" · none active")}</span>${dchips}${applyRow} ${dcChip}`
+        : `<span class="gdl">Denoms</span><span>—</span> ${dcChip}`;
       return `<div class="game">
         <div class="gh"><span class="pt">${esc(gameRtp(g))}</span>
           <span class="dv">${esc((g.paytableId||"").replace(/^[A-Z]{2,6}_/,""))} · dev ${esc(d)}</span></div>
-        <div class="gd">${denomTxt?esc(denomTxt):"denoms —"}${active.length?"":" · none active"}</div>
+        <div class="gd">${denomLine}</div>
         <div class="gb">${state}${tog}</div>
       </div>`;
     }).join("");
@@ -2684,6 +2980,204 @@ async function gpState(btn){
   if(!on) body.disableText="Game disabled from CabiNet";
   const r=await cmd(body,(on?"Enable":"Disable")+" game "+btn.dataset.dev);
   flash(btn,r.ok);
+}
+/* ---- per-title denom enable/disable (G2S setActiveDenoms §6.15) --------
+   GM.denomEdit = {dev, set:[denomId strings]} — one device edited at a
+   time, module-level so the 2s repaint keeps the chips. Apply sends the
+   FULL selection (replacement semantics); an empty set is refused here
+   AND at the hub (it would force-disable the device — that's what the
+   game Disable button is for). The EGM may defer the physical apply
+   until idle; "denoms applying" rides g.denomChange until the paired
+   gameDenomList (or a refusal) answers. */
+/* Optimistic apply face (the SASLNK pattern): the hub stamps denomChange
+   result="sent" only when the per-assoc FIFO worker actually BUILDS the
+   frame, so between the Apply tap and that stamp the hub still carries the
+   OLD record — without this face every 2s repaint shows the old lit set
+   (the change looks like it undid itself; longer under queue congestion)
+   and a stale terminal verdict from an EARLIER change keeps rendering.
+   Superseded by ANY sentTs change on the record (clock-skew-free — hub
+   time is never compared to client time) or a 30s self-heal cap (the
+   hub's own denomChange lazy-timeout horizon). */
+const DENAPP={};   // egm+"/"+dev -> {set:[denomId strings], prevTs, at}
+const DENDONE={};  // egm+"/"+dev -> first-seen ms of a terminal "applied"
+function denomPendFace(pk, dc){
+  const p=DENAPP[pk];
+  if(!p) return null;
+  if(((dc||{}).sentTs)!==p.prevTs || Date.now()-p.at>30000){
+    delete DENAPP[pk]; return null;
+  }
+  return p;
+}
+// DENOM_PUSH_ENABLED (2026-07-25): the per-title denom PUSH (setActiveDenoms
+// §6.15) is disabled in the UI. Confirmed on a G2S_enabled, egmEnabled, idle,
+// doors-closed AVP: the EGM never enters its config-apply lock, sits idle, and
+// lets the 30s timeToLive expire -> G2S_APX011 "Time-to-live Expired", nothing
+// changes. Not our bug (machine-side deferral, no game selected to land on),
+// but unreliable, so pull the control. The denom READ/display stays. Flip this
+// to true to re-enable once the config-lock apply path is solved.
+const DENOM_PUSH_ENABLED=false;
+function gmDenomTap(dev, id){
+  if(!DENOM_PUSH_ENABLED) return;   // push disabled (APX011); chips are read-only
+  // first tap on a device enters edit mode seeded from its CURRENT active
+  // set (so Apply without other taps is a no-op replacement); then toggle.
+  if(!GM.denomEdit || GM.denomEdit.dev!==dev){
+    const g=((snap(GM.egm)||{}).gamePlay||{})[dev]||{};
+    const cur=gameDenoms(g).filter(x=>String(x.active)==="true")
+      .map(x=>String(x.denomId));
+    GM.denomEdit={dev:dev, set:cur};
+  }
+  const s=GM.denomEdit.set, i=s.indexOf(id);
+  if(i>=0) s.splice(i,1); else s.push(id);
+  renderGames();
+}
+function gmDenomCancel(){ GM.denomEdit=null; renderGames(); }
+async function gmDenomApply(egm, dev){
+  if(!DENOM_PUSH_ENABLED){ toast("Denom control is temporarily disabled", false); return; }
+  const ed=GM.denomEdit;
+  if(!ed||ed.dev!==dev) return;
+  const denoms=ed.set.map(Number).filter(n=>Number.isInteger(n)&&n>=1000);
+  if(!denoms.length){
+    toast("Pick at least one denomination — to shut the whole title off, use its Disable button", false);
+    return;
+  }
+  GM.denomEdit=null;
+  // optimistic face BEFORE the POST (the SASLNK idiom) — a 2s repaint must
+  // never show the old lit set between the tap and the hub's "sent" stamp.
+  // prevTs = the CURRENT record's sentTs: any change to it means the hub
+  // built our frame and its own lifecycle chips take over.
+  const pk=egm+"/"+dev;
+  const dc0=((((snap(egm)||{}).gamePlay||{})[dev]||{}).denomChange)||{};
+  DENAPP[pk]={set:denoms.map(String), prevTs:dc0.sentTs, at:Date.now()};
+  delete DENDONE[pk];          // a fresh apply re-arms the applied flash
+  const r=await cmd({action:"setActiveDenoms", egmId:egm, deviceId:dev,
+                     denoms:denoms},
+                    "Set denoms · game "+dev+" ("+denoms.length+")");
+  if(r.ok) tickStatus();
+  else delete DENAPP[pk];      // refused/unreachable — back to hub truth
+  // deliberately NOT restoring GM.denomEdit on failure: replacement
+  // semantics make a stale edit dangerous to re-offer.
+  renderGames();
+}
+
+/* ---- SAS per-game enable/disable (LP09 + 0x56 read-back) --------------
+   Games census rides m.machineInfo (satellite one-shot: 0x51 total, 0x56
+   enabled-at-current-denom, 0xA0 multi-denom capability). A toggle queues
+   sas_game_state on the pull channel (~1s cadence); the satellite ACKs
+   the LP09 then VERIFIES via a fresh 0x56 — the verdict rides
+   commandResults (the usual toast) and the census refreshes on the next
+   report. Per-DENOM on/off over SAS needs the B0 preamble (spec section
+   16 — off-disk, bench/bundle-gated), so the capability line tells the
+   truth about what's possible today. */
+function sasGamesOpen(key){
+  S.modal={kind:"sasgames", id:key};
+  renderSasGamesModal(key);
+  $("modal").classList.add("on");
+}
+function renderSasGamesModal(key){
+  const m=((S.status||{}).sas||{})[key];
+  if(!m){ return; }
+  const mi=m.machineInfo||{};
+  /* enabledGames === null means the 0x56 read never ANSWERED — the
+     enabled set is UNKNOWN, which must never render as "all disabled"
+     (an operator would start enabling games that are already on).
+     [] is the different, known fact: none enabled. */
+  const egKnown=Array.isArray(mi.enabledGames);
+  const enabled=new Set(egKnown?mi.enabledGames:[]);
+  const total=mi.totalGames||0;
+  const nums=[];
+  for(let g=1; g<=Math.min(total,500); g++) nums.push(g);
+  (egKnown?mi.enabledGames:[]).forEach(g=>{ if(g>total) nums.push(g); });
+  $("m-title").textContent="Games on this machine";
+  const cap=(mi.multiDenom===true)
+    ?`multi-denom extensions: <b>supported</b> — per-denom on/off is a
+      future step (its wire preamble isn't in the on-disk spec yet; a
+      support bundle from a machine like this one is how it gets pinned)`
+    :(mi.multiDenom===false)
+      ?"multi-denom extensions: not supported — games switch at the machine's current denom"
+      :"multi-denom extensions: unknown (no 0xA0 answer)";
+  /* census age off the satellite's own staleness stamps (censusAt = the
+     games census, readAt = the 0x1F identity; carried-forward data keeps
+     its OLD stamp, so age is honest across satellite bounces). Feature-
+     detected: absent on an older hub/satellite. */
+  const at=mi.censusAt||mi.readAt;
+  let ageTxt="", aged=false;
+  const ams=at?Date.parse(at):NaN;
+  if(isFinite(ams)){
+    const min=Math.max(0,Math.round((Date.now()-ams)/60000));
+    aged=min>=30;
+    ageTxt="census read "+(min<1?"just now":(min+" min ago"));
+  }
+  const en=sasEnabledFace(key,m);
+  const canRe=!!m.online&&!m.stale&&en;
+  const reread=`<div class="mact" style="margin:0 0 10px">
+    <button class="btn slim ${canRe?"":"off"}" data-key="${esc(key)}"
+      onclick="sasCensusReread(this)">
+      <span class="bl">↻ Re-read census</span>
+      <span class="ba">${canRe?"0x1F identity + games list — a button, never a timer"
+        :(en?"machine offline":"SAS parked in Settings")}</span></button>
+  </div>`;
+  const rows=nums.map(g=>{
+    if(!egKnown)
+      return `<div class="mrowset" style="display:flex;align-items:center;gap:10px">
+        <span style="flex:1;font:13px var(--mono)">game ${esc(String(g))}</span>
+        ${chip("state unknown","warn")}
+      </div>`;
+    const on=enabled.has(g);
+    return `<div class="mrowset" style="display:flex;align-items:center;gap:10px">
+      <span style="flex:1;font:13px var(--mono)">game ${esc(String(g))}</span>
+      ${chip(on?"enabled":"disabled", on?"ok":"")}
+      <button class="btn slim ${on?"danger":""}" data-key="${esc(key)}"
+        data-game="${esc(String(g))}" data-en="${on?"0":"1"}"
+        onclick="sasGameToggle(this)">
+        <span class="bl">${on?"Disable":"Enable"}</span></button>
+    </div>`;
+  }).join("");
+  setHTML($("m-body"),`
+    <p class="none" style="margin:0 0 6px">${esc(String(total))} game(s)
+      implemented · ${egKnown
+        ?esc(String(enabled.size))+` enabled at the current
+      denomination (SAS 0x56). Toggles apply at the machine's current
+      denom and verify by re-reading the list.`
+        :`enabled set <b>unknown</b> — the 0x56 read hasn't answered
+      (that is not "all disabled"; ↻ asks again).`}</p>
+    <p class="none" style="margin:0 0 10px">${cap}</p>
+    ${ageTxt?`<p class="none" style="margin:0 0 10px${aged?";opacity:.55":""}">${esc(ageTxt)}${aged?" — consider a re-read":""}</p>`:""}
+    ${reread}
+    ${rows||'<p class="none">No games census yet — the satellite reads it at session start; ↻ asks again without waiting.</p>'}`);
+}
+/* ↻ census re-read — the GR-30 refresh-button doctrine (a button, never a
+   timer). No wire traffic from the hub: the satellite re-arms its own
+   SAS_POLL_FLOOR-paced 0x1F + A0/51/56 census and the refreshed
+   machineInfo (with new censusAt/readAt stamps) rides later reports. */
+async function sasCensusReread(btn){
+  const key=btn.dataset.key;
+  const m=((S.status||{}).sas||{})[key]||{};
+  try{
+    const r=await fetch("/api/sas/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({smibId:m.smibId, type:"read_machine_info"})});
+    const j=await r.json().catch(()=>({}));
+    if(j.ok) toast("Census re-read queued — fresh data rides the next reports", true);
+    else toast("Re-read refused · "+String(j.error||r.status).slice(0,120), false);
+    flash(btn, !!j.ok);
+  }catch(e){ toast("Hub unreachable — re-read not sent", false); }
+}
+async function sasGameToggle(btn){
+  const on=btn.dataset.en==="1";
+  if(!on && !armCheck(btn,"disable this game")) return;
+  const key=btn.dataset.key;
+  const m=((S.status||{}).sas||{})[key]||{};
+  try{
+    const r=await fetch("/api/sas/command",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({smibId:m.smibId,
+        type:"sas_game_state", game:+btn.dataset.game, enable:on})});
+    const j=await r.json().catch(()=>({}));
+    if(j.ok) toast((on?"Enable":"Disable")+" game "+btn.dataset.game+
+                   " queued — verdict rides the next report", true);
+    else toast("Game toggle refused · "+String(j.error||r.status).slice(0,120), false);
+    flash(btn, !!j.ok);
+  }catch(e){ toast("Hub unreachable — game toggle not sent", false); }
 }
 
 /* ---- game-name overrides (the theme-header ✎) --------------------------
@@ -4797,6 +5291,8 @@ function renderDebug(){
 /* ---- modal ------------------------------------------------------------- */
 function closeModal(){
   S.modal=null;
+  disarm();                 // a two-step arm (e.g. sasgames Disable) must
+                            // NOT survive a close/reopen as a live single tap
   $("modal").classList.remove("on");
 }
 $("modal").addEventListener("click",e=>{if(e.target===$("modal"))closeModal();});

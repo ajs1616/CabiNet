@@ -33,6 +33,7 @@ Run from G2S/:  python3 g2s_host.py            (NO sudo — see bench checklist)
 import argparse
 import collections
 import errno
+import hashlib
 import html
 import itertools
 import http.client
@@ -361,6 +362,27 @@ GP_RESCAN_DESC_WAIT_SEC = 15
 # automatic rescan — at most one per this window (an install narrates dozens
 # of GPE events over minutes; one rescan catches them all).
 GP_EVENT_RESCAN_DEBOUNCE_SEC = 120
+# Denom freshness horizon (2026-07-22). Active denom sets are HOST- and
+# OPERATOR-mutable state now (setActiveDenoms shipped + the EGM's own menu
+# both flip them), so a last-known gameDenomList older than this is due a
+# re-read. Consumed by the event-anchored backfill (descriptor harvest at
+# join, GPE201 applies — never a free-running timer) and the GR-30 rescan;
+# it also throttles the backfill's own asks, so a device that never answers
+# (a partial-G2S cabinet acking-then-ignoring gamePlay reads) is asked at
+# most once per window — silence-tolerance, not a retry storm.
+GP_DENOM_FRESH_SEC = 3600
+
+# /api/status snapshot cache TTL (the hub-perf fix, 2026-07-25). The build
+# is the whale — ~0.18s CPU for the 6MB full view, and the ~0.15s slim view
+# proved the BUILD dominates, not the wire (the 07-22 slim ship cut bytes
+# 68x and the hub still pegged a core: ~12 standing pollers × every 2s =
+# ~6 builds/s ≈ 110% of the one GIL core, starving the EGM event pipeline
+# into 15-30s backlogs — the handpay-clear race, live-hit 07-23). One
+# build+serialize+ETag per TTL window per variant (full/slim), every other
+# poll served from the cached bytes. 1.0s < the UI's 2s poll, so any state
+# change still shows within one poll (the liveness pin); the replay gate
+# runs against this default and enforces it empirically.
+STATUS_CACHE_TTL_SEC = 1.0
 
 # On-demand gamePlay STATUS refresh (GR-30). The join sweep (G2S-21) reads
 # status/profile/denoms ONCE per epoch; absent a re-handshake the enabled-state
@@ -429,6 +451,18 @@ def now_iso():
     """XML dateTime, UTC, millisecond precision (spec §1.12 requires ms)."""
     dt = datetime.now(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def iso_ts(s):
+    """Epoch seconds for one of our own now_iso() stamps (or any ISO-8601
+    string). Absent/foreign junk reads as 0.0 = infinitely old — the safe
+    direction for every freshness check that consumes this."""
+    if not isinstance(s, str) or not s:
+        return 0.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def escape_g2s_string(s):
@@ -1020,8 +1054,13 @@ REMOTE_CREDIT_ENABLE_PARAMS = {
 # ----------------------------------------------------------------------------
 
 class EgmAssociation:
-    def __init__(self, egm_id):
+    def __init__(self, egm_id, host_id="1"):
         self.egm_id = egm_id
+        # OUR host id (the engine's), so snapshot() can filter host_items to
+        # the devices WE own — the exact owned_media_display_devices signal
+        # (host_items keys are the wire hostId strings; host 0 / other hosts
+        # own devices we must NOT claim). Stamped at creation by assoc().
+        self.host_id = host_id
         self.egm_location = None        # from commsOnLine (required attr)
         self.device_id = "1"
         self.lock = threading.Lock()    # guards counters + epoch
@@ -1040,6 +1079,14 @@ class EgmAssociation:
         self.eventsub_sent = False      # eventHandler bring-up issued this epoch
         self.metersub_sent = False      # setMeterSub re-arm issued this epoch
         self.gamesweep_started = False  # staggered gamePlay sweep this epoch
+        # Denom backfill (2026-07-22) bookkeeping: the epoch whose harvest
+        # already fired a backfill pass (once per epoch), the last pass's
+        # wall-clock (GPE201 debounce), and per-device last-ask stamps —
+        # deliberately NOT reset in new_epoch, so a bouncing link can't turn
+        # silence-tolerant one-shots into a per-rejoin ask storm.
+        self.denom_backfill_epoch = -1
+        self.denom_backfill_at = 0.0
+        self.denom_backfill_asked = {}
         self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
         self.descriptors = []           # harvest: device inventory (getDescriptor)
         self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
@@ -1510,6 +1557,19 @@ class EgmAssociation:
             # the fold, nested censuses never mutated after — dict-copy each
             # device (the wat_devices treatment).
             media = {k: dict(v) for k, v in self.media.items()}
+            # Glass toggle (card UI): media_capable = WE (our host) own any
+            # IGT_mediaDisplay device — the exact owned_media_display_devices
+            # signal glassShow/glassHide gate on (host_items[our host].owned
+            # only; a device owned by host 0 / another host would make the
+            # toggle lie, since the sequencer would refuse it). Read here
+            # under the lock we already hold, so no re-entry. glass_visible =
+            # the show/hide belief, so the card's toggle reflects state and
+            # drives the SAME show/hide mechanism as the service button and
+            # card-IN (glassShow when hidden, glassHide when shown).
+            _owned = (self.host_items.get(self.host_id) or {}).get("owned") or []
+            media_capable = any(
+                str(d).startswith("IGT_mediaDisplay/") for d in _owned)
+            glass_visible = bool(self.glass_visible)
         # G2S-20: derive a clock-sync timeout LAZILY (no timer thread, no
         # retry): a setDateTime still unanswered after its 30s timeToLive
         # surfaces as result=timeout. The underlying record is untouched, so
@@ -1545,6 +1605,15 @@ class EgmAssociation:
             if sc and sc.get("result") in ("sent", "acked") and \
                     time.time() - sc.get("sentTs", 0) > 30:
                 gp_copy["stateChange"] = dict(sc, result="timeout")
+            # same 30s lazy-timeout for a setActiveDenoms that never got a
+            # sessionId-paired gameDenomList/error — the copy is stamped so
+            # a late confirm still lands, but the UI stops saying "applying"
+            # forever. This is the AVP-unproven command's most likely first
+            # outcome (ack-then-silence), so it MUST self-heal like siblings.
+            dc = gp_copy.get("denomChange")
+            if dc and dc.get("result") == "sent" and \
+                    time.time() - dc.get("sentTs", 0) > 30:
+                gp_copy["denomChange"] = dict(dc, result="timeout")
         # G2S-25: same lazy-timeout treatment for an unanswered setRemoteKeyOff
         # (30s timeToLive, no retry). Only the COPY is stamped — the underlying
         # record stays live so a late remoteKeyOffAck/keyedOff still lands.
@@ -1649,6 +1718,12 @@ class EgmAssociation:
             # mediaDisplay probe evidence (#18 P3) — {} until a probe drew a
             # response; feature-detected downstream, no UI contract yet.
             "mediaDisplay": media,
+            # Glass toggle (card UI): does the host own a mediaDisplay device
+            # (show the toggle at all), and is the menu believed visible
+            # (which way the toggle points). Feature-detected — an old hub
+            # omits both and the card simply shows no glass toggle.
+            "mediaCapable": media_capable,
+            "glassVisible": glass_visible,
             # voucher device status/profile (beside the VoucherStore truth)
             "voucherDevice": voucher_device,
             # remote reboot (RB) — last reboot attempt + its verdict
@@ -3280,6 +3355,19 @@ class G2SHost:
                  auto_clock=True, game_sweep=False):
         self.host_id = host_id
         self.sync_timer = sync_timer
+        # /api/status snapshot cache (STATUS_CACHE_TTL_SEC): variant key
+        # ("full"/"slim") -> {"body": str, "etag": str, "at": float}.
+        # status_cache_building is the single-flight marker per variant —
+        # while one poller rebuilds, the others serve the previous body
+        # (staleness bounded by TTL + one build) instead of stampeding N
+        # parallel 0.2s builds at every expiry.
+        self.status_cache = {}
+        self.status_cache_building = {}
+        self.status_cache_lock = threading.Lock()
+        # Bumped (under status_cache_lock) by every do_POST — a cached body
+        # is served only while its seq still matches, so any state change
+        # invalidates instantly (read-your-writes; the replay gate pins it).
+        self.status_state_seq = 0
         # Our own G2S host URL as the AVP has it configured — needed for
         # commConfig.setCommChange's setHostItem.hostLocation (spec §8.15 Table
         # 8.14, a REQUIRED attribute). getCommHostList is silent on this AVP so
@@ -3644,7 +3732,7 @@ class G2SHost:
         with self.assoc_lock:
             a = self.associations.get(egm_id)
             if a is None:
-                a = EgmAssociation(egm_id)
+                a = EgmAssociation(egm_id, self.host_id)
                 # GR-10 warm-restart seed: repopulate the optionConfig
                 # inventory from the persisted store BEFORE the association
                 # becomes visible (no lock needed on `a` yet). The handpay
@@ -3679,8 +3767,9 @@ class G2SHost:
                 # egmEnabled may be stale) — gamePlayAsOf carries the
                 # store's stamp so the UI can say how old it is.
                 if saved and saved.get("gamePlay"):
-                    a.game_play = {k: dict(v) for k, v
-                                   in saved["gamePlay"].items()}
+                    a.game_play = self._strip_dead_session_verdicts(
+                        {k: dict(v) for k, v
+                         in saved["gamePlay"].items()})
                     a.game_play_as_of = saved.get("gamePlayAt")
                     log.info("[%s] gamePlay inventory RELOADED from %s — "
                              "%d device(s), last refreshed %s (last-known "
@@ -3906,7 +3995,13 @@ class G2SHost:
             def _bi(v, lo, hi):
                 if isinstance(v, bool) or not isinstance(v, (int, float)):
                     return None
-                iv = int(v)
+                try:
+                    iv = int(v)
+                except (ValueError, OverflowError):
+                    return None      # 1e999 parses to inf and DODGES the
+                                     # parse_constant guard (that hook only
+                                     # fires on the NaN/Infinity tokens) —
+                                     # int(inf) must clamp, never 500
                 return iv if lo <= iv <= hi else None
             asset = _bi(af.get("asset"), 1, 0xFFFFFFFF)   # 0/absent -> no asset
             key_fp = af.get("keyFp")
@@ -3925,6 +4020,63 @@ class G2SHost:
                 "aftStatus": _bi(af.get("aftStatus"), 0, 0xFF),
                 "inHouseEnabled": in_house if isinstance(in_house, bool)
                                   else None,
+            }
+        # machine-info (denom code + identity), one-shot from the satellite's
+        # 0x1F read. Attacker-typed like everything here — clamped to a fixed
+        # shape. denomCode is the RAW SAS accounting-denomination code (1
+        # byte); it is surfaced UN-DECODED. The hub never turns it into money
+        # here — the code->cents table (SAS spec C-4) is bench-gated, so
+        # denomCents stays the operator-set money scale (_sas_denom_cents),
+        # and this raw code is a SUGGESTION surface + the first C-4 data point.
+        mi = payload.get("machineInfo")
+        if isinstance(mi, dict):
+            def _mbi(v, hi):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    return None
+                try:
+                    iv = int(v)
+                except (ValueError, OverflowError):
+                    return None      # smuggled inf/nan (1e999) clamps
+                if iv != v:
+                    return None      # 1.9 is not a code a machine sent —
+                                     # truncating would MANUFACTURE a
+                                     # bench-verified C-4 hit from junk
+                return iv if 0 <= iv <= hi else None
+            def _ms(v, n):
+                return _s(v, n) if isinstance(v, str) else None
+            # games census (A0/51/56, one-shot like the 0x1F): multiDenom
+            # a STRICT bool (absent/junk = unknown, never False — the B0
+            # gate must act on positive knowledge only), enabledGames a
+            # bounded int list (the LP09 read-back at the CURRENT denom).
+            md = mi.get("multiDenom")
+            eg = mi.get("enabledGames")
+            games = None
+            if isinstance(eg, list) and len(eg) <= 500:
+                # RANGE-check first: a 400-digit JSON int makes float(g)
+                # raise OverflowError, and this comprehension is on the
+                # unauthenticated wire (the never-500 law — see _mbi). The
+                # 1..9999 bound is a pure-int compare, so it fences out the
+                # huge literal before any float() coercion runs.
+                games = [int(g) for g in eg
+                         if not isinstance(g, bool)
+                         and isinstance(g, (int, float))
+                         and 1 <= g <= 9999 and float(g).is_integer()]
+            entry["machineInfo"] = {
+                "denomCode": _mbi(mi.get("denomCode"), 0xFF),
+                "gameId": _ms(mi.get("gameId"), 8),
+                "paytableId": _ms(mi.get("paytableId"), 16),
+                "rtpRaw": _ms(mi.get("rtpRaw"), 8),
+                "maxBet": _mbi(mi.get("maxBet"), 0xFFFF),
+                "multiDenom": md if isinstance(md, bool) else None,
+                "totalGames": _mbi(mi.get("totalGames"), 9999),
+                "enabledGames": games,
+                # staleness stamps (2026-07-22): the satellite stamps
+                # readAt only on a PARSED 0x1F and censusAt only on a
+                # parsed census single — the UI renders census age from
+                # them (carried-forward data must never read as
+                # present-tense truth). Absent on an old satellite.
+                "readAt": _ms(mi.get("readAt"), 32),
+                "censusAt": _ms(mi.get("censusAt"), 32),
             }
         # pendingHandpay: the satellite's 0x51 handpay latch (C3) — rides
         # the entry into /api/status verbatim so the UI can raise the
@@ -3948,11 +4100,16 @@ class G2SHost:
         td = payload.get("ticketData")
         if isinstance(td, dict):
             ar = td.get("appliedRev")
-            ar_ok = (isinstance(ar, (int, float))
-                     and not isinstance(ar, bool)
-                     and 0 <= int(ar) <= 10 ** 9)
+            ar_i = None
+            if isinstance(ar, (int, float)) and not isinstance(ar, bool):
+                try:
+                    iv = int(ar)
+                    if 0 <= iv <= 10 ** 9:
+                        ar_i = iv
+                except (ValueError, OverflowError):
+                    pass             # smuggled inf/nan reads as never-applied
             entry["ticketData"] = {
-                "appliedRev": int(ar) if ar_ok else None,
+                "appliedRev": ar_i,
                 "detail": _s(td.get("detail"), 96)}
         # commandResults: the satellite's verdicts on hub commands (newest
         # first, bounded like recentEvents) — the UI diffs [0].id to toast
@@ -4003,6 +4160,18 @@ class G2SHost:
         # AJ's penny BB2 is correctly valued at 1¢ either way; setting its denom
         # in Options clears the flag.
         entry["denomAssumed"] = self._sas_denom_cents(entry)[1]
+        # denomSuggest: the satellite's 0x1F denom code held up against the
+        # operator-set denomCents — {code, cents, state, since} (see
+        # _sas_denom_suggest for the states). Computed fresh per report so it
+        # tracks pref changes on the next tick; key ABSENT when the satellite
+        # never reported a code (the UI's older-satellite detect). Suggestion
+        # only — nothing here feeds money math. "since" (epoch seconds) is
+        # stamped hub-side so the tile's unconfirmed-denom nudge survives
+        # page reloads (D14) — see _stamp_denom_suggest_since.
+        suggest = self._sas_denom_suggest(entry)
+        if suggest is not None:
+            entry["denomSuggest"] = \
+                self._stamp_denom_suggest_since(key, suggest)
         # sasEnabled: hub.db is the truth (C4) — absent row/NULL = enabled,
         # so pre-v5 machines stay live. Rides the entry for /api/status
         # (the UI hides disabled tiles) AND the C2 reply below, which is
@@ -4047,6 +4216,45 @@ class G2SHost:
                 (self.sas_machines.get(key) or {}).get("lockState") or \
                 prefs.get("lockState") or \
                 "enabled"
+            # machineInfo: this report's dict wins; when the satellite sent
+            # machineInfo=null (its stats are memory-only — a casinonet-sas
+            # restart blanks them until the one-shot 0x1F/census re-lands,
+            # and the one-shot is gated online+enabled, so a dark/parked
+            # machine can stay census-less for the whole session), carry
+            # the previous entry's census forward — the lockState
+            # treatment. Without this the wholesale entry replace erased
+            # the census within one 1 s report and the 🎲 Games button +
+            # denomSuggest row vanished on every satellite bounce. The
+            # satellite already guards its own re-reads this way
+            # (sas_host.py's prev-census fold); this is the hub half.
+            if "machineInfo" not in entry:
+                prev_mi = (self.sas_machines.get(key) or {}) \
+                    .get("machineInfo")
+                if isinstance(prev_mi, dict):
+                    entry["machineInfo"] = prev_mi
+                    # denomSuggest was derived pre-lock from the
+                    # census-less entry — recompute against the carried
+                    # census (key stays ABSENT when there is truly no
+                    # reported denom code, the UI's older-satellite
+                    # detect).
+                    suggest = self._sas_denom_suggest(entry)
+                    if suggest is not None:
+                        entry["denomSuggest"] = \
+                            self._stamp_denom_suggest_since(key, suggest)
+            # aft: same wholesale-replace wipe as machineInfo — the
+            # satellite reports aft:null until its own cache read lands
+            # after a casinonet-sas restart, and one such report erased
+            # the registration face (AFT chip flapped to "registering…",
+            # sasCashoutReady dropped, the Wallet picker lost the
+            # machine for a beat). Carry the previous aft forward when
+            # the payload lacks a dict; a report carrying a REAL aft
+            # dict (fresh read, RAM-clear state included) always wins.
+            if "aft" not in entry and isinstance(prev_aft, dict):
+                entry["aft"] = prev_aft
+                # sasCashoutReady was derived pre-lock from the aft-less
+                # entry (the denomSuggest ordering trap) — recompute
+                # against the carried registration.
+                entry["sasCashoutReady"] = self.sas_from_egm_ready(entry)
             self.sas_machines[key] = entry
             # Drain this SMIB's pending commands into the reply (AFTER the
             # registry-full early return — a rejected report must never
@@ -4464,6 +4672,54 @@ class G2SHost:
                 "type": "aft_set_host_cashout", "enable": False})
         except Exception:  # noqa: BLE001 — best-effort disarm, never fatal
             log.exception("SAS cash-out disarm (%s) failed (ignored)", key)
+
+    #: debounce for the linked-leg census refresh below: wide enough that the
+    #: accept fold and a same-window GPE201 (the immediate-apply case) fire
+    #: ONE read, short enough that a genuinely §6.15-deferred apply landing
+    #: minutes later still earns its own re-read.
+    LINKED_CENSUS_DEBOUNCE_SEC = 10.0
+
+    def _linked_sas_census_refresh(self, assoc, reason):
+        """SAS is the denom authority on a linked cabinet — after a G2S-side
+        denom change lands (setActiveDenoms accept fold, or a GPE201
+        narrating a deferred apply / operator-menu change), the SAS leg's
+        0x1F identity + A0/51/56 games census is stale: the game mix at the
+        (possibly shifted) accounting denom changed under it. Enqueue ONE
+        read_machine_info to the leg's satellite (the same no-wire re-arm
+        the UI's refresh button uses — the satellite does the
+        SAS_POLL_FLOOR-paced reads itself), debounced per EGM so the accept
+        fold and the GPE201 path can't double-fire. Callers must NOT hold
+        assoc.lock or sas_lock (sas_enqueue_command takes sas_lock — the
+        hub's enqueue-outside-locks rule). No-ops for an unlinked cabinet or
+        a PARKED leg (the satellite would only answer sas_disabled, and the
+        armed read would fire wire traffic at re-enable — the C5 posture).
+        Best-effort, never raises."""
+        try:
+            leg = getattr(self, "sas_links", {}).get(assoc.egm_id)
+            if not leg:
+                return
+            now = time.time()
+            asked = self.__dict__.setdefault("_linked_census_asked", {})
+            if now - asked.get(assoc.egm_id, 0) < \
+                    self.LINKED_CENSUS_DEBOUNCE_SEC:
+                return
+            if (self.hub_store.machine_prefs(leg) or {}) \
+                    .get("sasEnabled") is False:
+                return
+            with self.sas_lock:
+                entry = self.sas_machines.get(leg) or {}
+            smib = entry.get("smibId") or str(leg).split("/", 1)[0]
+            r = self.sas_enqueue_command(smib, {
+                "id": f"census{next(self._fob_seq)}-{int(now)}",
+                "type": "read_machine_info"})
+            if r.get("ok"):
+                asked[assoc.egm_id] = now
+                log.info("📖 [%s] G2S denom change (%s) — SAS census "
+                         "re-read queued to linked leg %s (%s)",
+                         assoc.egm_id, reason, leg, r.get("id"))
+        except Exception:  # noqa: BLE001 — freshness nudge, never fatal
+            log.exception("linked SAS census refresh (%s) failed (ignored)",
+                          getattr(assoc, "egm_id", "?"))
 
     def _boot_disarm_sas_once(self, key):
         """One-time-per-satellite cash-out disarm after a hub (re)start
@@ -6341,6 +6597,77 @@ class G2SHost:
             return 1, True
         return denom, False
 
+    # SAS Table C-4 (denomination code -> cents), BENCH-VERIFIED ROWS ONLY.
+    # The table itself is off-disk (the 6.01 PDF is an excerpt that stops
+    # before Appendix C — re-checked 2026-07-22), so every row here must come
+    # from a REAL machine whose denomination is independently known: a bench
+    # cabinet or a forum member's support bundle. Never add a row from memory
+    # or another implementation — a wrong row would put a confidently-wrong
+    # suggestion in front of the operator. Codes not in this dict surface as
+    # state="unverified" (raw code shown, operator sets denom manually).
+    # NOTE the accounting denom is CONFIGURATION (set up at RAM clear), not
+    # machine identity — and on a MULTI-denom setup it is REQUIRED to be the
+    # minimum denom, in practice $0.01 (AJ 2026-07-22), so every multi-denom
+    # cabinet reads code 0x01. Non-0x01 codes come from single-denom (or
+    # higher-minimum) configurations — mostly forum support bundles, not this
+    # bench. A row is verified by knowing the configured denom independently
+    # of the code it produces. (The cabinet's HARD mechanical meters may run
+    # at the HIGHEST denom on most titles — never reconcile wire meters
+    # against a photo of the hard meters.)
+    SAS_C4_DENOM_CENTS = {
+        0x01: 1,     # $0.01 — BB2, multi-denom accounting min, live read 2026-07-22
+    }
+
+    @classmethod
+    def _sas_denom_suggest(cls, entry):
+        """The 0x1F read as a SUGGESTION, never authority (the denom law:
+        read-to-suggest + operator-confirm; _sas_denom_cents stays the only
+        money seam). Returns a fresh dict {code, cents, state} or None when
+        the satellite hasn't reported a machineInfo/denomCode. States:
+          confirm    — verified C-4 row, operator denom unset: offer it
+          match      — verified row agrees with the operator's setting
+          mismatch   — verified row DISAGREES: someone's wrong, wave a flag
+          unverified — code has no bench-verified row yet: show it raw
+        None (key absent on /api/status) doubles as the UI's feature/older-hub
+        detect — the suggestion row renders nothing when absent."""
+        mi = entry.get("machineInfo")
+        if not isinstance(mi, dict):
+            return None
+        code = mi.get("denomCode")
+        if isinstance(code, bool) or not isinstance(code, int):
+            return None
+        cents = cls.SAS_C4_DENOM_CENTS.get(code)
+        if cents is None:
+            return {"code": code, "cents": None, "state": "unverified"}
+        denom, assumed = cls._sas_denom_cents(entry)
+        if assumed:
+            state = "confirm"
+        elif denom == cents:
+            state = "match"
+        else:
+            state = "mismatch"
+        return {"code": code, "cents": cents, "state": state}
+
+    def _stamp_denom_suggest_since(self, key, suggest):
+        """Attach "since" (EPOCH SECONDS) to a freshly-computed denomSuggest
+        dict: how long THIS (code, state) pair has been standing. The suggest
+        is recomputed on every ~1 s satellite report, so a naive
+        time.time() here would slide every second — instead a small hub-side
+        map keyed by the sas machine key remembers the pair and its first-seen
+        stamp, resetting only when code or state actually flips. Feeds the
+        Home tile's "denom unconfirmed" nudge (which otherwise restarts its
+        10-min clock on every page reload); display-only like the suggest
+        itself — never money math. Lazily inits its map so __new__-built
+        test harnesses need no extra setup. Returns the (mutated) suggest."""
+        seen = self.__dict__.setdefault("_denom_suggest_since", {})
+        pair = (suggest.get("code"), suggest.get("state"))
+        prev = seen.get(key)
+        if prev is None or (prev[0], prev[1]) != pair:
+            prev = (pair[0], pair[1], time.time())
+            seen[key] = prev
+        suggest["since"] = prev[2]
+        return suggest
+
     def _machine_credits_mc(self, assoc):
         """The cabinet's current cashable credits (millicents). 0 when
         unmetered/disconnected. Never raises (best-effort read).
@@ -7008,6 +7335,32 @@ class G2SHost:
                  out["durationSec"], out["countdownSec"])
         return out
 
+    def _tournament_seat_denom(self, entry, leg):
+        """Layer A scoring-denom freeze (plan 2026-07-21, "Ship this
+        first"): resolve a sas/linked seat's credit->money scale ONCE, at
+        ARM, through the exact chain the score tick used to re-resolve
+        live — entry echo, fallback machine_prefs, fallback the FLAGGED
+        1¢/credit assumption — so a mid-run ✎ denomination edit can never
+        rescale a running race. Returns (denom_cents:int>=1,
+        assumed:bool). The frozen pair is stamped as
+        seat["lockDenomCents"]/["lockDenomAssumed"] and rides
+        tournament_snapshot verbatim (the board's honesty flag)."""
+        denom = (entry or {}).get("denomCents")
+        if not denom:
+            denom = (self.hub_store.machine_prefs(leg) or {}) \
+                .get("denomCents")
+        try:
+            denom = int(denom) if denom else 0
+        except (TypeError, ValueError):
+            denom = 0
+        if denom < 1:
+            # denom unset -> the raw CREDIT counters score at 1¢/credit:
+            # correct for a penny machine, an ASSUMPTION for any other
+            # cabinet (we never decode the 0x1F code table — see
+            # _sas_denom_cents) — flagged, never silent.
+            return 1, True
+        return denom, False
+
     def _tournament_enumerate_seats(self):
         """Build the seat map for an ARM — a pure read pass (no wire, no
         state writes; the arm publishes the result). Returns (seats,
@@ -7117,6 +7470,13 @@ class G2SHost:
                 "locked": False, "baseScore": None, "scoreMc": 0,
                 "absorbedMc": 0,
                 "sweep": None}
+            if leg:
+                # Layer A: a LINKED seat scores over its SAS leg — freeze
+                # its denom at ARM (g2s seats score money-absolute mc and
+                # need no freeze).
+                d_c, d_a = self._tournament_seat_denom(entry, leg)
+                seats[a.egm_id]["lockDenomCents"] = d_c
+                seats[a.egm_id]["lockDenomAssumed"] = d_a
         for key, entry in sas_entries.items():
             if key in claimed_legs:
                 continue    # a linked leg rides its G2S owner's seat
@@ -7145,6 +7505,11 @@ class G2SHost:
                 "locked": False, "baseScore": None, "scoreMc": 0,
                 "absorbedMc": 0,
                 "sweep": None}
+            # Layer A: freeze the scoring denom at ARM (see the linked
+            # seat's stamp above).
+            d_c, d_a = self._tournament_seat_denom(entry, key)
+            seats["sas:" + key]["lockDenomCents"] = d_c
+            seats["sas:" + key]["lockDenomAssumed"] = d_a
         return seats, skipped
 
     def _tournament_lock_seat(self, seat_key, seat, enable, text="",
@@ -7298,6 +7663,49 @@ class G2SHost:
                 return {"ok": False,
                         "error": "configure first (tournamentConfigure: "
                                  "creditsCents + durationSec)"}
+        # Denom-fairness closes the DEFERRED-APPLY window (review 2026-07-22):
+        # the /api/command 409 only blocks a denom write at POST time, but a
+        # setActiveDenoms the EGM ACCEPTED-BUT-DEFERRED (§6.15: apply waits
+        # for credits=0 + idle) would physically flip DURING arm's CLEAR
+        # stage — which manufactures exactly that idle condition — or
+        # mid-race as a seat busts to 0. So refuse to arm while any device
+        # still shows an unsettled denomChange (sent OR accepted-not-yet-
+        # narrated-by-GPE201); the operator waits for it to land. Same for a
+        # sas_game_state still queued against a satellite (drained below).
+        pend = []
+        for a in list(self.associations.values()):
+            with a.lock:
+                for dev, gp in (a.game_play or {}).items():
+                    dc = gp.get("denomChange") or {}
+                    dcr = dc.get("result")
+                    if dcr == "sent" and \
+                            time.time() - dc.get("sentTs", 0) > 30:
+                        # the snapshot's 30 s lazy-timeout rule, applied
+                        # here too: a send the EGM never answered is DEAD,
+                        # not settling — it must not wedge arming forever.
+                        # (Read-only skip — the live record stays "sent"
+                        # so a late confirm can still land, exactly the
+                        # snapshot doctrine.)
+                        continue
+                    if dcr in ("sent", "accepted"):
+                        pend.append(f"{a.egm_id}/dev{dev}")
+        if pend:
+            err = ("a denomination change is still settling on "
+                   + ", ".join(pend[:4])
+                   + " — wait for it to apply (GPE201) before arming, so "
+                     "it can't flip a game mid-race")
+            with self.tournament_lock:
+                self.tournament["lastArm"] = {
+                    "at": now_iso(), "ok": False, "error": err}
+            return {"ok": False, "error": err}
+        # drop any hub-queued per-game SAS writes so none delivers post-arm
+        # (the pull channel could hold one up to its 30s expiry).
+        with self.sas_lock:
+            for sid, q in self.sas_commands.items():
+                keep = [c for c in q if c.get("type") != "sas_game_state"]
+                if len(keep) != len(q):
+                    q.clear()
+                    q.extend(keep)
         seats, skipped = self._tournament_enumerate_seats()
         if not seats:
             # nothing was claimed — a plain refusal, no rollback needed.
@@ -7392,8 +7800,21 @@ class G2SHost:
         log.info("🏆 tournament %s ARMED — %d seat(s); the pipeline "
                  "clears each glass, funds $%.2f from the House, then "
                  "locks", run_id, len(seats), credits_cents / 100)
-        return {"phase": "armed", "tournamentId": run_id,
-                "seats": len(seats), "skipped": skipped}
+        out = {"phase": "armed", "tournamentId": run_id,
+               "seats": len(seats), "skipped": skipped}
+        # Layer A honesty at the door: name every seat whose frozen denom
+        # is the 1¢/credit ASSUMPTION — set denoms for a fair race. The
+        # warning rides the arm reply (and the seats carry
+        # lockDenomAssumed for the board); it never blocks the arm.
+        assumed_seats = sorted(s.get("machine") or k
+                               for k, s in seats.items()
+                               if s.get("lockDenomAssumed"))
+        if assumed_seats:
+            out["denomWarning"] = (
+                "set denominations for a fair race — scoring assumes "
+                "1¢/credit on: " + ", ".join(assumed_seats))
+            log.warning("🏆 %s", out["denomWarning"])
+        return out
 
     def tournament_start(self):
         """tournamentStart — armed -> countdown, REFUSED until the whole
@@ -8087,24 +8508,19 @@ class G2SHost:
             if coin is None and jack is None:
                 out[seat_key] = None
                 continue
-            denom = entry.get("denomCents")
-            if not denom:
-                denom = (self.hub_store.machine_prefs(leg) or {}) \
-                    .get("denomCents")
-            try:
-                denom = int(denom) if denom else 0
-            except (TypeError, ValueError):
-                denom = 0
-            # denom unset -> score the raw coinOut/jackpot CREDIT deltas at
-            # 1¢/credit (correct for a penny machine; an ASSUMPTION for a
-            # non-penny cabinet, which would then fold its wins 5x/100x low and
-            # never out-score a penny seat). We can't read the machine's own
-            # denom (0x1F code table is spec-only, not decoded — see
-            # _sas_denom_cents), so flag the assumption on the seat instead of
-            # silently mis-scoring the showpiece.
-            assumed = denom < 1
-            if assumed:
-                denom = 1
+            # Layer A freeze: the ARM stamped this seat's denom ONCE
+            # (lockDenomCents/lockDenomAssumed) — score every tick at the
+            # FROZEN value for the run's whole life, so a mid-run ✎
+            # denomination edit can never rescale a live race. A seat armed
+            # by a pre-freeze hub (no stamp) falls back to the old live
+            # re-resolution; either way an unset denom scores at the
+            # FLAGGED 1¢/credit assumption (see _tournament_seat_denom).
+            denom = seat.get("lockDenomCents")
+            if denom:
+                assumed = bool(seat.get("lockDenomAssumed"))
+                denom = int(denom)
+            else:
+                denom, assumed = self._tournament_seat_denom(entry, leg)
             out[seat_key] = {"coinOut": coin, "jackpot": jack,
                              "denomCents": denom, "denomAssumed": assumed}
         return out
@@ -9948,10 +10364,12 @@ class G2SHost:
         2026-07-16 after an AVP game install: only the next re-handshake's
         join sweep revealed it). The sweep pass then reads status for
         EVERY device, plus the full profile/denoms trio for devices the
-        store has never profiled (the new installs; profile/denoms are
-        static per theme+paytable, so known devices stay status-only —
-        the cheap common case of a game toggled at the EGM's own
-        operator/e-key menu). Same GP_SWEEP_BATCH trickle + epoch gate as
+        store has never profiled (the new installs). PROFILES are static
+        per theme+paytable so known devices skip the profile read — but
+        active denom sets are host- AND operator-mutable state now
+        (setActiveDenoms + the EGM's own menu, 2026-07-22), so a known
+        device whose denomsAt is past GP_DENOM_FRESH_SEC draws a denoms
+        re-read too. Same GP_SWEEP_BATCH trickle + epoch gate as
         the join sweep; a SINGLE pass, no timer. Returns {devices: N} for
         the caller's report (the count is the pre-rescan inventory — the
         fresh descriptorList may grow it before the sweep runs)."""
@@ -9978,9 +10396,13 @@ class G2SHost:
                         break
                 time.sleep(0.2)
             ids = self.game_play_device_ids(assoc)
+            horizon = time.time() - GP_DENOM_FRESH_SEC
             with assoc.lock:
                 profiled = {d for d, g in assoc.game_play.items()
                             if g.get("profile")}
+                denom_stale = {d for d in ids
+                               if iso_ts((assoc.game_play.get(d) or {})
+                                         .get("denomsAt")) < horizon}
             new_ids = [i for i in ids if i not in profiled]
             if new_ids:
                 log.info("[%s] 🎮 rescan revealed %d unprofiled gamePlay "
@@ -10004,6 +10426,11 @@ class G2SHost:
                     self.enqueue_get_game_play_status(assoc, gp_id)
                     if gp_id not in profiled:
                         self.enqueue_get_game_play_profile(assoc, gp_id)
+                        self.enqueue_get_game_denoms(assoc, gp_id)
+                    elif gp_id in denom_stale:
+                        # denoms alone became mutable state (2026-07-22):
+                        # a stale-denomsAt known device re-reads denoms,
+                        # never the (genuinely static) profile.
                         self.enqueue_get_game_denoms(assoc, gp_id)
 
         log.info("[%s] 🔄 gamePlay rescan — inventory re-harvest + status "
@@ -10042,6 +10469,54 @@ class G2SHost:
             return
         if known:
             self.enqueue_get_game_play_status(assoc, dev)
+            # GPE201 = Active Denominations Changed (§6.23.22) — fired when
+            # the EGM APPLIES a setActiveDenoms (possibly long after our
+            # send, §6.15 deferred-apply) AND when the operator flips denoms
+            # at the machine's own menu. Either way the stored denom list is
+            # now stale — one scoped getGameDenoms re-read makes the chips
+            # honest (same no-timer doctrine: the machine tells us when).
+            if ev.get("eventCode") == "G2S_GPE201":
+                # GPE201 IS the physical apply: advance an "accepted"
+                # denomChange to TERMINAL "applied" — before this, nothing
+                # ever moved "accepted" onward and the tournament arm-guard
+                # held the whole floor for it forever (the 2026-07-22
+                # dev-129 wedge). Wholesale replace, never in place —
+                # snapshot() shares the nested dict by reference.
+                with assoc.lock:
+                    gp = assoc.game_play.get(dev)
+                    dc = (gp or {}).get("denomChange") or {}
+                    applied = gp is not None and \
+                        dc.get("result") == "accepted"
+                    if applied:
+                        gp["denomChange"] = dict(
+                            dc, result="applied", appliedAt=now_iso(),
+                            appliedTs=time.time())
+                if applied:
+                    log.info("🎰 [%s] ACTIVE DENOMS APPLIED dev=%s — "
+                             "GPE201 narrated the physical apply",
+                             assoc.egm_id, dev)
+                    self._schedule_game_play_persist(assoc)
+                log.info("🎰 [%s] GPE201 dev=%s — active denoms changed "
+                         "(deferred apply or operator menu); scoped "
+                         "getGameDenoms re-read", assoc.egm_id, dev)
+                self.enqueue_get_game_denoms(assoc, dev)
+                # linked cabinet: whatever fired this GPE201 (our deferred
+                # apply landing OR an operator-menu change), the SAS leg's
+                # census is stale now — SAS is the denom authority on a
+                # linked cabinet. Debounced against the accept fold's nudge.
+                self._linked_sas_census_refresh(assoc, f"GPE201 dev={dev}")
+                # Sibling freshness: one apply (host- or operator-driven)
+                # can reshape OTHER devices' menus on shared-denom
+                # cabinets — one horizon-checked backfill pass, debounced,
+                # excluding this device (its scoped re-read is queued).
+                _bf_now = time.time()
+                with assoc.lock:
+                    fire_bf = _bf_now - assoc.denom_backfill_at > 60
+                    if fire_bf:
+                        assoc.denom_backfill_at = _bf_now
+                if fire_bf:
+                    self._start_game_denom_backfill(assoc, exclude=dev,
+                                                    reason="GPE201")
             # GR-32: "now playing" truth (live-caught by AJ 2026-07-16 — the
             # tile said Pharaoh's Fortune while he played Mystical Mermaid).
             # cabinet.themeId is only read at join/state-change, so a game
@@ -10112,6 +10587,129 @@ class G2SHost:
                 str(sid), "30000")
             return inner, f"getGameDenoms(dev={device_id},cid={cid})"
         self._enqueue(assoc, build)
+
+    def enqueue_set_active_denoms(self, assoc, device_id="1", denoms=None):
+        """gamePlay.setActiveDenoms (§6.15) — REPLACE the device's active
+        game-combination set with exactly `denoms` (millicent ints).
+        Explicit activeDenom singles only — no activeRange (the UI holds
+        the precise list; ranges save nothing and add a decode surface).
+        §6.15 semantics: full overwrite (anything omitted goes inactive),
+        atomic on error, owner-only (host 1 owns the gamePlay devices —
+        proven), and the EGM MAY defer the physical apply until
+        credits=0 + cabinet-idle: the sessionId-paired gameDenomList
+        response is ACCEPTANCE, G2S_GPE201 narrates the real apply (and
+        also fires for operator-menu changes; the GR-31 hook re-reads on
+        it). An EMPTY set is spec-legal but force-disables the device
+        (GPE201 then GPE001) — refused upstream at /api/command; per-
+        title disable stays setGamePlayState's job. Verdict rides
+        game_play[dev]["denomChange"]: sent -> accepted / disagree on
+        the paired gameDenomList, error on a class-level errorCode.
+        BENCH-PENDING: whether AJ's AVP honors this command at all is
+        wire truth we don't have yet — this send IS the probe, and every
+        refusal shape (APX008 not-supported, GPX001 bad denom, GPX002
+        collision) surfaces honestly through the error path."""
+        denoms = [int(d) for d in (denoms or [])]
+        def build(a):
+            dev = str(device_id)
+            sid = a.next_session_id()
+            kids = "".join(f'<g2s:activeDenom g2s:denomId="{d}"/>'
+                           for d in denoms)
+            inner, cid = self.build_inner_request(
+                a, "gamePlay", dev,
+                f"<g2s:setActiveDenoms>{kids}</g2s:setActiveDenoms>",
+                str(sid), "30000")
+            a.game_play.setdefault(dev, {})["denomChange"] = {
+                "denoms": [str(d) for d in denoms],
+                "sessionId": str(sid), "sentAt": now_iso(),
+                "sentTs": time.time(), "result": "sent"}
+            return inner, (f"setActiveDenoms(dev={dev},n={len(denoms)},"
+                           f"cid={cid},sid={sid})")
+        self._enqueue(assoc, build)
+
+    @staticmethod
+    def _strip_dead_session_verdicts(game_play):
+        """GR-28 reseed hygiene (2026-07-22): drop dead-session write
+        verdicts from a store-reloaded gamePlay map. A persisted denomChange
+        left at "sent"/"accepted" can never advance (its sessionId died with
+        the old process) and the tournament arm-guard would refuse to arm
+        forever (the dev-129 wedge). Non-success terminals (error/timeout/
+        disagree) are just as dead: the operator who sent that write watched
+        the refusal land hours ago in another hub life, yet the persisted
+        record kept painting an alarm chip forever — a structural refusal
+        like APX999 (progressive-linked) can NEVER succeed, so the dev-45
+        "denoms refused" chip survived every restart. Only "applied"
+        survives the reseed: it is steady-state history (appliedAt dates the
+        current active set), not a block or an alarm. Same treatment for an
+        in-flight setGamePlayState stateChange ("sent"/"acked") — not
+        arm-blocking, but the same stale-forever class (no terminal strip
+        there: stateChange verdicts render no chip). In place; the map is
+        returned for assignment chaining."""
+        for gp in game_play.values():
+            dc = gp.get("denomChange")
+            if isinstance(dc, dict) and dc.get("result") != "applied":
+                gp.pop("denomChange", None)
+            sc = gp.get("stateChange")
+            if isinstance(sc, dict) and sc.get("result") in ("sent",
+                                                             "acked"):
+                gp.pop("stateChange", None)
+        return game_play
+
+    def _start_game_denom_backfill(self, assoc, exclude=None, reason="join"):
+        """Denom-freshness backfill (2026-07-22). Active denom sets are
+        host- AND operator-mutable state now — setActiveDenoms shipped, and
+        the EGM's own operator menu narrates the same GPE201 — but the join
+        sweep is opt-in-only in production (--game-sweep, the a3b19f8
+        starvation decision), the GR-30 button read status only, and the
+        GPE201 scoped re-read covers ONLY the changed device. So a KNOWN
+        device's chips could sit stale for weeks with no automatic path to
+        freshness. This pass enqueues ONE getGameDenoms for every known
+        gamePlay device whose denomsAt is absent (never read — e.g. a
+        partial-G2S cabinet's whole inventory) or past GP_DENOM_FRESH_SEC,
+        riding the exact join-sweep trickle (GP_SWEEP_BATCH + FIFO drain
+        wait + settle) so interactive /api/command sends never starve.
+        Event-anchored only — the descriptor harvest at join and GPE201
+        applies call it; no free-running timer (the dormancy law). Reads
+        are silence-tolerant one-shots throttled by the per-device asked
+        tracker: an EGM that acks-then-ignores is re-asked at most once
+        per horizon window, never storm-retried."""
+        with assoc.lock:
+            epoch = assoc.epoch
+            if assoc.comms_state != "onLine":
+                return
+        ids = self.game_play_device_ids(assoc)
+        horizon = time.time() - GP_DENOM_FRESH_SEC
+        with assoc.lock:
+            stale = [i for i in ids
+                     if i != exclude
+                     and iso_ts((assoc.game_play.get(i) or {})
+                                .get("denomsAt")) < horizon
+                     and assoc.denom_backfill_asked.get(i, 0) < horizon]
+        if not stale:
+            return
+        log.info("[%s] 🎮 denom backfill (%s) — %d of %d device(s) past "
+                 "the freshness horizon, batches of %d", assoc.egm_id,
+                 reason, len(stale), len(ids), GP_SWEEP_BATCH)
+
+        def loop():
+            for i in range(0, len(stale), GP_SWEEP_BATCH):
+                if i:
+                    # the join-sweep trickle: bounded FIFO drain + settle,
+                    # so the backfill queues behind at most one batch of
+                    # itself and never ahead of an interactive command.
+                    deadline = time.time() + GP_SWEEP_DRAIN_WAIT_SEC
+                    while assoc.send_queue.qsize() > 0 and \
+                            time.time() < deadline:
+                        time.sleep(0.1)
+                    time.sleep(GP_SWEEP_DELAY_SEC)
+                with assoc.lock:
+                    if epoch != assoc.epoch or assoc.comms_state != "onLine":
+                        return  # superseded / offline — abandon the pass
+                for gp_id in stale[i:i + GP_SWEEP_BATCH]:
+                    with assoc.lock:
+                        assoc.denom_backfill_asked[gp_id] = time.time()
+                    self.enqueue_get_game_denoms(assoc, gp_id)
+
+        threading.Thread(target=loop, daemon=True).start()
 
     def _schedule_game_play_persist(self, assoc):
         """GR-28: debounced mirror of assoc.game_play into the store's
@@ -10332,6 +10930,55 @@ class G2SHost:
         with assoc.lock:
             assoc.note_acceptor["status"] = data
         return data, raised
+
+    # Table 3.3 booleans that default FALSE and that IGT OMITS at default
+    # (wire-proven 2026-07-25: the AVP's doors-closed cabinetStatus carries
+    # NO door attributes at all — only the DateTime stamps — while the BB2E
+    # spells out logicDoorOpen="false" etc. explicitly). Without an
+    # absent=false fold, a doorOpen="true" that once landed in assoc.cabinet
+    # is sticky for the life of the Association — no later IGT report can
+    # ever clear it (the stale-tile incident's second, latent bug).
+    # DELIBERATE wire-proven subset (the fleet-brief law: extend only with
+    # wire evidence): other Table 3.3 absent-default booleans (generalTilt,
+    # generalFault, ...) keep the sticky-true latch, but no UI or host
+    # logic keys off them today — add them here WITH a capture the day one
+    # grows a reader.
+    CABINET_STATUS_FLAGS = (
+        "logicDoorOpen", "auxDoorOpen", "cabinetDoorOpen",
+        "serviceLampOn", "hostLocked")
+
+    def _fold_cabinet_status(self, assoc, el, source):
+        """Fold ONE cabinetStatus element (§3.9 Table 3.3 — every attribute
+        optional) into assoc.cabinet. Shared by the cabinetStatus response
+        handler and the eventReport affected-status ride-along (the
+        _fold_note_acceptor_status twin), so egmState/doors track the CBE
+        narration live with zero class reads — the stale-tile fix
+        2026-07-25: a rejoin mid-operator-menu froze egmState=operatorMode/
+        doors-open in the tile because cabinet CBE events carry a full
+        cabinetStatus in their deviceList (wire-proven) and the handler
+        dropped it, and the doors could never fold shut anyway (see
+        CABINET_STATUS_FLAGS). Defaults: hostEnabled/egmEnabled ABSENT =
+        TRUE (Table 3.3 + the repo rule — the restore path is sacred);
+        CABINET_STATUS_FLAGS ABSENT = FALSE. Updates (never replaces)
+        assoc.cabinet — profile/egmDateTime/identity ride on other keys.
+        cabinet_at is the tournament-restage freshness stamp; an event
+        ride-along IS the EGM's own report (a locked EGM emits
+        hostEnabled="false" explicitly, so no restage flap). Takes
+        assoc.lock — MUST be called without it held. Returns data."""
+        data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
+        data.setdefault("hostEnabled", "true")
+        data.setdefault("egmEnabled", "true")
+        for f in self.CABINET_STATUS_FLAGS:
+            data.setdefault(f, "false")
+        data["statusAt"] = now_iso()
+        data["statusSource"] = source
+        with assoc.lock:
+            assoc.cabinet.update(data)
+            # freshness stamp for the tournament lock restage: only a
+            # report YOUNGER than the last commanded send is delivery
+            # evidence (a stale hostEnabled must never flap the restage)
+            assoc.cabinet_at = time.time()
+        return data
 
     # ------------------------------------------------------------ wat — G2S-39
     #
@@ -12009,8 +12656,31 @@ class G2SHost:
                     # <8s-stale stamp can't short-circuit the NEXT show
                     # over content that just displaced the SPA
                     self._glass_spa_seen.pop(assoc.egm_id, None)
-                old_cnt = assoc.media_content.get(dev)
-                old_txn = assoc.media_txn.get(dev)
+                # Release-before-load must clear the window by the DEVICE's
+                # OWN reported content, not the host's remembered arm-id.
+                # media_content/media_txn desync on RAM-clear / reboot (the
+                # EGM txn counter resets) / an APX016-rejected push (arm-id
+                # set, device never loaded) → the release frees the WRONG id
+                # → the load no-ops on the still-occupied window
+                # (maxContentLoaded=1) → contentPending forever, no browser
+                # fetch, no SPA poll, no advance: the stuck-glass clog
+                # (live-hit 2026-07-25, cleared only by a manual probe
+                # release keyed on the LIVE id). A tester bringing up fresh
+                # AVPs has NO probe escape hatch, so the AUTO path must
+                # self-clear. The last contentStatus the EGM narrated is
+                # ground truth: its contentId+transactionId, gated on a LIVE
+                # contentState (a release narration clears the state, so an
+                # absent state = empty window = nothing to free → fall back
+                # to the remembered arm-id, which is itself empty on a fresh
+                # window → no release → the load lands in the clear).
+                cs = (assoc.media.get(dev) or {}).get("contentStatus") or {}
+                dev_cnt = cs.get("contentId")
+                dev_txn = cs.get("transactionId")
+                if dev_cnt and dev_txn and (cs.get("contentState") or ""):
+                    old_cnt, old_txn = dev_cnt, dev_txn
+                else:
+                    old_cnt = assoc.media_content.get(dev)
+                    old_txn = assoc.media_txn.get(dev)
                 assoc.glass_push[dev] = {"stage": "loading",
                                          "contentId": cnt,
                                          "uri": uri, "startedTs": now}
@@ -12148,30 +12818,117 @@ class G2SHost:
                      GLASS_RETRY_MAX)
 
     def sweep_glass_pushes(self, now=None):
-        """Sequencer stage timeout (watchdog cadence, so a stall clears in
+        """Sequencer stage timeout (watchdog cadence, so a stall resolves in
         25-45s): a push stuck mid-lifecycle past GLASS_PUSH_TIMEOUT_SEC is
-        ⚠️-logged and CLEARED — the manual mediaDisplayProbe rungs stay
-        usable as the fallback and the next glassShow/recovery starts
-        clean. 'shown' is the resting state, never swept. Dormant while
+        either PARKED or cleared. PARKED (the late-fetch fix, live-hit
+        2026-07-25 ×3: a freshly RAM-cleared / mid-config AVP takes MINUTES
+        to spawn its media browser, so the fetch lands long after the old
+        25s delete — the content then went contentLoaded with no push
+        record left to advance it, and the glass sat dark though the page
+        was on the machine): when the device's OWN last contentStatus still
+        shows THIS push's content pending/loaded, the fetch may still come
+        — keep the record (stage preserved so the fold and
+        _glass_poll_advance still recognize it, tries reset so the
+        post-fetch SPA polls get a fresh retry budget) and the first poll
+        from the finally-fetched page completes the ladder unattended.
+        A parked push is never re-swept (parked flag) and never blocks a
+        new glassShow (the in-flight guard only honors pushes younger than
+        the timeout — supersession replaces a parked one freely). CLEARED:
+        no matching device content = the load truly died (rejected/orphan)
+        — delete as before; the manual probe rungs remain the fallback.
+        'shown' is the resting state, never swept. Dormant while
         glass_push is empty — zero cost on a floor that never glassShows."""
         now = time.time() if now is None else now
         with self.assoc_lock:
             assocs = list(self.associations.values())
         for assoc in assocs:
             stale = []
+            parked = []
+            probes = []
+            diags = []
             with assoc.lock:
                 for dev, push in list(assoc.glass_push.items()):
                     if push.get("stage") != "shown" and \
+                            not push.get("parked") and \
                             now - (push.get("startedTs") or 0) > \
                             GLASS_PUSH_TIMEOUT_SEC:
-                        del assoc.glass_push[dev]
-                        stale.append((dev, push))
+                        cs = (assoc.media.get(dev) or {}).get(
+                            "contentStatus") or {}
+                        if (cs.get("contentId") == push.get("contentId")
+                                and (cs.get("contentState") or "") in
+                                ("IGT_contentPending",
+                                 "IGT_contentLoaded")):
+                            push = dict(push, parked=True, tries=0)
+                            assoc.glass_push[dev] = push
+                            parked.append((dev, push))
+                        else:
+                            del assoc.glass_push[dev]
+                            stale.append((dev, push))
+                            continue
+                    # The patient re-driver (fix D, 2026-07-25 — "manual
+                    # works every time"): a human on the probe rungs
+                    # patiently asks getContentStatus until the machine's
+                    # browser has fetched, then setactive/show land. The
+                    # auto path must do the same. For every in-flight or
+                    # parked push (comms up, EGM txn known), ask the device
+                    # for THIS content's status once per sweep pass (~20s):
+                    # the contentStatus narration lands in the fold, whose
+                    # EXISTING advance logic (contentLoaded -> setActive,
+                    # executing -> show) finishes the ladder unattended —
+                    # 4 seconds or 10 minutes after the load, whenever the
+                    # machine is actually ready. Wire-proven 2026-07-25
+                    # 22:49: a manual contentstatus probe returned
+                    # contentLoaded minutes after the push died; only the
+                    # deleted record kept it from self-completing.
+                    push = assoc.glass_push.get(dev)
+                    if (push and assoc.comms_state == "onLine"
+                            and push.get("stage") in ("loading",
+                                                      "activating")
+                            and push.get("txn")
+                            and now - (push.get("startedTs") or 0) > 10):
+                        probes.append((dev, push["contentId"],
+                                       push["txn"]))
+                        # One-time actionable diagnosis instead of silent
+                        # dark glass: pending past 3 minutes = the window's
+                        # browser has not spawned — that is operator-menu
+                        # territory (window enable / max memory), not
+                        # something the hub can push through.
+                        if push.get("parked") and \
+                                not push.get("diagLogged") and \
+                                now - (push.get("startedTs") or 0) > 180:
+                            assoc.glass_push[dev] = dict(push,
+                                                         diagLogged=True)
+                            diags.append((dev, push))
+            for dev, push in parked:
+                log.warning("⏳ 🪟 [%s] glass push dev=%s stalled at "
+                            "stage=%r (content=%s) — PARKED awaiting the "
+                            "late fetch (device still reports the content "
+                            "%s); the page's first poll will finish the "
+                            "ladder, and any new glassShow supersedes",
+                            assoc.egm_id, dev, push.get("stage"),
+                            push.get("contentId"),
+                            ((assoc.media.get(dev) or {}).get(
+                                "contentStatus") or {}).get(
+                                "contentState"))
             for dev, push in stale:
                 log.warning("⚠️ 🪟 [%s] glass push dev=%s stalled at "
                             "stage=%r (content=%s) — cleared after %ds; "
                             "the manual probe rungs remain the fallback",
                             assoc.egm_id, dev, push.get("stage"),
                             push.get("contentId"), GLASS_PUSH_TIMEOUT_SEC)
+            for dev, cnt, txn in probes:
+                self.enqueue_get_content_status(assoc, dev, cnt, txn)
+            for dev, push in diags:
+                log.warning("🩺 🪟 [%s] glass content %s on dev=%s still "
+                            "PENDING after 3 minutes — the window's browser "
+                            "has not fetched. This is machine-side: in the "
+                            "AVP operator menu check Media Display Setup — "
+                            "the window's \"Enable media display\" AND its "
+                            "max memory allocation (64MB known-good), then "
+                            "Global Options \"Application handles service "
+                            "button\"=YES. The push stays parked and will "
+                            "finish on its own the moment the fetch lands.",
+                            assoc.egm_id, push.get("contentId"), dev)
 
     # -------------------------------------------------- meters (read) — G2S-15
 
@@ -13333,15 +14090,60 @@ class G2SHost:
             # sweep. 'activating' is deliberately NOT cleared: MDX005
             # ("Content not loaded.") there is the expected too-early
             # verdict the poll heartbeat retries through.
-            if req["class"] == "mediaDisplay":
+            # ...EXCEPT IGT_MDX002 "Invalid contentId/transactionId": that is
+            # the verdict on the best-effort RELEASE that precedes the load in
+            # the same FIFO batch — the release targeted content the device no
+            # longer has (a RAM-cleared/rebooted EGM restarted its txn counter,
+            # so an old contentId/txn is phantom). It is NOT the load's verdict;
+            # the load rides right behind it and stands on its own (live-hit
+            # 2026-07-25: the browser fetched the freshly-loaded glass, and only
+            # this phantom-release MDX002 aborted the push, so a loaded glass
+            # never showed). Skip the fail-fast here and let the load's own
+            # outcome — the contentStatus advance, or its own MDX003 — decide.
+            if req["class"] == "mediaDisplay" and rerr != "IGT_MDX002":
                 mdev = str(req.get("deviceId") or "")
                 cleared = []
+                recover = []
                 with assoc.lock:
                     for d, p in list(assoc.glass_push.items()):
                         if p.get("stage") == "loading" and \
                                 (not mdev or mdev == d):
-                            del assoc.glass_push[d]
-                            cleared.append((d, p))
+                            # IGT_MDX003 "Must release loaded content." is NOT a
+                            # dead end for the AUTO first-spawn: the window
+                            # holds content from a prior session, but host
+                            # memory is empty (a fresh host restart, or Fix A
+                            # wiped media_content/media_txn on a RAM clear), so
+                            # start_glass_show had no occupant id to release
+                            # before loading and the bare load smashed into
+                            # maxContentLoaded=1. The MANUAL operator wins
+                            # because their FIRST rung is a discovery read
+                            # (logstatus/log/getContentStatus) that seeds
+                            # exactly that release — the auto path must
+                            # self-discover. Hold the push (stage='recovering'),
+                            # pull getContentLog to learn the occupant, then
+                            # release + reload (live A/B 2026-07-25: adding one
+                            # discovery read flipped the identical auto glassShow
+                            # from MDX003 straight to full SHOWN — the only
+                            # variable changed). One-shot (recovered flag): a
+                            # second MDX003 after we already released is the
+                            # honest failure the manual rungs still backstop.
+                            if rerr == "IGT_MDX003" and not p.get("recovered"):
+                                assoc.glass_push[d] = dict(
+                                    p, stage="recovering", recovered=True,
+                                    startedTs=time.time())
+                                recover.append((d, p))
+                            else:
+                                del assoc.glass_push[d]
+                                cleared.append((d, p))
+                for d, p in recover:
+                    self.enqueue_get_content_log(assoc, d, 0)
+                    log.warning("🔎 🪟 [%s] glass push dev=%s (content=%s) hit "
+                                "%s at load — window occupied, host held no "
+                                "occupant id. Pulling getContentLog to "
+                                "self-discover + release the occupant, then "
+                                "reload (auto mirror of the manual discovery "
+                                "rung; live-proven 2026-07-25).",
+                                assoc.egm_id, d, p.get("contentId"), rerr)
                 for d, p in cleared:
                     log.warning("⚠️ 🪟 [%s] glass push dev=%s (content=%s) "
                                 "REJECTED at load (%s%s) — cleared now "
@@ -13350,6 +14152,31 @@ class G2SHost:
                                 "probe rungs recover it.",
                                 assoc.egm_id, d, p.get("contentId"), rerr,
                                 f' "{rtext}"' if rtext else "")
+            # denom write (§6.15): a gamePlay-class error response IS the
+            # verdict on a pending setActiveDenoms — error responses carry
+            # NO child command, so the gameDenomList fold can never fire.
+            # Pair by sessionId and stamp the errorCode/errorText so the UI
+            # shows the machine's own refusal (APX008 not-supported, GPX001
+            # bad denom, GPX002 theme/denom collision) instead of a forever-
+            # pending "sent". §6.15 atomicity: nothing changed on the EGM.
+            if req["class"] == "gamePlay":
+                gdev = str(req.get("deviceId") or "")
+                stamped = False
+                with assoc.lock:
+                    gp = assoc.game_play.get(gdev) or {}
+                    dc = gp.get("denomChange") or {}
+                    if dc.get("result") == "sent" and \
+                            req["sessionId"] == dc.get("sessionId"):
+                        gp["denomChange"] = dict(
+                            dc, result="error", errorCode=rerr,
+                            errorText=rtext or "", confirmedAt=now_iso())
+                        stamped = True
+                if stamped:
+                    log.warning("🎰 [%s] setActiveDenoms dev=%s REFUSED by "
+                                "the EGM — %s%s (nothing was changed, "
+                                "§6.15 atomicity)", assoc.egm_id, gdev,
+                                rerr, f' "{rtext}"' if rtext else "")
+                    self._schedule_game_play_persist(assoc)
             # G2S-19: a commConfig-class error while the ownership cycle is
             # mid-flight is its verdict (error responses carry NO child
             # command, so the commChangeStatus handler below can never fire).
@@ -13991,6 +14818,21 @@ class G2SHost:
                     assoc.gamesweep_started = True
                 if start_sweep:
                     self._start_game_play_sweep(assoc)
+            else:
+                # Denom backfill (2026-07-22): with the full sweep gated
+                # off (the a3b19f8 starvation decision — production runs
+                # no --game-sweep, so NO join ever read denoms), known
+                # devices' denom chips starved for weeks. The harvest is
+                # the join's device-inventory moment, so it anchors the
+                # paced denomsAt-horizon backfill — once per epoch (the
+                # harvest also re-fires on GR-30 rescans, which read
+                # their own stale denoms).
+                with assoc.lock:
+                    start_bf = assoc.denom_backfill_epoch != assoc.epoch
+                    if start_bf:
+                        assoc.denom_backfill_epoch = assoc.epoch
+                if start_bf:
+                    self._start_game_denom_backfill(assoc, reason="harvest")
 
         elif cmd in ("printerStatus", "printerProfile",
                      "printerTemplateList", "printComplete") \
@@ -14154,6 +14996,31 @@ class G2SHost:
                     if localname(st_el.tag) == "noteAcceptorStatus":
                         self._fold_note_acceptor_status(assoc, st_el, "event")
                         break
+            # Stale-tile fix (2026-07-25): cabinet events carry the device
+            # status along too (same sendDeviceStatus subscription — the
+            # affected device status of a CBE is cabinetStatus, §3.9). Fold
+            # it so egmState/doors track the CBE narration live (operator
+            # menu exit, door close) with zero class reads. Before this,
+            # the ride-along was silently dropped and the tile could freeze
+            # at a join-time operatorMode/doors-open picture until the next
+            # join (live-hit tonight; the recovery narration was on the
+            # wire and ignored). Wire-proven on the AVP (CBE203/205/206/
+            # 307/308 all carry it). Pre-dedupe placement is deliberate:
+            # the AVP stamps ride-along status at SEND time (retried events
+            # carry FRESHER status than their eventDateTime), matching the
+            # meters re-fold doctrine below. ⚠️ NO fallback for an EGM whose
+            # CBEs ride no cabinetStatus (BB2E-on-G2S unproven — fixture≠
+            # wire): such a tile still refreshes only at join. A debounced
+            # getCabinetStatus fallback was designed + reviewed 2026-07-25
+            # and SHELVED — it inserts pre-ack FIFO traffic the replay gate
+            # pins (Step 6.6 + four timing-dependent assertions). Bench the
+            # BB2E ride-along question first; if it needs the fallback,
+            # land it WITH the gate update as its own change.
+            if ev["deviceClass"] == "G2S_cabinet":
+                for st_el in el.iter():
+                    if localname(st_el.tag) == "cabinetStatus":
+                        self._fold_cabinet_status(assoc, st_el, "event")
+                        break
             # G2S-23: type the 💵 bill-in. G2S_NAE114 Note Stacked is THE
             # money-in event (Tables 13.35/13.36 — the EGM inserts the log
             # entry BEFORE raising the event, so the transaction record
@@ -14257,6 +15124,55 @@ class G2SHost:
                              ev["deviceId"],
                              f' "{ev["eventText"]}"' if ev["eventText"]
                              else "")
+                # GLASS SEQUENCER — the REAL "content loaded" cue (2026-07-25
+                # live wire). The AVP reports contentLoaded ONLY as an
+                # IGT_MDE102 eventReport — NEVER as an unsolicited contentStatus
+                # (its unsolicited contentStatus stops at IGT_contentPending).
+                # So the auto first-spawn's poll-driven setActiveContent races
+                # AHEAD of the load and the EGM answers IGT_MDX005 "Content not
+                # loaded." (proven: 23:21:05,845 poll-driven setActiveContent ->
+                # MDX005, then 23:21:06,502 IGT_MDE102 contentLoaded, 0.74s too
+                # LATE) — and because the un-shown WebKit page polls only ONCE,
+                # the 5-try retry budget never re-fires and the push dies at the
+                # 25s sweep. The MANUAL operator wins precisely because they
+                # fire setactive AFTER contentLoaded — IGT_MDE102 IS that cue.
+                # Drive setActiveContent off it, exactly like the human, while a
+                # SPAWN push for this device is still loading/activating (never
+                # the resident show/hide toggle — it never sits at those
+                # stages, so it is untouched). Decision under assoc.lock,
+                # enqueue AFTER it (the tap path's no-nesting rule); epoch
+                # captured HERE (GR-18: glass_push is a per-epoch guard).
+                if code == "IGT_MDE102":
+                    mdev = str(ev["deviceId"] or "")
+                    etxn = str(ev["transactionId"] or "")
+                    md_fire = None
+                    md_epoch = None
+                    with assoc.lock:
+                        md_epoch = assoc.epoch
+                        gpush = assoc.glass_push.get(mdev)
+                        if gpush and gpush.get("stage") in ("loading",
+                                                            "activating"):
+                            ptxn = gpush.get("txn")
+                            txn = ptxn or (etxn if etxn.isdigit()
+                                           and int(etxn) >= 1 else None)
+                            # Ignore a stale MDE102 for other content: when BOTH
+                            # the push and the event name a txn they must match
+                            # (maxContentLoaded=1 makes a mismatch a leftover).
+                            if txn and (not ptxn or not etxn
+                                        or str(ptxn) == etxn):
+                                assoc.glass_push[mdev] = dict(
+                                    gpush, txn=str(txn), stage="activating",
+                                    lastTryTs=time.time(), tries=1)
+                                md_fire = (mdev, gpush["contentId"], str(txn))
+                    if md_fire:
+                        self.enqueue_set_active_content(
+                            assoc, md_fire[0], md_fire[1], md_fire[2],
+                            epoch=md_epoch)
+                        log.info("🪟 [%s] glass sequencer dev=%s -> "
+                                 "setActiveContent (IGT_MDE102 contentLoaded — "
+                                 "the real load cue, mirrors the manual "
+                                 "operator; beats the MDX005 poll-race)",
+                                 assoc.egm_id, md_fire[0])
                 if bill is not None:
                     log.info("=" * 64)
                     log.info("💵 [%s] BILL IN — %s (#%d this session, "
@@ -14422,6 +15338,36 @@ class G2SHost:
                             "sequences); high-water reset, entries merged "
                             "fresh", assoc.egm_id, entries[-1][0],
                             restarted_from)
+                # A RAM/NVRAM clear also wiped the EGM's mediaDisplay state:
+                # every contentId/transactionId the hub remembered (the fold,
+                # media_content/media_txn, the resident-SPA belief) is now
+                # PHANTOM — the fresh device holds nothing and restarted its
+                # txn counter near 1. Left stale, the next glassShow releases a
+                # txn the machine never had -> IGT_MDX002, the sequencer's
+                # fail-fast blames the load and kills the push, and a
+                # SUCCESSFULLY-loaded glass never gets shown (live-hit
+                # 2026-07-25, tester's RAM clear — the load fetched fine, only
+                # the phantom release aborted it). Forget it so the recovery
+                # push loads clean into the now-empty window. This clears ONLY
+                # on a real RAM clear — a plain reconnect deliberately
+                # PRESERVES the resident SPA (media_content/media_txn init
+                # comments), which is why new_epoch never touched them.
+                # NB: glass_push is deliberately NOT wiped here — the reboot
+                # that a RAM clear forces already ran new_epoch (which clears
+                # glass_push), so at this point it holds at most a FRESH push
+                # a tester armed by pressing the service button in the
+                # reconnect->backfill window; wiping it would orphan that live
+                # push (load succeeds, nothing advances it — the very bug we
+                # fix). Leave it: FIX B skips the phantom-release MDX002 and
+                # the fold advances the surviving push to 'shown'.
+                with assoc.lock:
+                    assoc.media = {}
+                    assoc.media_content = {}
+                    assoc.media_txn = {}
+                self._glass_spa_seen.pop(assoc.egm_id, None)
+                log.info("🧹 [%s] mediaDisplay tracking cleared after RAM "
+                         "clear — next glassShow loads clean into the empty "
+                         "window", assoc.egm_id)
             if entries:
                 log.info("🔔 [%s] LOG BACKFILL — %d log entr%s: %d merged, "
                          "%d duplicate/known skipped; lastSequence=%d "
@@ -14635,13 +15581,12 @@ class G2SHost:
 
         elif cmd == "cabinetStatus" and stype == "G2S_response":
             el = req["commandEl"]
-            data = {k.rsplit('}', 1)[-1]: v for k, v in el.attrib.items()}
-            # hostEnabled/egmEnabled ABSENT = TRUE (Table 3.3 defaults + the
-            # repo rule). Fold the default explicitly so a disable -> enable
-            # round-trip whose enable response omits hostEnabled cannot leave
-            # a stale "false" in assoc.cabinet (the restore path is sacred).
-            data.setdefault("hostEnabled", "true")
-            data.setdefault("egmEnabled", "true")
+            # The fold (defaults incl. the absent=false door/lamp/lock
+            # booleans + the cabinet_at stamp) is shared with the eventReport
+            # ride-along — _fold_cabinet_status. Everything BELOW stays
+            # response-only: the setCabinetState confirm pairs via sessionId
+            # echo, which events never carry.
+            data = self._fold_cabinet_status(assoc, el, "response")
             # Cabinet control (G2S-20 rest): a cabinetStatus whose sessionId
             # echoes the pending setCabinetState IS its application response
             # (§3.7) — confirm when the echoed hostEnabled matches what we
@@ -14650,11 +15595,6 @@ class G2SHost:
             # exactly as this status disagreement).
             verdict = want = None
             with assoc.lock:
-                assoc.cabinet.update(data)
-                # freshness stamp for the tournament lock restage: only a
-                # report YOUNGER than the last commanded send is delivery
-                # evidence (a stale hostEnabled must never flap the restage)
-                assoc.cabinet_at = time.time()
                 csc = assoc.cabinet_state_change
                 if csc.get("result") in ("sent", "acked") and \
                         req["sessionId"] == csc.get("sessionId"):
@@ -14954,6 +15894,7 @@ class G2SHost:
                         "active": attr(child, "active") or "false"})
             active = [d["denomId"] for d in denoms
                       if d["active"].lower() == "true" and d["denomId"]]
+            verdict = None
             with assoc.lock:
                 gp = assoc.game_play.setdefault(dev, {})
                 gp["denoms"] = denoms
@@ -14961,6 +15902,56 @@ class G2SHost:
                 gp["activeDenoms"] = active
                 gp["denomsAt"] = now_iso()
                 assoc.game_play_as_of = now_iso()  # GR-28: live-parse stamp
+                # denomChange verdict: a gameDenomList whose sessionId echoes
+                # the pending setActiveDenoms IS its application response
+                # (§6.15). "accepted" = the active set now matches what we
+                # asked (the EGM may still defer the PHYSICAL apply until
+                # idle — GPE201 narrates that); "disagree" = it answered
+                # with a different active set. Wholesale replacement, never
+                # in-place (snapshot() shares the nested dict by reference).
+                dc = gp.get("denomChange") or {}
+                asked = list(dc.get("denoms") or [])   # captured IN the lock
+                if dc.get("result") == "sent" and \
+                        req["sessionId"] == dc.get("sessionId"):
+                    verdict = ("accepted" if set(asked) == set(active)
+                               else "disagree")
+                    gp["denomChange"] = dict(
+                        dc, result=verdict, confirmedAt=now_iso(),
+                        active=list(active))
+                elif dc.get("result") == "accepted" and \
+                        set(asked) == set(active):
+                    # a LATER list still matching the ASKED set settles a
+                    # lingering "accepted" to TERMINAL "applied" — the
+                    # deferred physical apply happened (or never deferred).
+                    # Covers a missed/unsubscribed GPE201: the GPE201 hook
+                    # can't be the only exit, and "accepted" otherwise
+                    # wedges the tournament arm-guard forever. Compare
+                    # against the ASKED set (the promise), and note the
+                    # paired-fold gate above is result=="sent" — a fresh
+                    # re-read's new sessionId lands HERE, by design.
+                    verdict = "applied"
+                    gp["denomChange"] = dict(
+                        dc, result="applied", appliedAt=now_iso(),
+                        appliedTs=time.time())
+            if verdict == "applied":
+                log.info("🎰 [%s] ACTIVE DENOMS APPLIED dev=%s — a re-read "
+                         "matched the accepted set [%s] (settled)",
+                         assoc.egm_id, dev, ",".join(active))
+            elif verdict == "accepted":
+                log.info("🎰 [%s] ACTIVE DENOMS ACCEPTED dev=%s — [%s] "
+                         "(physical apply may defer until idle; GPE201 "
+                         "narrates it)", assoc.egm_id, dev, ",".join(active))
+            elif verdict == "disagree":
+                log.warning("🎰 [%s] ACTIVE DENOMS DISAGREEMENT dev=%s — "
+                            "asked [%s], EGM reports [%s]", assoc.egm_id,
+                            dev, ",".join(asked), ",".join(active))
+            if verdict in ("accepted", "applied"):
+                # linked cabinet: the G2S leg just changed the denom menu —
+                # nudge the SAS leg's census (SAS = denom authority; it must
+                # not stay stale after a G2S denom write). Outside assoc.lock
+                # by construction here; debounced inside.
+                self._linked_sas_census_refresh(
+                    assoc, f"gameDenomList {verdict} dev={dev}")
             self._schedule_game_play_persist(assoc)  # GR-28 (debounced)
             log.info("🎰 [%s] gameDenomList dev=%s — %d denom(s), %d "
                      "range(s); active=[%s]%s", assoc.egm_id, dev,
@@ -16661,6 +17652,21 @@ class G2SHost:
             data = {k.rsplit('}', 1)[-1][:64]: str(v)[:200]
                     for k, v in el.attrib.items()}
             dev = req["deviceId"]
+            # MDX003 self-recovery pre-parse: a getContentLog answer
+            # (contentLogList) carries the window's content records as
+            # attr-less <contentLog> CHILDREN — the parent element's own attribs
+            # are empty (proven attrs={}), so `data` above sees nothing. Pull
+            # each child's (contentId, transactionId, logSequence) here so the
+            # release decision under the lock is O(1). Only consulted when a
+            # push for this device is 'recovering' (the MDX003 hold, below).
+            content_log = []
+            if cmd == "contentLogList":
+                for ch in el.iter():
+                    if localname(ch.tag) == "contentLog":
+                        content_log.append((
+                            attr(ch, "contentId"),
+                            attr(ch, "transactionId"),
+                            attr(ch, "logSequence")))
             with assoc.lock:
                 assoc.media[dev] = dict(assoc.media.get(dev) or {},
                                         lastCommand=cmd,
@@ -16692,13 +17698,16 @@ class G2SHost:
                 # would retag the job and fire a stale setActiveContent /
                 # showMediaDisplay at the freshly rejoined cabinet.
                 glass_step = None
+                glass_recover = None
                 glass_epoch = assoc.epoch
                 push = assoc.glass_push.get(dev)
                 if push and cmd == "contentStatus" and \
                         str(data.get("contentId") or "") == \
                         push.get("contentId"):
                     cstate = data.get("contentState") or ""
-                    if push.get("stage") == "loading" and \
+                    if push.get("stage") in ("loading", "activating") and \
+                            cstate in ("IGT_contentLoaded",
+                                       "IGT_contentPending") and \
                             txn and str(txn).isdigit() and int(txn) >= 1:
                         # BENCH LESSON (2026-07-10, live AVP): pending is
                         # TOO EARLY for setActiveContent — the EGM answers
@@ -16709,6 +17718,14 @@ class G2SHost:
                         # a poll can only come from a fetched page, and its
                         # 1.5s cadence is the retry heartbeat). contentLoaded,
                         # when the EGM narrates it, still advances right here.
+                        # 2026-07-25: the gate now also accepts 'activating' so
+                        # the PATIENT getContentStatus re-driver (sweep fix D)
+                        # can complete the ladder off a genuine IGT_contentLoaded
+                        # even after a premature poll (or an MDE102 fire) already
+                        # advanced the stage — a solicited getContentStatus is
+                        # the ONLY way the fold ever sees contentLoaded (the AVP
+                        # never narrates it unsolicited), and re-firing
+                        # setActiveContent on truly-loaded content is idempotent.
                         if cstate == "IGT_contentLoaded":
                             assoc.glass_push[dev] = dict(
                                 push, txn=str(txn), stage="activating",
@@ -16727,6 +17744,33 @@ class G2SHost:
                     assoc.glass_push[dev] = dict(push, stage="shown")
                     assoc.glass_visible = True
                     glass_step = ("shown", None, None)
+                # MDX003 self-recovery: the getContentLog we fired when the auto
+                # load hit MDX003 has answered. Release the occupant (highest
+                # logSequence = the current content under maxContentLoaded=1),
+                # re-arm the held push back to 'loading' and reload the content
+                # the operator originally asked for — the auto equivalent of the
+                # manual "log -> release -> load" rungs. Empty log => the window
+                # is already clear, so just reload. Decision here, enqueue AFTER
+                # the lock (below) on the glass_epoch captured above.
+                rpush = assoc.glass_push.get(dev)
+                if cmd == "contentLogList" and rpush and \
+                        rpush.get("stage") == "recovering":
+                    occ = None
+                    best = -1
+                    for c_id, c_txn, c_seq in content_log:
+                        if not (c_id and str(c_id).isdigit()
+                                and c_txn and str(c_txn).isdigit()
+                                and int(c_txn) >= 1):
+                            continue
+                        n = int(c_seq) if c_seq and str(c_seq).isdigit() \
+                            else 0
+                        if n >= best:
+                            best, occ = n, (str(c_id), str(c_txn))
+                    assoc.glass_push[dev] = dict(
+                        rpush, stage="loading", startedTs=time.time(),
+                        tries=0, lastTryTs=0)
+                    assoc.media_content[dev] = rpush["contentId"]
+                    glass_recover = (occ, rpush["contentId"], rpush["uri"])
             log.info("🖥️ [%s] mediaDisplay %s dev=%s attrs=%s — WIRE "
                      "EVIDENCE (schema-adjudicated igtMediaDisplay v1.8; "
                      "captured to /api/status mediaDisplay)", assoc.egm_id,
@@ -16744,6 +17788,23 @@ class G2SHost:
                          "SHOWN — resident page live"
                          if glass_step[0] == "shown"
                          else f"auto-{glass_step[0]}")
+            if glass_recover is not None:
+                # FIFO order is the correctness: the worker sends the release
+                # and only then the load, so the window is clear when the
+                # reload lands (the same guarantee start_glass_show relies on).
+                occ, reload_cnt, reload_uri = glass_recover
+                if occ:
+                    self.enqueue_release_content(assoc, dev, occ[0], occ[1],
+                                                 epoch=glass_epoch)
+                self.enqueue_load_content(assoc, dev, reload_cnt, reload_uri,
+                                          epoch=glass_epoch)
+                log.warning("🪟 [%s] glass MDX003 self-recovery dev=%s — %s, "
+                            "reloading content=%s into the cleared window "
+                            "(auto mirror of the manual release->load; "
+                            "live-proven 2026-07-25)", assoc.egm_id, dev,
+                            (f"releasing occupant content={occ[0]} txn={occ[1]}"
+                             if occ else "content log empty (window clear)"),
+                            reload_cnt)
             if stype == "G2S_request":
                 # contentToHostMessage's name suggests EGM->host requests
                 # exist; the ack verb is unrecovered — APX008 is the
@@ -16842,19 +17903,59 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
     timeout = 120
     host_engine = None              # set by main()
 
+    # /api/command read pacing (2026-07-22): identical read-class repeats
+    # from ONE client for ONE (egm, action, device) inside this window are
+    # refused with an honest 429 {ok:false} — the SAS_POLL_FLOOR discipline
+    # at the G2S hub edge. Every accepted read becomes a REAL wire read on
+    # an unbounded per-assoc FIFO, and a runaway client loop (a stale tab /
+    # leftover script — live-caught 2026-07-22 sweeping getGameDenoms
+    # round-robin for hours) is otherwise indistinguishable from operator
+    # intent. The window is short on purpose: it stops loops, not
+    # operators — a double-click re-asks in 2 s. Hub-internal reads
+    # (GPE201 re-reads, sweeps, backfill) never pass through here and are
+    # never paced. Class-level: handler instances are per-request.
+    READ_PACE_WINDOW_SEC = 2.0
+    READ_PACE_ACTIONS = frozenset((
+        "getGameDenoms", "getGamePlayStatus", "getGamePlayProfile",
+        "getCabinetStatus", "getCabinetProfile", "getMeterInfo",
+        "getDescriptor"))
+    _cmd_pace = {}
+    _cmd_pace_lock = threading.Lock()
+
+    # /api/status ETag hash source: neutralize the clock-DERIVED per-call
+    # fields (tournament serverNow, sas/companion reportAgeSec, glass
+    # idleSec) so identical DATA hashes identical across calls — without
+    # this every response hashes unique and the 304 never fires. The
+    # "stale" booleans are deliberately NOT in the list: a satellite going
+    # quiet is a data change and must bust the cache. Escaped occurrences
+    # inside JSON string values can't match — their quotes arrive as \".
+    _ETAG_CLOCK_NOISE = re.compile(
+        r'"(serverNow|reportAgeSec|idleSec)": -?[0-9][0-9.eE+-]*')
+
     def log_message(self, fmt, *args):
         log.debug("http: " + fmt, *args)
 
     def _send(self, code, body, content_type="text/xml; charset=utf-8",
-              soap=True):
+              soap=True, etag=None):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        if etag:
+            self.send_header("ETag", etag)
         if soap:
             self.send_header("SOAPAction", '""')
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # a poller that hung up mid-response (sleeping tab, kiosk
+            # reload, Wi-Fi blip) is routine — one line, never the
+            # 30-line socketserver traceback that buries real signals
+            # in the journal.
+            log.info("http: client %s dropped mid-response (%s, %d bytes)",
+                     getattr(self, "client_address", ("?",))[0],
+                     e.__class__.__name__, len(data))
 
     def _serve_webui(self, rel_path):
         """G2S-36: static serving for the Test Panel — files under G2S/webui/
@@ -16906,8 +18007,14 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         # serves a stale page and a UI update looks "not deployed". Files are
         # tiny and LAN-served, so revalidating every load costs nothing.
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # the _send treatment: a mid-download hangup is one line.
+            log.info("http: client %s dropped mid-page (%s, %s)",
+                     getattr(self, "client_address", ("?",))[0],
+                     e.__class__.__name__, name)
 
     def do_GET(self):
         # Strip the query string, then unquote BEFORE routing/serving so
@@ -16916,147 +18023,271 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         path = urllib.parse.unquote(self.path.split("?", 1)[0])
         if path.startswith("/api/status"):
             engine = self.host_engine
-            with engine.assoc_lock:        # avoid 'dict changed size' vs new EGM
-                assocs = list(engine.associations.values())
-            snap = {a.egm_id: a.snapshot() for a in assocs}
-            # Machine linking (task #20): stamp each G2S entry's SAS-leg
-            # link from the in-memory map (hub.db truth cached at init +
-            # settings writes) — null when unlinked, and NO db read on
-            # the 2 s poll.
-            _nicks = engine.hub_store.names()
-            for a in assocs:
-                snap[a.egm_id]["sasLink"] = engine.sas_links.get(a.egm_id)
-                # 'known' = the hub has a PERSISTED identity for this cabinet:
-                # a config-inventory record (only written AFTER a real join
-                # reads optionConfig/gamePlay) or an operator-set nickname
-                # (names() is WHERE nickname IS NOT NULL). A REGISTERED machine
-                # (AJ: "make sure it wont hit registered machines — sometimes
-                # registered machines will be offline") — exempt from the
-                # never-joined reaper and shown even while offline/mid-join.
-                # Neither signal can be tripped by an anonymous phantom that
-                # only ever hit :8081 without joining or being named.
-                snap[a.egm_id]["known"] = bool(
-                    engine.config_store.get(a.egm_id)) or bool(
-                    _nicks.get(a.egm_id))
-            # Register G2S machines in the hub.db registry (throttled — a
-            # cheap upsert, but not every 2s poll). Lock-safe: runs outside
-            # assoc.lock. Gives the AVP a registry row + server-side name slot.
-            engine.register_g2s_machines(assocs)
-            # G2S-13 live activity tape: newest-first semantic entries from
-            # the typed event hooks (engine-level — one tape across EGMs).
-            snap["activity"] = engine.activity_snapshot()
-            snap["_engine"] = engine.engine_meta()
-            # The SAS floor: machines reported by sas_host.py satellites
-            # (protocol-agnostic hub — the Home UI shows G2S + SAS side by
-            # side). Reserved key: the UI's EGM iteration must skip it like
-            # activity/_engine.
-            snap["sas"] = engine.sas_snapshot()
-            # Server-side machine names (hub.db) — {machineKey: nickname}.
-            # The UI prefers these over its localStorage cache so the kiosk
-            # and a phone agree. Another reserved key the EGM loop skips.
-            snap["names"] = engine.hub_store.names()
-            # hub.db phase 2: cross-machine TITO ledger counts (best-effort,
-            # degrades to {} — bench/UI visibility). Reserved key.
-            snap["tito"] = engine.hub_store.tito_counts()
-            # Tournament mode (board v2): the phase machine's live state —
-            # the board's takeover gate (+ serverNow so the TV computes
-            # countdowns against the hub's clock). Reserved key; guarded
-            # like the sas dumps fallback below — the poll the whole UI
-            # depends on must never 500 over a scoring hiccup.
-            try:
-                snap["tournament"] = engine.tournament_snapshot()
-            except Exception:  # noqa: BLE001 — status must never 500
-                snap["tournament"] = {"phase": "idle",
-                                      "error": "tournament snapshot failed"}
-            # Companion RFID floor (phase 1): reader daemons + the active
-            # carded sessions ({egmId: {uid, name, since}} — the UI's tile
-            # badge). Two more reserved keys the EGM loop skips; both {}
-            # until a companion reports (dormant on a fob-less floor).
-            snap["companions"] = engine.companion_snapshot()
-            snap["cardSessions"] = engine.card_sessions_snapshot()
-            # Glass nav v1: live glass-session summary (count + tier/name
-            # per EGM — NO token values; the token travels only in the
-            # carded EGM's own /api/glass/state poll). Reserved key the
-            # UI's EGM loop must skip like cardSessions.
-            snap["glassSessions"] = engine.glass_sessions.summary()
-            # Host-wide options (C4) — the Settings tab's host card reads
-            # this; the write path is POST /api/settings. Reserved key.
-            # "ticket" is ALWAYS present (absent fields null) — the UI
-            # feature-detects the subsection on the key, and rev drives
-            # the per-machine "ticket header pending" note against each
-            # SAS entry's ticketData.appliedRev.
-            _th = engine.ticket_header()
-            snap["hostOptions"] = {
-                "sysvalFallback": engine.sysval_fallback(),
-                # the collector's gameroom name (Settings ▸ prefill); "" unset.
-                "gameroomName": engine.hub_store.host_setting(
-                    "gameroom_name", ""),
-                # Gameroom Board (wall TV at /board): ships ON; the toggle
-                # blanks the page render, the route always serves.
-                "boardEnabled": engine.hub_store.host_setting(
-                    "board_enabled", "1") == "1",
-                # Collector economy (2026-07-13, de-caged 07-15): the bank's
-                # current balance (so Options ▸ House Bankroll prefills) and
-                # whether it may run negative. The Bank is just bankroll
-                # minus handouts — machine take-tracking is GONE.
-                "houseBankrollMc": int((engine.account_store.get("house")
-                                        or {}).get("cashableMillicents", 0)
-                                       or 0),
-                "houseAllowNegative": engine.house_allow_negative(),
-                # Tournament alias roster (board v2) — the EFFECTIVE list
-                # (defaults when unset), so the admin card's textarea can
-                # prefill; write path = /api/settings tournamentNames.
-                "tournamentNames": engine.tournament_names(),
-                "ticket": {"propName": _th.get("propName"),
-                           "line1": _th.get("line1"),
-                           "line2": _th.get("line2"),
-                           "titleCash": _th.get("titleCash"),
-                           "expireDays": int(_th.get("expireDays") or 0),
-                           "rev": int(_th.get("rev") or 0)}}
-            # UI build stamp: home.html's mtime. The DSI kiosk (chromium
-            # --incognito, nobody ever presses F5 on it) reloads itself when
-            # this changes, so a webui deploy shows up without restarting
-            # the kiosk service. One stat per poll — negligible.
-            try:
-                snap["uiStamp"] = int(os.path.getmtime(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "webui", "home.html")))
-            except OSError:
-                pass
-            # smib.html's OWN mtime: the BB2 panel is a kiosk too (no keyboard
-            # to F5), but it must NOT self-reload mid-session, so it watches
-            # this separately from uiStamp/uiBuild and only reloads while idle
-            # (attract). A webui deploy then reaches the panel without bouncing
-            # its kiosk browser. One extra stat per poll — negligible.
-            try:
-                snap["smibStamp"] = int(os.path.getmtime(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "webui", "smib.html")))
-            except OSError:
-                pass
-            # board.html's OWN mtime (board v2): the wall TV is a kiosk too
-            # (nobody presses F5 on it), but it must never reload mid-show —
-            # the board watches this stamp and reloads ONLY while idle in
-            # attract (no tournament, no fireworks), the smibStamp posture.
-            # One extra stat per poll — negligible.
-            try:
-                snap["boardStamp"] = int(os.path.getmtime(os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "webui", "board.html")))
-            except OSError:
-                pass
-            # allow_nan=False: a non-finite value must never reach the wire as
-            # a bare NaN/Infinity token (unparseable by browsers). Ingest
-            # already rejects them; this is the belt-and-suspenders. On the
-            # (should-be-impossible) TypeError, drop the sas section rather
-            # than 500 the poll that the whole UI depends on.
-            try:
-                body = json.dumps(snap, indent=2, allow_nan=False)
-            except ValueError:
-                snap["sas"] = {"_error": "a SAS report held a non-finite "
-                               "value and was dropped"}
-                body = json.dumps(snap, indent=2, allow_nan=False)
-            self._send(200, body, "application/json", soap=False)
+            # ?slim=1 — the POLLER view (2026-07-22). The full payload
+            # crossed 6 MB (131 gamePlay profiles with wagerCategories/
+            # winLevels dominate) while 5+ standing clients pulled it every
+            # ~2 s — MB/s of JSON serialized in-process with the EGM
+            # handlers, riding wlan0. Tiles need name/online/credits/
+            # machineInfo/denomSuggest — not 131 full profiles; pollers
+            # (kiosk, board, debug_console) should ask slim and fetch the
+            # full view on demand (e.g. when the games modal opens).
+            slim = (urllib.parse.parse_qs(self.path.partition("?")[2])
+                    .get("slim") or ["0"])[0] not in ("", "0", "false")
+            # Hub-perf fix (2026-07-25, see STATUS_CACHE_TTL_SEC): the
+            # build+serialize+ETag below runs ONCE per TTL window per
+            # variant; every other poll serves the cached bytes. Single
+            # flight: the poller that finds the entry expired rebuilds;
+            # anyone arriving mid-rebuild serves the previous body
+            # (staleness bounded by TTL + one build) instead of a
+            # thundering herd of ~0.2s builds. Cold start (no previous
+            # body) lets concurrent pollers build once in parallel.
+            variant = "slim" if slim else "full"
+            _now_c = time.time()
+            with engine.status_cache_lock:
+                _ent = engine.status_cache.get(variant)
+                # Serve cached only while NOTHING has POSTed since it was
+                # built (seq match = read-your-writes) AND it is inside the
+                # TTL (the cap for timer-driven mutations that bypass
+                # POST). A stale-seq entry is still served to pollers
+                # arriving MID-rebuild (single-flight) — bounded by one
+                # build, beats a thundering herd.
+                _fresh = bool(
+                    _ent
+                    and _ent["seq"] == engine.status_state_seq
+                    and _now_c - _ent["at"] <= STATUS_CACHE_TTL_SEC)
+                if _ent and (_fresh
+                             or engine.status_cache_building.get(variant)):
+                    body, etag = _ent["body"], _ent["etag"]
+                    _served_cached = True
+                else:
+                    engine.status_cache_building[variant] = True
+                    # capture the seq BEFORE building: a POST landing
+                    # mid-build stamps the entry already-stale, so the
+                    # next poll rebuilds rather than trusting a body that
+                    # may or may not contain that change.
+                    _build_seq = engine.status_state_seq
+                    _served_cached = False
+            if not _served_cached:
+                try:
+                    with engine.assoc_lock:        # avoid 'dict changed size' vs new EGM
+                        assocs = list(engine.associations.values())
+                    snap = {a.egm_id: a.snapshot() for a in assocs}
+                    if slim:
+                        snap["slim"] = True
+                        for a in assocs:
+                            e = snap.get(a.egm_id)
+                            if isinstance(e, dict):
+                                # the payload whales; everything else rides. The
+                                # scalar summaries (meterCount, gamePlayAsOf,
+                                # descriptorCount, ...) stay so slim pages can
+                                # still say how much they are not showing.
+                                for k in ("meterSubs", "configOptions",
+                                          "configDevices"):
+                                    e.pop(k, None)
+                                # meters: keep ONLY the cabinet class — an
+                                # UNLINKED G2S cabinet's tile CREDITS line reads
+                                # G2S_cabinet/1/G2S_player*Amt (the AVP has no SAS
+                                # leg to fall back on), and freezing it would be a
+                                # new staleness bug. ~30 keys survive of the 2,000+
+                                # per-gamePlay-device whale. New dict — snapshot()'s
+                                # copies may be shared, never filter in place.
+                                m = e.get("meters")
+                                if isinstance(m, dict):
+                                    e["meters"] = {
+                                        k: v for k, v in m.items()
+                                        if isinstance(k, str)
+                                        and k.startswith("G2S_cabinet/")}
+                                # gamePlay: per-device MICRO view — exactly the
+                                # tile fields (title counts via themeId, tilt
+                                # chips, machine-off), never the profile/denoms/
+                                # wagerCats whale (3 MB of the AVP's 3.2). The
+                                # games page needs the full shape and polls the
+                                # FULL view while it is open (home.html D13).
+                                gp = e.get("gamePlay")
+                                if isinstance(gp, dict):
+                                    e["gamePlay"] = {
+                                        d: ({k: g[k] for k in
+                                             ("themeId", "egmEnabled",
+                                              "generalTilt", "reelTilt")
+                                             if k in g}
+                                            if isinstance(g, dict) else {})
+                                        for d, g in gp.items()}
+                    # Machine linking (task #20): stamp each G2S entry's SAS-leg
+                    # link from the in-memory map (hub.db truth cached at init +
+                    # settings writes) — null when unlinked, and NO db read on
+                    # the 2 s poll.
+                    _nicks = engine.hub_store.names()
+                    for a in assocs:
+                        snap[a.egm_id]["sasLink"] = engine.sas_links.get(a.egm_id)
+                        # 'known' = the hub has a PERSISTED identity for this cabinet:
+                        # a config-inventory record (only written AFTER a real join
+                        # reads optionConfig/gamePlay) or an operator-set nickname
+                        # (names() is WHERE nickname IS NOT NULL). A REGISTERED machine
+                        # (AJ: "make sure it wont hit registered machines — sometimes
+                        # registered machines will be offline") — exempt from the
+                        # never-joined reaper and shown even while offline/mid-join.
+                        # Neither signal can be tripped by an anonymous phantom that
+                        # only ever hit :8081 without joining or being named.
+                        snap[a.egm_id]["known"] = bool(
+                            engine.config_store.get(a.egm_id)) or bool(
+                            _nicks.get(a.egm_id))
+                    # Register G2S machines in the hub.db registry (throttled — a
+                    # cheap upsert, but not every 2s poll). Lock-safe: runs outside
+                    # assoc.lock. Gives the AVP a registry row + server-side name slot.
+                    engine.register_g2s_machines(assocs)
+                    # G2S-13 live activity tape: newest-first semantic entries from
+                    # the typed event hooks (engine-level — one tape across EGMs).
+                    snap["activity"] = engine.activity_snapshot()
+                    snap["_engine"] = engine.engine_meta()
+                    # The SAS floor: machines reported by sas_host.py satellites
+                    # (protocol-agnostic hub — the Home UI shows G2S + SAS side by
+                    # side). Reserved key: the UI's EGM iteration must skip it like
+                    # activity/_engine.
+                    snap["sas"] = engine.sas_snapshot()
+                    # Server-side machine names (hub.db) — {machineKey: nickname}.
+                    # The UI prefers these over its localStorage cache so the kiosk
+                    # and a phone agree. Another reserved key the EGM loop skips.
+                    snap["names"] = engine.hub_store.names()
+                    # hub.db phase 2: cross-machine TITO ledger counts (best-effort,
+                    # degrades to {} — bench/UI visibility). Reserved key.
+                    snap["tito"] = engine.hub_store.tito_counts()
+                    # Tournament mode (board v2): the phase machine's live state —
+                    # the board's takeover gate (+ serverNow so the TV computes
+                    # countdowns against the hub's clock). Reserved key; guarded
+                    # like the sas dumps fallback below — the poll the whole UI
+                    # depends on must never 500 over a scoring hiccup.
+                    try:
+                        snap["tournament"] = engine.tournament_snapshot()
+                    except Exception:  # noqa: BLE001 — status must never 500
+                        snap["tournament"] = {"phase": "idle",
+                                              "error": "tournament snapshot failed"}
+                    # Companion RFID floor (phase 1): reader daemons + the active
+                    # carded sessions ({egmId: {uid, name, since}} — the UI's tile
+                    # badge). Two more reserved keys the EGM loop skips; both {}
+                    # until a companion reports (dormant on a fob-less floor).
+                    snap["companions"] = engine.companion_snapshot()
+                    snap["cardSessions"] = engine.card_sessions_snapshot()
+                    # Glass nav v1: live glass-session summary (count + tier/name
+                    # per EGM — NO token values; the token travels only in the
+                    # carded EGM's own /api/glass/state poll). Reserved key the
+                    # UI's EGM loop must skip like cardSessions.
+                    snap["glassSessions"] = engine.glass_sessions.summary()
+                    # Host-wide options (C4) — the Settings tab's host card reads
+                    # this; the write path is POST /api/settings. Reserved key.
+                    # "ticket" is ALWAYS present (absent fields null) — the UI
+                    # feature-detects the subsection on the key, and rev drives
+                    # the per-machine "ticket header pending" note against each
+                    # SAS entry's ticketData.appliedRev.
+                    _th = engine.ticket_header()
+                    snap["hostOptions"] = {
+                        "sysvalFallback": engine.sysval_fallback(),
+                        # the collector's gameroom name (Settings ▸ prefill); "" unset.
+                        "gameroomName": engine.hub_store.host_setting(
+                            "gameroom_name", ""),
+                        # Gameroom Board (wall TV at /board): ships ON; the toggle
+                        # blanks the page render, the route always serves.
+                        "boardEnabled": engine.hub_store.host_setting(
+                            "board_enabled", "1") == "1",
+                        # Collector economy (2026-07-13, de-caged 07-15): the bank's
+                        # current balance (so Options ▸ House Bankroll prefills) and
+                        # whether it may run negative. The Bank is just bankroll
+                        # minus handouts — machine take-tracking is GONE.
+                        "houseBankrollMc": int((engine.account_store.get("house")
+                                                or {}).get("cashableMillicents", 0)
+                                               or 0),
+                        "houseAllowNegative": engine.house_allow_negative(),
+                        # Tournament alias roster (board v2) — the EFFECTIVE list
+                        # (defaults when unset), so the admin card's textarea can
+                        # prefill; write path = /api/settings tournamentNames.
+                        "tournamentNames": engine.tournament_names(),
+                        "ticket": {"propName": _th.get("propName"),
+                                   "line1": _th.get("line1"),
+                                   "line2": _th.get("line2"),
+                                   "titleCash": _th.get("titleCash"),
+                                   "expireDays": int(_th.get("expireDays") or 0),
+                                   "rev": int(_th.get("rev") or 0)}}
+                    # UI build stamp: home.html's mtime. The DSI kiosk (chromium
+                    # --incognito, nobody ever presses F5 on it) reloads itself when
+                    # this changes, so a webui deploy shows up without restarting
+                    # the kiosk service. One stat per poll — negligible.
+                    try:
+                        snap["uiStamp"] = int(os.path.getmtime(os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "webui", "home.html")))
+                    except OSError:
+                        pass
+                    # smib.html's OWN mtime: the BB2 panel is a kiosk too (no keyboard
+                    # to F5), but it must NOT self-reload mid-session, so it watches
+                    # this separately from uiStamp/uiBuild and only reloads while idle
+                    # (attract). A webui deploy then reaches the panel without bouncing
+                    # its kiosk browser. One extra stat per poll — negligible.
+                    try:
+                        snap["smibStamp"] = int(os.path.getmtime(os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "webui", "smib.html")))
+                    except OSError:
+                        pass
+                    # board.html's OWN mtime (board v2): the wall TV is a kiosk too
+                    # (nobody presses F5 on it), but it must never reload mid-show —
+                    # the board watches this stamp and reloads ONLY while idle in
+                    # attract (no tournament, no fireworks), the smibStamp posture.
+                    # One extra stat per poll — negligible.
+                    try:
+                        snap["boardStamp"] = int(os.path.getmtime(os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "webui", "board.html")))
+                    except OSError:
+                        pass
+                    # allow_nan=False: a non-finite value must never reach the wire as
+                    # a bare NaN/Infinity token (unparseable by browsers). Ingest
+                    # already rejects them; this is the belt-and-suspenders. On the
+                    # (should-be-impossible) TypeError, drop the sas section rather
+                    # than 500 the poll that the whole UI depends on.
+                    try:
+                        body = json.dumps(snap, indent=2, allow_nan=False)
+                    except ValueError:
+                        snap["sas"] = {"_error": "a SAS report held a non-finite "
+                                       "value and was dropped"}
+                        body = json.dumps(snap, indent=2, allow_nan=False)
+                    # Conditional GET (2026-07-22): a content-hash ETag — correct
+                    # by construction (moves exactly when the DATA moves; never
+                    # keyed on uiStamp, which is only home.html's mtime). Hashed
+                    # over the _ETAG_CLOCK_NOISE-normalized body, NOT the raw one:
+                    # serverNow/reportAgeSec/idleSec tick every call, so a raw
+                    # hash never repeats and the 304 would be dead code. The 304
+                    # saves the multi-MB wire leg for a poller whose view hasn't
+                    # changed — but ONLY if the client revalidates: the browser
+                    # pollers fetch with cache:"no-cache" (NOT no-store, which
+                    # stores no validator and never sends If-None-Match, leaving
+                    # this pure cost). The build+serialize now runs once per
+                    # STATUS_CACHE_TTL_SEC window (the snapshot cache is the
+                    # CPU fix — slim only ever cut the wire); the 304 saves
+                    # the send.
+                    etag = '"' + hashlib.md5(self._ETAG_CLOCK_NOISE.sub(
+                        r'"\1": 0', body).encode("utf-8")).hexdigest() + '"'
+                    with engine.status_cache_lock:
+                        engine.status_cache[variant] = {
+                            "body": body, "etag": etag,
+                            "at": time.time(), "seq": _build_seq}
+                finally:
+                    with engine.status_cache_lock:
+                        engine.status_cache_building[variant] = False
+            if self.headers.get("If-None-Match") == etag:
+                try:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    # same routine hang-up guard as _send: a poller that
+                    # drops mid-304 must never surface the socketserver
+                    # traceback (now reachable — the pollers revalidate).
+                    log.info("http: client %s dropped mid-304 (%s)",
+                             getattr(self, "client_address", ("?",))[0],
+                             e.__class__.__name__)
+                return
+            self._send(200, body, "application/json", soap=False,
+                       etag=etag)
         elif path.startswith("/api/accounts"):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
             self._send(200, json.dumps(
@@ -17268,11 +18499,39 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         the join choreography. Read-only/non-destructive actions, plus
         deliberate bench operations (claimOwnership, voidValidationId)."""
         engine = self.host_engine
+        peer = getattr(self, "client_address", None)
+        peer = peer[0] if peer else "?"
         try:
             req = json.loads(raw) if raw.strip() else {}
         except (ValueError, TypeError):
             return self._send(400, '{"ok": false, "error": "invalid JSON"}',
                               "application/json", soap=False)
+        # Stale-client fence (2026-07-22): the Home SPA echoes the uiStamp
+        # it was SERVED with (home.html's mtime — the same watermark the
+        # kiosk self-reload watches) on every command; a mismatch means the
+        # tab is running superseded JS, and its writes/reads should not
+        # reach the wire — 409 tells cmd() to reload. FEATURE-DETECTED:
+        # a stampless request (curl, Test Panel, glass, older pages) always
+        # passes — curl is a first-class client here.
+        ui_stamp = req.get("uiStamp")
+        if ui_stamp is not None:
+            try:
+                cur_stamp = int(os.path.getmtime(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "webui", "home.html")))
+            except OSError:
+                cur_stamp = None
+            try:
+                sent_stamp = int(ui_stamp)
+            except (TypeError, ValueError):
+                sent_stamp = None
+            if cur_stamp is not None and sent_stamp != cur_stamp:
+                log.warning("/api/command from %s REFUSED — stale UI "
+                            "(uiStamp %r != %s, action=%s)", peer,
+                            ui_stamp, cur_stamp, req.get("action"))
+                return self._send(409, json.dumps({
+                    "ok": False, "error": "stale UI — reload"}),
+                    "application/json", soap=False)
         action = req.get("action")
         egm_id = req.get("egmId")
         actions = {
@@ -17321,6 +18580,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             "getGamePlayStatus": engine.enqueue_get_game_play_status,
             "getGamePlayProfile": engine.enqueue_get_game_play_profile,
             "getGameDenoms": engine.enqueue_get_game_denoms,
+            # denom write (§6.15): REPLACE a gamePlay device's active denom
+            # set. Strictly validated below (millicent int list, never
+            # empty); refused while a tournament is non-idle.
+            "setActiveDenoms": engine.enqueue_set_active_denoms,
             # gamePlay full sweep (G2S-21) — on-demand trigger for the
             # staggered status/profile/denoms read of EVERY gamePlay device
             # (operator "refresh all games"). Deliberately NOT auto-fired on
@@ -17330,12 +18593,14 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # opt-in — the sweep is epoch-gated and silence-tolerant, so a
             # double-click just re-trickles harmlessly.
             "gameSweep": engine._start_game_play_sweep,
-            # gamePlay STATUS-only refresh (GR-30) — the UI "refresh games"
-            # button. One paced pass of getGamePlayStatus across every device
-            # (NOT profile/denoms — those are static, so this is ~1/3 the
-            # traffic of gameSweep) to pull the LIVE hostEnabled/egmEnabled
-            # after a game was toggled at the EGM's own operator/e-key menu
-            # (which fires no host event). On-demand, not on a timer — no idle
+            # gamePlay refresh (GR-30) — the UI "refresh games" button. One
+            # paced pass of getGamePlayStatus across every device, plus the
+            # profile/denoms trio for never-profiled devices and a denoms
+            # re-read for known devices past the GP_DENOM_FRESH_SEC horizon
+            # (PROFILES are static per theme+paytable; active denom sets
+            # are host- AND operator-mutable since 2026-07-22, so "denoms
+            # are static" stopped being true) — still far lighter than
+            # gameSweep. On-demand, not on a timer — no idle
             # flood. Returns {devices:N}; epoch-gated, silence-tolerant.
             "refreshGameStatus": engine.refresh_game_play_status,
             # idReader bench probe (RFID phase 1, the GR-30 posture):
@@ -17608,6 +18873,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         kwargs = {}
         if action in ("getGamePlayStatus", "getGamePlayProfile",
                       "getGameDenoms", "setGamePlayState",
+                      "setActiveDenoms",
                       "getNoteAcceptorStatus",
                       "getNoteAcceptorProfile", "setNoteAcceptorState",
                       "watStatus", "watProfile", "watEnable", "watDisable",
@@ -17618,6 +18884,50 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                       "printerProbe", "printTicket") \
                 and req.get("deviceId") is not None:
             kwargs["device_id"] = str(req["deviceId"])
+        if action == "setActiveDenoms":
+            # §6.15 REPLACEMENT set, millicent ints. Strict: 1..64 values,
+            # each 1000..500_000_000 (1¢..$5,000 — the IGT ladder's span),
+            # real ints only (bools/floats 400). An EMPTY list is spec-
+            # legal but force-disables the device (GPE201 -> GPE001) —
+            # refused here; per-title disable is setGamePlayState's job.
+            # And no denom-set changes while a tournament is LIVE (armed/
+            # countdown/running — the race-fairness window, Layer B).
+            # ⚠️ ONLY those phases: a completed run PARKS at "finished"
+            # until someone clears the board, and the old !=idle guard
+            # froze denom control indefinitely after every tournament
+            # (live-hit: "tournament is finished — denom sets are frozen
+            # until it finishes", AJ 2026-07-25). Terminal/quiescent
+            # phases (idle, finished) must never gate the floor.
+            # deviceId digits-only (the bonus/glass precedent): it lands
+            # RAW inside a wire XML attribute (build_inner_request), so a
+            # non-numeric id breaks out of the frame — this is a WRITE, so
+            # gate it even though the sibling reads historically don't.
+            dev = kwargs.get("device_id", "1")
+            if not dev.isdigit() or not 1 <= int(dev) <= 9999:
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "deviceId must be a number 1..9999"}),
+                    "application/json", soap=False)
+            with engine.tournament_lock:
+                t_phase = engine.tournament.get("phase")
+            if t_phase in ("armed", "countdown", "running"):
+                return self._send(409, json.dumps({
+                    "ok": False,
+                    "error": f"tournament is {t_phase} — denom sets are "
+                             "frozen while it runs"}),
+                    "application/json", soap=False)
+            dn = req.get("denoms")
+            if not isinstance(dn, list) or not dn or len(dn) > 64 or any(
+                    isinstance(d, bool) or not isinstance(d, int)
+                    or not 1000 <= d <= 500_000_000 for d in dn):
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "denoms must be 1..64 integer millicent "
+                             "values (1000..500000000); an empty set is "
+                             "refused — disable the title with "
+                             "setGamePlayState instead"}),
+                    "application/json", soap=False)
+            kwargs["denoms"] = sorted(set(dn))
         # printer printTicket (G2S-24): strict validation — junk draws 400
         # here; templateIndex 0-999 (Table 16.5), regions a bounded list of
         # {index, data} (data lands inside a wire XML attribute, escaped +
@@ -17875,10 +19185,41 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 kwargs["apply_condition"] = str(req["applyCondition"])
             if req.get("disableCondition"):
                 kwargs["disable_condition"] = str(req["disableCondition"])
+        # Read pacing (see the class-head constants): refuse an identical
+        # read-class repeat from the same client inside the window. Keyed
+        # AFTER assoc resolution so the key names the real EGM; the map is
+        # pruned in place so a rogue client can't grow it unbounded.
+        if action in self.READ_PACE_ACTIONS:
+            pace_key = (peer, action, assoc.egm_id,
+                        str(req.get("deviceId") or "1"))
+            now_mono = time.monotonic()
+            with self._cmd_pace_lock:
+                if len(self._cmd_pace) > 1024:
+                    cutoff = now_mono - self.READ_PACE_WINDOW_SEC
+                    for k in [k for k, ts in self._cmd_pace.items()
+                              if ts < cutoff]:
+                        del self._cmd_pace[k]
+                last = self._cmd_pace.get(pace_key, 0.0)
+                paced = now_mono - last < self.READ_PACE_WINDOW_SEC
+                if not paced:
+                    self._cmd_pace[pace_key] = now_mono
+            if paced:
+                log.warning("[%s] /api/command action=%s dev=%s from %s "
+                            "PACED (identical read inside %.0fs)",
+                            assoc.egm_id, action,
+                            req.get("deviceId") or "1", peer,
+                            self.READ_PACE_WINDOW_SEC)
+                return self._send(429, json.dumps({
+                    "ok": False,
+                    "error": f"paced — identical {action} for this device "
+                             f"inside {self.READ_PACE_WINDOW_SEC:.0f}s; "
+                             "retry shortly"}),
+                    "application/json", soap=False)
         result = actions[action](assoc, **kwargs)  # enqueue_* re-acquires
         #                                            assoc.lock
-        log.info("[%s] /api/command action=%s enqueued (commsState=%s)",
-                 assoc.egm_id, action, state)
+        log.info("[%s] /api/command action=%s dev=%s enqueued "
+                 "(commsState=%s, from %s)", assoc.egm_id, action,
+                 req.get("deviceId") or "-", state, peer)
         payload = {"ok": True, "action": action, "egmId": assoc.egm_id,
                    "commsState": state}
         # Store-level actions (voidValidationId) answer synchronously with a
@@ -18603,12 +19944,14 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         cmd_type = req.get("type")
         if cmd_type not in ("legacy_bonus", "handpay_reset", "aft_register",
                             "aft_transfer", "aft_set_host_cashout",
-                            "sas_disable", "sas_enable", "set_validation_id"):
+                            "sas_disable", "sas_enable", "set_validation_id",
+                            "sas_game_state", "read_machine_info"):
             return self._send(400, json.dumps(
                 {"ok": False, "error":
                  "type must be 'legacy_bonus', 'handpay_reset', "
                  "'aft_register', 'aft_transfer', 'aft_set_host_cashout', "
-                 "'sas_disable', 'sas_enable' or 'set_validation_id'"}),
+                 "'sas_disable', 'sas_enable', 'set_validation_id', "
+                 "'sas_game_state' or 'read_machine_info'"}),
                 "application/json", soap=False)
         cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
                "type": cmd_type}
@@ -18621,6 +19964,37 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                      f"{engine.SAS_BONUS_MAX_CREDITS}"}),
                     "application/json", soap=False)
             cmd["credits"] = credits
+        elif cmd_type == "sas_game_state":
+            # Per-game enable/disable via LP09 on the satellite. game =
+            # 2-BCD game number (Table 7.6.1 range 0001-9999); enable a
+            # strict bool. Acts at the machine's CURRENT denom (per-denom
+            # needs the off-disk B0 preamble — bench/bundle-gated). Not
+            # money, but it changes what a player can select — so frozen
+            # while a tournament is LIVE (armed/countdown/running), same
+            # law (and same 2026-07-25 fix) as setActiveDenoms: a run
+            # parked at "finished" must never keep gating the floor.
+            with engine.tournament_lock:
+                t_phase = engine.tournament.get("phase")
+            if t_phase in ("armed", "countdown", "running"):
+                return self._send(409, json.dumps(
+                    {"ok": False,
+                     "error": f"tournament is {t_phase} — game/denom sets "
+                              "are frozen while it runs"}),
+                    "application/json", soap=False)
+            game = req.get("game")
+            if (not isinstance(game, int) or isinstance(game, bool)
+                    or not 1 <= game <= 9999):
+                return self._send(400, json.dumps(
+                    {"ok": False,
+                     "error": "game must be an integer 1..9999"}),
+                    "application/json", soap=False)
+            enable = req.get("enable")
+            if not isinstance(enable, bool):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "enable must be a boolean"}),
+                    "application/json", soap=False)
+            cmd["game"] = game
+            cmd["enable"] = enable
         elif cmd_type == "set_validation_id":
             # Optional system_id (1..99) overrides the enhanced-validation
             # barcode namespace the satellite seeds via 0x4C. Omit to use the
@@ -18759,7 +20133,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             _emoji = {"legacy_bonus": "🎁", "handpay_reset": "🔑",
                       "aft_register": "🎫", "aft_transfer": "💵",
                       "sas_disable": "🔒", "sas_enable": "🔓",
-                      "set_validation_id": "🎟️"}.get(cmd_type, "•")
+                      "set_validation_id": "🎟️",
+                      "read_machine_info": "📖"}.get(cmd_type, "•")
             _amt = (f" {cmd['credits']} credits" if cmd_type == "legacy_bonus"
                     else f" ${cmd['cents'] / 100:.2f} from "
                     f"{cmd.get('accountId') or 'house'}"
@@ -18795,6 +20170,31 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 "application/json", soap=False)
         proto = str(req.get("protocol") or "unknown")[:8]
         out = {"ok": True, "machineKey": key}
+        # Race fairness (Layer A, the setActiveDenoms-409 twin): denomCents
+        # IS the SAS money scale — funding/clearing math still resolves it
+        # LIVE even though scoring froze at ARM — so a denomCents write
+        # against a SEATED machine is refused while a tournament is
+        # non-idle. Name-only writes and unseated machines pass; the seat
+        # match covers both the seat-map key and the linked leg's sasKey
+        # (the UI writes a linked cabinet's denom against its LEG key).
+        if "denomCents" in req:
+            engine = self.host_engine
+            with engine.tournament_lock:
+                t = engine.tournament
+                t_phase = t.get("phase")
+                seat_keys = set()
+                if t_phase != "idle":
+                    for sk, s in (t.get("seats") or {}).items():
+                        seat_keys.add(sk)
+                        if s.get("sasKey"):
+                            seat_keys.add(s["sasKey"])
+            if t_phase != "idle" and key in seat_keys:
+                return self._send(409, json.dumps({
+                    "ok": False,
+                    "error": f"tournament is {t_phase} — {key} is seated "
+                             "and denomCents is its money scale; wait for "
+                             "the run to finish"}),
+                    "application/json", soap=False)
         try:
             # denom first: it is the newly-typed field most likely to be
             # junk — failing BEFORE the name write means a 400 leaves
@@ -19411,6 +20811,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                           json.dumps(reply), "application/json", soap=False)
 
     def do_POST(self):
+        # /api/status cache invalidation (the read-your-writes half of the
+        # hub-perf fix): EVERY state mutation enters through a POST — EGM
+        # messages to /G2S, /api/command, /api/settings, the SAS satellite
+        # reports — so one unconditional seq bump here makes the next
+        # status poll rebuild. A bump on a pure-noise POST costs at most
+        # one extra build; a MISSED mutation path would cost correctness
+        # (the replay gate's read-your-writes assertions pin this). The
+        # only mutators that bypass POST are internal timers (offline
+        # demotion) — the cache TTL caps their staleness at 1s.
+        with self.host_engine.status_cache_lock:
+            self.host_engine.status_state_seq += 1
         length = int(self.headers.get("Content-Length", 0))
         # Cap the body: an EGM SOAP meterInfo push is ~250KB; a SAS report is
         # a few KB. 2MB is generous headroom and stops a hostile/buggy peer on
@@ -19508,6 +20919,29 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         body = self.host_engine.wrap_sync_response(reply_inner)
         wire.info("IN  >>> sync reply to %s\n%s", peer, body)
         self._send(200, body)
+
+
+class QuietDisconnectHTTPServer(ThreadingHTTPServer):
+    """A client dropping the TCP connection BEFORE sending a request line
+    (phone browser preconnect, a sleeping tab's half-open socket) raises
+    inside http.server's handle_one_request — upstream of every handler
+    guard (_send's mid-response guard can't reach it) — and socketserver's
+    default handle_error dumps the 20-line traceback that buries real
+    signals in the journal (the exact noise class the _send guard exists
+    to suppress). One INFO line for routine disconnects; anything else
+    still gets the full default dump."""
+
+    _ROUTINE_DISCONNECTS = (ConnectionResetError, BrokenPipeError,
+                            TimeoutError)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self._ROUTINE_DISCONNECTS):
+            log.info("http: client %s dropped pre-request (%s)",
+                     client_address[0] if client_address else "?",
+                     exc.__class__.__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 # ----------------------------------------------------------------------------
@@ -19742,7 +21176,8 @@ def main():
     # per attempt. One plain fatal line instead; the unit's StartLimit
     # settings (deploy/casinonet-g2s.service) backstop any other loop.
     try:
-        server = ThreadingHTTPServer((args.bind, args.port), G2SRequestHandler)
+        server = QuietDisconnectHTTPServer(
+            (args.bind, args.port), G2SRequestHandler)
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             print(f"FATAL: {args.bind}:{args.port} is already in use — "

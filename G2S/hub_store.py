@@ -753,8 +753,10 @@ class HubStore:
             return None
 
     def set_denom(self, machine_key, denom_cents, protocol="unknown"):
-        """Set (or clear) a machine's display denomination in CENTS per
-        credit (R2, display-only — never money math). set_nickname's
+        """Set (or clear) a machine's denomination in CENTS per credit.
+        This IS the SAS money scale — _machine_credits_mc values 0x1A
+        credits with it and tournament scoring rides it (an earlier
+        "display-only" note here predated those callers). set_nickname's
         posture: creates the row if the machine hasn't reported yet (within
         the MAX_MACHINES cap), RAISES ValueError on bad input so the
         endpoint answers 400. 0 / None / '' / '0' clears (stores NULL).

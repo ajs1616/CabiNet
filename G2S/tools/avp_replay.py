@@ -274,6 +274,20 @@ def post_command_err(payload):
         return e.code, json.loads(e.read())
 
 
+def post_sas_command_err(payload):
+    """POST /api/sas/command tolerating an expected non-2xx (e.g. the 409
+    tournament freeze) — returns (status, body) instead of raising."""
+    req = urllib.request.Request(
+        "http://127.0.0.1:8081/api/sas/command",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
 def get_json(url):
     """GET a host JSON endpoint (/api/accounts, /api/debug/log, ...)."""
     with urllib.request.urlopen(url, timeout=5) as resp:
@@ -507,6 +521,12 @@ class FakeEgmHandler(BaseHTTPRequestHandler):
                     out["command"] = localname(child.tag)
                     out["commandAttrs"] = {
                         localname(k): v for k, v in child.attrib.items()}
+                    # grandchildren (e.g. setActiveDenoms' activeDenom /
+                    # activeRange singles) — tag + attrs, in wire order
+                    out["children"] = [
+                        {"tag": localname(gc.tag),
+                         **{localname(k): v for k, v in gc.attrib.items()}}
+                        for gc in child]
                 break
         except ET.ParseError as e:
             out["error"] = f"parse error: {e}"
@@ -1377,6 +1397,37 @@ def main():
                   "153-device inventory)",
                   snap2.get(EGM_ID, {}).get("descriptorCount") == 153,
                   f"got {snap2.get(EGM_ID, {}).get('descriptorCount')}")
+            # Denom-freshness backfill (2026-07-22): with the full join
+            # sweep gated off in production (--game-sweep, the a3b19f8
+            # starvation decision), the descriptor harvest is now the
+            # join's denom anchor — folding a descriptorList fires ONE
+            # paced getGameDenoms pass over every known gamePlay device
+            # whose denomsAt is absent or past GP_DENOM_FRESH_SEC (the
+            # join-sweep trickle pacing). Drain and pin it BEFORE the
+            # on-demand sweep so the exact-order slices below stay
+            # deterministic. Rejoins re-anchor per epoch but the per-device
+            # asked-tracker keeps those passes EMPTY — pinned implicitly by
+            # every later exact-wire step (a second 119-read pass would
+            # break them all).
+            bf_seen = {}
+            bf_bad = []
+            for _ in range(len(gp_ids)):
+                m = expect_host_post("harvest denom-backfill getGameDenoms",
+                                     timeout=20)
+                if not m:
+                    break
+                if m["command"] != "getGameDenoms" \
+                        or m.get("commandAttrs", {}) != {}:
+                    bf_bad.append(
+                        f"{m.get('command')}/dev{m.get('deviceId')}")
+                bf_seen[m["deviceId"]] = bf_seen.get(m["deviceId"], 0) + 1
+            check("harvest denom backfill asks EVERY device exactly once — "
+                  "119 EMPTY getGameDenoms, nothing else interleaved",
+                  not bf_bad and set(bf_seen) == set(gp_ids)
+                  and all(v == 1 for v in bf_seen.values()),
+                  f"bad={bf_bad[:3]} devs={len(bf_seen)}")
+            expect_no_host_post("backfill settled — one pass, no timer "
+                                "(dormancy law)")
             # The gamePlay sweep no longer auto-fires on the descriptorList
             # response (game_sweep defaults OFF — the 119-device × 3-read
             # flood starved the join FIFO). Trigger it on demand, the same
@@ -1943,6 +1994,84 @@ def main():
               .get("stateChange", {}).get("result") == "confirmed",
               f"got {snap_gs.get(EGM_ID, {}).get('gamePlay', {}).get('2')}")
 
+    print("— Step 6.895: setActiveDenoms (§6.15) — accepted / disagree / "
+          "error verdict folds + wire shape")
+    # (a) ACCEPTED — the paired gameDenomList echoing the asked active set
+    # upgrades denomChange sent -> accepted. Also pins the outbound XML:
+    # activeDenom singles with g2s:denomId, sorted, NO activeRange.
+    cs, cbody = post_command({"action": "setActiveDenoms", "deviceId": 2,
+                              "denoms": [25000, 1000, 5000], "egmId": EGM_ID})
+    check("setActiveDenoms accepted-path command queued", cs == 200
+          and cbody.get("ok"))
+    m = expect_host_post("setActiveDenoms (dev 2)")
+    if m:
+        check("wire: gamePlay.setActiveDenoms G2S_request dev=2 ttl=30000",
+              m["class"] == "gamePlay"
+              and m["command"] == "setActiveDenoms"
+              and m["sessionType"] == "G2S_request" and m["deviceId"] == "2"
+              and m["timeToLive"] == "30000",
+              f"got {m.get('class')}.{m.get('command')}/dev={m.get('deviceId')}")
+        kids = m.get("children") or []
+        check("wire: activeDenom singles only (sorted denomIds, no "
+              "activeRange)",
+              [c.get("tag") for c in kids] == ["activeDenom"] * 3
+              and [c.get("denomId") for c in kids]
+              == ["1000", "5000", "25000"], f"got {kids}")
+        # gameDenomList echoing the asked set active=true -> accepted
+        post_to_host(avp_wrap(avp_class_command(
+            "gamePlay",
+            '<g2s:gameDenomList>'
+            '<g2s:gameDenom g2s:denomId="1000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="5000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="25000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="100000" g2s:active="false"/>'
+            '</g2s:gameDenomList>',
+            "330", m["sessionId"], "G2S_response", device_id="2")))
+        time.sleep(0.3)
+        gp2 = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+               .get("2", {}))
+        dc = gp2.get("denomChange", {})
+        check("status: denomChange ACCEPTED (asked set == active set)",
+              dc.get("result") == "accepted"
+              and set(dc.get("active") or []) == {"1000", "5000", "25000"},
+              f"got {dc}")
+        check("status: activeDenoms folded from the gameDenomList",
+              set(gp2.get("activeDenoms") or []) == {"1000", "5000", "25000"},
+              f"got {gp2.get('activeDenoms')}")
+
+    # (b) DISAGREE — the EGM answers with a DIFFERENT active set.
+    cs, _ = post_command({"action": "setActiveDenoms", "deviceId": 2,
+                          "denoms": [1000, 5000], "egmId": EGM_ID})
+    m = expect_host_post("setActiveDenoms disagree (dev 2)")
+    if m:
+        post_to_host(avp_wrap(avp_class_command(
+            "gamePlay",
+            '<g2s:gameDenomList>'
+            '<g2s:gameDenom g2s:denomId="1000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="5000" g2s:active="false"/>'
+            '</g2s:gameDenomList>',
+            "331", m["sessionId"], "G2S_response", device_id="2")))
+        time.sleep(0.3)
+        dc = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+              .get("2", {}).get("denomChange", {}))
+        check("status: denomChange DISAGREE (EGM active set != asked)",
+              dc.get("result") == "disagree", f"got {dc}")
+
+    # (c) ERROR — a gamePlay-class error response (no child) paired by
+    # sessionId stamps result=error + the errorCode (the AVP's real GPX002/
+    # APX999 refusals surface honestly).
+    cs, _ = post_command({"action": "setActiveDenoms", "deviceId": 2,
+                          "denoms": [1000], "egmId": EGM_ID})
+    m = expect_host_post("setActiveDenoms error (dev 2)")
+    if m:
+        post_to_host(avp_wrap(gp_error(m["sessionId"], "2", "G2S_GPX002")))
+        time.sleep(0.3)
+        dc = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+              .get("2", {}).get("denomChange", {}))
+        check("status: denomChange ERROR carries the EGM's errorCode",
+              dc.get("result") == "error"
+              and dc.get("errorCode") == "G2S_GPX002", f"got {dc}")
+
     print("— Step 6.9: web UI + enriched event (labels + affected meters)")
     ui_status, ui_body = None, ""
     try:
@@ -2104,6 +2233,276 @@ def main():
     # A non-object payload is refused.
     st, _ = raw_post("/api/sas/report", "[1,2,3]")
     check("non-object SAS report -> 400", st == 400, f"status={st}")
+
+    # denomSuggest: the satellite's 0x1F denom code held against the
+    # operator-set denomCents. Full state walk on the real ingest path —
+    # the C-4 table has ONE bench-verified row (0x01 = 1¢, BB2 2026-07-22),
+    # so code 1 drives confirm/match/mismatch and an unlisted code drives
+    # unverified. The denom pref rides POST /api/names (the ✎ modal path).
+    def _sas_entry():
+        return get_json(STATUS_URL).get("sas", {}).get("smib-test/3", {})
+
+    st, body = raw_post("/api/names", json.dumps(
+        {"machineKey": "smib-test/3", "denomCents": 0}))     # ensure UNSET
+    check("denom pref cleared for the suggest walk (200)",
+          st == 200, f"status={st} body={body[:120]}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1, "gameId": "WM",
+                        "paytableId": "42B19D", "rtpRaw": "9599",
+                        "maxBet": 200}}))
+    def _ds(e, code, cents, state):
+        """denomSuggest shape pin: {code, cents, state} exact + a "since"
+        epoch-seconds stamp (D14 — the hub-side first-seen the tile nudge
+        rides across page reloads)."""
+        ds = e.get("denomSuggest") or {}
+        return (ds.get("code") == code and ds.get("cents") == cents
+                and ds.get("state") == state
+                and isinstance(ds.get("since"), float)
+                and ds.get("since") > 0
+                and set(ds) == {"code", "cents", "state", "since"})
+
+    e = _sas_entry()
+    check("verified code + denom unset -> denomSuggest state=confirm "
+          "(+ epoch-seconds since)",
+          st == 200 and _ds(e, 1, 1, "confirm"),
+          f"status={st} got {e.get('denomSuggest')}")
+    since_confirm = (e.get("denomSuggest") or {}).get("since")
+    check("machineInfo rides the entry un-decoded (raw code preserved)",
+          (e.get("machineInfo") or {}).get("denomCode") == 1
+          and (e.get("machineInfo") or {}).get("gameId") == "WM",
+          f"got {e.get('machineInfo')}")
+    # Auto-apply tripwires (the denom law: read-to-suggest + OPERATOR
+    # confirm). If ingest ever wrote the suggested cents into the pref
+    # itself, (a) denomAssumed would flip False here, and (b) a second
+    # identical report would come back "match" instead of "confirm" —
+    # both with zero operator involvement. Pin both.
+    check("confirm state leaves the pref UNSET (denomAssumed stays True — "
+          "no auto-apply at ingest)",
+          e.get("denomAssumed") is True, f"got {e.get('denomAssumed')}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1}}))
+    e = _sas_entry()
+    check("second report, prefs untouched: STILL confirm (an auto-write "
+          "would have made it match)",
+          st == 200 and _ds(e, 1, 1, "confirm"),
+          f"got {e.get('denomSuggest')}")
+    check("since is STABLE across an identical recompute (a naive "
+          "time.time() stamp would slide every report)",
+          (e.get("denomSuggest") or {}).get("since") == since_confirm,
+          f"was {since_confirm} got "
+          f"{(e.get('denomSuggest') or {}).get('since')}")
+
+    st, _ = raw_post("/api/names", json.dumps(
+        {"machineKey": "smib-test/3", "denomCents": 1}))
+    st2, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1}}))
+    e = _sas_entry()
+    check("operator denom agrees with the machine -> state=match",
+          st == 200 and st2 == 200 and _ds(e, 1, 1, "match"),
+          f"got {e.get('denomSuggest')}")
+    check("the confirm -> match flip RESET since (state changes re-anchor "
+          "the first-seen stamp)",
+          (e.get("denomSuggest") or {}).get("since") is not None
+          and (e.get("denomSuggest") or {}).get("since") != since_confirm,
+          f"still {since_confirm}")
+
+    st, _ = raw_post("/api/names", json.dumps(
+        {"machineKey": "smib-test/3", "denomCents": 25}))
+    st2, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1}}))
+    e = _sas_entry()
+    check("operator denom disagrees with the machine -> state=mismatch",
+          st == 200 and st2 == 200 and _ds(e, 1, 1, "mismatch"),
+          f"got {e.get('denomSuggest')}")
+
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 9}}))
+    e = _sas_entry()
+    check("code with no bench-verified C-4 row -> state=unverified, "
+          "cents=None (never guessed)",
+          st == 200 and _ds(e, 9, None, "unverified"),
+          f"got {e.get('denomSuggest')}")
+
+    # Attacker-typed machineInfo: junk clamps to nulls; a null denomCode
+    # yields NO denomSuggest key (the UI's older-satellite detect), and
+    # /api/status stays parseable.
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": "boom", "maxBet": {"x": 1},
+                        "gameId": 7}}))
+    e = _sas_entry()
+    check("junk machineInfo clamps (denomCode null) and denomSuggest "
+          "is absent, status parseable",
+          st == 200 and "denomSuggest" not in e
+          and (e.get("machineInfo") or {}).get("denomCode") is None,
+          f"status={st} mi={e.get('machineInfo')} "
+          f"ds={'denomSuggest' in e}")
+    # 1e999 parses to float inf and BYPASSES the parse_constant NaN guard
+    # (that hook only fires on the literal NaN/Infinity tokens) — the int()
+    # clamps must answer 200-with-nulls, never OverflowError-drop the
+    # socket. Same smuggle via the aft and ticketData int fields.
+    st, _ = raw_post("/api/sas/report",
+                     '{"smibId": "smib-test", "address": "3", "online": true,'
+                     ' "machineInfo": {"denomCode": 1e999, "maxBet": -1e999},'
+                     ' "aft": {"asset": 1e999},'
+                     ' "ticketData": {"appliedRev": 1e999}}')
+    e = _sas_entry()
+    check("smuggled inf (1e999) clamps everywhere it can ride — 200, all "
+          "nulls, no denomSuggest",
+          st == 200 and "denomSuggest" not in e
+          and (e.get("machineInfo") or {}).get("denomCode") is None
+          and (e.get("aft") or {}).get("asset") is None
+          and (e.get("ticketData") or {}).get("appliedRev") is None,
+          f"status={st} mi={e.get('machineInfo')} aft={e.get('aft')} "
+          f"td={e.get('ticketData')}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1.9}}))
+    e = _sas_entry()
+    check("fractional denomCode (1.9) is REJECTED, not truncated into a "
+          "manufactured C-4 hit",
+          st == 200 and "denomSuggest" not in e
+          and (e.get("machineInfo") or {}).get("denomCode") is None,
+          f"status={st} mi={e.get('machineInfo')}")
+
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True}))
+    e = _sas_entry()
+    check("report with no machineInfo at all -> no denomSuggest key",
+          st == 200 and "denomSuggest" not in e, f"status={st}")
+
+    st, _ = raw_post("/api/names", json.dumps(
+        {"machineKey": "smib-test/3", "denomCents": 0}))     # leave clean
+    check("denom pref cleared after the suggest walk (200)",
+          st == 200, f"status={st}")
+
+    # Games census (A0/51/56 one-shot): multiDenom is a STRICT tri-state
+    # bool, enabledGames a bounded filtered int list — junk entries drop
+    # individually, never poison the whole list.
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1, "multiDenom": True,
+                        "totalGames": 12,
+                        "enabledGames": [1, 2, 7]}}))
+    e = _sas_entry()
+    mi = e.get("machineInfo") or {}
+    check("games census rides the clamp (multiDenom/totalGames/"
+          "enabledGames)",
+          st == 200 and mi.get("multiDenom") is True
+          and mi.get("totalGames") == 12
+          and mi.get("enabledGames") == [1, 2, 7], f"got {mi}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1, "multiDenom": "yes",
+                        "totalGames": True,
+                        "enabledGames": [0, 2.5, "9", 7, 10000, True]}}))
+    e = _sas_entry()
+    mi = e.get("machineInfo") or {}
+    check("junk census clamps: multiDenom null (never a guessed bool), "
+          "bool totalGames null, enabledGames filtered to [7]",
+          st == 200 and mi.get("multiDenom") is None
+          and mi.get("totalGames") is None
+          and mi.get("enabledGames") == [7], f"got {mi}")
+
+    # Hub-side census carry-forward (D8, the lockState treatment): the
+    # satellite reports machineInfo:null after a casinonet-sas restart
+    # (its stats are memory-only) — and an old satellite omits the key
+    # entirely. Either shape must carry the LAST census forward instead
+    # of wiping it (pre-fix the wholesale entry replace erased it within
+    # one 1 s report and the 🎲 Games button + denomSuggest vanished),
+    # with denomSuggest recomputed AGAINST the carried census. NOTE: this
+    # positive gate sits AFTER the "no machineInfo -> no denomSuggest"
+    # check above by design — that older check only passes because the
+    # census carried at that point has denomCode None from the junk-clamp
+    # reports. Also pinned here: the satellite's readAt/censusAt
+    # staleness stamps RIDE the clamp (the UI's census-age line).
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": {"denomCode": 1, "multiDenom": True,
+                        "totalGames": 12, "enabledGames": [1, 2, 7],
+                        "readAt": "2026-07-22T10:00:00",
+                        "censusAt": "2026-07-22T10:00:05"}}))
+    e = _sas_entry()
+    mi = e.get("machineInfo") or {}
+    check("full census lands and the readAt/censusAt staleness stamps "
+          "ride the clamp",
+          st == 200 and mi.get("enabledGames") == [1, 2, 7]
+          and mi.get("readAt") == "2026-07-22T10:00:00"
+          and mi.get("censusAt") == "2026-07-22T10:00:05", f"got {mi}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True,
+        "machineInfo": None}))
+    e = _sas_entry()
+    mi = e.get("machineInfo") or {}
+    check("machineInfo:null (the satellite-restart window) carries the "
+          "census forward — games, stamps and a recomputed denomSuggest "
+          "survive",
+          st == 200 and mi.get("enabledGames") == [1, 2, 7]
+          and mi.get("totalGames") == 12
+          and mi.get("censusAt") == "2026-07-22T10:00:05"
+          and (e.get("denomSuggest") or {}).get("state") == "confirm",
+          f"got mi={mi} ds={e.get('denomSuggest')}")
+    st, _ = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True}))
+    e = _sas_entry()
+    mi = e.get("machineInfo") or {}
+    check("machineInfo key entirely ABSENT (old satellite) carries it "
+          "forward too",
+          st == 200 and mi.get("enabledGames") == [1, 2, 7]
+          and (e.get("denomSuggest") or {}).get("state") == "confirm",
+          f"got mi={mi} ds={e.get('denomSuggest')}")
+
+    # read_machine_info (the census re-read): whitelisted at the hub edge
+    # (the UI ↻ button + the linked-leg denom-write nudge both POST it)
+    # and delivered on the satellite's pull channel like every command.
+    st, body = raw_post("/api/sas/command", json.dumps(
+        {"smibId": "smib-test", "type": "read_machine_info"}))
+    check("read_machine_info passes the /api/sas/command whitelist "
+          "(200 ok:true)",
+          st == 200 and json.loads(body).get("ok") is True,
+          f"status={st} body={body[:120]}")
+    st, body = raw_post("/api/sas/report", json.dumps({
+        "smibId": "smib-test", "address": "3", "online": True}))
+    _cmds = (json.loads(body) or {}).get("commands") or []
+    check("the queued read_machine_info delivers in the next report reply",
+          st == 200 and any(c.get("type") == "read_machine_info"
+                            for c in _cmds),
+          f"status={st} commands={_cmds}")
+    st, _ = raw_post("/api/sas/command", json.dumps(
+        {"smibId": "smib-test", "type": "read_machine_info",
+         "credits": 5}))
+    check("read_machine_info with a credits field is refused (only "
+          "legacy_bonus carries an amount)", st == 400, f"status={st}")
+
+    # sas_game_state hub-side validation (the satellite executes LP09;
+    # the hub's job is the strict gate + queueing).
+    st, body = raw_post("/api/sas/command", json.dumps(
+        {"smibId": "smib-test", "type": "sas_game_state",
+         "game": 0, "enable": True}))
+    check("sas_game_state game 0 -> 400", st == 400, f"status={st}")
+    st, body = raw_post("/api/sas/command", json.dumps(
+        {"smibId": "smib-test", "type": "sas_game_state",
+         "game": 3, "enable": "yes"}))
+    check("sas_game_state non-bool enable -> 400", st == 400,
+          f"status={st}")
+    # setActiveDenoms (§6.15) strict millicent-list gate — the 400 walk
+    # touches no wire. The VALID send + denomChange stamp (and the valid
+    # sas_game_state queue) run at the very END of the replay: a real
+    # host send mid-choreography pollutes the step expectations (live-hit
+    # 2026-07-22 — 38 downstream checks broke on the extra gamePlay POST).
+    for bad, why in (
+            (None, "absent"), ([], "empty (would force-disable)"),
+            ([999], "below 1¢"), ([1000.5], "float"),
+            ([True], "bool"), (list(range(1000, 1000 + 65)), "65 items")):
+        st, _ = raw_post("/api/command", json.dumps(
+            {"action": "setActiveDenoms", "egmId": EGM_ID,
+             "deviceId": "1", "denoms": bad}))
+        check(f"setActiveDenoms {why} -> 400", st == 400, f"status={st}")
 
     # The UI pages still serve (the "sas" key must not break the EGM loops).
     s_st, _, s_body = raw_get("/")
@@ -4992,6 +5391,109 @@ def main():
               "/api/ticket_qr" not in home_body and "vidCopy" in home_body,
               "home.html still references /api/ticket_qr or lost the "
               "copyable validation number")
+        # Denom-control UI lifecycle (2026-07-22 fix wave, D14): the ✎
+        # Name & denomination modal was an open-time snapshot — a
+        # denomSuggest landing/flipping while it was open stayed invisible
+        # until close/reopen. Pinned: the stable m-denom-suggest container
+        # re-rendered per poll from renderActive (ONLY the row — the name/
+        # denom inputs are mid-edit and must survive). The tile nudge +
+        # credits note are now gated on DISAGREEMENT: a "confirm" whose
+        # reported denom matches the value in use (0x01 = 1¢, the penny
+        # fleet) has nothing to confirm and must stay silent — only a
+        # non-penny box reading low earns the "set the denom" nudge.
+        check("Home UI ✎ modal: denom-suggest row live-tracks the hub + "
+              "confirm nudge gated on disagreement, silent when the wire "
+              "matches the value in use (D14)",
+              'id="m-denom-suggest"' in home_body
+              and 'S.modal.kind==="nick"' in home_body
+              and "ds.cents!==inUse" in home_body.replace(" ", "")
+              and "· set the denom" in home_body
+              and "DSCONFIRM" in home_body,
+              "home.html lost the live suggest-row re-render or the "
+              "disagreement-gated denom nudge")
+        # D15: the Apply window and success were mute — gmDenomApply
+        # cleared the edit before the POST and the hub stamps "sent" only
+        # at frame-build (FIFO worker), so every 2s repaint showed the OLD
+        # lit chips ("the change undid itself"); "accepted" (§6.15
+        # deferred apply) rendered no chip at all. Pinned: the DENAPP
+        # optimistic face (SASLNK pattern — superseded by any sentTs
+        # change on the record, 30s self-heal) + visible chips for
+        # accepted and the terminal applied state.
+        check("Home UI games modal: optimistic denom-apply face + "
+              "accepted/applied denomChange chips (D15)",
+              "DENAPP" in home_body
+              and "denomPendFace" in home_body
+              and 'dc.result==="accepted"' in home_body
+              and 'dc.result==="applied"' in home_body
+              and "applies at idle" in home_body,
+              "home.html lost the optimistic apply face or the "
+              "accepted/applied denomChange chips")
+        # Structural refusals render CALM, not alarming: APX999
+        # (progressive-linked — refuses every host denom set by design)
+        # and GPX002 (theme-side config verification) get neutral
+        # informational chips; only genuinely transient refusals keep the
+        # red "denoms refused" treatment. The dev-45 Lucky Larry chip
+        # lesson: a permanent property painted red reads as a fault.
+        check("Home UI games modal: APX999/GPX002 refusals render as calm "
+              "locked-state chips, transient errors stay loud — and the "
+              "specific branches PRECEDE the generic error branch (an "
+              "else-if reorder would silently restore the red fault chip "
+              "while every substring stays present)",
+              'dc.errorCode==="G2S_APX999"' in home_body
+              and "progressive-linked · denoms locked" in home_body
+              and 'dc.errorCode==="G2S_GPX002"' in home_body
+              and "theme locks denoms" in home_body
+              and "denoms refused" in home_body
+              and home_body.find('dc.errorCode==="G2S_APX999"')
+              < home_body.find("denoms refused · ")
+              and home_body.find('dc.errorCode==="G2S_GPX002"')
+              < home_body.find("denoms refused · "),
+              "home.html lost the structural-refusal calm chips, the "
+              "transient refused chip, or their branch ORDER")
+        # D7 client half: every /api/command body echoes the uiStamp of
+        # the JS actually RUNNING (uiStamp0, first-seen by uiStampCheck —
+        # never the latest polled value, which is the NEW deploy's stamp)
+        # and a 409 whose error says "stale UI" reloads the tab. The
+        # ?kiosk=1 self-reload is a separate mechanism and must survive.
+        check("Home UI cmd() echoes uiStamp0 and reloads on the 409 "
+              "stale-UI fence; kiosk self-reload intact (D7)",
+              "uiStamp:uiStamp0" in home_body.replace(" ", "")
+              and "stale UI" in home_body
+              and 'QS.get("kiosk")==="1"' in home_body,
+              "home.html lost the uiStamp echo, the 409 reload, or the "
+              "kiosk self-reload")
+        # D8 client half: the 🎲 Games button gates on machineInfo alone
+        # (the modal's census-less empty state must be REACHABLE — the
+        # old enabledGames gate hid the button exactly when the operator
+        # needed the ↻ re-read), and the modal distinguishes
+        # enabledGames === null (0x56 unanswered — unknown, NEVER "all
+        # disabled") from [] (known none).
+        check("Home UI SAS games: machineInfo-only button gate + the "
+              "null-vs-[] enabled-set honesty (D8)",
+              "m.machineInfo&&m.machineInfo.enabledGames" not in home_body
+              and "${m.machineInfo?" in home_body
+              and "egKnown" in home_body
+              and "state unknown" in home_body,
+              "home.html regressed the games-button gate or renders an "
+              "unknown enabled set as all-disabled")
+        # Census freshness surface: age from the satellite's censusAt/
+        # readAt stamps + the ↻ re-read button (GR-30 doctrine: a button,
+        # never a timer) POSTing read_machine_info.
+        check("Home UI SAS games modal renders census age and carries "
+              "the ↻ read_machine_info re-read button",
+              "censusAt" in home_body
+              and "read_machine_info" in home_body
+              and "sasCensusReread" in home_body
+              and "Re-read census" in home_body,
+              "home.html lost the census-age line or the re-read button")
+        # D13 client half: the 2s heartbeat polls the SLIM view; the FULL
+        # view rides only while the per-machine games page (GM.egm) is
+        # open — where renderGames + the D15 chips need real gamePlay.
+        check("Home UI 2s poll rides ?slim=1 with the full view on the "
+              "open games page (D13)",
+              'GM.egm?"/api/status":"/api/status?slim=1"' in home_body,
+              "home.html is not polling the slim view (or dropped the "
+              "games-page full-view switch)")
     else:
         check("/ FALLS BACK to the Test Panel (home.html not created yet)",
               root_st == 200 and root_body == idx_body,
@@ -4999,6 +5501,24 @@ def main():
         h_st, _, _ = raw_get("/home")
         check("/home 404s while home.html doesn't exist", h_st == 404,
               f"status={h_st}")
+    board_file = webui_dir / "board.html"
+    if board_file.is_file():
+        board_body = board_file.read_text(errors="replace")
+        # The wall-TV board is a pure spectator — it never reads the
+        # gamePlay/meters whales, so its 2s poll rides the slim view
+        # (D13); and it renders the tournament seats' frozen-denom
+        # honesty badge (D9 — lockDenomAssumed rides tournament_snapshot).
+        check("Board polls ?slim=1 and renders the assumed-1¢ seat "
+              "honesty badge (D9/D13), gated on the SAS wire — a seat "
+              "whose 0x1F report confirms its frozen denom is NOT flagged "
+              "(the same de-nag as the home card)",
+              "/api/status?slim=1" in board_body
+              and "lockDenomAssumed" in board_body
+              and "assumed 1¢" in board_body
+              and "seatDenomWireOk" in board_body
+              and "!seatDenomWireOk(s)" in board_body,
+              "board.html is not polling slim or lost the wire-gated "
+              "lockDenomAssumed badge")
     check("Test Panel topbar links the Home UI + carries the new "
           "voucher/WAT wiring (G2S-40) — and NO QR preview",
           'href="/home"' in idx_body and "getVoucherLog" in idx_body
@@ -9502,11 +10022,52 @@ def main():
           st_v == 200 and dv.get("ok") is False and dv.get("egmId") == EGM_ID,
           f"got {st_v}/{json.dumps(dv)[:200]}")
     st_v, dv = glass_act(ad_tok, {"action": "refreshGames"})
-    check("refreshGames (admin): 200 ok (status-only gamePlay refresh fires, "
+    check("refreshGames (admin): 200 ok (the GR-30 deep rescan fires, "
           "egmId from the token)",
           st_v == 200 and dv.get("ok") is True and dv.get("egmId") == EGM_ID,
           f"got {st_v}/{json.dumps(dv)[:200]}")
-    drain_host_posts(12, timeout=2)         # the async refresh getGameStatus wave
+    # The refresh is a DEEP rescan now (GR-30 v2 + denom freshness
+    # 2026-07-22): getDescriptor first, and the sweep waits for the fresh
+    # descriptorList — or fires anyway after GP_RESCAN_DESC_WAIT_SEC (15s).
+    # Left unanswered, that timeout is a time bomb whose ~355-post sweep
+    # detonates inside a LATER slice's exact-wire window (2026-07-22 gate
+    # run: it poisoned Step 100's dormancy negatives). Answer it NOW so the
+    # sweep runs immediately, then drain and PIN the denom-aware
+    # composition. LAW: any slice that triggers refresh_game_play_status
+    # must settle its own sweep like this before returning.
+    m_rd = expect_host_post("refreshGames rescan getDescriptor")
+    check("refreshGames re-harvests the inventory FIRST (getDescriptor "
+          "ahead of any sweep read)",
+          bool(m_rd) and m_rd["command"] == "getDescriptor",
+          f"got {m_rd and m_rd.get('command')}")
+    if m_rd and m_rd["command"] == "getDescriptor":
+        post_to_host(avp_wrap(first_light_reply(
+            "descriptorList_sid1003.xml", m_rd["sessionId"])))
+        # dev 1 is the only PROFILED device (join trio) and its denomsAt
+        # is fresh (folded at join) -> status only, no denom re-read; the
+        # other 118 were never profiled -> full status+profile+denoms trio.
+        gl_ids = first_light_gameplay_ids()
+        gl_want = {d: ({"getGamePlayStatus"} if d == "1" else
+                       {"getGamePlayStatus", "getGamePlayProfile",
+                        "getGameDenoms"}) for d in gl_ids}
+        gl_seen = {}
+        gl_bad = []
+        for _ in range(sum(len(v) for v in gl_want.values())):
+            m = expect_host_post("glass-refresh sweep read", timeout=20)
+            if not m:
+                break
+            if m["class"] != "gamePlay" or \
+                    m["command"] not in gl_want.get(m["deviceId"], set()):
+                gl_bad.append(f"{m.get('command')}/dev{m.get('deviceId')}")
+                continue
+            gl_seen.setdefault(m["deviceId"], set()).add(m["command"])
+        check("glass-refresh sweep PINNED — status for every device, the "
+              "full trio for the 118 unprofiled, dev 1 status-only (fresh "
+              "denomsAt is NOT re-read), nothing else interleaved",
+              not gl_bad and gl_seen == gl_want,
+              f"bad={gl_bad[:3]} devs={len(gl_seen)}/{len(gl_want)}")
+        expect_no_host_post("glass-refresh sweep settled — one pass, no "
+                            "timer (dormancy law)")
     companion_tap(17, uid="0FF1CE0B01")     # card OUT
     expect_host_post("admin card-OUT setIdValidation")
     expect_host_post("follow-card hideMediaDisplay (admin card-OUT)")
@@ -9814,6 +10375,293 @@ def main():
                                          "accountId": gp_id}))
     for uid in ("6A55D0FB01", "6A55D0FB02", "0FF1CE0B01"):
         raw_post("/api/fobs", json.dumps({"action": "delete", "uid": uid}))
+
+    # ---- denom-write tail (2026-07-22) — the wire-touching halves of the
+    # Step 6.925 gates run HERE, after every choreography expectation, so
+    # the real gamePlay POST and the queued SAS command can't pollute a
+    # step's exact-wire assertions.
+    print("— Step 99: denom-write sends (post-choreography)")
+    raw_post("/api/sas/report", json.dumps({     # revive smib-test — a
+        "smibId": "smib-test", "address": "3",   # later slice forgets it
+        "online": True}))
+
+    # (1) tournament-freeze 409 FIRST — while no denomChange is pending, so
+    # the arm guard (which refuses to arm with a denom write in flight) lets
+    # it through. Arming spawns the runner which POSTs to the EGM, but there
+    # is nothing after this tail that reads the host-POST queue.
+    post_command({"action": "tournamentConfigure",
+                  "creditsCents": 5000, "durationSec": 300})
+    post_command({"action": "tournamentArm"})
+    tphase = (get_json(STATUS_URL).get("tournament") or {}).get("phase")
+    if tphase and tphase != "idle":
+        st, _ = post_command_err(
+            {"action": "setActiveDenoms", "egmId": EGM_ID,
+             "deviceId": "2", "denoms": [1000]})
+        check("setActiveDenoms -> 409 while tournament is non-idle",
+              st == 409, f"status={st}")
+        st, _ = post_sas_command_err(
+            {"smibId": "smib-test", "type": "sas_game_state",
+             "game": 3, "enable": True})
+        check("sas_game_state -> 409 while tournament is non-idle",
+              st == 409, f"status={st}")
+    else:
+        check("tournament armed for the freeze check", False,
+              f"phase={tphase} — arm did not take")
+    post_command({"action": "tournamentCancel"})
+    post_command({"action": "tournamentReset"})
+
+    # (2) valid sends — AFTER the tournament is idle again. The setActiveDenoms
+    # leaves a denomChange=sent (no EGM response in replay), which is exactly
+    # why it runs last: a pending denom write correctly BLOCKS a later arm.
+    st, body = raw_post("/api/sas/command", json.dumps(
+        {"smibId": "smib-test", "type": "sas_game_state",
+         "game": 3, "enable": False}))
+    check("sas_game_state valid -> 200 queued",
+          st == 200 and json.loads(body).get("ok") is True,
+          f"status={st} body={body[:120]}")
+    st, body = raw_post("/api/command", json.dumps(
+        {"action": "setActiveDenoms", "egmId": EGM_ID,
+         "deviceId": "1", "denoms": [5000, 1000, 25000]}))
+    check("setActiveDenoms valid -> 200 accepted",
+          st == 200 and json.loads(body).get("ok") is True,
+          f"status={st} body={body[:120]}")
+    dc = {}
+    for _ in range(30):                      # worker-thread send settles
+        gp1 = ((get_json(STATUS_URL).get(EGM_ID, {})
+                .get("gamePlay", {}) or {}).get("1", {}) or {})
+        dc = gp1.get("denomChange") or {}
+        if dc.get("result") == "sent":
+            break
+        time.sleep(0.1)
+    check("denomChange stamped result=sent with the sorted denom set",
+          dc.get("result") == "sent"
+          and dc.get("denoms") == ["1000", "5000", "25000"],
+          f"got {dc}")
+
+    # ---- Step 100: GPE201 freshness chain (D10, 2026-07-22). The ONLY
+    # mechanism keeping denom chips honest on a §6.15 deferred apply or an
+    # operator-menu denom flip is the GR-31 hook's scoped getGameDenoms
+    # re-read (g2s_host._game_play_event_refresh, G2S_GPE201 = Active
+    # Denominations Changed §6.23.22). It was live-proven on the AVP
+    # (2026-07-22 03:23:53, dev 129, 4ms event->read) yet had ZERO replay
+    # coverage — a typo'd eventCode would have shipped green. Runs dead
+    # LAST on purpose: every injection below draws real host POSTs, and
+    # all earlier exact-wire expectations are already settled (the Step 99
+    # rationale). Do NOT answer the (e) getDescriptor: the unknown-device
+    # rescan's sweep flood only starts after GP_RESCAN_DESC_WAIT_SEC (15s),
+    # which keeps (f)'s queue-quiet assertions inside the window.
+    print("— Step 100: GPE201 -> scoped getGameDenoms re-read (GR-31 "
+          "freshness chain) + dormancy negatives")
+    # Settle the tail first: Step 99's tournament arm/cancel runner and its
+    # final setActiveDenoms all POSTed with nobody reading the queue —
+    # drain until quiet so the assertions below see ONLY their own traffic.
+    leftover = drain_host_posts(60, timeout=2.5)
+    print(f"    (drained {len(leftover)} settled tail post(s))")
+    snap_pre = get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+    pre2 = snap_pre.get("2", {}) or {}
+    pre2_dc = pre2.get("denomChange") or {}
+    pre2_at = pre2.get("denomsAt") or ""
+    check("precondition: dev 2 carries folded denom state to go stale "
+          "(activeDenoms + denomsAt from Step 6.895)",
+          pre2.get("activeDenoms") is not None and bool(pre2_at),
+          f"got {pre2.get('activeDenoms')}/{pre2_at!r}")
+
+    # (a) POSITIVE — a LIVE GPE201 from KNOWN dev 2 draws the GR-31 status
+    # re-read PLUS the scoped getGameDenoms, both riding the FIFO ahead of
+    # the eventAck (the hook enqueues pre-ack).
+    gpe_dt = now_iso()
+    post_to_host(avp_wrap(avp_class_command(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="2" '
+        'g2s:eventCode="G2S_GPE201" g2s:eventId="90" '
+        f'g2s:eventDateTime="{gpe_dt}" g2s:transactionId="0"/>',
+        "940", "970", "G2S_request")))
+    m_gps = expect_host_post("GPE201 GR-31 getGamePlayStatus (dev 2)")
+    m_gd = expect_host_post("GPE201 scoped getGameDenoms (dev 2)")
+    ack = expect_host_post("eventAck (GPE201)")
+    check("GPE201 draws getGamePlayStatus THEN the scoped getGameDenoms, "
+          "both ahead of the eventAck",
+          bool(m_gps) and bool(m_gd) and bool(ack)
+          and m_gps["command"] == "getGamePlayStatus"
+          and m_gd["command"] == "getGameDenoms"
+          and ack["command"] == "eventAck"
+          and ack.get("commandAttrs", {}).get("eventId") == "90",
+          f"got {[x and x.get('command') for x in (m_gps, m_gd, ack)]}")
+    if m_gd and m_gd["command"] == "getGameDenoms":
+        check("wire: the re-read is SCOPED — gamePlay.getGameDenoms dev=2, "
+              "EMPTY G2S_request (ttl=30000), its own fresh sessionId",
+              m_gd["class"] == "gamePlay" and m_gd["deviceId"] == "2"
+              and m_gd["sessionType"] == "G2S_request"
+              and m_gd["timeToLive"] == "30000"
+              and m_gd.get("commandAttrs", {}) == {}
+              and bool(m_gps) and m_gd["sessionId"] != m_gps["sessionId"],
+              f"got {m_gd.get('class')}.{m_gd.get('command')}/dev="
+              f"{m_gd.get('deviceId')}/{m_gd.get('commandAttrs')}")
+        # The machine answers with a CHANGED list (the whole point of the
+        # re-read): 1000 went inactive, 5000+25000 are the new active set.
+        post_to_host(avp_wrap(avp_class_command(
+            "gamePlay",
+            '<g2s:gameDenomList>'
+            '<g2s:gameDenom g2s:denomId="1000" g2s:active="false"/>'
+            '<g2s:gameDenom g2s:denomId="5000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="25000" g2s:active="true"/>'
+            '<g2s:gameDenom g2s:denomId="100000" g2s:active="false"/>'
+            '</g2s:gameDenomList>',
+            "941", m_gd["sessionId"], "G2S_response", device_id="2")))
+        time.sleep(0.3)
+        gp2 = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+               .get("2", {}) or {})
+        check("status: chips honest again — activeDenoms folded to the "
+              "machine's NEW set",
+              set(gp2.get("activeDenoms") or []) == {"5000", "25000"},
+              f"got {gp2.get('activeDenoms')}")
+        check("status: denomsAt advanced past the pre-event stamp",
+              (gp2.get("denomsAt") or "") > pre2_at,
+              f"got {gp2.get('denomsAt')!r} vs pre {pre2_at!r}")
+        check("the UNPAIRED re-read fold never adjudicates: dev 2's "
+              "denomChange verdict is byte-identical (sessionId gate)",
+              (gp2.get("denomChange") or {}) == pre2_dc,
+              f"got {gp2.get('denomChange')} want {pre2_dc}")
+
+    # (b) DEDUPE — a persisted-event retry (same eventId + eventDateTime,
+    # §4.1.7) re-acks but must NOT re-fire the hook: no re-read.
+    post_to_host(avp_wrap(avp_class_command(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="2" '
+        'g2s:eventCode="G2S_GPE201" g2s:eventId="90" '
+        f'g2s:eventDateTime="{gpe_dt}" g2s:transactionId="0"/>',
+        "942", "971", "G2S_request")))
+    ack = expect_host_post("eventAck (GPE201 retry)")
+    if ack:
+        check("GPE201 retry re-acked (eventId=90)",
+              ack["command"] == "eventAck"
+              and ack.get("commandAttrs", {}).get("eventId") == "90",
+              f"got {ack.get('command')}/{ack.get('commandAttrs')}")
+    expect_no_host_post("deduped GPE201 retry (no re-read)")
+
+    # (c) PENDING-SENT GUARD — dev 1 still carries Step 99's denomChange
+    # result=sent. A GPE201 there re-reads too, but the fold's sessionId
+    # does not echo the pending setActiveDenoms — so it must NOT fake an
+    # accepted/disagree verdict (§6.15 pairing is by sessionId ONLY).
+    pre1_dc = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+               .get("1", {}) or {}).get("denomChange") or {}
+    check("precondition: dev 1 denomChange still pending (result=sent)",
+          pre1_dc.get("result") == "sent", f"got {pre1_dc}")
+    post_to_host(avp_wrap(avp_class_command(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="1" '
+        'g2s:eventCode="G2S_GPE201" g2s:eventId="91" '
+        f'g2s:eventDateTime="{now_iso()}" g2s:transactionId="0"/>',
+        "943", "972", "G2S_request")))
+    m_gps1 = expect_host_post("GPE201 GR-31 getGamePlayStatus (dev 1)")
+    m_gd1 = expect_host_post("GPE201 scoped getGameDenoms (dev 1)")
+    expect_host_post("eventAck (GPE201 dev 1)")
+    check("dev-1 GPE201 draws the same read pair (status + scoped denoms)",
+          bool(m_gps1) and bool(m_gd1)
+          and m_gps1["command"] == "getGamePlayStatus"
+          and m_gd1["command"] == "getGameDenoms"
+          and m_gd1["deviceId"] == "1",
+          f"got {[x and x.get('command') for x in (m_gps1, m_gd1)]}")
+    if m_gd1 and m_gd1["command"] == "getGameDenoms":
+        # Answer with a set matching NEITHER the ask nor anything sane —
+        # if the sessionId gate ever regressed to "any gameDenomList
+        # adjudicates", this fold would stamp a bogus disagree.
+        post_to_host(avp_wrap(avp_class_command(
+            "gamePlay",
+            '<g2s:gameDenomList>'
+            '<g2s:gameDenom g2s:denomId="1000" g2s:active="true"/>'
+            '</g2s:gameDenomList>',
+            "944", m_gd1["sessionId"], "G2S_response", device_id="1")))
+        time.sleep(0.3)
+        gp1 = (get_json(STATUS_URL).get(EGM_ID, {}).get("gamePlay", {})
+               .get("1", {}) or {})
+        check("pending denomChange stays result=sent — the unpaired "
+              "GPE201 fold never upgrades the verdict",
+              (gp1.get("denomChange") or {}) == pre1_dc,
+              f"got {gp1.get('denomChange')} want {pre1_dc}")
+        check("…while the fold itself still lands (dev 1 activeDenoms + "
+              "denomsAt stamped)",
+              gp1.get("activeDenoms") == ["1000"]
+              and bool(gp1.get("denomsAt")),
+              f"got {gp1.get('activeDenoms')}/{gp1.get('denomsAt')!r}")
+
+    # (d) BACKFILL DORMANCY — the same GPE201 arriving as a
+    # getEventHandlerLog merge is HISTORY, not a live event: the merge
+    # path never fires the GR-31 hook, so no re-read may hit the wire.
+    pre_bf = get_json(STATUS_URL).get(EGM_ID, {})
+    pre_bf_n = pre_bf.get("ehBackfilledCount") or 0
+    pre_bf_at = (pre_bf.get("gamePlay", {}).get("2", {})
+                 or {}).get("denomsAt")
+    cs, cbody = post_command({"action": "getEventHandlerLog",
+                              "egmId": EGM_ID})
+    check("getEventHandlerLog command accepted", cs == 200
+          and bool(cbody.get("ok")), f"got {cs}/{cbody}")
+    m_ehl = expect_host_post("getEventHandlerLog (backfill sweep)")
+    if m_ehl:
+        post_to_host(avp_wrap(avp_class_command(
+            "eventHandler",
+            '<g2s:eventHandlerLogList>'
+            '<g2s:eventHandlerLog g2s:logSequence="999" '
+            'g2s:deviceClass="G2S_gamePlay" g2s:deviceId="2" '
+            'g2s:eventCode="G2S_GPE201" g2s:eventId="92" '
+            f'g2s:eventDateTime="{now_iso()}" g2s:transactionId="0" '
+            'g2s:eventAck="true"/>'
+            '</g2s:eventHandlerLogList>',
+            "945", m_ehl["sessionId"], "G2S_response")))
+        time.sleep(0.4)
+        snap_bf = get_json(STATUS_URL).get(EGM_ID, {})
+        check("backfilled GPE201 MERGED into the ring "
+              "(ehBackfilledCount +1)",
+              snap_bf.get("ehBackfilledCount") == pre_bf_n + 1,
+              f"got {snap_bf.get('ehBackfilledCount')} want {pre_bf_n + 1}")
+        expect_no_host_post("backfill-merged GPE201 (dormancy — the merge "
+                            "path never triggers reads)")
+        check("dev 2 denomsAt untouched by the backfill merge",
+              (snap_bf.get("gamePlay", {}).get("2", {})
+               or {}).get("denomsAt") == pre_bf_at,
+              f"got {(snap_bf.get('gamePlay', {}).get('2', {}) or {}).get('denomsAt')!r} "
+              f"want {pre_bf_at!r}")
+
+    # (e) UNKNOWN DEVICE — a GPE201 from a deviceId outside the store is
+    # the install/new-title case: the hook answers with the debounced GR-31
+    # FULL rescan (inventory re-harvest first — getDescriptor), never a
+    # lone scoped getGameDenoms.
+    check("fixture sanity: devices 998/999 are outside the first-light "
+          "inventory",
+          not {"998", "999"} & set(first_light_gameplay_ids()))
+    post_to_host(avp_wrap(avp_class_command(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="999" '
+        'g2s:eventCode="G2S_GPE201" g2s:eventId="93" '
+        f'g2s:eventDateTime="{now_iso()}" g2s:transactionId="0"/>',
+        "946", "973", "G2S_request")))
+    m_rs1 = expect_host_post("GR-31 rescan getDescriptor (unknown dev)")
+    m_rs2 = expect_host_post("eventAck (GPE201 unknown dev)")
+    check("unknown-device GPE201 fires the FULL rescan (getDescriptor "
+          "re-harvest ahead of the ack) — never a scoped getGameDenoms",
+          bool(m_rs1) and bool(m_rs2)
+          and m_rs1["command"] == "getDescriptor"
+          and m_rs2["command"] == "eventAck"
+          and m_rs2.get("commandAttrs", {}).get("eventId") == "93",
+          f"got {[x and x.get('command') for x in (m_rs1, m_rs2)]}")
+
+    # (f) DEBOUNCE — a second unknown-device GPE201 inside
+    # GP_EVENT_RESCAN_DEBOUNCE_SEC re-acks but skips the rescan (an
+    # install narrates dozens of GPE events; one rescan catches them all).
+    post_to_host(avp_wrap(avp_class_command(
+        "eventHandler",
+        '<g2s:eventReport g2s:deviceClass="G2S_gamePlay" g2s:deviceId="998" '
+        'g2s:eventCode="G2S_GPE201" g2s:eventId="94" '
+        f'g2s:eventDateTime="{now_iso()}" g2s:transactionId="0"/>',
+        "947", "974", "G2S_request")))
+    ack = expect_host_post("eventAck (GPE201 unknown dev, debounced)")
+    if ack:
+        check("second unknown-device GPE201 within the debounce window "
+              "re-acks ONLY (no second rescan)",
+              ack["command"] == "eventAck"
+              and ack.get("commandAttrs", {}).get("eventId") == "94",
+              f"got {ack.get('command')}/{ack.get('commandAttrs')}")
+    expect_no_host_post("debounced unknown-device GPE201")
 
     print(f"\n{'=' * 50}\nRESULT: {PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
