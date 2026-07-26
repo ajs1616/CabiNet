@@ -1031,6 +1031,26 @@ OPTION_CONFIG_ERRORS = {
 # validated set anyway.
 OPTION_CHANGE_ABANDON_SEC = 120
 
+# Post-apply read-back retry ladder, in seconds (2026-07-25). The EGM reports
+# G2S_applied at the START of its apply window, not the end — with
+# applyCondition=G2S_disable it is still disabling/applying/re-enabling itself
+# when our scoped getOptionList lands, and it answers with the OLD value. One
+# early read is not proof of failure. Only after the last of these delays may
+# a mismatch be stamped verifyFailed. Ladder chosen against the observed AVP
+# window (self-disable -> CBE205 in ~3s) with generous headroom.
+OPTION_VERIFY_BACKOFF = (3, 8, 20)
+
+# The denom ceremony's enterOptionConfigMode timeToLive, in ms (§1.17). The
+# 30 s builder default was reaping a BB2E that was lawfully holding the request
+# (§9.7 has the EGM wait for credits=0 then cabinet idleTimePeriod) and came
+# back G2S_APX011 "Time To Live Expired" at 33 s — read for months as an EGM
+# refusal when it was our own clock. 5 minutes gives any real deferral room
+# while still guaranteeing a verdict.
+# ⚠️ Deliberately NOT 0/unexpirable — tried live 2026-07-26 and reverted the
+# same night: a cabinet with no live config mode (every WMS Bluebird) then goes
+# silent forever with host commands parked on it. See start_denom_ceremony.
+CEREMONY_MODE_TTL_MS = 300000
+
 # enableRemoteHandpay (G2S-25/27): the handpay params a remote reset-to-
 # credits needs flipped, per §11.26.4/Table 11.46 and the live 2026-07-02
 # inventory read (19 booleans under complexValue G2S_handpayParams,
@@ -1151,6 +1171,22 @@ class EgmAssociation:
         self.pending_option_txn_id = None
         self.option_change = {}
         self.option_change_log = {}
+        # optionConfig CONFIGURATION MODE (spec §9.7-9.9) — a DIFFERENT mode
+        # from the commConfig one below. Wire-proven necessary 2026-07-25: the
+        # AVP refuses an option change outright with G2S_OCX002 "EGM is not in
+        # optionConfig mode and provided applyCondition does not disable the
+        # EGM". While enabled the EGM MUST NOT allow game play (§9.7), so this
+        # is deliberate and disruptive — API-triggered ONLY, never automatic.
+        # None = never asked; True/False = the EGM's last optionConfigModeStatus.
+        self.optionconfig_mode = None
+        self.optionconfig_mode_at = None
+        # denomApply ceremony (§9.7 + §6.15) — the ONLY path that actually
+        # lands a denomination change, proven end-to-end on the AVP
+        # 2026-07-25 18:05 (drop) and 18:09 (restore), and again 18:12 with a
+        # door icon showing. Outside optionConfig mode a gamePlay write is
+        # INERT. Stages: entering -> writing -> exiting -> done|failed.
+        # {dev, denoms[], stage, startedAt, error}
+        self.denom_ceremony = None
         # commConfig ownership: host_items is the parsed commHostList (hostId ->
         # {index, location, registered, owned[], config[], guest[]}); the
         # ownership state machine tracks the enterCommConfigMode -> setCommChange
@@ -1611,9 +1647,26 @@ class EgmAssociation:
             # forever. This is the AVP-unproven command's most likely first
             # outcome (ack-then-silence), so it MUST self-heal like siblings.
             dc = gp_copy.get("denomChange")
-            if dc and dc.get("result") == "sent" and \
-                    time.time() - dc.get("sentTs", 0) > 30:
-                gp_copy["denomChange"] = dict(dc, result="timeout")
+            if dc and dc.get("result") == "sent":
+                # ⚠️ The horizon MUST follow the timeToLive we actually sent
+                # (2026-07-25). A flat 30 s stamped result="timeout" on a push
+                # carrying ttlMs=300000 while the EGM was still legitimately
+                # holding it — the UI said "no denom reply" 2.5 minutes before
+                # the command could even expire. §6.15 lets the EGM defer the
+                # apply until credits=0 + idle; our clock does not get to
+                # overrule the TTL we chose. +15s grace for the round trip.
+                ttl_ms = dc.get("ttlMs")
+                if ttl_ms is None:
+                    ttl_ms = 30000
+                # ⚠️ ttlMs == 0 means UNLIMITED (§1.17: "the command MUST NOT be
+                # expired by the recipient"). `or 30000` treated 0 as falsy and
+                # stamped "timeout" at 45 s on a command the EGM was legitimately
+                # still holding — wire-proven 2026-07-25 14:03:54, sid=1262: the
+                # AVP never answered because it MUST not, and we called it dead.
+                # A zero-TTL write has NO horizon; only a real reply resolves it.
+                if ttl_ms > 0 and \
+                        time.time() - dc.get("sentTs", 0) > ttl_ms / 1000.0 + 15:
+                    gp_copy["denomChange"] = dict(dc, result="timeout")
         # G2S-25: same lazy-timeout treatment for an unanswered setRemoteKeyOff
         # (30s timeToLive, no retry). Only the COPY is stamped — the underlying
         # record stays live so a late remoteKeyOffAck/keyedOff still lands.
@@ -1659,6 +1712,14 @@ class EgmAssociation:
             "ownedClaim": self.owned_claim,
             # optionConfig change cycle (G2S-27)
             "optionConfigStage": self.optionconfig_stage,
+            # §9.7 configuration mode — True while the EGM has game play
+            # locked out for option changes; None = never asked this session.
+            "optionConfigMode": self.optionconfig_mode,
+            "optionConfigModeAt": self.optionconfig_mode_at,
+            # denomApply ceremony (G2S-38) — drives the UI's "reconfiguring"
+            # face; nested dict replaced wholesale, never mutated in place.
+            "denomCeremony": dict(self.denom_ceremony)
+            if self.denom_ceremony else None,
             "optionChange": option_change,
             "optionChangeLog": option_change_log,
             "configOptionCount": len(config_options),
@@ -4061,8 +4122,23 @@ class G2SHost:
                          if not isinstance(g, bool)
                          and isinstance(g, (int, float))
                          and 1 <= g <= 9999 and float(g).is_integer()]
+            # PLAYER denominations (§16.3 B1 / §16.4 B2) — Table C-4 codes,
+            # 01-3F. Deliberately SEPARATE keys from denomCode: that one is the
+            # ACCOUNTING denomination from 0x1F (the unit every credit meter is
+            # reported in, fixed at RAM clear). On the BB2 both read 01 today,
+            # so a shared key would hide the conflation forever.
+            pd = mi.get("playerDenoms")
+            player_denoms = None
+            if isinstance(pd, list) and len(pd) <= 64:
+                player_denoms = [int(c) for c in pd
+                                 if not isinstance(c, bool)
+                                 and isinstance(c, (int, float))
+                                 and 1 <= c <= 0x3F and float(c).is_integer()]
             entry["machineInfo"] = {
                 "denomCode": _mbi(mi.get("denomCode"), 0xFF),
+                "playerDenoms": player_denoms,
+                "currentPlayerDenom": _mbi(mi.get("currentPlayerDenom"), 0x3F),
+                "denomsAt": _ms(mi.get("denomsAt"), 32),
                 "gameId": _ms(mi.get("gameId"), 8),
                 "paytableId": _ms(mi.get("paytableId"), 16),
                 "rtpRaw": _ms(mi.get("rtpRaw"), 8),
@@ -10251,7 +10327,9 @@ class G2SHost:
             return inner, f"setDateTime(cid={cid},sid={sid})"
         self._enqueue(assoc, build, epoch=epoch)
 
-    def enqueue_set_cabinet_state(self, assoc, enable=True, disable_text=""):
+    def enqueue_set_cabinet_state(self, assoc, enable=True, disable_text="",
+                                  enable_game_play=True, enable_money_in=True,
+                                  enable_money_out=True):
         """cabinet.setCabinetState (spec §3.7, Table 3.2) — enable/disable the
         WHOLE machine. Owner-only, API-triggered ONLY (never automatic). Every
         attribute defaults TRUE, so a partial send implicitly resets omitted
@@ -10276,9 +10354,22 @@ class G2SHost:
             if not enable and disable_text:
                 text = (' g2s:disableText="'
                         f'{html.escape(disable_text, quote=True)}"')
+            # ⭐ GRANULAR LOCK (2026-07-25). These were hardcoded "true", so
+            # every "disable" we ever sent simultaneously asserted
+            # enableGamePlay="true" — i.e. WE HAVE NEVER LOCKED GAME PLAY on
+            # a cabinet. That is why the AVP never reaches idle: it answered a
+            # setScript in 333 ms with G2S_APX999 "EGM is not idle. There are
+            # 10 second(s) remaining until the EGM is idle." while game play
+            # was still enabled by our own command. §6.15/§6.9 gate the apply
+            # on idle, so no gamePlay write could ever land.
+            # THE RESTORE PATH REMAINS SACRED: all three default TRUE, so
+            # enable=true with no kwargs is still the clean full restore.
+            gp = str(bool(enable_game_play)).lower()
+            mi = str(bool(enable_money_in)).lower()
+            mo = str(bool(enable_money_out)).lower()
             cmd = (f'<g2s:setCabinetState g2s:enable="{on}" '
-                   'g2s:enableGamePlay="true" g2s:enableMoneyIn="true" '
-                   f'g2s:enableMoneyOut="true"{text}/>')
+                   f'g2s:enableGamePlay="{gp}" g2s:enableMoneyIn="{mi}" '
+                   f'g2s:enableMoneyOut="{mo}"{text}/>')
             inner, cid = self.build_inner_request(
                 a, "cabinet", "1", cmd, str(sid), "30000")
             a.cabinet_state_change = {
@@ -10575,6 +10666,129 @@ class G2SHost:
             return inner, f"getGamePlayProfile(dev={device_id},cid={cid})"
         self._enqueue(assoc, build)
 
+    def start_denom_ceremony(self, assoc, device_id="1", denoms=None):
+        """THE operator path for changing active denominations (G2S-38).
+
+        Wire-proven on the AVP 2026-07-25 — three clean runs, ~600 ms apply:
+            enterOptionConfigMode      -> optionConfigModeStatus enabled=true
+                                          + OCE101, EGM UNLOADS the title
+            getGameDenoms (§6.15)      -> gameDenomList: the supported combos,
+                                          read immediately before the write
+            setActiveDenoms            -> gameDenomList echo + G2S_GPE201
+            exitOptionConfigMode       -> OCE102 + CBE205, cabinet playable
+
+        Outside the mode the write is INERT — that is the whole reason this
+        exists. The stages are advanced by the inbound handlers
+        (optionConfigModeStatus / the denomChange verdict), never by sleeping.
+        The exit ALWAYS fires, success or failure, so the cabinet can never be
+        left with game play locked out.
+
+        MACHINE PREREQUISITES (deploy/AVP_SETUP.md, both were wrong from the
+        factory): Remote Configuration ▸ Advanced ▸ "Protocol that controls
+        LEGACY METER CHANGE" = Not Required, and "Door status disallows machine
+        idle state" = No. Without the first the EGM aborts with G2S_APX999
+        "Legacy protocols are unable to collect the meters."; without the
+        second a door icon stops it ever reaching idle."""
+        dev = str(device_id)
+        denoms = sorted({int(d) for d in (denoms or [])})
+        with assoc.lock:
+            cur = assoc.denom_ceremony
+            # The stale-window must cover the mode-entry's own TTL, or the guard
+            # releases while the EGM still holds a live request and the next tap
+            # parks a SECOND enterOptionConfigMode on the cabinet. That happened
+            # live on the BB2E 2026-07-26 (ceremonies at 00:54:35 and 00:56:52,
+            # both parked) — §9.7's own contract is that the EGM refuses a second
+            # config-mode initiation, so stacking them can only ever hurt. The
+            # window is the TTL plus a small grace for the expiry response to
+            # travel; a ceremony that reaches a terminal stage ('failed',
+            # 'applied') is not covered by this and a retry is immediate.
+            if cur and cur.get("stage") in ("entering", "writing", "exiting") \
+                    and time.time() - cur.get("startedTs", 0) < \
+                    (CEREMONY_MODE_TTL_MS / 1000.0) + 15:
+                return {"ok": False,
+                        "error": f"a denomination change is already running on "
+                                 f"dev {cur.get('dev')} (stage "
+                                 f"{cur.get('stage')}) — one at a time: the EGM "
+                                 f"refuses a second config-mode initiation"}
+            assoc.denom_ceremony = {
+                "dev": dev, "denoms": [str(d) for d in denoms],
+                "stage": "entering", "startedAt": now_iso(),
+                "startedTs": time.time()}
+        log.info("[%s] 🎰 DENOM CEREMONY start dev=%s -> %s — entering "
+                 "optionConfig mode (§9.7); the EGM will unload the title",
+                 assoc.egm_id, dev, denoms)
+        # ttl_ms = CEREMONY_MODE_TTL_MS — bounded, but far longer than the 30 s
+        # default. NOT 0/unexpirable: see the BB2E lesson below.
+        # ⚠️ WIRE-PROVEN ON THE BB2E 2026-07-26, and it is why denomApply did
+        # NOTHING on that cabinet — no lock, no error, no feedback:
+        #     00:43:51.364  EGM acked enterOptionConfigMode(enable=True)
+        #     00:44:24.884  optionConfig G2S_APX011 "Time To Live Expired"
+        # §9.7 says the EGM's own logic "waits for the credit meter to reach 0
+        # then for cabinet idleTimePeriod idle" before it enters the mode — so
+        # the EGM was LAWFULLY HOLDING our command and our own 30 s default
+        # reaped it 33 s later. APX011 here is OUR clock expiring, never an EGM
+        # refusal (the second time that error text has been misread as a
+        # capability limit — see the deleted "APX011 = the EGM refuses denom
+        # changes" note). The AVP only ever worked because it enters the mode
+        # fast enough to beat the fuse, which hid this for the whole feature.
+        # The ttlMs lever added the same day covered setActiveDenoms — the
+        # WRITE — but the ceremony never reaches the write if the mode-entry
+        # itself is reaped first.
+        #
+        # ⛔ WHY NOT ttl_ms=0 (tried, live, 2026-07-26 — REVERTED same night):
+        # unexpirable looked like the clean reading of §1.17, and on the AVP it
+        # is harmless (that cabinet opens the mode in ~12 ms). On the BB2E it
+        # was actively worse than the bug it replaced. A WMS Bluebird has NO
+        # live config mode at all — comms/protocol settings change ONLY during
+        # the boot right after a RAM clear (AJ 2026-07-09) — so it ACKS
+        # enterOptionConfigMode at the transport layer, never enters the mode,
+        # and never errors. With a TTL it eventually answers APX011 and we get
+        # a verdict; with ttl=0 it has nothing to say and goes SILENT FOREVER,
+        # leaving unexpirable host commands parked on the cabinet (two of them,
+        # because the 120 s stage guard let the operator tap Apply twice). The
+        # cabinet stayed playable, but a parked mode-entry that lands at an
+        # unpredictable later moment is exactly the hazard the setActiveDenoms
+        # ttlMs comment already warns about — do not reintroduce 0 here.
+        #
+        # LESSON: a TTL is a BACKSTOP, not a timeout mechanism. Make it long
+        # enough that a legitimately deferring EGM (§9.7: waits for credits=0
+        # then idleTimePeriod) is never reaped mid-wait, and short enough that
+        # a cabinet which can never comply still yields a verdict. The honest
+        # "never entered the mode" verdict belongs to the ceremony's own
+        # watchdog, not to the wire TTL.
+        self.enqueue_enter_option_config_mode(
+            assoc, enable=True, disable_text="Remote configuration in progress",
+            ttl_ms=CEREMONY_MODE_TTL_MS)
+        return {"ok": True, "ceremony": "entering", "deviceId": dev,
+                "denoms": [str(d) for d in denoms]}
+
+    def _denom_ceremony_mode_open(self, assoc):
+        """optionConfigModeStatus enabled=true arrived — if a ceremony is
+        waiting on it, do the §6.15 read-then-write inside the window."""
+        with assoc.lock:
+            c = assoc.denom_ceremony
+            if not c or c.get("stage") != "entering":
+                return
+            c["stage"] = "writing"
+            dev, denoms = c["dev"], [int(d) for d in c["denoms"]]
+        log.info("[%s] 🎰 DENOM CEREMONY mode open — getGameDenoms then "
+                 "setActiveDenoms dev=%s", assoc.egm_id, dev)
+        self.enqueue_get_game_denoms(assoc, dev)
+        self.enqueue_set_active_denoms(assoc, device_id=dev, denoms=denoms)
+
+    def _denom_ceremony_write_settled(self, assoc, dev, outcome):
+        """The denomChange verdict reached a terminal state — close the mode.
+        ALWAYS exits, so a refusal can never strand the cabinet locked."""
+        with assoc.lock:
+            c = assoc.denom_ceremony
+            if not c or c.get("stage") != "writing" or c.get("dev") != str(dev):
+                return
+            c["stage"] = "exiting"
+            c["outcome"] = outcome
+        log.info("[%s] 🎰 DENOM CEREMONY dev=%s outcome=%s — exiting "
+                 "optionConfig mode", assoc.egm_id, dev, outcome)
+        self.enqueue_enter_option_config_mode(assoc, enable=False)
+
     def enqueue_get_game_denoms(self, assoc, device_id="1"):
         """gamePlay.getGameDenoms (spec §6.14) — empty request element; the
         response is gameDenomList (§6.16 — there is NO getGameDenomList
@@ -10588,9 +10802,21 @@ class G2SHost:
             return inner, f"getGameDenoms(dev={device_id},cid={cid})"
         self._enqueue(assoc, build)
 
-    def enqueue_set_active_denoms(self, assoc, device_id="1", denoms=None):
+    def enqueue_set_active_denoms(self, assoc, device_id="1", denoms=None,
+                                  ttl_ms=None):
         """gamePlay.setActiveDenoms (§6.15) — REPLACE the device's active
         game-combination set with exactly `denoms` (millicent ints).
+
+        ⚠️ THIS IS THE RAW WRITE — outside optionConfig mode the EGM treats it
+        as inert (it parks or, with a finite TTL, dies as G2S_APX011). The
+        supported operator path is `denomApply`, which runs the full §9.7
+        ceremony around it. Kept raw for bench work and for callers that are
+        already inside the mode.
+        §6.15 also prescribes a getGameDenoms read BEFORE the write (both
+        answer with the same gameDenomList — one read/modify/write cycle). That
+        read belongs to the ceremony, NOT to this enqueue: welding it in here
+        inserts an extra command into every wire sequence and desynchronised 91
+        replay-gate assertions (step 6.895 onward) on 2026-07-25.
         Explicit activeDenom singles only — no activeRange (the UI holds
         the precise list; ranges save nothing and add a decode surface).
         §6.15 semantics: full overwrite (anything omitted goes inactive),
@@ -10617,11 +10843,14 @@ class G2SHost:
             inner, cid = self.build_inner_request(
                 a, "gamePlay", dev,
                 f"<g2s:setActiveDenoms>{kids}</g2s:setActiveDenoms>",
-                str(sid), "30000")
+                str(sid), str(ttl_ms if ttl_ms is not None else 30000))
             a.game_play.setdefault(dev, {})["denomChange"] = {
                 "denoms": [str(d) for d in denoms],
                 "sessionId": str(sid), "sentAt": now_iso(),
-                "sentTs": time.time(), "result": "sent"}
+                "sentTs": time.time(), "result": "sent",
+                # the TTL we actually put on the wire — snapshot()'s lazy
+                # timeout derives its horizon from this, never a flat 30s.
+                "ttlMs": int(ttl_ms if ttl_ms is not None else 30000)}
             return inner, (f"setActiveDenoms(dev={dev},n={len(denoms)},"
                            f"cid={cid},sid={sid})")
         self._enqueue(assoc, build)
@@ -10946,6 +11175,55 @@ class G2SHost:
     CABINET_STATUS_FLAGS = (
         "logicDoorOpen", "auxDoorOpen", "cabinetDoorOpen",
         "serviceLampOn", "hostLocked")
+
+    def _fold_game_play_status(self, assoc, el, dev, source):
+        """Fold a gamePlayStatus (§6.11) element into assoc.game_play[dev] —
+        STATUS FIELDS ONLY. The setGamePlayState verdict logic deliberately
+        stays in the response handler; an event ride-along is narration, not
+        an answer to a command we sent.
+
+        WHY THIS EXISTS (AJ, 2026-07-25): "when a game is enabled or disabled
+        with the eKey its reported to the host... why isnt it updated based
+        off what the cabinet is already screaming?" It is — every gamePlay
+        event carries the affected device's status inline under the same
+        sendDeviceStatus subscription the cabinet ride-along uses. We folded
+        the cabinet half earlier today and never extended it here, so an eKey
+        enable/disable was logged and then thrown away, leaving egmEnabled /
+        themeId / paytableId frozen at their last explicit read — NINE DAYS
+        stale across two RAM clears on the AVP, which put phantom paytables on
+        the Games page under the wrong game names."""
+        data = {
+            "themeId": attr(el, "themeId"),
+            "paytableId": attr(el, "paytableId"),
+            "hostEnabled": attr(el, "hostEnabled") or "true",
+            "egmEnabled": attr(el, "egmEnabled") or "true",
+            "generalTilt": attr(el, "generalTilt") or "false",
+            "reelTilt": attr(el, "reelTilt") or "false",
+            "statusAt": now_iso(),
+        }
+        cfg = attr(el, "configurationId")
+        if cfg is not None:
+            data["configurationId"] = cfg
+        dev = str(dev)
+        moved = None
+        with assoc.lock:
+            gp = assoc.game_play.setdefault(dev, {})
+            was = (gp.get("egmEnabled"), gp.get("hostEnabled"),
+                   gp.get("themeId"), gp.get("paytableId"))
+            gp.update(data)
+            assoc.game_play_as_of = now_iso()
+            now_t = (data["egmEnabled"], data["hostEnabled"],
+                     data["themeId"], data["paytableId"])
+            if was[0] is not None and was != now_t:
+                moved = (was, now_t)
+        if moved:
+            log.info("🎰 [%s] gamePlay dev=%s status CHANGED via %s — "
+                     "egmEnabled %s->%s hostEnabled %s->%s theme %s->%s",
+                     assoc.egm_id, dev, source, moved[0][0], moved[1][0],
+                     moved[0][1], moved[1][1],
+                     str(moved[0][2])[:24], str(moved[1][2])[:24])
+            self._schedule_game_play_persist(assoc)
+        return moved
 
     def _fold_cabinet_status(self, assoc, el, source):
         """Fold ONE cabinetStatus element (§3.9 Table 3.3 — every attribute
@@ -13396,6 +13674,52 @@ class G2SHost:
     # is silence-tolerant (a pre-ownership AVP acks-then-ignores, the record
     # parks and snapshot() times it out). Nothing here fires automatically.
 
+    def enqueue_enter_option_config_mode(self, assoc, enable=True,
+                                         disable_text="", ttl_ms=None):
+        """optionConfig.enterOptionConfigMode (spec §9.7, Table 9.3). Owner-only.
+        Rides under <g2s:optionConfig> at deviceId = hostId (§9.1) like the rest
+        of the class. When enabled, the EGM is placed into the mode "that allows
+        option configuration changes to execute" and it "MUST NOT allow game
+        play"; the EGM's own apply logic waits for the credit meter to reach 0
+        then for cabinet idleTimePeriod idle. Events: G2S_OCE101 entered /
+        G2S_OCE102 exited. Response: optionConfigModeStatus (§9.9).
+
+        WHY THIS EXISTS — wire-proven 2026-07-25 on the AVP: a setOptionChange
+        sent OUTSIDE this mode is refused in ~195 ms with G2S_OCX002, errorText
+        "EGM is not in optionConfig mode and provided applyCondition does not
+        disable the EGM. To modify the following option(s) EGM needs to be
+        disabled: IGT_defaultPlayerDenoms." The commConfig config mode (§8.7) is
+        a DIFFERENT mode and does NOT satisfy it (entered live the same day, the
+        EGM confirmed CCE101, and gamePlay/option writes were unaffected).
+        Deliberate and DISRUPTIVE — API-triggered ONLY, never automatic, and the
+        caller owns the exit (enable=false)."""
+        def build(a):
+            sid = a.next_session_id()
+            text = ""
+            if enable and disable_text:
+                text = (' g2s:disableText="'
+                        f'{html.escape(disable_text, quote=True)}"')
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                f'<g2s:enterOptionConfigMode '
+                f'g2s:enable="{str(bool(enable)).lower()}"{text}/>',
+                str(sid), str(ttl_ms if ttl_ms is not None else 30000))
+            return inner, (f"enterOptionConfigMode(enable={bool(enable)},"
+                           f"cid={cid})")
+        self._enqueue(assoc, build)
+
+    def enqueue_get_option_config_mode_status(self, assoc):
+        """optionConfig.getOptionConfigModeStatus (spec §9.8) — read whether the
+        EGM is currently in option configuration mode. Response:
+        optionConfigModeStatus (§9.9). A pure read, safe any time."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "optionConfig", self.host_id,
+                "<g2s:getOptionConfigModeStatus/>", str(sid), "30000")
+            return inner, f"getOptionConfigModeStatus(cid={cid})"
+        self._enqueue(assoc, build)
+
     def enqueue_set_option_change(self, assoc, config_id, dc, di, gid, oid,
                                   current_values_xml, apply_condition,
                                   disable_condition=None):
@@ -13469,7 +13793,8 @@ class G2SHost:
         self._enqueue(assoc, build)
 
     def enqueue_get_option_list(self, assoc, epoch=None,
-                                device_class="G2S_all", device_id="-1"):
+                                device_class="G2S_all", device_id="-1",
+                                option_detail=False):
         """optionConfig.getOptionList (§9.10 Table 9.6) — read the option
         inventory back on demand (GR-10). All five attributes are REQUIRED:
         deviceClass/deviceId default to the everything-wildcards G2S_all/-1
@@ -13495,9 +13820,11 @@ class G2SHost:
                 a, "optionConfig", self.host_id,
                 f'<g2s:getOptionList g2s:deviceClass="{device_class}" '
                 f'g2s:deviceId="{device_id}" g2s:optionGroupId="G2S_all" '
-                'g2s:optionId="G2S_all" g2s:optionDetail="false"/>',
+                'g2s:optionId="G2S_all" g2s:optionDetail='
+                f'"{str(bool(option_detail)).lower()}"/>',
                 str(sid), "30000")
-            return inner, f"getOptionList({device_class}/{device_id},cid={cid})"
+            return inner, (f"getOptionList({device_class}/{device_id},"
+                           f"detail={bool(option_detail)},cid={cid})")
         self._enqueue(assoc, build, epoch=epoch)
 
     def persist_config_inventory(self, assoc):
@@ -14177,6 +14504,46 @@ class G2SHost:
                                 "§6.15 atomicity)", assoc.egm_id, gdev,
                                 rerr, f' "{rtext}"' if rtext else "")
                     self._schedule_game_play_persist(assoc)
+                    # a refused write must STILL close the ceremony's mode —
+                    # otherwise the cabinet sits with game play locked out.
+                    self._denom_ceremony_write_settled(
+                        assoc, gdev, f"error:{rerr}")
+            # An optionConfig-class error while a denom ceremony is waiting on
+            # the mode is THAT ceremony's verdict. Error responses carry no
+            # child command, so optionConfigModeStatus can never fire and
+            # _denom_ceremony_mode_open is never called — the ceremony would
+            # sit at 'entering' in total silence until the 120 s stage guard
+            # aged it out. That silence is exactly what the BB2E showed the
+            # operator on 2026-07-26: pressed Apply, no lock, no error, nothing.
+            # Stamp the machine's own errorCode/errorText so the UI can say
+            # what happened. NOTE: a failed entry means the mode never opened,
+            # so unlike the commConfig cycle below we must NOT send an exit —
+            # exiting a mode the EGM never entered just draws a second error.
+            # A ceremony already past 'entering' keeps its existing exit path
+            # (_denom_ceremony_write_settled always exits).
+            if req["class"] == "optionConfig":
+                failed = None
+                with assoc.lock:
+                    c = assoc.denom_ceremony
+                    if c and c.get("stage") == "entering":
+                        c["stage"] = "failed"
+                        c["outcome"] = f"error:{rerr}"
+                        c["errorCode"] = rerr
+                        c["errorText"] = rtext or ""
+                        c["settledAt"] = now_iso()
+                        failed = dict(c)
+                if failed:
+                    hint = ""
+                    if rerr == "G2S_APX011":
+                        hint = (" — this is OUR time-to-live expiring, not an "
+                                "EGM refusal: §9.7 lets the EGM hold the "
+                                "request until credits=0 and the cabinet has "
+                                "been idle for idleTimePeriod")
+                    log.warning("🎰 [%s] DENOM CEREMONY dev=%s FAILED entering "
+                                "optionConfig mode — %s%s%s (mode never "
+                                "opened, so no exit is sent; nothing changed)",
+                                assoc.egm_id, failed.get("dev"), rerr,
+                                f' "{rtext}"' if rtext else "", hint)
             # G2S-19: a commConfig-class error while the ownership cycle is
             # mid-flight is its verdict (error responses carry NO child
             # command, so the commChangeStatus handler below can never fire).
@@ -14309,7 +14676,16 @@ class G2SHost:
                     if gp is not None and \
                             sc.get("result") in ("sent", "acked") and \
                             req["sessionId"] == sc.get("sessionId"):
-                        gp["stateChange"] = dict(sc, result=f"error:{rerr}")
+                        # Keep the EGM's OWN errorText, not just the code
+                        # (2026-07-25): an APX011 on this AVP carried
+                        # "Time-to-live Expired. EGM must be idle: Doors
+                        # icons are showing. Restart icon is showing." —
+                        # the machine naming the exact thing an operator
+                        # must clear. Dropping it left the UI saying only
+                        # "G2S_APX011" while the fix was on the glass.
+                        gp["stateChange"] = dict(
+                            sc, result=f"error:{rerr}", errorCode=rerr,
+                            errorText=rtext or "")
                         gp_rejected = True
                         want = sc.get("enable")
                 if gp_rejected:
@@ -15020,6 +15396,23 @@ class G2SHost:
                 for st_el in el.iter():
                     if localname(st_el.tag) == "cabinetStatus":
                         self._fold_cabinet_status(assoc, st_el, "event")
+                        break
+            # SAME ride-along for gamePlay (2026-07-25): an eKey enable/disable
+            # at the cabinet raises a gamePlay event carrying that device's
+            # gamePlayStatus inline. Keyed by the statusInfo's OWN deviceId —
+            # an event may carry several devices' statuses and must never
+            # cross-write. Without this the Games page served egmEnabled/
+            # themeId/paytableId frozen since the last explicit read.
+            for si in el.iter():
+                if localname(si.tag) != "statusInfo":
+                    continue
+                if attr(si, "deviceClass") != "G2S_gamePlay":
+                    continue
+                si_dev = attr(si, "deviceId") or ev["deviceId"]
+                for st_el in si.iter():
+                    if localname(st_el.tag) == "gamePlayStatus":
+                        self._fold_game_play_status(
+                            assoc, st_el, si_dev, "event")
                         break
             # G2S-23: type the 💵 bill-in. G2S_NAE114 Note Stacked is THE
             # money-in event (Tables 13.35/13.36 — the EGM inserts the log
@@ -15945,6 +16338,9 @@ class G2SHost:
                 log.warning("🎰 [%s] ACTIVE DENOMS DISAGREEMENT dev=%s — "
                             "asked [%s], EGM reports [%s]", assoc.egm_id,
                             dev, ",".join(asked), ",".join(active))
+            if verdict in ("accepted", "applied", "disagree"):
+                # ceremony: the write settled inside the mode — close it.
+                self._denom_ceremony_write_settled(assoc, dev, verdict)
             if verdict in ("accepted", "applied"):
                 # linked cabinet: the G2S leg just changed the denom menu —
                 # nudge the SAS leg's census (SAS = denom authority; it must
@@ -16241,6 +16637,8 @@ class G2SHost:
                 # push). Nested verify dict is assigned wholesale, never
                 # mutated, so snapshot()'s shallow copy stays consistent.
                 verified = mismatches = None
+                retry_after = None
+                retry_scope = (None, None)
                 with assoc.lock:
                     oc = assoc.option_change
                     if oc.get("result") == "applied" and \
@@ -16267,18 +16665,59 @@ class G2SHost:
                                 "at": now_iso(), "mismatches": mism,
                                 "readback": {p: readback.get(p)
                                              for p in expected}}
-                            oc["result"] = ("verifyFailed" if mism
-                                            else "verified")
-                            oc["progressTs"] = time.time()
-                            verified, mismatches = not mism, mism
+                            # ⚠️ THE VERIFY RACE (fixed 2026-07-25). The
+                            # read-back is enqueued the instant the EGM says
+                            # G2S_applied, but with applyCondition=G2S_disable
+                            # the AVP is still inside its own disable ->
+                            # apply -> re-enable window at that moment, and it
+                            # answers with the PRE-change value. Live proof:
+                            # IGT_defaultPlayerDenoms 100000 -> 5000 was
+                            # stamped verifyFailed at 12:53:48 ("got 100000"),
+                            # yet a detail read 3 minutes later showed
+                            # currentValue=5000 — the change HAD applied and
+                            # we libelled the machine. A single early read is
+                            # not evidence of failure: retry the read-back a
+                            # few times before calling it, and only the LAST
+                            # attempt may stamp verifyFailed.
+                            tries = int(oc.get("verifyTries") or 0)
+                            if mism and tries < len(OPTION_VERIFY_BACKOFF):
+                                oc["verifyTries"] = tries + 1
+                                oc["result"] = "applied"   # stay pending
+                                oc["progressTs"] = time.time()
+                                retry_after = OPTION_VERIFY_BACKOFF[tries]
+                                retry_scope = (oc.get("deviceClass"),
+                                               oc.get("deviceId"))
+                            else:
+                                oc["result"] = ("verifyFailed" if mism
+                                                else "verified")
+                                oc["progressTs"] = time.time()
+                                verified, mismatches = not mism, mism
                 if verified is True:
                     log.info("[%s] ✅ OPTION CHANGE VERIFIED — the EGM's "
                              "read-back matches every changed param "
                              "(stage stays 'applied')", assoc.egm_id)
                 elif verified is False:
                     log.warning("[%s] ❌ OPTION CHANGE VERIFY FAILED — the "
-                                "EGM said applied but its read-back "
-                                "disagrees: %s", assoc.egm_id, mismatches)
+                                "EGM said applied but its read-back still "
+                                "disagrees after %d retries: %s",
+                                assoc.egm_id,
+                                len(OPTION_VERIFY_BACKOFF), mismatches)
+                if retry_after is not None and retry_scope[0]:
+                    # Re-read on a delay from a TIMER thread — never from the
+                    # FIFO worker (the ce2602f deadlock), same rule as the
+                    # first read-back's enqueue.
+                    log.info("[%s] ⏳ option read-back still shows the old "
+                             "value — the EGM is likely mid disable/apply/"
+                             "re-enable; re-reading %s/%s in %ss before "
+                             "judging", assoc.egm_id, retry_scope[0],
+                             retry_scope[1], retry_after)
+                    t = threading.Timer(
+                        retry_after, self.enqueue_get_option_list,
+                        kwargs={"assoc": assoc,
+                                "device_class": retry_scope[0],
+                                "device_id": retry_scope[1]})
+                    t.daemon = True
+                    t.start()
             if stype == "G2S_request":
                 log.info("[%s] optionConfig.optionList (config-sync) -> "
                          "optionListAck", assoc.egm_id)
@@ -16290,6 +16729,38 @@ class G2SHost:
                 log.info("[%s] optionConfig.optionList (response to "
                          "getOptionList, sessionId=%s) — parsed, no ack "
                          "due", assoc.egm_id, req["sessionId"])
+
+        elif cmd == "optionConfigModeStatus":
+            # Response to enterOptionConfigMode/getOptionConfigModeStatus
+            # (spec §9.9). Purely informational to the host: this mode is
+            # API-driven, so nothing here auto-advances a cycle (unlike the
+            # commConfig twin above, which chains straight into setCommChange).
+            # We record it so /api/status can show whether the EGM is sitting
+            # in configuration mode with game play locked out.
+            el = req["commandEl"]
+            enabled = (attr(el, "enabled") or "").lower() == "true"
+            with assoc.lock:
+                assoc.optionconfig_mode = enabled
+                assoc.optionconfig_mode_at = now_iso()
+            log.info("[%s] ⚙️  optionConfigModeStatus enabled=%s — the EGM is "
+                     "%s option configuration mode%s", assoc.egm_id, enabled,
+                     "IN" if enabled else "OUT of",
+                     " (GAME PLAY LOCKED OUT, §9.7)" if enabled else "")
+            # denomApply ceremony stages ride the mode transitions.
+            if enabled:
+                self._denom_ceremony_mode_open(assoc)
+            else:
+                done = None
+                with assoc.lock:
+                    c = assoc.denom_ceremony
+                    if c and c.get("stage") == "exiting":
+                        c["stage"] = "done"
+                        c["finishedAt"] = now_iso()
+                        done = (c.get("dev"), c.get("outcome"))
+                if done:
+                    log.info("[%s] 🎰 DENOM CEREMONY COMPLETE dev=%s "
+                             "outcome=%s — cabinet returned to play",
+                             assoc.egm_id, done[0], done[1])
 
         elif cmd == "optionChangeStatus":
             # Response to setOptionChange/authorizeOptionChange/cancelOption-
@@ -18669,6 +19140,19 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             "enterCommConfigMode": engine.enqueue_enter_comm_config_mode,
             "exitCommConfigMode": engine.enqueue_enter_comm_config_mode,
             "claimOwnership": engine.start_ownership_cycle,
+            # optionConfig CONFIGURATION MODE (spec §9.7-9.9) — the mode the
+            # AVP names in G2S_OCX002 when it refuses an option change. NOT
+            # the commConfig mode above. enter DISABLES GAME PLAY; the caller
+            # owns the exit (exitOptionConfigMode).
+            "enterOptionConfigMode": engine.enqueue_enter_option_config_mode,
+            "exitOptionConfigMode": engine.enqueue_enter_option_config_mode,
+            # ⭐ THE operator path for denominations (G2S-38): runs the whole
+            # §9.7 ceremony — enter mode, §6.15 read, write, exit. A bare
+            # setActiveDenoms outside the mode is inert; this is what the UI
+            # calls. Wire-proven on the AVP 2026-07-25.
+            "denomApply": engine.start_denom_ceremony,
+            "getOptionConfigModeStatus":
+                engine.enqueue_get_option_config_mode_status,
             # optionConfig change cycle (G2S-27). setOption runs the full
             # guarded setOptionChange -> authorize -> apply sequence for ONE
             # option value ({deviceClass, deviceId, optionId, value} + optional
@@ -18884,6 +19368,34 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                       "printerProbe", "printTicket") \
                 and req.get("deviceId") is not None:
             kwargs["device_id"] = str(req["deviceId"])
+        if action == "denomApply":
+            # same validation as the raw write — the ceremony is a wrapper,
+            # not a bypass. deviceId digits-only (it lands raw in wire XML),
+            # denoms 1..64 real ints in millicents, empty set refused.
+            dev = str(req.get("deviceId") or "1")
+            if not dev.isdigit() or not 1 <= int(dev) <= 9999:
+                return self._send(400, json.dumps({
+                    "ok": False, "error": "deviceId must be a number 1..9999"}),
+                    "application/json", soap=False)
+            with engine.tournament_lock:
+                t_phase = engine.tournament.get("phase")
+            if t_phase in ("armed", "countdown", "running"):
+                return self._send(409, json.dumps({
+                    "ok": False,
+                    "error": f"tournament is {t_phase} — denom sets are "
+                             "frozen while it runs"}),
+                    "application/json", soap=False)
+            dn = req.get("denoms")
+            if not isinstance(dn, list) or not dn or len(dn) > 64 or any(
+                    isinstance(d, bool) or not isinstance(d, int)
+                    or not 1000 <= d <= 500_000_000 for d in dn):
+                return self._send(400, json.dumps({
+                    "ok": False,
+                    "error": "denoms must be 1..64 integer millicent values "
+                             "(1000..500000000); an empty set is refused"}),
+                    "application/json", soap=False)
+            kwargs["device_id"] = dev
+            kwargs["denoms"] = sorted(set(dn))
         if action == "setActiveDenoms":
             # §6.15 REPLACEMENT set, millicent ints. Strict: 1..64 values,
             # each 1000..500_000_000 (1¢..$5,000 — the IGT ladder's span),
@@ -18928,6 +19440,26 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                              "setGamePlayState instead"}),
                     "application/json", soap=False)
             kwargs["denoms"] = sorted(set(dn))
+            # BENCH LEVER (2026-07-25, default unchanged at 30000): §6.15 lets
+            # the EGM DEFER the apply until credits=0 + cabinet idle, but every
+            # builder hardcodes a 30 s timeToLive — so a legitimately deferred
+            # apply is reaped by our own clock and comes back G2S_APX011
+            # "Time-to-live Expired". §1.17: "When the value of 0 is set for
+            # the time-to-live, the command MUST NOT be expired by the
+            # recipient." ttl=0 therefore parks the command on the EGM until
+            # its apply window opens. ⚠️ An unexpirable deferred apply can land
+            # at an unpredictable later moment — the tournament arm-guard
+            # already refuses to arm on an unsettled denomChange, keep it.
+            if req.get("ttlMs") is not None:
+                t = req["ttlMs"]
+                if isinstance(t, bool) or not isinstance(t, int) \
+                        or not 0 <= t <= 3_600_000:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "ttlMs must be an integer 0..3600000 "
+                                 "(0 = never expire, §1.17)"}),
+                        "application/json", soap=False)
+                kwargs["ttl_ms"] = t
         # printer printTicket (G2S-24): strict validation — junk draws 400
         # here; templateIndex 0-999 (Table 16.5), regions a bounded list of
         # {index, data} (data lands inside a wire XML attribute, escaped +
@@ -19099,6 +19631,15 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # GR-10 refresh defaults to the full wildcard; the bonus dossier
             # probes scope it ({"deviceClass": "G2S_bonus"}) — the engine
             # method always supported the scoping, this passes it through.
+            # optionDetail=true asks the EGM for the parameter DEFINITIONS
+            # (canModRemote / canModLocal / min / max / allowed values) on top
+            # of current values. Never sent before 2026-07-25, which is why we
+            # had no way to know whether an option we were writing was even
+            # remotely modifiable — the AVP answers G2S_applied either way and
+            # simply doesn't change the value (proved on IGT_defaultPlayerDenoms
+            # 12:53:47: applied, read-back still 100000).
+            if req.get("optionDetail"):
+                kwargs["option_detail"] = True
             if req.get("deviceClass"):
                 kwargs["device_class"] = str(req["deviceClass"])
             if req.get("deviceId") is not None:
@@ -19111,6 +19652,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 not in ("false", "0", "")
             if req.get("disableText"):
                 kwargs["disable_text"] = str(req["disableText"])
+            # cabinet only: granular locks (§3.7 Table 3.2). Omitted = true, so
+            # the sacred full-restore call is unchanged. enableGamePlay:false
+            # is the actual GAME PLAY LOCK — the thing that lets the EGM reach
+            # idle so a deferred gamePlay config apply (§6.15) can run.
+            if action == "setCabinetState":
+                for json_key, kw in (("enableGamePlay", "enable_game_play"),
+                                     ("enableMoneyIn", "enable_money_in"),
+                                     ("enableMoneyOut", "enable_money_out")):
+                    if req.get(json_key) is not None:
+                        kwargs[kw] = str(req[json_key]).lower() \
+                            not in ("false", "0", "")
         if action == "setWatCashOut":
             # separate from the tuple above: setWatCashOut has no
             # disableText (Table 22.15 carries only cashOutToWat)
@@ -19145,6 +19697,31 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             kwargs["script_id"] = str(req["scriptId"])
         if action == "exitCommConfigMode":
             kwargs["enable"] = False
+        if action == "exitOptionConfigMode":
+            kwargs["enable"] = False
+        if action == "enterOptionConfigMode":
+            # §9.7 disableText is player-facing while play is locked out.
+            kwargs["enable"] = True
+            if req.get("disableText") is not None:
+                kwargs["disable_text"] = str(req["disableText"])[:256]
+        if action in ("enterOptionConfigMode", "exitOptionConfigMode"):
+            # §9.7 carries NO applyCondition — entering the mode makes the EGM
+            # UNLOAD the running title, so the machine honours it only when it
+            # is willing to make that transition. That makes it queue-until-able
+            # exactly like setActiveDenoms, and our flat 30 s TTL was reaping it
+            # before the EGM got there (wire-proven all afternoon: instant entry
+            # at 15:13, then nothing but APX011 "Time-to-live Expired").
+            # ttlMs=0 = §1.17 unlimited: park it until the EGM can unload.
+            if req.get("ttlMs") is not None:
+                t = req["ttlMs"]
+                if isinstance(t, bool) or not isinstance(t, int) \
+                        or not 0 <= t <= 3_600_000:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "ttlMs must be an integer 0..3600000 "
+                                 "(0 = never expire, §1.17)"}),
+                        "application/json", soap=False)
+                kwargs["ttl_ms"] = t
         if action == "claimOwnership" and req.get("devices"):
             # explicit claim list ["G2S_printer/1", ...] — overrides the
             # default commHostList+config-sync union. §8.15 setHostItem
@@ -19945,16 +20522,76 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         if cmd_type not in ("legacy_bonus", "handpay_reset", "aft_register",
                             "aft_transfer", "aft_set_host_cashout",
                             "sas_disable", "sas_enable", "set_validation_id",
-                            "sas_game_state", "read_machine_info"):
+                            "sas_game_state", "read_machine_info",
+                            "multidenom_probe", "sas_denom_game_state",
+                            "sas_read_player_denoms", "sas_read_game_info"):
             return self._send(400, json.dumps(
                 {"ok": False, "error":
                  "type must be 'legacy_bonus', 'handpay_reset', "
                  "'aft_register', 'aft_transfer', 'aft_set_host_cashout', "
                  "'sas_disable', 'sas_enable', 'set_validation_id', "
-                 "'sas_game_state' or 'read_machine_info'"}),
+                 "'sas_game_state', 'read_machine_info', "
+                 "'multidenom_probe', 'sas_denom_game_state', "
+                 "'sas_read_player_denoms' or 'sas_read_game_info'"}),
                 "application/json", soap=False)
         cmd = {"id": f"cmd{next(self._SAS_CMD_SEQ)}-{int(time.time())}",
                "type": cmd_type}
+        if cmd_type == "multidenom_probe":
+            # READ-ONLY bench probe for the SAS 6.02 §16.1 B0 preamble — wraps
+            # a multi-denom-aware READ (default LP 0x56) to prove the frame and
+            # response decode before any B0-wrapped write. Optional baseCommand
+            # (Table 16.1d) and denom (Table C-4 code, 00 = default). Validated
+            # satellite-side; kept narrow here because it reaches the wire.
+            for k, lo, hi in (("baseCommand", 0x01, 0xFF),
+                              ("denom", 0x00, 0x3F)):
+                v = req.get(k)
+                if v is None:
+                    continue
+                if isinstance(v, bool) or not isinstance(v, int) \
+                        or not lo <= v <= hi:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": f"{k} must be an integer "
+                                 f"{lo:#04x}..{hi:#04x}"}),
+                        "application/json", soap=False)
+                cmd[k] = v
+            # Optional "data" = the BASE poll's own data field, hex. Five of
+            # Table 16.1d's twelve polls (09, 2F, 6F, FA, B5) are unsendable
+            # without it — our data-less B5 attempt on 2026-07-25 drew a
+            # Table 16.1c error 04 that was OUR malformed frame, not the
+            # machine's verdict. Validated strictly here (hex, <= 32 bytes)
+            # AND satellite-side, which additionally enforces the per-base
+            # minimum length so a short frame never reaches the wire.
+            d = req.get("data")
+            if d is not None:
+                if not isinstance(d, str) or len(d) > 128:
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "data must be a hex string of at most 32 "
+                                 "bytes"}), "application/json", soap=False)
+                try:
+                    raw = bytes.fromhex(d.replace(" ", ""))
+                except ValueError:
+                    return self._send(400, json.dumps({
+                        "ok": False, "error": "data must be valid hex"}),
+                        "application/json", soap=False)
+                if len(raw) > 32:
+                    return self._send(400, json.dumps({
+                        "ok": False, "error": "data exceeds 32 bytes"}),
+                        "application/json", soap=False)
+                cmd["data"] = raw.hex()
+        elif cmd_type == "sas_read_game_info":
+            # READ-ONLY bare LP B5 (§7.23). game 0000 = the gaming machine and
+            # is the DEFAULT — that form uniquely considers disabled games too.
+            game = req.get("game", 0)
+            if (not isinstance(game, int) or isinstance(game, bool)
+                    or not 0 <= game <= 9999):
+                return self._send(400, json.dumps(
+                    {"ok": False,
+                     "error": "game must be an integer 0..9999 "
+                              "(0 = the gaming machine)"}),
+                    "application/json", soap=False)
+            cmd["game"] = game
         if cmd_type == "legacy_bonus":
             credits = req.get("credits")
             if (not isinstance(credits, int) or isinstance(credits, bool)
@@ -19995,6 +20632,64 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     "application/json", soap=False)
             cmd["game"] = game
             cmd["enable"] = enable
+        elif cmd_type == "sas_denom_game_state":
+            # PER-DENOM game enable/disable — LP09 wrapped in the SAS 6.02
+            # §16.1 B0 preamble (spec recovered 2026-07-25; the preamble is
+            # wire-proven on the BB2). Same tournament freeze as its
+            # current-denom sibling above: it changes what a player can select.
+            with engine.tournament_lock:
+                t_phase = engine.tournament.get("phase")
+            if t_phase in ("armed", "countdown", "running"):
+                return self._send(409, json.dumps(
+                    {"ok": False,
+                     "error": f"tournament is {t_phase} — game/denom sets "
+                              "are frozen while it runs"}),
+                    "application/json", soap=False)
+            # Game 0000 is TOLERATED here (its bare sibling above keeps Table
+            # 7.6.1's literal 0001-9999) only so an operator can probe it. It is
+            # NOT the recommended value and it is NOT a fix:
+            #   * Table 7.6.1 states LP09's game number range as 0001-9999, so
+            #     0000 is out of range FOR THIS POLL. The "0000 = the gaming
+            #     machine" meaning comes from §2.2.2.3, and the "must be 0000
+            #     behind the preamble" rule in §16.2 is written specifically
+            #     about long poll 2F — neither transfers to LP09.
+            #   * Wire-tested 2026-07-26 on a WMS BB2E: game 0000 and game 0012,
+            #     at denoms 00/01/02, with and without an inner length byte —
+            #     five frame forms, all answered Table 16.1c error 04. Game 0000
+            #     is not the unlock; that cabinet's firmware simply does not
+            #     implement LP09 behind the preamble.
+            # Prefer a real game number. Per-denom control remains correct per
+            # §7.6.1 ("games may be enabled or disabled for a specific
+            # denomination") and is expected to work on machines that implement
+            # it — the refusal above is one cabinet's answer, not the protocol's.
+            game = req.get("game")
+            if (not isinstance(game, int) or isinstance(game, bool)
+                    or not 0 <= game <= 9999):
+                return self._send(400, json.dumps(
+                    {"ok": False,
+                     "error": "game must be an integer 0..9999 "
+                              "(0 = the gaming machine, SAS 6.02 §16.2)"}),
+                    "application/json", soap=False)
+            enable = req.get("enable")
+            if not isinstance(enable, bool):
+                return self._send(400, json.dumps(
+                    {"ok": False, "error": "enable must be a boolean"}),
+                    "application/json", soap=False)
+            # Table C-4 code, NOT cents and NOT millicents. 00 = every player
+            # denomination (Table 16.1d's default for LP09) — the satellite
+            # REFUSES a disable there (it would strand the machine) and runs a
+            # live last-denomination guard before any other disable.
+            denom = req.get("denom", 0x00)
+            if (not isinstance(denom, int) or isinstance(denom, bool)
+                    or not 0x00 <= denom <= 0x3F):
+                return self._send(400, json.dumps(
+                    {"ok": False,
+                     "error": "denom must be a Table C-4 code 0..63 "
+                              "(0 = all player denominations)"}),
+                    "application/json", soap=False)
+            cmd["game"] = game
+            cmd["enable"] = enable
+            cmd["denom"] = denom
         elif cmd_type == "set_validation_id":
             # Optional system_id (1..99) overrides the enhanced-validation
             # barcode namespace the satellite seeds via 0x4C. Omit to use the

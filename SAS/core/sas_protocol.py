@@ -45,6 +45,100 @@ SAS_MIN_ADDRESS = 1
 SAS_MAX_ADDRESS = 127
 GENERAL_POLL_FLAG = 0x80
 
+# SAS 6.02 §16 multi-denom extensions. The B0 preamble wraps a base long poll
+# so it acts on ONE player denomination (denom 00 = the default, which for
+# LP 09 means ALL player denominations). Support is advertised by the LP A0
+# census bit (multi_denom_extensions); a machine without it IGNORES B0 polls.
+MULTIDENOM_PREAMBLE = 0xB0
+
+# Table 16.1c — the 1-byte code carried in the DATA field when the response's
+# base-command byte is 00.
+MULTIDENOM_ERRORS = {
+    0x01: "long poll not supported or ignored",
+    0x02: "long poll malformed",
+    0x03: "not a multi-denom-aware long poll",
+    0x04: "long poll not supported in that format for a specific denomination",
+    0x05: "not a valid player denomination",
+}
+
+# The base polls whose BARE form answers with nothing but an ACK or a NACK —
+# and therefore the ONLY ones to which §16.1's data-field convention applies.
+# ENGLISH 6.02:
+#   "For long polls that only respond with an ACK/NACK, the data will be the
+#    gaming machine's polling address for ACK, or the polling address OR'd
+#    with hex 80 for NACK."
+#   (Spanish copy, agrees word for word.)
+# In Table 16.1d that scope is LP 09 alone; every other multi-denom-aware poll
+# is a READ whose data field carries real census/meter payload.
+#
+# ⚠️ WIRE PROOF that applying the convention unconditionally is WRONG — from
+# the 2026-07-25 BB2 sweep, at SAS address 0x01:
+#     01 b0 04 05 56 01 00      LP56 @ denom 05 (50c) -> inner len 01,
+#                               count 00 = ZERO games enabled at 50c
+#     01 b0 06 06 11 01 06 00 00  LP11 @ denom 06 ($1) -> coin-in 1,060,000
+# Both payloads START with 0x01, which is also this machine's poll address, so
+# the old unconditional test classified both as "ack" and threw the data away.
+# That misclassification hid the single most valuable result of the sweep (the
+# per-denom differentiation we were sweeping FOR). Address 0x01 collides with
+# LP56's inner length byte and with any BCD meter whose top byte is 0x01.
+MULTIDENOM_ACKNACK_BASES = frozenset({0x09})
+
+# Minimum DATA bytes a wrapped base poll must carry — i.e. the bytes that
+# follow the command byte in the base poll's BARE form, excluding its CRC
+# (Table 16.1a describes this field as the data appropriate to the wrapped base
+# long poll). A frame short of this is MALFORMED, and a machine is entitled to
+# answer error 02.
+#
+# ⚠️ WIRE LESSON 2026-07-25: our own B5 probe sent `01 b0 02 <denom> b5 <crc>`
+# with NO game-number bytes — Table 7.23a makes the 2-byte BCD game number
+# MANDATORY on B5 (2 BCD, range 0000-9999) — and the machine answered error 04.
+# That
+# refusal is UNINTERPRETABLE in either direction: our frame was our own bug.
+# The guard exists so the probe refuses to emit such a frame ever again rather
+# than harvesting another un-analyzable error code.
+MULTIDENOM_BASE_MIN_DATA = {
+    0x09: 3,   # Table 7.6.1: game# 2 BCD + 1-byte enable/disable flag
+    0x2F: 4,   # Table 16.2c: inner length + game# 2 BCD + >=1 1-byte code
+    0x6F: 5,   # §4.4.25: inner length + game# 2 BCD + >=1 2-byte code
+    0xAF: 5,   # documented as 6F's alternate code — same request shape
+               # ⚠️ 0xAF, NOT 0xFA. The Spanish 6.02 translation transposed
+               # the digits in Table 16.1d; the ENGLISH 6.02
+               # reads "AF  Send extended meters (alternate)". Caught by
+               # cross-checking the two copies 2026-07-26 — a wrapped poll
+               # sent to 0xFA would have earned error 03 forever.
+    0xB5: 2,   # Table 7.23a: game# 2 BCD (0000 = the gaming machine)
+}
+
+# Table 16.1d — the polls a machine will accept behind the preamble. Sending
+# anything else earns error 03.
+MULTIDENOM_AWARE_POLLS = {
+    0x09: "enable/disable game n (denom 00 = all player denominations)",
+    0x11: "total coin in meter",
+    0x12: "total coin out meter",
+    0x14: "total jackpot meter",
+    0x15: "games played meter",
+    0x16: "games won meter",
+    0x17: "games lost meter",
+    0x2F: "selected meters",
+    0x56: "enabled game numbers (denom 00 = currently selected denom)",
+    0x6F: "extended meters",
+    0xAF: "extended meters (alternate)",   # AF — see the note above
+    0xB5: "extended game info",
+}
+
+# Table C-4 denomination codes -> cents. Recovered in full from the SAS 6.02
+# spec 2026-07-25; the BB2's bench-verified code 01 = 1c matches. Fractional
+# entries below a cent are expressed as floats deliberately.
+DENOM_CODE_CENTS = {
+    0x00: None, 0x01: 1, 0x02: 5, 0x03: 10, 0x04: 25, 0x05: 50,
+    0x06: 100, 0x07: 500, 0x08: 1000, 0x09: 2000, 0x0A: 10000,
+    0x0B: 20, 0x0C: 200, 0x0D: 250, 0x0E: 2500, 0x0F: 5000,
+    0x10: 20000, 0x11: 25000, 0x12: 50000, 0x13: 100000,
+    0x14: 200000, 0x15: 250000, 0x16: 500000,
+    0x17: 2, 0x18: 3, 0x19: 15, 0x1A: 40,
+    0x1B: 0.5, 0x1C: 0.25, 0x1D: 0.2, 0x1E: 0.1, 0x1F: 0.05,
+}
+
 class SASCommand(enum.IntEnum):
     """SAS long-poll command codes.
 
@@ -146,14 +240,14 @@ class SASPacket:
     data: bytes
     crc: int
     raw: bytes
-    
+
     def is_valid(self) -> bool:
         """Validate CRC"""
         # Calculate CRC on address + command + data
         calc_data = bytes([self.address, self.command]) + self.data
         calculated_crc = sas_crc(calc_data)
         return calculated_crc == self.crc
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization"""
         return {
@@ -263,6 +357,139 @@ class SASProtocol:
             packet += struct.pack('<H', sas_crc(packet))  # LSB first
         return packet
 
+    def build_multidenom_poll(self, address: int, denom_code: int,
+                              base_command: int, data: bytes = b'',
+                              allow_short: bool = False) -> bytes:
+        """SAS 6.02 §16.1 Table 16.1a — the B0 multi-denom preamble WRAPPING a
+        base long poll, so the poll acts on ONE player denomination.
+
+            [addr][B0][length][denom][base cmd][data...][CRC16]
+
+        `length` is the count of bytes that FOLLOW it, EXCLUDING the CRC —
+        i.e. denom + base command + data (so 2 + len(data), range 02-FF).
+        `denom_code` is a Table C-4 code (NOT millicents, NOT cents):
+        00 = the default response, which for LP 09 means ALL player
+        denominations; 01 = 1c, 02 = 5c, 04 = 25c, 06 = $1 ... 1F = $0.0005.
+        A machine that does not support multi-denom extensions IGNORES this
+        poll entirely, so gate on the LP A0 census bit
+        (multi_denom_extensions) before sending one.
+
+        Variable-length type-S poll, so it always carries a CRC — unlike the
+        two-byte short polls.
+
+        `data` is exactly what the BARE base poll carries after its command
+        byte, minus its CRC. MULTIDENOM_BASE_MIN_DATA is enforced here so we
+        can never again emit a frame like the 2026-07-25 `01 b0 02 <d> b5`
+        (B5 with its mandatory game number missing) and then read the
+        machine's refusal as a machine limitation. Pass allow_short=True ONLY
+        to deliberately probe a machine's malformed-frame taxonomy, and label
+        the result as a deliberately-malformed frame when you report it."""
+        if not 0x00 <= denom_code <= 0x3F:
+            raise ValueError(f"denom code {denom_code:#04x} outside C-4 range "
+                             "00-3F")
+        if not 0x01 <= base_command <= 0xFF:
+            raise ValueError(f"base command {base_command:#04x} outside 01-FF")
+        need = MULTIDENOM_BASE_MIN_DATA.get(base_command, 0)
+        if len(data) < need and not allow_short:
+            raise ValueError(
+                f"base poll {base_command:#04x} needs at least {need} data "
+                f"byte(s) behind the B0 preamble, got {len(data)} — sending it "
+                "short is a MALFORMED frame and the machine's refusal would be "
+                "our bug, not its verdict (see MULTIDENOM_BASE_MIN_DATA)")
+        body = bytes([denom_code, base_command]) + data
+        if len(body) > 0xFF:
+            raise ValueError(f"multi-denom body {len(body)} bytes exceeds the "
+                             "1-byte length field")
+        return self.build_packet(address, MULTIDENOM_PREAMBLE,
+                                 bytes([len(body)]) + body)
+
+    def parse_multidenom_response(self, address: int, reply: bytes) -> dict:
+        """SAS 6.02 §16.1 Table 16.1b — decode a B0 preamble response.
+
+            [addr][B0][length][denom][base cmd][data...][CRC16]
+
+        Returns {ok, denom, baseCommand, data, error, errorText, outcome}.
+
+        ⭐ The reason this matters: base command byte 00 means ERROR and the
+        data is a 1-byte code from Table 16.1c. And for base polls that answer
+        only ACK/NACK (LP 09 is one), the DATA field is the machine's poll
+        address for ACK, or address|0x80 for NACK — an EXPLICIT verdict where
+        a bare LP 09 gave us ambiguous silence.
+
+        `outcome` values:
+          silent | busy      — nothing / the §4.1 [addr][00] frame, i.e. the
+                               PREAMBLE itself was not serviced
+          malformed          — not a B0 response from this address
+          error              — base byte 00; `error`/`errorText` = Table 16.1c
+          ack | nack         — ONLY for MULTIDENOM_ACKNACK_BASES (LP 09)
+          busy_base          — the machine serviced the preamble but answered
+                               BUSY to the base command. Per §16.1, when the
+                               machine means the BASE command is busy, that busy
+                               reply rides as the DATA field of the preamble
+                               response rather than replacing it.
+          data               — everything else: real base-poll payload
+
+        ⚠️ `busy_base` is detected ONLY behind an ACK/NACK base, and that is
+        deliberate, not an oversight. The §4.1 busy frame is [addr][00], and on
+        THIS cabinet (address 0x01) a perfectly good LP56 answer for a
+        denomination with no games enabled is byte-for-byte the same two bytes
+        — wire-observed 2026-07-25: `01 b0 04 05 56 01 00`, where the data
+        `01 00` decodes as inner-length 01, game-count 00. There is no way to
+        tell those apart, so for READ bases we report `data` and let the
+        payload parser speak. Behind LP 09 the normal data field is exactly ONE
+        byte, so a 2-byte [addr][00] is unambiguous. Do NOT "fix" this by
+        checking [addr][00] globally — you would re-create exactly the
+        misclassification documented on MULTIDENOM_ACKNACK_BASES.
+        """
+        out = {"ok": False, "denom": None, "baseCommand": None, "data": b"",
+               "error": None, "errorText": None, "outcome": "silent",
+               "raw": bytes(reply or b"")}
+        if not reply:
+            return out
+        # §4.1 busy: the 2-byte [addr][00] frame. Its first byte equals the
+        # bare address, so rule it out BEFORE any address comparison.
+        if len(reply) == 2 and reply[1] == 0x00:
+            out["outcome"] = "busy"
+            return out
+        if len(reply) < 5 or reply[0] != address or \
+                reply[1] != MULTIDENOM_PREAMBLE:
+            out["outcome"] = "malformed"
+            return out
+        length = reply[2]
+        body = reply[3:3 + length]
+        if len(body) < 2:
+            out["outcome"] = "malformed"
+            return out
+        out["denom"] = body[0]
+        base = body[1]
+        payload = body[2:]
+        out["data"] = payload
+        if base == 0x00:
+            code = payload[0] if payload else None
+            out["error"] = code
+            out["errorText"] = MULTIDENOM_ERRORS.get(
+                code, f"unknown multi-denom error {code}")
+            out["outcome"] = "error"
+            return out
+        out["baseCommand"] = base
+        out["ok"] = True
+        # ACK/NACK-only base polls answer with the address (ack) or the
+        # address OR 0x80 (nack) in the DATA field (§16.1). SCOPED to
+        # MULTIDENOM_ACKNACK_BASES — see this method's docstring and the
+        # constant's wire proof for why an unconditional test ate real data.
+        if base in MULTIDENOM_ACKNACK_BASES:
+            if payload == bytes([address, 0x00]):
+                out["outcome"] = "busy_base"
+            elif payload[:1] == bytes([address]):
+                out["outcome"] = "ack"
+            elif payload[:1] == bytes([address | 0x80]):
+                out["outcome"] = "nack"
+            else:
+                out["outcome"] = "data"
+        else:
+            out["outcome"] = "data"
+        return out
+
     def build_short_poll(self, address: int, command: int) -> bytes:
         """Two-byte long poll (e.g. 0x1A current credits): no CRC."""
         return bytes([address, command])
@@ -279,17 +506,17 @@ class SASProtocol:
     def build_meter_request(self, address: int, meter_code: int) -> bytes:
         """Build a meter request: two-byte poll, no CRC."""
         return self.build_short_poll(address, meter_code)
-    
+
     def parse_meter_response(self, packet: SASPacket) -> Optional[int]:
         """Parse meter value from response"""
         if not packet.is_valid():
             return None
-            
+
         # Meter responses are typically 4-byte BCD values
         if len(packet.data) == 4:
             return self._bcd_to_int(packet.data)
         return None
-    
+
     def _bcd_to_int(self, bcd_bytes: bytes) -> int:
         """Convert BCD bytes to integer"""
         result = 0
@@ -302,7 +529,7 @@ class SASProtocol:
                 return None
             result = result * 100 + (high * 10) + low
         return result
-    
+
     def _int_to_bcd(self, value: int, length: int = 4) -> bytes:
         """Convert a non-negative integer to packed BCD, MSB-first, in
         `length` bytes (spec §2.2.3: BCD data are sent most-significant byte
@@ -384,6 +611,7 @@ class MeterGroup:
         0x11: "Coin In",
         0x12: "Coin Out",
         0x13: "Total Drop",
+        0x14: "Total Jackpot",     # Appendix B Table B-1: type R, 4-byte BCD
         0x15: "Games Played",
         0x16: "Games Won",
         0x17: "Games Lost",

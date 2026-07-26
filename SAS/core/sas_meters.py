@@ -113,10 +113,27 @@ RECEIVE_VALIDATION_NUMBER = 0x58
 # §4.5.2/.5/.6, §4.6.3. 0x57 (Send Pending Cashout Information) is likewise a
 # bare read (cross-verified, see above) — added so build_meter_poll and the
 # poller treat it as CRC-less.
+#
+# Added 2026-07-25 from SAS 6.02 Appendix B Table B-1,
+# which lists a Type column per poll:
+#   0x14 Send total jackpot meter — type R. It was already in
+#        MULTIDENOM_AWARE_POLLS (Table 16.1d), so we could WRAP a poll we could
+#        not SEND bare; build_meter_poll raised on it.
+#   0xB1 Send current player denomination — type R (§16.3, Table 16.3)
+#   0xB2 Send enabled player denominations — type R (§16.4, Table 16.4)
+# B1/B2 are the machine's OWN answer about player denominations — the only
+# spec-defined way to learn the enabled-denomination set without inferring it
+# from a 31-poll B0+56 sweep. Both §16.3 and §16.4 close by stating that a
+# gaming machine which does not support the multi-denom extensions ignores the
+# poll — so a machine WITHOUT multi-denom extensions IGNORES them, and
+# silence from such a machine is spec-correct and means nothing. Silence from
+# a machine whose A0 census advertises multiDenom=TRUE is a real finding:
+# report it as "unanswered", never as "unsupported" (§4.4 — an unsupported
+# long poll is ignored, never NACKed, so the host cannot tell them apart).
 TYPE_R_POLLS = frozenset({
-    0x0F, 0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A,
+    0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A,
     0x1E, 0x1F, 0x20, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x46,
-    0x48, 0x51, 0x54, 0x55, 0x56, 0x3D, 0x57, 0x7E, 0xA0,
+    0x48, 0x51, 0x54, 0x55, 0x56, 0x3D, 0x57, 0x7E, 0xA0, 0xB1, 0xB2,
 })
 
 _PROTO = SASProtocol()          # stateless; safe to share

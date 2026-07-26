@@ -804,7 +804,13 @@ function parseDollars(v){
   if(!isFinite(n)||n<=0) return 0;
   return Math.round(n*100)*1000;
 }
-function chip(txt, cls){return `<span class="chip ${cls||""}">${esc(txt)}</span>`;}
+function chip(txt, cls, title){
+  /* optional title = hover detail (e.g. the raw G2S error code behind a
+     machine-worded refusal); omitted everywhere else, so callers are
+     unaffected. */
+  const t=title?` title="${esc(String(title))}"`:"";
+  return `<span class="chip ${cls||""}"${t}>${esc(txt)}</span>`;
+}
 function pendChip(what){
   return `<span class="pend">${esc(what)} — awaiting host update</span>`;
 }
@@ -2890,6 +2896,34 @@ function renderGames(){
          it) and shows Apply / ✕. setActiveDenoms is a REPLACEMENT set
          (§6.15) so Apply sends the whole lit selection. The pending/refused
          verdict rides g.denomChange (hub-stamped, sessionId-paired). */
+      /* Title enable/disable had NO verdict surface at all (2026-07-25): the
+         Disable button toasted "sent" and the EGM's later refusal died in the
+         log — which is how three days of setGamePlayState APX011 went unseen.
+         Same treatment as denoms: show the machine's own words. */
+      /* A TERMINAL verdict is HISTORY, not status — bound it by age or the
+         card lies forever. Live-hit 2026-07-25: a bench setGamePlayState at
+         16:10 left "title change refused · G2S_APX011" pinned to Enchanted
+         Unicorn for the rest of the day, on a card whose denom change had
+         since APPLIED; dev 9 was still showing a verdict from 2026-07-09.
+         Worse, APX011 was never a refusal at all — it was our own timeToLive
+         reaping a command the EGM was lawfully holding. Pending states always
+         render (they ARE current); terminal ones get a short window and then
+         get out of the way, the same doctrine as the denoms "applied ✓". */
+      const sc=g.stateChange||{};
+      const scAge=sc.sentTs?(Date.now()/1000-sc.sentTs):Infinity;
+      const SC_TERMINAL_WINDOW=120;   // seconds a settled verdict stays up
+      let scChip="";
+      if(sc.result==="sent"||sc.result==="acked")
+        scChip=pendChip("title change applying");
+      else if(scAge<SC_TERMINAL_WINDOW){
+        if(String(sc.result||"").indexOf("error")===0){
+          const set=String(sc.errorText||"").trim();
+          scChip=set
+            ? chip("title change refused · "+set, "bad", sc.errorCode||"")
+            : chip("title change refused · "+(sc.errorCode||"error"),"bad");
+        }
+        else if(sc.result==="timeout") scChip=chip("no title reply","warn");
+      }
       const dc=g.denomChange||{};
       const pk=e+"/"+d;
       const pend=denomPendFace(pk,dc);
@@ -2917,8 +2951,18 @@ function renderGames(){
            sets (even a no-op replacement) — semi-permanent, same calm
            treatment; the code stays visible for the bench notebook. */
         dcChip=chip("theme locks denoms · G2S_GPX002");
-      else if(dc.result==="error")
-        dcChip=chip("denoms refused · "+(dc.errorCode||"error"),"bad");
+      else if(dc.result==="error"){
+        /* Show the MACHINE'S OWN errorText when it sent one (2026-07-25):
+           the AVP answers APX011 with "Time-to-live Expired. EGM must be
+           idle: Doors icons are showing. Restart icon is showing." — i.e.
+           it names the exact thing to clear at the cabinet. Rendering only
+           the code hid the answer for two days. Keep the code too (bench
+           notebook), and let the full text ride the title attribute. */
+        const et=String(dc.errorText||"").trim();
+        dcChip=et
+          ? chip("denoms refused · "+et, "bad", dc.errorCode||"")
+          : chip("denoms refused · "+(dc.errorCode||"error"),"bad");
+      }
       else if(dc.result==="disagree") dcChip=chip("denoms differ","warn");
       const editing=GM.denomEdit&&GM.denomEdit.dev===d;
       const litSet=editing?new Set(GM.denomEdit.set)
@@ -2942,8 +2986,8 @@ function renderGames(){
         : "";
       const denomLine=supported.length
         ? `<span class="gdl">Denoms${editing?" · tap, then Apply":
-             (active.length?"":" · none active")}</span>${dchips}${applyRow} ${dcChip}`
-        : `<span class="gdl">Denoms</span><span>—</span> ${dcChip}`;
+             (active.length?"":" · none active")}</span>${dchips}${applyRow} ${dcChip} ${scChip}`
+        : `<span class="gdl">Denoms</span><span>—</span> ${dcChip} ${scChip}`;
       return `<div class="game">
         <div class="gh"><span class="pt">${esc(gameRtp(g))}</span>
           <span class="dv">${esc((g.paytableId||"").replace(/^[A-Z]{2,6}_/,""))} · dev ${esc(d)}</span></div>
@@ -3008,14 +3052,31 @@ function denomPendFace(pk, dc){
   }
   return p;
 }
-// DENOM_PUSH_ENABLED (2026-07-25): the per-title denom PUSH (setActiveDenoms
-// §6.15) is disabled in the UI. Confirmed on a G2S_enabled, egmEnabled, idle,
-// doors-closed AVP: the EGM never enters its config-apply lock, sits idle, and
-// lets the 30s timeToLive expire -> G2S_APX011 "Time-to-live Expired", nothing
-// changes. Not our bug (machine-side deferral, no game selected to land on),
-// but unreliable, so pull the control. The denom READ/display stays. Flip this
-// to true to re-enable once the config-lock apply path is solved.
-const DENOM_PUSH_ENABLED=false;
+/* DENOM_PUSH_ENABLED — RE-ENABLED 2026-07-25 once the apply path was solved
+   and proven three times on the AVP (drop, restore, and again with a door
+   icon showing; ~600ms each, GPE201-confirmed).
+   The old failure was NOT machine-side deferral: a bare setActiveDenoms is
+   INERT outside optionConfig mode, and our own hardcoded 30s timeToLive was
+   reaping the command (every G2S_APX011 landed at 30.0-30.2s; the one
+   success answered in 12ms). Apply now calls `denomApply`, which runs the
+   full §9.7 ceremony host-side — enter mode (EGM unloads the title), §6.15
+   getGameDenoms, setActiveDenoms, exit mode — and always exits, even on a
+   refusal, so the cabinet is never left with game play locked out.
+   ⚠️ Machine prerequisites live in deploy/AVP_SETUP.md (LEGACY METER CHANGE =
+   Not Required; "Door status disallows machine idle state" = No).
+   ⚠️ CABINET SUPPORT IS NOT UNIVERSAL — read this before filing a bug.
+   The ceremony's first step is optionConfig mode, and a cabinet that has no
+   LIVE config mode can never enter it. Wire-tested 2026-07-26 on a WMS
+   Bluebird (BB2E): it ACKs enterOptionConfigMode at the transport layer in
+   ~80ms, then never enters the mode, never sends optionConfigModeStatus, and
+   never errors — because on a Bluebird these settings change only during the
+   boot right after a RAM clear. The ceremony therefore waits out
+   CEREMONY_MODE_TTL_MS and reports the machine's own G2S_APX011. That is
+   expected on that hardware, not a fault: on such a cabinet the enabled
+   denominations are operator-menu-owned. Proven working on the IGT AVP
+   (~2s, read-back confirmed). If your machine reports a refusal, the UI shows
+   the EGM's own errorCode/errorText — that text is the answer. */
+const DENOM_PUSH_ENABLED=true;
 function gmDenomTap(dev, id){
   if(!DENOM_PUSH_ENABLED) return;   // push disabled (APX011); chips are read-only
   // first tap on a device enters edit mode seeded from its CURRENT active
@@ -3049,9 +3110,16 @@ async function gmDenomApply(egm, dev){
   const dc0=((((snap(egm)||{}).gamePlay||{})[dev]||{}).denomChange)||{};
   DENAPP[pk]={set:denoms.map(String), prevTs:dc0.sentTs, at:Date.now()};
   delete DENDONE[pk];          // a fresh apply re-arms the applied flash
-  const r=await cmd({action:"setActiveDenoms", egmId:egm, deviceId:dev,
+  /* denomApply, NOT setActiveDenoms: the hub runs the whole §9.7 ceremony —
+     enter optionConfig mode (the machine UNLOADS the running title and shows
+     its remote-configuration screen), §6.15 getGameDenoms, the write, then
+     exit. A bare setActiveDenoms outside that mode is inert. The machine is
+     briefly out of play during it, so say so rather than let it look hung. */
+  const r=await cmd({action:"denomApply", egmId:egm, deviceId:dev,
                      denoms:denoms},
                     "Set denoms · game "+dev+" ("+denoms.length+")");
+  if(r.ok) toast("Reconfiguring the machine — it drops out of play for a "
+                 +"few seconds and comes back on its own", true);
   if(r.ok) tickStatus();
   else delete DENAPP[pk];      // refused/unreachable — back to hub truth
   // deliberately NOT restoring GM.denomEdit on failure: replacement

@@ -112,6 +112,8 @@ Run from G2S/:  python3 tools/test_tournament.py
 Must end "RESULT: N passed, 0 failed".
 """
 
+import collections
+import io
 import itertools
 import json
 import logging
@@ -168,6 +170,7 @@ class FakeAssoc:
         self.wat_devices = {}
         self.wat_transfers = []
         self.wat_transfer_count = 0
+        self.game_play = {}          # arm scans this for pending denomChange
 
     def next_command_id(self):
         self.host_command_id += 1
@@ -245,12 +248,23 @@ def make_engine():
     eng.assoc_lock = threading.Lock()
     eng.sas_machines = {}
     eng.sas_lock = threading.Lock()
+    eng.sas_commands = {}           # arm drains queued sas_game_state here
     eng.sas_links = {}
     eng.card_sessions = {}
     eng.companion_lock = threading.Lock()
     eng._fob_seq = itertools.count(1)
     eng._glass_pin_lock = threading.Lock()
     eng._glass_cash_out_pin = {}
+    # /api/status cache quartet — __init__ owns these in production and
+    # do_GET reads them on every status fetch, so a __new__ stub that omits
+    # them dies with AttributeError the moment a test calls status_get.
+    # (Added with the 2026-07-25 status-cache work; the stub was not updated
+    # alongside it.) Empty cache + seq 0 = every fetch builds fresh, which is
+    # what a deterministic test wants anyway.
+    eng.status_cache = {}
+    eng.status_cache_building = {}
+    eng.status_cache_lock = threading.Lock()
+    eng.status_state_seq = 0
     # the tournament state quartet __init__ owns in production
     eng.tournament = eng._tournament_idle_state()
     eng.tournament_lock = threading.Lock()
@@ -582,6 +596,39 @@ def main():
           and "not every seat is ready" in str(body.get("error"))
           and (body.get("seats") or {}).get(EGM, {}).get("armStage")
           == "clear", (code, body))
+
+    # ---------------------------------------------------------------
+    print("— arm guard: a denom write still settling BLOCKS arm (the "
+          "deferred-apply-mid-race fix)")
+    ge = make_engine()
+    ge.hub_store.set_denom("smib-bb2/1", 5)
+    with ge.sas_lock:
+        ge.sas_machines[SAS] = sas_entry(coin_out=5)
+    ge.tournament.update({"phase": "idle", "creditsCents": 5000,
+                          "durationSec": 300})
+    ga = FakeAssoc()                       # a pending (accepted-not-narrated)
+    ga.game_play["1"] = {"denomChange": {"result": "accepted",
+                                         "denoms": ["1000"]}}
+    ge.associations[EGM] = ga
+    code, body = command(ge, {"action": "tournamentArm"})
+    check("arm REFUSED while a denomChange is unsettled (sent/accepted)",
+          code == 200 and body.get("ok") is False
+          and "denomination change is still settling" in str(body.get("error"))
+          and ge.tournament.get("phase") == "idle", (code, body))
+    # once it settles (GPE201 -> gameDenomList narrates the apply, or the 30s
+    # lazy timeout), arm clears; and a stale queued per-game SAS write is
+    # drained at arm so none delivers mid-run.
+    ga.game_play["1"]["denomChange"] = {"result": "timeout"}      # settled
+    with ge.sas_lock:
+        ge.sas_commands = {"smib-bb2": collections.deque(
+            [{"id": "g1", "type": "sas_game_state", "game": 3,
+              "enable": True}])}
+    code, body = command(ge, {"action": "tournamentArm"})
+    drained = all(c.get("type") != "sas_game_state"
+                  for q in ge.sas_commands.values() for c in q)
+    check("arm now succeeds AND drains the queued sas_game_state write",
+          code == 200 and body.get("ok") is True
+          and body.get("phase") == "armed" and drained, (code, body))
 
     # ---------------------------------------------------------------
     print("— ticks 1+2: the g2s CLEAR confirms its zero fold FRESH, the "
@@ -1010,6 +1057,57 @@ def main():
                     "denomAssumed": True}, dread)
     with eng.sas_lock:
         del eng.sas_machines["smib-x/9"]
+
+    print("— denomSuggest: the 0x1F code as suggestion, never authority")
+    # _sas_denom_suggest holds the machine's own 0x1F denom report against
+    # the operator setting. The C-4 table carries bench-verified rows ONLY
+    # (0x01 = 1¢, BB2 live read 2026-07-22); everything else is
+    # state=unverified with cents=None — never a guessed value. No
+    # machineInfo / null code -> None (the key stays off /api/status, which
+    # is the UI's older-satellite detect).
+    sug = gh.G2SHost._sas_denom_suggest
+    check("no machineInfo / junk machineInfo / null code -> None",
+          sug({}) is None
+          and sug({"machineInfo": "boom"}) is None
+          and sug({"machineInfo": {}}) is None
+          and sug({"machineInfo": {"denomCode": None}}) is None
+          and sug({"machineInfo": {"denomCode": True}}) is None)
+    check("verified code, denom unset -> confirm (offers the C-4 value)",
+          sug({"machineInfo": {"denomCode": 1}}) ==
+          {"code": 1, "cents": 1, "state": "confirm"})
+    check("verified code, operator agrees -> match",
+          sug({"denomCents": 1, "machineInfo": {"denomCode": 1}}) ==
+          {"code": 1, "cents": 1, "state": "match"})
+    check("verified code, operator disagrees -> mismatch",
+          sug({"denomCents": 25, "machineInfo": {"denomCode": 1}}) ==
+          {"code": 1, "cents": 1, "state": "mismatch"})
+    check("unlisted code -> unverified with cents=None (never guessed)",
+          sug({"denomCents": 25, "machineInfo": {"denomCode": 9}}) ==
+          {"code": 9, "cents": None, "state": "unverified"})
+    check("bool/invalid operator denom counts as unset -> confirm not match",
+          sug({"denomCents": True, "machineInfo": {"denomCode": 1}}) ==
+          {"code": 1, "cents": 1, "state": "confirm"})
+    # THE MONEY SEAM stays deaf to the suggestion (review 2026-07-22: no
+    # gate pinned this — a consumer preferring denomSuggest.cents would
+    # have passed everything). A mismatch entry (operator 25¢, machine
+    # says 1¢) must value and score at the OPERATOR's 25¢.
+    mis = {"denomCents": 25, "machineInfo": {"denomCode": 1},
+           "denomSuggest": {"code": 1, "cents": 1, "state": "mismatch"}}
+    check("_sas_denom_cents ignores machineInfo/denomSuggest on the entry",
+          gh.G2SHost._sas_denom_cents(mis) == (25, False))
+    mseat = {"seam": {"kind": "sas", "sasKey": "smib-x/8"}}
+    with eng.sas_lock:
+        eng.sas_machines["smib-x/8"] = sas_entry(
+            coin_out=5, denom=25,
+            machineInfo={"denomCode": 1},
+            denomSuggest={"code": 1, "cents": 1, "state": "mismatch"})
+    mread = eng._tournament_read_meters(mseat)["seam"]
+    check("tournament scoring rides the operator 25¢, deaf to the 1¢ "
+          "suggestion riding the same entry",
+          mread == {"coinOut": 5, "jackpot": 0, "denomCents": 25,
+                    "denomAssumed": False}, mread)
+    with eng.sas_lock:
+        del eng.sas_machines["smib-x/8"]
 
     with eng.associations[EGM].lock:
         eng.associations[EGM].meters["G2S_gamePlay/42/G2S_egmPaidGameWonAmt"] = "250000"
@@ -2618,6 +2716,514 @@ def main():
     except AttributeError as e:
         check("_sas_cashout_pin survives a pre-tournament engine "
               "(getattr guard)", False, str(e))
+
+    # ---------------------------------------------------------------
+    print("— D2: denomChange lifecycle — stale 'sent' never wedges the "
+          "arm-guard; fresh 'sent' still blocks")
+    d2 = make_engine()
+    d2.hub_store.set_denom("smib-bb2/1", 5)
+    with d2.sas_lock:
+        d2.sas_machines[SAS] = sas_entry(coin_out=5)
+    d2.tournament.update({"creditsCents": 5000, "durationSec": 300})
+    da = FakeAssoc()
+    d2.associations[EGM] = da
+    # a 31 s-old unanswered 'sent' is DEAD (the snapshot's 30 s lazy-
+    # timeout law) — before the fix it blocked arming FOREVER (nothing
+    # ever stamps the LIVE record; the timeout only ever landed on the
+    # /api/status snapshot copy).
+    da.game_play["7"] = {"denomChange": {
+        "result": "sent", "denoms": ["1000"], "sessionId": "42",
+        "sentTs": time.time() - 31}}
+    code, body = command(d2, {"action": "tournamentArm"})
+    check("a stale (>30 s) unanswered 'sent' does NOT block arm",
+          code == 200 and body.get("ok") is not False
+          and body.get("phase") == "armed", (code, body))
+    with d2.tournament_lock:
+        d2.tournament = d2._tournament_idle_state()
+        d2.tournament.update({"creditsCents": 5000, "durationSec": 300})
+    da.game_play["7"]["denomChange"] = {
+        "result": "sent", "denoms": ["1000"], "sessionId": "43",
+        "sentTs": time.time()}
+    code, body = command(d2, {"action": "tournamentArm"})
+    check("a FRESH 'sent' still blocks arm (the guard's whole point)",
+          code == 200 and body.get("ok") is False
+          and "still settling" in str(body.get("error")), (code, body))
+    da.game_play.pop("7")
+
+    # ---------------------------------------------------------------
+    print("— D2: GPE201 advances accepted -> APPLIED (terminal) and the "
+          "scoped re-read still fires (GR-31)")
+
+    class _CfgStore:                       # absorbs the GR-28 persist
+        def save_game_play(self, *a, **k):
+            pass
+    d2.config_store = _CfgStore()
+    ra = gh.EgmAssociation(EGM)
+    ra.comms_state = "onLine"
+    ra.denom_backfill_at = time.time()     # debounce the sibling backfill
+    #                                        so the capture is exact
+    ra.game_play["2"] = {"denomChange": {
+        "result": "accepted", "denoms": ["25000"], "sessionId": "77",
+        "sentTs": time.time(), "active": ["25000"],
+        "confirmedAt": "2026-07-22T07:24:12.792Z"}}
+    d2.associations[EGM] = ra
+    n = len(d2.sent)
+    d2._game_play_event_refresh(ra, {
+        "deviceClass": "G2S_gamePlay", "deviceId": "2",
+        "eventCode": "G2S_GPE201"})
+    dcr = ra.game_play["2"]["denomChange"]
+    check("GPE201 (the physical apply) advances accepted -> applied, "
+          "wholesale, with appliedAt/appliedTs",
+          dcr.get("result") == "applied" and bool(dcr.get("appliedAt"))
+          and isinstance(dcr.get("appliedTs"), float), dcr)
+    check("the GPE201 scoped re-read still fires: status + denoms for "
+          "the changed device",
+          labels(d2.sent, n) == ["getGamePlayStatus", "getGameDenoms"],
+          labels(d2.sent, n))
+    with d2.tournament_lock:
+        d2.tournament = d2._tournament_idle_state()
+        d2.tournament.update({"creditsCents": 5000, "durationSec": 300})
+    code, body = command(d2, {"action": "tournamentArm"})
+    check("an 'applied' record is TERMINAL — the arm-guard passes",
+          code == 200 and body.get("phase") == "armed", (code, body))
+
+    # ---------------------------------------------------------------
+    print("— D2: store reseed strips DEAD-SESSION verdicts")
+    seeded = gh.G2SHost._strip_dead_session_verdicts({
+        "1": {"denomChange": {"result": "accepted", "denoms": ["1000"]},
+              "stateChange": {"result": "sent"}},
+        "2": {"denomChange": {"result": "applied", "appliedAt": "x"},
+              "stateChange": {"result": "confirmed"}},
+        "3": {"denomChange": {"result": "sent"}},
+        "4": {"denomChange": {"result": "error",
+                              "errorCode": "G2S_APX999"}},
+        "5": {"denomChange": {"result": "timeout"}},
+        "6": {"denomChange": {"result": "disagree"}}})
+    check("reseed keeps ONLY 'applied' (steady-state history): in-flight "
+          "(sent/accepted) AND non-success terminals (error/timeout/"
+          "disagree) are dead-session records — a structural APX999 "
+          "refusal chip must not survive restarts forever (the dev-45 "
+          "Lucky Larry chip)",
+          "denomChange" not in seeded["1"]
+          and "stateChange" not in seeded["1"]
+          and seeded["2"]["denomChange"]["result"] == "applied"
+          and seeded["2"]["stateChange"]["result"] == "confirmed"
+          and "denomChange" not in seeded["3"]
+          and "denomChange" not in seeded["4"]
+          and "denomChange" not in seeded["5"]
+          and "denomChange" not in seeded["6"], seeded)
+
+    # ---------------------------------------------------------------
+    print("— journal hygiene: pre-request client drops log ONE line, "
+          "never the socketserver traceback dump")
+    qsrv = object.__new__(gh.QuietDisconnectHTTPServer)  # no socket bind
+
+    class _CapHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.recs = []
+
+        def emit(self, record):
+            self.recs.append(record)
+
+    # Capture BOTH channels: the override's one INFO line rides gh.log;
+    # socketserver's default dump rides sys.stderr. Asserting only
+    # "doesn't raise" cannot tell them apart (the default never raises
+    # either) — this pins the actual contract both ways.
+    cap = _CapHandler()
+    gh.log.addHandler(cap)
+    old_level = gh.log.level
+    gh.log.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)   # lift the harness-wide gag (:131)
+    real_stderr, sys.stderr = sys.stderr, io.StringIO()  # for the capture
+    try:
+        for exc_cls in (ConnectionResetError, BrokenPipeError,
+                        TimeoutError):
+            try:
+                raise exc_cls("bench")
+            except exc_cls:
+                qsrv.handle_error(None, ("192.0.2.9", 1))
+        routine_infos = sum(1 for r in cap.recs
+                            if "dropped pre-request" in r.getMessage())
+        routine_stderr = sys.stderr.getvalue()
+        try:
+            raise ValueError("bench-real-error")
+        except ValueError:
+            qsrv.handle_error(None, ("192.0.2.9", 1))
+        dump = sys.stderr.getvalue()
+    finally:
+        sys.stderr = real_stderr
+        logging.disable(logging.CRITICAL)   # restore the harness gag
+        gh.log.removeHandler(cap)
+        gh.log.setLevel(old_level)
+    check("QuietDisconnectHTTPServer: one INFO line per routine disconnect "
+          "(ConnectionReset/BrokenPipe/Timeout), NOTHING on stderr",
+          routine_infos == 3 and routine_stderr == ""
+          and issubclass(gh.QuietDisconnectHTTPServer,
+                         gh.ThreadingHTTPServer),
+          (routine_infos, routine_stderr[:120]))
+    check("QuietDisconnectHTTPServer: a NON-routine error still delegates "
+          "to the full default dump (never silence real tracebacks)",
+          "ValueError" in dump and "bench-real-error" in dump,
+          dump[:160])
+    src = open(gh.__file__, encoding="utf-8").read()
+    check("main() builds the quiet-disconnect server (not the bare "
+          "ThreadingHTTPServer)",
+          "QuietDisconnectHTTPServer(" in src
+          and "ThreadingHTTPServer((args.bind" not in src, "main() wiring")
+
+    # ---------------------------------------------------------------
+    print("— D9 Layer A: the scoring denom FREEZES at ARM ('Ship this "
+          "first') and a mid-run ✎ edit can't rescale a live race")
+    fz = make_engine()
+    fz.hub_store.set_denom("smib-bb2/1", 5)
+    fz.tournament.update({"creditsCents": 5000, "durationSec": 300})
+    with fz.sas_lock:
+        fz.sas_machines[SAS] = sas_entry(coin_out=100)       # denom=5
+        fz.sas_machines["smib-nod/1"] = sas_entry(
+            smib="smib-nod", coin_out=10, denom=None)        # denom unset
+    code, body = command(fz, {"action": "tournamentArm"})
+    fseats = fz.tournament.get("seats") or {}
+    check("arm stamps lockDenomCents/lockDenomAssumed on every sas seat",
+          code == 200 and body.get("phase") == "armed"
+          and fseats.get("sas:" + SAS, {}).get("lockDenomCents") == 5
+          and fseats.get("sas:" + SAS, {}).get("lockDenomAssumed") is False
+          and fseats.get("sas:smib-nod/1", {}).get("lockDenomCents") == 1
+          and fseats.get("sas:smib-nod/1", {}).get("lockDenomAssumed")
+          is True,
+          {k: (s.get("lockDenomCents"), s.get("lockDenomAssumed"))
+           for k, s in fseats.items()})
+    check("the arm reply carries the 'fair race' warning naming the "
+          "assumed seat (and only that one)",
+          "smib-nod" in str(body.get("denomWarning"))
+          and "smib-bb2" not in str(body.get("denomWarning")),
+          body.get("denomWarning"))
+    # mid-run ✎ edit: flip the live entry AND the pref to 25¢ — scoring
+    # must keep riding the FROZEN 5¢ (pre-fix this read 25 and rescaled
+    # every later win 5x)
+    with fz.sas_lock:
+        fz.sas_machines[SAS]["denomCents"] = 25
+    fz.hub_store.set_denom("smib-bb2/1", 25)
+    reading = fz._tournament_read_meters(fseats)["sas:" + SAS]
+    check("mid-run denom edit does NOT rescale: the reading rides the "
+          "frozen 5¢, not the live 25¢",
+          reading.get("denomCents") == 5
+          and reading.get("denomAssumed") is False, reading)
+    # …and the frozen honesty flag rides too
+    nod_read = fz._tournament_read_meters(fseats)["sas:smib-nod/1"]
+    check("the assumed seat scores at the flagged 1¢ freeze",
+          nod_read.get("denomCents") == 1
+          and nod_read.get("denomAssumed") is True, nod_read)
+
+    # ---------------------------------------------------------------
+    print("— D9: /api/names denomCents is tournament-gated for SEATED "
+          "machines (the setActiveDenoms-409 twin)")
+
+    def names(engv, payload):
+        h = gh.G2SRequestHandler.__new__(gh.G2SRequestHandler)
+        h.host_engine = engv
+        sent = []
+        h._send = lambda code, body, ctype=None, soap=True: \
+            sent.append((code, json.loads(body)))
+        h._handle_set_name(json.dumps(payload))
+        return sent[0]
+
+    st, nb = names(fz, {"machineKey": SAS, "denomCents": 50})
+    check("denomCents write against a SEATED leg -> 409 while non-idle",
+          st == 409 and nb.get("ok") is False
+          and "tournament" in str(nb.get("error")), (st, nb))
+    st, nb = names(fz, {"machineKey": SAS, "name": "Racer"})
+    check("a name-only write still passes mid-run",
+          st == 200 and nb.get("ok") is True, (st, nb))
+    st, nb = names(fz, {"machineKey": "smib-idle/1", "denomCents": 25})
+    check("an UNSEATED machine's denom write passes mid-run",
+          st == 200 and nb.get("ok") is True, (st, nb))
+    with fz.tournament_lock:
+        fz.tournament["phase"] = "idle"
+    st, nb = names(fz, {"machineKey": SAS, "denomCents": 50})
+    check("once idle, the seated leg's denom write passes again",
+          st == 200 and nb.get("denomCents") == 50, (st, nb))
+
+    # ---------------------------------------------------------------
+    print("— D8: a machineInfo:null report can no longer wipe the census "
+          "(hub-side carry-forward, the lockState treatment)")
+    d8 = make_engine()
+    d8._registry_touched = {}
+    for _stub in ("_settle_aft_credit_pushes", "_settle_aft_cashouts",
+                  "_retire_tournament_pins", "_boot_disarm_sas_once",
+                  "_sweep_cash_out_pins"):
+        setattr(d8, _stub, lambda *a, **k: None)
+    d8.sysval_fallback = lambda: False
+    d8.ticket_header = lambda: {}
+    mi_full = {"denomCode": 1, "gameId": "0001", "multiDenom": True,
+               "totalGames": 12, "enabledGames": [1, 2, 3]}
+    rep = d8.sas_report({"smibId": "smib-mi", "address": "1",
+                         "online": True, "machineInfo": mi_full},
+                        "10.0.0.9")
+    e1 = d8.sas_machines["smib-mi/1"]
+    check("a full report lands census + denomSuggest",
+          rep.get("ok") is True
+          and e1.get("machineInfo", {}).get("totalGames") == 12
+          and e1.get("denomSuggest", {}).get("state") == "confirm",
+          (rep, e1.get("machineInfo")))
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": None}, "10.0.0.9")
+    e2 = d8.sas_machines["smib-mi/1"]
+    check("machineInfo:null (the satellite-restart window) carries the "
+          "census FORWARD — 🎲 Games + denomSuggest survive the bounce",
+          e2.get("machineInfo", {}).get("totalGames") == 12
+          and e2.get("machineInfo", {}).get("enabledGames") == [1, 2, 3]
+          and e2.get("denomSuggest", {}).get("state") == "confirm",
+          {"machineInfo": e2.get("machineInfo"),
+           "denomSuggest": e2.get("denomSuggest")})
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": {"denomCode": 9, "totalGames": 3,
+                                   "enabledGames": [7]}}, "10.0.0.9")
+    e3 = d8.sas_machines["smib-mi/1"]
+    check("a FRESH census always wins over the carried copy",
+          e3.get("machineInfo", {}).get("totalGames") == 3
+          and e3.get("denomSuggest", {}).get("state") == "unverified",
+          e3.get("machineInfo"))
+
+    # ---------------------------------------------------------------
+    print("— D8 adjacent: entry['aft'] gets the same carry-forward (the "
+          "satellite reports aft:null until its cache read; the AFT chip, "
+          "Wallet picker + sasCashoutReady all derive from it)")
+    d8._aft_autoreg = {}
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": True, "asset": 77,
+                           "availXfers": gh.AVAIL_XFER_FROM_EGM,
+                           "inHouseEnabled": True}}, "10.0.0.9")
+    ea1 = d8.sas_machines["smib-mi/1"]
+    check("a real aft block lands and sasCashoutReady derives from the "
+          "from-EGM bit",
+          ea1.get("aft", {}).get("asset") == 77
+          and ea1.get("sasCashoutReady") is True,
+          {"aft": ea1.get("aft"), "ready": ea1.get("sasCashoutReady")})
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": None}, "10.0.0.9")
+    ea2 = d8.sas_machines["smib-mi/1"]
+    check("aft:null (the satellite-restart window) carries registration "
+          "forward — and sasCashoutReady is RECOMPUTED post-carry (the "
+          "denomSuggest ordering trap)",
+          ea2.get("aft", {}).get("asset") == 77
+          and ea2.get("aft", {}).get("registered") is True
+          and ea2.get("sasCashoutReady") is True,
+          {"aft": ea2.get("aft"), "ready": ea2.get("sasCashoutReady")})
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "aft": {"registered": False}}, "10.0.0.9")
+    ea3 = d8.sas_machines["smib-mi/1"]
+    check("a FRESH aft always wins (a RAM-clear's unregistered truth is "
+          "never masked by the carry)",
+          ea3.get("aft", {}).get("registered") is False
+          and ea3.get("sasCashoutReady") is False,
+          {"aft": ea3.get("aft"), "ready": ea3.get("sasCashoutReady")})
+
+    # ---------------------------------------------------------------
+    print("— D14: denomSuggest carries a hub-side 'since' (epoch s) — "
+          "stable across the ~1 s recomputes, reset only on a real flip "
+          "(the tile nudge survives page reloads)")
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": mi_full}, "10.0.0.9")
+    s1 = d8.sas_machines["smib-mi/1"].get("denomSuggest", {}).get("since")
+    check("since is epoch seconds (home.html feature-detects "
+          "Number(ds.since)>0)",
+          isinstance(s1, float) and not isinstance(s1, bool) and s1 > 0
+          and abs(time.time() - s1) < 60, s1)
+    time.sleep(0.05)
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": mi_full}, "10.0.0.9")
+    s2 = d8.sas_machines["smib-mi/1"].get("denomSuggest", {}).get("since")
+    check("an identical recompute keeps the SAME since (a naive "
+          "time.time() stamp would slide every report)",
+          isinstance(s2, float) and s2 == s1, (s1, s2))
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": None}, "10.0.0.9")
+    s2b = d8.sas_machines["smib-mi/1"].get("denomSuggest", {}).get("since")
+    check("the machineInfo:null carry-forward recompute keeps it too",
+          isinstance(s2b, float) and s2b == s1, (s1, s2b))
+    time.sleep(0.05)
+    d8.hub_store.set_denom("smib-mi/1", 1)
+    d8.sas_report({"smibId": "smib-mi", "address": "1", "online": True,
+                   "machineInfo": mi_full}, "10.0.0.9")
+    ds3 = d8.sas_machines["smib-mi/1"].get("denomSuggest", {})
+    check("a real flip (confirm -> match after the operator blesses the "
+          "denom) RESETS since",
+          ds3.get("state") == "match"
+          and (ds3.get("since") or 0) > (s1 or 0),
+          (s1, ds3))
+
+    # ---------------------------------------------------------------
+    print("— D7: /api/command stale-client fence — a mismatched uiStamp "
+          "draws 409; matching and stampless (curl) requests pass")
+    d7 = make_engine()
+    code, body = command(d7, {"action": "tournamentArm", "uiStamp": 1})
+    check("a STALE uiStamp is refused 409 before any dispatch",
+          code == 409 and body.get("ok") is False
+          and "stale UI" in str(body.get("error")), (code, body))
+    cur_stamp = int(os.path.getmtime(os.path.join(
+        os.path.dirname(os.path.abspath(gh.__file__)),
+        "webui", "home.html")))
+    code, body = command(d7, {"action": "tournamentArm",
+                              "uiStamp": cur_stamp})
+    check("the MATCHING uiStamp passes the fence (reaches the arm's own "
+          "config refusal, not the fence's)",
+          code == 200 and "configure first" in str(body.get("error")),
+          (code, body))
+    code, body = command(d7, {"action": "tournamentArm"})
+    check("a STAMPLESS request passes — curl/Test Panel are first-class "
+          "clients, the fence is feature-detected",
+          code == 200 and "configure first" in str(body.get("error")),
+          (code, body))
+
+    # ---------------------------------------------------------------
+    print("— D7: read pacing — an identical read-class repeat inside the "
+          "window is refused 429 and never reaches the wire")
+    dp = make_engine()
+    pa = gh.EgmAssociation(EGM)
+    pa.comms_state = "onLine"
+    dp.associations[EGM] = pa
+    gh.G2SRequestHandler._cmd_pace.clear()   # class-level — isolate the slice
+    n0 = len(dp.sent)
+    code, b1 = command(dp, {"action": "getGameDenoms", "deviceId": 5})
+    code2, b2 = command(dp, {"action": "getGameDenoms", "deviceId": 5})
+    check("first read enqueues (200); the immediate identical repeat is "
+          "PACED 429 with an honest ok:false and NO wire job",
+          code == 200 and b1.get("ok") is True and code2 == 429
+          and b2.get("ok") is False and "paced" in str(b2.get("error"))
+          and len(dp.sent) == n0 + 1,
+          (code, code2, b2, len(dp.sent) - n0))
+    code3, _b = command(dp, {"action": "getGameDenoms", "deviceId": 6})
+    code4, _b = command(dp, {"action": "getGamePlayStatus", "deviceId": 5})
+    check("a DIFFERENT device or action is not paced (key = "
+          "peer+action+egm+device)", code3 == 200 and code4 == 200,
+          (code3, code4))
+    with gh.G2SRequestHandler._cmd_pace_lock:
+        for k in list(gh.G2SRequestHandler._cmd_pace):
+            gh.G2SRequestHandler._cmd_pace[k] -= \
+                gh.G2SRequestHandler.READ_PACE_WINDOW_SEC + 0.1
+    code5, _b = command(dp, {"action": "getGameDenoms", "deviceId": 5})
+    check("past the window the same read passes again — a loop-stopper, "
+          "not an operator throttle", code5 == 200, code5)
+    gh.G2SRequestHandler._cmd_pace.clear()
+
+    # ---------------------------------------------------------------
+    print("— D13: /api/status ?slim=1 poller view + a WORKING conditional "
+          "GET (ETag hashed over clock-noise-normalized content)")
+    ds = make_engine()
+    sa = gh.EgmAssociation(EGM)
+    sa.comms_state = "onLine"
+    sa.game_play["4"] = {"themeId": "IGT_testTheme",
+                         "egmEnabled": "true",
+                         "denoms": [{"denomId": "1000", "active": "true"}],
+                         "activeDenoms": ["1000"],
+                         "denomsAt": "2026-07-22T00:00:00Z"}
+    # meters: one cabinet-class row (the unlinked tile's LIVE credits) and
+    # one per-device row (the whale class) — slim must keep the first and
+    # drop the second.
+    sa.meters = {"G2S_cabinet/1/G2S_playerCashableAmt": "120000",
+                 "G2S_gamePlay/4/G2S_wageredAmt": "999"}
+    ds.associations[EGM] = sa
+    with ds.sas_lock:
+        ds.sas_machines[SAS] = sas_entry()
+    # the /api/status composite touches surfaces the tournament fake
+    # doesn't carry — stub the non-slice-relevant ones flat
+    ds.config_store = type("_CS", (), {"get": staticmethod(lambda k:
+                                                           None)})()
+    ds.register_g2s_machines = lambda assocs: None
+    ds.activity_snapshot = lambda: []
+    ds.engine_meta = lambda: {"harvest": True}
+    ds.companions = {}
+    ds.glass_sessions = type("_GS", (), {
+        "summary": staticmethod(lambda: {"count": 0, "byEgm": {}})})()
+    ds.sysval_fallback = lambda: False
+    ds.ticket_header = lambda: {}
+
+    def status_get(engv, path, inm=None):
+        """Drive the REAL do_GET /api/status branch socket-free."""
+        h = gh.G2SRequestHandler.__new__(gh.G2SRequestHandler)
+        h.host_engine = engv
+        h.path = path
+        h.headers = {"If-None-Match": inm} if inm else {}
+        out = {"hdrs": {}}
+        h._send = lambda code, body, ctype=None, soap=True, etag=None: \
+            out.update(code=code, body=body, etag=etag)
+        h.send_response = lambda code: out.update(code=code)
+        h.send_header = lambda k, v: out["hdrs"].__setitem__(k, v)
+        h.end_headers = lambda: None
+        h.do_GET()
+        return out
+
+    full = status_get(ds, "/api/status")
+    fsnap = json.loads(full["body"])
+    slim = status_get(ds, "/api/status?slim=1")
+    ssnap = json.loads(slim["body"])
+    check("full view still carries the per-device whales (gamePlay with "
+          "denoms, all meters) and no slim stamp",
+          full["code"] == 200
+          and "denoms" in fsnap.get(EGM, {}).get("gamePlay", {}).get("4", {})
+          and "G2S_gamePlay/4/G2S_wageredAmt"
+              in fsnap.get(EGM, {}).get("meters", {})
+          and "slim" not in fsnap, sorted(fsnap.get(EGM, {})))
+    check("?slim=1 drops the meterSubs/configOptions/configDevices whales "
+          "wholesale and stamps slim:true",
+          slim["code"] == 200 and ssnap.get("slim") is True
+          and not any(k in ssnap.get(EGM, {})
+                      for k in ("meterSubs", "configOptions",
+                                "configDevices")),
+          sorted(ssnap.get(EGM, {})))
+    # slim gamePlay = the per-device MICRO view: exactly the tile fields
+    # (themeId counts, egmEnabled, tilt chips) — never the denoms/profile
+    # whale. Wholesale ?slim=1-drops-gamePlay was the shipped v1; it broke
+    # the tile's games button + tilt chips the moment home.html moved its
+    # 2s poll to slim, so the micro view is the contract now.
+    sgp = (ssnap.get(EGM) or {}).get("gamePlay") or {}
+    check("slim gamePlay keeps the MICRO tile fields (themeId/egmEnabled) "
+          "and drops the denoms/profile whale",
+          sgp.get("4", {}).get("themeId") == "IGT_testTheme"
+          and sgp.get("4", {}).get("egmEnabled") == "true"
+          and "denoms" not in sgp.get("4", {})
+          and "activeDenoms" not in sgp.get("4", {}), sgp)
+    # slim meters = cabinet class only: the UNLINKED G2S tile's CREDITS
+    # line reads G2S_cabinet/1/G2S_player*Amt live (the AVP has no SAS leg
+    # to fall back on) — freezing it would be a new staleness bug.
+    smt = (ssnap.get(EGM) or {}).get("meters") or {}
+    check("slim meters keep the cabinet class (live tile credits) and "
+          "drop the per-device rows",
+          smt.get("G2S_cabinet/1/G2S_playerCashableAmt") == "120000"
+          and "G2S_gamePlay/4/G2S_wageredAmt" not in smt, smt)
+    check("slim keeps the tile fields + reserved sections (commsState, "
+          "known, sas, tournament)",
+          "commsState" in ssnap.get(EGM, {})
+          and "known" in ssnap.get(EGM, {})
+          and SAS in (ssnap.get("sas") or {})
+          and "tournament" in ssnap, sorted(ssnap))
+    # Conditional GET: the SECOND identical read must 304. serverNow and
+    # reportAgeSec tick on EVERY call, so this only holds because the
+    # hash source neutralizes the clock-derived fields — the pre-fix raw
+    # content hash never repeated and the 304 was dead code.
+    etag = full.get("etag")
+    again = status_get(ds, "/api/status", inm=etag)
+    check("unchanged data + If-None-Match -> 304 (the ETag survives the "
+          "per-call serverNow/reportAgeSec ticks)",
+          bool(etag) and again.get("code") == 304
+          and again["hdrs"].get("ETag") == etag,
+          (etag, again.get("code"), again.get("etag")))
+    with ds.sas_lock:
+        ds.sas_machines[SAS]["meters"]["coinOut"] += 500
+    # Production mutations ALL arrive as POSTs (EGM pushes included), and
+    # do_POST bumps status_state_seq unconditionally so the next poll
+    # rebuilds. This test mutates the engine directly, so it must stand in
+    # for that bump — otherwise the status cache legitimately serves the
+    # previous body and the ETag never moves. (Added 2026-07-25 with the
+    # status-cache work; without it this asserts against the cache rather
+    # than against the ETag logic it means to test.)
+    with ds.status_cache_lock:
+        ds.status_state_seq += 1
+    changed = status_get(ds, "/api/status", inm=etag)
+    check("a REAL data change busts the ETag (200 + a new tag)",
+          changed.get("code") == 200 and changed.get("etag")
+          and changed["etag"] != etag, (etag, changed.get("etag")))
 
     print(f"\nRESULT: {_p} passed, {_f} failed")
     sys.exit(1 if _f else 0)

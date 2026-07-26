@@ -42,10 +42,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from loguru import logger
 
-from core.sas_protocol import SASProtocol, SASCommandBuilder
+from core.sas_protocol import (SASProtocol, SASCommandBuilder,
+                               MULTIDENOM_AWARE_POLLS,
+                               MULTIDENOM_BASE_MIN_DATA, DENOM_CODE_CENTS)
 from core.sas_poller import MeterSpec, SASPoller
-from core.sas_meters import (SAS_POLL_FLOOR, parse_meters_10_15,
-                             parse_single_meter)
+from core.sas_machine_info import (parse_enabled_game_numbers,
+                                   parse_machine_id,
+                                   parse_current_player_denom,
+                                   parse_enabled_player_denoms,
+                                   build_extended_game_info_poll,
+                                   parse_extended_game_info,
+                                   denom_code_cents)
+from core.sas_meters import (SAS_POLL_FLOOR, build_meter_poll,
+                             parse_enabled_features, parse_meters_10_15,
+                             parse_single_meter, parse_total_games)
 from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
                                     HANDPAY_RESET_EXCEPTION)
 from core.hub_ticket_client import HubTicketAuthority
@@ -88,10 +98,36 @@ REPORT_SEC = 1               # hub report + command-pull cadence. Was 5, which
 #                              instead of ~4. Proper fix is a decoupled command
 #                              poll (keeps state reports cheap); this is the
 #                              one-line 4-5x win first.
+#: Adaptive report cadence (2026-07-22, dev-floor experiment): while a
+#: command sequence is IN FLIGHT the report loop tightens to FAST_REPORT_SEC
+#: so the NEXT queued command is pulled (and each tournament stage handoff
+#: closed) in ~0.25s instead of a full 1s — on top of the event-driven
+#: verdict return. Driven by REAL pending work (a command received or a
+#: result produced) so the dormancy law holds: after FAST_WINDOW_SEC of
+#: quiet it relaxes to REPORT_SEC. Still HTTP-only (no serial), and a DOWN
+#: hub always uses the slow cadence (never burst-retries a dead endpoint).
+FAST_REPORT_SEC = 0.25       # tightened cadence during an active sequence
+FAST_WINDOW_SEC = 3.0        # stay fast this long after the last activity
 AFT_STATUS_SEC = 30          # poll-thread AFT (73/FF + asset) status cache
 #                              refresh cadence — a registration swap is rare,
 #                              so read it seldom to keep the journal quiet and
 #                              steady-state at ~5 polls/s (GR-01/02)
+MACHINE_INFO_RETRY_SEC = 30  # a FAILED machine-info/census attempt retries on
+#                              this floor (bounded, like AFT_STATUS_SEC). A
+#                              SUCCESSFUL read goes IDLE — no periodic re-read
+#                              (dormancy law) — until something re-arms it: an
+#                              offline drop, an LP09 toggle, a 0x3C/0x8C
+#                              machine event, or the hub's read_machine_info
+#                              command. See machine_info_read in main().
+MACHINE_INFO_BUSY_SEC = 2.0  # §2.2 busy-frame answer to the 0x1F -> retry
+#                              SOON: the boot-busy chirp window rides the
+#                              first online flip, so the bringup census can
+#                              land on a machine that is awake but not ready
+#                              — a short retry, not a consumed 30s attempt.
+MACHINE_INFO_SETTLE_SEC = 2.0  # 0x3C/0x8C -> census re-read delay: an event
+#                              burst (a player flipping through a multi-game
+#                              menu) coalesces into ONE re-read after the
+#                              last event, not one census per flip.
 
 # The rig's fixed 20-byte AFT registration key. A freshly RAM-cleared machine
 # is keyless, so the host must ALWAYS supply a key at 73/00 + 73/01 (the
@@ -505,10 +541,23 @@ class HubReporter:
     thread drains + executes them between polls (stop_or_heartbeat);
     results ride back to the hub in the next snapshot()."""
 
-    #: hub->SMIB queue bound: a burst beyond this drops OLDEST commands
-    #: (deque maxlen) — better to lose a stale queued bonus than to fire
-    #: a surprise backlog at the machine minutes later.
-    MAX_PENDING = 8
+    #: hub->SMIB queue bound. The hub delivers each command EXACTLY ONCE
+    #: (its queue pops on reply, never re-sends), so a drop is a permanent
+    #: loss — _take_commands refuses NEWEST-past-the-bound and logs each
+    #: drop loudly rather than silently pushing out the oldest. Sized well
+    #: above any real floor's burst (a tournament sequence is a handful).
+    MAX_PENDING = 32
+    #: SMIB->hub verdict ring bound. INVARIANT: >= MAX_PENDING. The hub's
+    #: exactly-once delivery cuts BOTH ways — a verdict evicted before a
+    #: report POST carries it is gone forever — and drain_hub_commands
+    #: executes the ENTIRE pending queue in one pass, so an instant-result
+    #: drain (parked refusals, malformed batch) can mint a whole queue's
+    #: verdicts in microseconds, before the report thread wakes. A ring
+    #: smaller than the queue silently evicts the oldest (the downstream
+    #: half of the 8->32 pending bump). Headroom past MAX_PENDING covers
+    #: satellite-originated records (aft_cashout) sharing this ring,
+    #: including a hub-outage backlog.
+    RESULTS_RING = MAX_PENDING + 16
 
     def __init__(self, hub_url, smib_id, port_path, address, poller, stats,
                  recent_events, store, sas_enabled=None, handpay_latch=None,
@@ -536,7 +585,7 @@ class HubReporter:
         self.failing = False
         self.stop = False
         self.pending_commands = collections.deque(maxlen=self.MAX_PENDING)
-        self.command_results = collections.deque(maxlen=20)
+        self.command_results = collections.deque(maxlen=self.RESULTS_RING)
         # Event-driven verdict return (2026-07-22): the POLL thread sets this
         # when it deposits a fresh command result, so the report thread fires
         # the verdict the INSTANT it exists instead of waiting out the flat
@@ -545,8 +594,16 @@ class HubReporter:
         # the report thread is HTTP-only and never touches the SAS transport,
         # so no single-writer/tcdrain/never-flush-mid-frame rule is in play.
         self.result_ready = threading.Event()
-        # Dedupe: the hub re-sends a command until it sees its result echoed
-        # back, so remember recently-seen ids (bounded).
+        # monotonic stamp of the last command-channel activity (a command
+        # received or a result produced) — drives the adaptive cadence. 0 =
+        # long ago = idle = slow REPORT_SEC.
+        self._last_activity = 0.0
+        # Dedupe: the hub delivers each command exactly ONCE (its queue pops
+        # on reply — it does NOT re-send until a result is echoed), so this
+        # only guards a DUPLICATE delivery (e.g. a hub restart replaying an
+        # already-seen id). Never size anything off a re-send assumption —
+        # a lost command/verdict is lost for good (see MAX_PENDING /
+        # RESULTS_RING above).
         self._seen_cmd_ids = collections.deque(maxlen=64)
 
     def record_result(self, result):
@@ -555,6 +612,7 @@ class HubReporter:
         flat 1s tick. The single seam every result path uses — add new ones
         here, never a bare command_results.appendleft."""
         self.command_results.appendleft(result)
+        self._last_activity = time.monotonic()   # keep the cadence fast
         self.result_ready.set()
 
     def snapshot(self):
@@ -590,6 +648,14 @@ class HubReporter:
             # writer) and read here (single reader) — lock-free like meters.
             # None until the first cache read; the hub clamps + ingests it.
             "aft": self.stats.get("aft"),
+            # machine-info + games census (denom code + identity + A0/51/56),
+            # cached by the poll thread: armed at bringup, re-armed by an
+            # offline drop / LP09 / 0x3C / 0x8C / read_machine_info — the
+            # VALUE rides every report, the CONTENT refreshes on those
+            # triggers (readAt/censusAt stamp actual parses). None until
+            # read. RAW denomCode — the hub surfaces it, decode is
+            # bench-gated (C-4 table off-disk).
+            "machineInfo": self.stats.get("machineInfo"),
             "commandResults": list(self.command_results),
             # C3: both keys are ALWAYS present (pendingHandpay rides as
             # null when clear) so the payload shape is stable for the hub.
@@ -638,16 +704,35 @@ class HubReporter:
         commands = data.get("commands", [])
         if not isinstance(commands, list):
             return
-        for cmd in commands[:self.MAX_PENDING]:
+        # The hub delivers each command exactly ONCE (its queue pops on
+        # reply), so anything this side declines to hold is LOST — and a
+        # deque push-out or a silent [:MAX_PENDING] slice loses them with
+        # no record (live-hit by the 11-command test batch 2026-07-22:
+        # two commands vanished traceless). No silent caps: take only
+        # what fits and SHOUT about the rest; MAX_PENDING is sized so a
+        # real floor never gets near it.
+        dropped = 0
+        for cmd in commands:
             if not isinstance(cmd, dict):
                 continue
             cmd_id = cmd.get("id")
             if not isinstance(cmd_id, str) or not cmd_id:
                 continue
             if cmd_id in self._seen_cmd_ids:
-                continue                     # hub re-send until result echoed
+                continue          # duplicate delivery (hub restart) — done
+            if len(self.pending_commands) >= self.MAX_PENDING:
+                dropped += 1
+                logger.error("⚠️ command DROPPED (pending full at {}): "
+                             "id={} type={} — the hub will never re-send "
+                             "it", self.MAX_PENDING, cmd_id,
+                             cmd.get("type"))
+                continue
             self._seen_cmd_ids.append(cmd_id)
             self.pending_commands.append(cmd)
+            # a real queued command opens the fast-cadence window: more are
+            # likely coming (a tournament sequence) and the verdict wants a
+            # prompt next report to ride back on
+            self._last_activity = time.monotonic()
 
     def run(self):
         while not self.stop:
@@ -674,7 +759,18 @@ class HubReporter:
                     logger.warning("hub report failed ({}: {}) — will keep "
                                    "retrying quietly every {}s",
                                    self.url, e, REPORT_SEC)
-            self.result_ready.wait(REPORT_SEC)
+            self.result_ready.wait(self._report_wait())
+
+    def _report_wait(self):
+        """The cadence for the next report: fast while a command sequence is
+        in flight (recent activity), slow when idle. A DOWN hub always waits
+        the full slow cadence — never burst-retry a dead endpoint (GR-01/02
+        quiet-journal). The event still cuts any wait short for a verdict."""
+        if self.failing:
+            return REPORT_SEC
+        if time.monotonic() - self._last_activity < FAST_WINDOW_SEC:
+            return FAST_REPORT_SEC
+        return REPORT_SEC
 
 
 class RxWedgeWatchdog:
@@ -778,6 +874,138 @@ def open_port(path, mock, address, protocol):
                            "(HAT not installed yet is fine)",
                            path, e, OPEN_RETRY_SEC)
             time.sleep(OPEN_RETRY_SEC)
+
+
+# --- per-denomination write safety -----------------------------------------
+# Table C-4 player-denomination codes, ascending, 0x00 excluded (00 is the
+# preamble's "default response" selector, never a real denomination).
+DENOM_SWEEP_CODES = tuple(sorted(c for c in DENOM_CODE_CENTS if c))
+
+
+def read_enabled_player_denoms(transport, address, protocol,
+                               sleep=time.sleep, pace=SAS_POLL_FLOOR):
+    """LP B2 (§16.4, Table 16.4) — the machine's OWN list of enabled player
+    denominations, as Table C-4 codes. Returns (codes, detail):
+    codes is None when the machine did not answer a parseable B2 frame.
+
+    Silence here is NOT "unsupported" — §4.4, ENGLISH 6.02
+    verbatim: "If a gaming machine receives a long poll it does not support, it
+    must ignore the long poll and not NACK it. It is the responsibility of the
+    host to determine which long polls are supported by the gaming machine."
+    The host cannot distinguish "ignored" from "not implemented". Report it as
+    UNANSWERED."""
+    sleep(pace)
+    reply = transport.transact(build_meter_poll(address, 0xB2))
+    if not reply:
+        return None, "B2 unanswered (silence)"
+    if len(reply) == 2 and reply[1] == 0x00:
+        return None, "B2 answered BUSY (§4.1 [addr][00])"
+    pkt = protocol.parse_packet(reply)
+    if pkt is None or pkt.address != address or pkt.command != 0xB2:
+        return None, f"B2 reply not a B2 frame: {reply.hex(' ')}"
+    try:
+        return parse_enabled_player_denoms(pkt.data), \
+            f"B2 answered: {reply.hex(' ')}"
+    except ValueError as e:
+        return None, f"B2 parse failed ({e}): {reply.hex(' ')}"
+
+
+def denom_disable_guard(transport, address, protocol, game, denom,
+                        sleep=time.sleep, pace=SAS_POLL_FLOOR):
+    """⛔ THE STRANDING GUARD. Answers ONE question before any per-denom
+    DISABLE reaches the wire: would this write leave the cabinet with no
+    denomination a player can play?
+
+    WHY IT EXISTS — and why it is not a spec rule. Two independent exhaustive
+    walks of the SAS 6.02 text found NO requirement that a denomination or a
+    game stay enabled; the spec says the opposite direction is legal — §16,
+    ENGLISH 6.02 verbatim: "A multi-denom gaming machine
+    can be configured such that only one player denomination is enabled." The
+    rule is the OWNER'S machine/jurisdictional knowledge: at
+    least one denomination must remain active, the machine itself will refuse a
+    change that strands it, and "there are other ways to disable the machine".
+    So this guard is a HOST-side courtesy — it must never be described as a SAS
+    requirement, and it is NOT the explanation for any refusal the machine
+    issues on its own (notably it does not explain the 2026-07-25 error 04,
+    which also came back for 5c while seven other denominations stayed active).
+
+    Evidence order — computed LIVE every time, never from a cached census:
+      1. LP B2 (§16.4): the machine's own enabled-denomination list. Refuse iff
+         the target is the ONLY entry.
+      2. If B2 is unanswered: a B0+56 sweep for a SECOND denomination at which
+         `game` is enabled, short-circuiting on the first hit (on a cabinet
+         with several live denominations this costs one or two polls, not 31).
+      3. If neither produced evidence: REFUSE. We cannot prove the write is
+         safe, and an unprovable write against the owner's hard rule is not a
+         write we get to make.
+
+    Returns a dict: {allow, basis, detail, enabledDenoms, otherDenom}."""
+    codes, b2_detail = read_enabled_player_denoms(
+        transport, address, protocol, sleep=sleep, pace=pace)
+    if codes is not None:
+        if denom not in codes:
+            return {"allow": True, "basis": "B2", "enabledDenoms": codes,
+                    "otherDenom": None,
+                    "detail": (f"{b2_detail} -> denom 0x{denom:02X} is not in "
+                               "the machine's enabled player-denomination "
+                               "list, so this write cannot strand it")}
+        if len(codes) <= 1:
+            return {"allow": False, "basis": "B2", "enabledDenoms": codes,
+                    "otherDenom": None,
+                    "detail": (f"{b2_detail} -> denom 0x{denom:02X} is the "
+                               "machine's ONLY enabled player denomination; "
+                               "disabling the game there would leave the "
+                               "machine with no active denomination")}
+        others = [c for c in codes if c != denom]
+        return {"allow": True, "basis": "B2", "enabledDenoms": codes,
+                "otherDenom": others[0],
+                "detail": (f"{b2_detail} -> {len(codes)} enabled player "
+                           f"denominations; 0x{others[0]:02X} survives")}
+    # --- fallback: prove a SECOND live denomination with B0+56 --------------
+    observed = 0
+    for code in DENOM_SWEEP_CODES:
+        if code == denom:
+            continue
+        sleep(pace)
+        try:
+            frame = protocol.build_multidenom_poll(address, code, 0x56)
+        except ValueError:
+            continue
+        dec = protocol.parse_multidenom_response(
+            address, transport.transact(frame))
+        if dec["outcome"] != "data" or dec["baseCommand"] != 0x56:
+            continue
+        try:
+            games = [g for g in parse_enabled_game_numbers(dec["data"]) if g]
+        except ValueError:
+            continue
+        observed += 1
+        # game 0000 addresses THE GAMING MACHINE (§2.2.2.3), not a game, so
+        # "does this denomination survive?" becomes "does the player still
+        # have ANY game here?". For a real game number it is that game.
+        survives = bool(games) if game == 0 else game in games
+        if survives:
+            what = ("play" if game == 0 else f"game {game}")
+            return {"allow": True, "basis": "B0+56", "enabledDenoms": None,
+                    "otherDenom": code,
+                    "detail": (f"{b2_detail}; B0+56 sweep found {what} still "
+                               f"available at denom 0x{code:02X}, which "
+                               "survives this write")}
+    if observed:
+        what = ("any enabled game" if game == 0 else f"game {game}")
+        return {"allow": False, "basis": "B0+56", "enabledDenoms": None,
+                "otherDenom": None,
+                "detail": (f"{b2_detail}; a B0+56 sweep of {observed} "
+                           f"denomination(s) found {what} at NO "
+                           f"denomination other than 0x{denom:02X} — "
+                           "disabling it there would leave the machine with "
+                           "no active denomination")}
+    return {"allow": False, "basis": "none", "enabledDenoms": None,
+            "otherDenom": None,
+            "detail": (f"{b2_detail}; the B0+56 fallback sweep produced no "
+                       "usable answer either. REFUSING: with no evidence "
+                       "about the machine's other denominations this write "
+                       "cannot be shown safe. Enables are unaffected.")}
 
 
 def _gateway_hub_url(port=8081, fallback="http://192.168.50.2:8081"):
@@ -914,6 +1142,17 @@ def main():
     hp_latch = HandpayLatch()          # the HANDPAY banner state (C3)
     ticket_header = TicketHeaderState()  # the C2 ticket-header push state
 
+    # Machine-info + games-census scheduler (poll-thread only: the event
+    # callback below and the census block in stop_or_heartbeat both run on
+    # the poll thread — no lock needed). "at" is the next-attempt time
+    # (monotonic): 0.0 = due now (bringup / re-armed), None = the last read
+    # succeeded — IDLE until something says the data changed. Re-armers:
+    # an offline drop (machine swap / reconnect), an LP09 game toggle, a
+    # 0x3C/0x8C machine event (on_typed_event), and the hub's
+    # read_machine_info command. Never a free-running refresh timer, so
+    # the dormancy law holds.
+    machine_info_read = {"at": 0.0}
+
     def on_online(addr):
         logger.info("🎰 SAS machine ONLINE at address {}", addr)
         # C2: a rejoin re-arms ONE ticket-header attempt for a rev that
@@ -927,6 +1166,16 @@ def main():
     def on_typed_event(addr, info):
         stats["events"] += 1
         hp_latch.on_exception(info.code)   # C3 latch: 0x51 sets, 0x52 clears
+        # 0x3C "operator changed configuration" / 0x8C "game selected" is
+        # the machine ANNOUNCING that the games/denom census data just
+        # changed — re-arm the paced census re-read. (The old code logged
+        # these and kept serving a stale census until an offline drop or a
+        # restart: AJ flips a game at the operator menu, the hub tile and
+        # Games modal lie for days.) Scheduled MACHINE_INFO_SETTLE_SEC out
+        # so an event burst coalesces into one re-read after the last one.
+        if getattr(info, "event", "") in ("config_changed", "game_selected"):
+            machine_info_read["at"] = (time.monotonic()
+                                       + MACHINE_INFO_SETTLE_SEC)
         name = getattr(info, "name", "") or ""
         logger.info("🔔 addr {} exception 0x{:02X} {}", addr, info.code, name)
         recent_events.appendleft({
@@ -1125,8 +1374,9 @@ def main():
             # C3: parked. EVERY current command type touches the machine
             # (wire polls), and the park promise is a silent port — refuse
             # with an honest typed record instead of queueing surprise wire
-            # traffic. One record per command id (hub dedupe), so no
-            # re-send log spam; the operator re-enables in Settings.
+            # traffic. One record per command id (_seen_cmd_ids dedupe), so
+            # a duplicate delivery can't double-log; the operator
+            # re-enables in Settings.
             result["ok"] = False
             result["outcome"] = "sas_disabled"
             result["detail"] = "SAS is disabled for this machine (Settings)"
@@ -1476,6 +1726,586 @@ def main():
                             "🔒" if lock else "🔓", cmd_id,
                             "disable" if lock else "enable", result["result"])
                 return result
+            if cmd.get("type") == "sas_game_state":
+                # Per-game enable/disable = LP09 (Table 7.6.1, type M):
+                # [addr][09][game# 2-BCD 0001-9999][00=off|01=on][CRC].
+                # ACK = bare address byte, NACK = address|0x80, SILENCE =
+                # unsupported long poll OR invalid game number (§4.4 makes
+                # those indistinguishable) — so the verdict is the 0x56
+                # READ-BACK, not the ack: applied iff the game's membership
+                # in the enabled list now matches the ask. Acts at the
+                # machine's CURRENT denom; PER-DENOM game control is the
+                # B0-preamble sibling below (sas_denom_game_state).
+                #
+                # Game range is Table 7.6.1's LITERAL 0001-9999 here and stays
+                # that way. Its B0 sibling deliberately allows 0000 — §16.2
+                # requires it behind the preamble — but nothing in §7.6.1
+                # sanctions a BARE LP09 at game 0000, and §2.2.2.3
+                # says a gaming machine IGNORES a type-M
+                # poll whose game number is out of range. Widening this one
+                # would buy an un-analyzable silence.
+                game = cmd.get("game")
+                enable = bool(cmd.get("enable"))
+                if isinstance(game, bool) or not isinstance(game, int) \
+                        or not 1 <= game <= 9999:
+                    result["ok"] = False
+                    result["result"] = "rejected: game must be 1..9999"
+                    return result
+                frame = poller.protocol.build_packet(
+                    args.address, 0x09,
+                    poller.protocol._int_to_bcd(game, 2)
+                    + (b"\x01" if enable else b"\x00"))
+                reply = poller.transport.transact(frame)
+                # Classify the 1-byte reply. NOTE the BUSY frame is the
+                # 2-byte [addr][0x00] (§2.2) — its FIRST byte equals the
+                # bare address, so a naive reply[:1]==addr check would call
+                # a machine that DECLINED the command an "ack". Rule out
+                # busy (len 2, second byte 0x00) before the ack test.
+                if reply and len(reply) == 2 and reply[1] == 0x00:
+                    outcome = "busy"
+                elif reply and reply[:1] == bytes([args.address | 0x80]):
+                    outcome = "nack"
+                elif reply and reply[:1] == bytes([args.address]):
+                    outcome = "ack"
+                else:
+                    outcome = "silent"
+                result["outcome"] = outcome
+                result["game"] = game
+                result["enable"] = enable
+                # RAW BYTES, always — this path is where "the BB2 does not
+                # support LP09" was concluded from silence on 2026-07-22, and
+                # because only an English verdict sentence was logged those two
+                # attempts are permanently unauditable: nobody can now tell
+                # whether the machine was silent, busy, or answering something
+                # we misread. That note then became the documented reason not
+                # to retry and cost days. Cheapest possible insurance; keep it.
+                result["sent"] = frame.hex(" ")
+                result["raw"] = reply.hex(" ") if reply else ""
+                applied = None
+                try:
+                    time.sleep(SAS_POLL_FLOOR)         # 200ms floor: an
+                    # unpaced read-back on a busy machine reads silence and
+                    # would stamp a false "unsupported" verdict.
+                    r2 = poller.transport.transact(
+                        build_meter_poll(args.address, 0x56))
+                    p2 = poller.protocol.parse_packet(r2) if r2 else None
+                    if p2 and p2.address == args.address \
+                            and p2.command == 0x56:
+                        games = [g for g in
+                                 parse_enabled_game_numbers(p2.data) if g]
+                        # copy-then-swap (never mutate the published dict —
+                        # the report thread may be serializing it), and a
+                        # parsed 0x56 is fresh census truth: stamp it so
+                        # staleness stays visible hub-side.
+                        mi2 = dict(stats.get("machineInfo") or {})
+                        mi2["enabledGames"] = games
+                        mi2["censusAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                        stats["machineInfo"] = mi2
+                        applied = (game in games) == enable
+                except Exception as ve:               # noqa: BLE001
+                    logger.warning("0x56 read-back failed (ignored): {}", ve)
+                if applied is True:
+                    result["ok"] = True
+                    result["result"] = "verified via 0x56"
+                elif applied is False:
+                    result["ok"] = False
+                    # OUR ATTEMPT FAILED — never "the machine does not support
+                    # LP09". The EGM is the certified reference implementation
+                    # and we are the suspect; this project is already 0-for-2
+                    # on machine-limitation claims (this exact sentence, and
+                    # "APX011 = the EGM refuses denom changes" which was our
+                    # own 30 s timeout). The raw bytes ride in result["raw"].
+                    result["result"] = (
+                        f"OUR ATTEMPT FAILED — sent {frame.hex(' ')}, got "
+                        f"{reply.hex(' ') if reply else '(silence)'} "
+                        f"({outcome}); the 0x56 read-back shows the game "
+                        "unchanged; mechanism unknown")
+                else:
+                    # read-back inconclusive: ONLY a clean ack counts as ok;
+                    # busy/nack/silent are never a silent success.
+                    result["ok"] = outcome == "ack"
+                    result["result"] = f"{outcome} (0x56 read-back silent)"
+                # a game-set change can shift the machine's minimum denom,
+                # and multi-denom accounting RIDES the minimum — force the
+                # full census re-read rather than trust the cached code
+                machine_info_read["at"] = 0.0
+                logger.info("🎲 hub command {}: game {} {} | sent={} raw={} "
+                            "-> {}", cmd_id, game,
+                            "enable" if enable else "disable",
+                            frame.hex(" "),
+                            reply.hex(" ") if reply else "(silence)",
+                            result["result"])
+                return result
+            if cmd.get("type") == "sas_denom_game_state":
+                # PER-DENOM game enable/disable — SAS 6.02 §16.1: LP 09 wrapped
+                # in the B0 preamble so it acts on ONE player denomination
+                # (Table 16.1d: denom 00 = ALL player denominations).
+                #
+                #   [addr][B0][len][C-4 denom][09][game BCD][enable][CRC]
+                #
+                # Unlike a BARE LP09 — which answers with silence we cannot
+                # distinguish from "unsupported" — the wrapped form gives an
+                # EXPLICIT verdict: base-command byte 09 with the data field
+                # carrying the address (ack) or address|0x80 (nack), or base
+                # byte 00 plus a Table 16.1c error code. The verdict is still
+                # confirmed by a 0x56 read-back at the SAME denom, because an
+                # ack means "accepted", not "applied".
+                #
+                # ═══ WIRE RECORD, WMS BB2 (smib-bb2), 2026-07-25 ═══
+                # The preamble itself WORKS on this cabinet — first attempt,
+                # read probe, LP 0x56 at denom 00:
+                #     sent: 01 b0 02 00 56 d3 e8
+                #     got : 01 b0 06 01 56 03 01 00 12 09 35
+                #   = addr 01 | b0 | len 06 | denom 01 (the machine RESOLVED
+                #     our 00 default to its actual selected denom, 1c) | base
+                #     56 echoed (not 00 => no error) | payload 03 01 00 12
+                #     (inner len 03, one game, 0012 BCD) | CRC.
+                # But every B0-wrapped LP09 was REFUSED with Table 16.1c error
+                # 04 ("long poll not supported in that format for a specific
+                # denomination"), at all three denominations tried:
+                #     denom 00 (all) -> 01 b0 03 00 00 04
+                #     denom 01 (1c)  -> 01 b0 03 01 00 04
+                #     denom 02 (5c)  -> 01 b0 03 02 00 04
+                # §16.1 atomicity held every time — the machine changed
+                # NOTHING. Note 5c is one of eight active player denominations
+                # on this cabinet, so error 04 is NOT a last-denomination
+                # guard. Every one of those frames carried game 0012.
+                #
+                # ⚠️ WHAT WE DO NOT KNOW. Error 04 is defined with a
+                # per-GAME example — Table 16.1c, ENGLISH 6.02
+                # verbatim: "Long poll not supported in
+                # that format for specific denomination (for example,
+                # requesting meter for specific game)" — and §16.2
+                # verbatim: "the host may not combine a
+                # request for specific denominations with a request for
+                # specific games, i.e., when using the multi-denom preamble
+                # with long poll 2F, the game number must be 0000". That is
+                # the best-supported reading of the refusals, and it is a
+                # HYPOTHESIS, not a finding — note the sentence names 2F, so
+                # applying it to 09 is inference. It is why `game` now accepts
+                # 0000 here (see the validator below) while its bare sibling
+                # stays at Table 7.6.1's stated 0001-9999.
+                #
+                # OUR ATTEMPT FAILED — sent the frames above, got error 04,
+                # mechanism unknown. NOT "the machine does not support
+                # per-denom control": this project is 0-for-2 on such claims
+                # and both became the documented reason not to retry.
+                game = cmd.get("game")
+                enable = bool(cmd.get("enable"))
+                denom = cmd.get("denom", 0x00)
+                # game 0000 is ALLOWED here and only here. §16.2 requires the
+                # game number to be 0000 when the multi-denom preamble is in
+                # play, and §2.2.2.3 gives it meaning,
+                # verbatim: "Type M long polls containing a game number of zero
+                # indicate a request for the gaming machine data instead of a
+                # specific game's data." — game 0000 addresses THE GAMING
+                # MACHINE.
+                # Evidence against, stated plainly: Table 7.6.1 gives LP09's
+                # game field as 0001-9999, 0000 is not in that stated range,
+                # and §2.2.2.3 says an out-of-range game number is IGNORED. A
+                # silent reply is a genuinely possible outcome, and extending
+                # a paragraph about METER requests to a WRITE is inference.
+                # The 0000 frame has never been sent — our own validators (in
+                # both layers) forbade it until 2026-07-25, which is why the
+                # most spec-indicated per-denom frame has no wire record.
+                if isinstance(game, bool) or not isinstance(game, int) \
+                        or not 0 <= game <= 9999:
+                    result["ok"] = False
+                    result["result"] = ("rejected: game must be 0..9999 "
+                                        "(0000 = the gaming machine, §16.2)")
+                    return result
+                if isinstance(denom, bool) or not isinstance(denom, int) \
+                        or not 0x00 <= denom <= 0x3F:
+                    result["ok"] = False
+                    result["result"] = ("rejected: denom must be a Table C-4 "
+                                        "code 0x00-0x3F (00 = all denoms)")
+                    return result
+                # A0 census gate. Reads the PUBLISHED census (stats), not
+                # machine_info_read — that dict only ever holds the scheduler's
+                # "at" key, so the old `machine_info_read.get("data")` lookup
+                # was always {} and this gate never fired. Still positive-
+                # knowledge-only: unknown (None) proceeds, an explicit False
+                # stops, exactly as before.
+                mi = stats.get("machineInfo") or {}
+                if mi.get("multiDenom") is False:
+                    result["ok"] = False
+                    result["result"] = ("rejected: machine does not advertise "
+                                        "multi-denom extensions (A0 census) — "
+                                        "it would ignore a B0 poll; use "
+                                        "sas_game_state instead")
+                    return result
+                if not enable and denom == 0x00:
+                    # Table 16.1d, LP09 row: denom 00's default response is
+                    # "Habilitar/deshabilitar el juego para todas las
+                    # denominaciones de jugadores" — ALL of them. A disable
+                    # there is the single most dangerous frame in this feature
+                    # and is exactly the write the owner's rule forbids.
+                    # Enables at denom 00 stay allowed.
+                    result["ok"] = False
+                    result["result"] = (
+                        "rejected: denom 00 means ALL player denominations "
+                        "(Table 16.1d) — a DISABLE there would strand the "
+                        "machine with no active denomination. Name a specific "
+                        "C-4 denomination code to disable.")
+                    return result
+                if not enable:
+                    guard = denom_disable_guard(
+                        poller.transport, args.address, poller.protocol,
+                        game, denom)
+                    result["denomGuard"] = guard
+                    if not guard["allow"]:
+                        result["ok"] = False
+                        result["result"] = (
+                            "refused by the host stranding guard — "
+                            + guard["detail"])
+                        logger.warning("⛔ hub command {}: per-denom disable "
+                                       "REFUSED (game {} @ denom 0x{:02X}): "
+                                       "{}", cmd_id, game, denom,
+                                       guard["detail"])
+                        return result
+                frame = poller.protocol.build_multidenom_poll(
+                    args.address, denom, 0x09,
+                    poller.protocol._int_to_bcd(game, 2)
+                    + (b"\x01" if enable else b"\x00"))
+                reply = poller.transport.transact(frame)
+                dec = poller.protocol.parse_multidenom_response(
+                    args.address, reply)
+                # read back the enabled list AT THE SAME DENOM — the ack is
+                # acceptance, the read-back is truth.
+                applied = None
+                enabled_after = None
+                try:
+                    time.sleep(SAS_POLL_FLOOR)
+                    rb = poller.transport.transact(
+                        poller.protocol.build_multidenom_poll(
+                            args.address, denom, 0x56))
+                    rbd = poller.protocol.parse_multidenom_response(
+                        args.address, rb)
+                    if rbd["ok"] and rbd["baseCommand"] == 0x56 and rbd["data"]:
+                        # same parser the bare-LP09 path uses; the preamble
+                        # hands back exactly the payload LP 0x56 would have
+                        # answered with (§16.1), so it decodes unchanged. Since
+                        # the 2026-07-25 ACK/NACK-scoping fix a ZERO-game
+                        # answer finally lands here as outcome "data" with an
+                        # empty list instead of being swallowed as "ack".
+                        games = [g for g in
+                                 parse_enabled_game_numbers(rbd["data"]) if g]
+                        enabled_after = games
+                        # game 0000 = the gaming machine (§2.2.2.3), not a
+                        # member of the enabled-games list — judge it by
+                        # whether the denomination still offers ANY game.
+                        present = bool(games) if game == 0 else game in games
+                        applied = present == enable
+                except Exception as e:  # noqa - read-back must never mask the write
+                    logger.warning("B0 0x56 read-back failed: {}", e)
+                result["multidenom"] = {
+                    "sent": frame.hex(" "),
+                    "denomCode": f"0x{denom:02X}",
+                    "denomCents": denom_code_cents(denom),
+                    "game": game, "enable": enable,
+                    "outcome": dec["outcome"],
+                    # BOTH the numeric Table 16.1c code and the machine's own
+                    # error text — the operator sees WHAT the machine said, not
+                    # a generic "command failed" that hides the taxonomy.
+                    "errorCode": (f"0x{dec['error']:02X}"
+                                  if dec["error"] is not None else None),
+                    "error": dec["errorText"],
+                    "echoedDenom": dec["denom"],
+                    "raw": dec["raw"].hex(" ") if dec["raw"] else "",
+                    "enabledAfter": enabled_after,
+                }
+                if dec["outcome"] == "error":
+                    # An EXPLICIT machine error is the verdict, full stop. The
+                    # read-back can agree by coincidence — asking to ENABLE a
+                    # game that is already enabled makes (game in games)==enable
+                    # true even though the machine refused — and reporting that
+                    # as success is exactly the false-positive that wasted a day
+                    # elsewhere in this project. Never let a read-back overrule
+                    # an error code.
+                    #
+                    # The wording is the project's reporting contract: what WE
+                    # sent, what the machine answered in ITS OWN Table 16.1c
+                    # words, and "mechanism unknown". Never "the machine does
+                    # not support per-denom control" — that sentence, written
+                    # once before about LP09, became the documented reason not
+                    # to retry and blocked the fix for days.
+                    result["ok"] = False
+                    result["result"] = (
+                        f"OUR ATTEMPT FAILED — sent {frame.hex(' ')}, got "
+                        f"error 0x{dec['error']:02X} "
+                        f"({dec['errorText']}); §16.1 atomicity held, nothing "
+                        "changed; mechanism unknown")
+                elif applied is True:
+                    result["ok"] = True
+                    result["result"] = f"{dec['outcome']} + 0x56 read-back CONFIRMS"
+                elif applied is False:
+                    result["ok"] = False
+                    result["result"] = (
+                        f"OUR ATTEMPT FAILED — sent {frame.hex(' ')}, got "
+                        f"{dec['raw'].hex(' ') if dec['raw'] else '(silence)'} "
+                        f"({dec['outcome']}); the B0+0x56 read-back at denom "
+                        f"0x{denom:02X} shows it unchanged "
+                        f"(enabled={enabled_after}); mechanism unknown")
+                else:
+                    result["ok"] = dec["outcome"] == "ack"
+                    result["result"] = (
+                        f"{dec['outcome']}"
+                        + (f" — {dec['errorText']}" if dec["errorText"] else "")
+                        + " (0x56 read-back inconclusive)")
+                machine_info_read["at"] = 0.0   # force a fresh census
+                logger.info("🎰 hub command {}: B0 LP09 game {} {} @ denom "
+                            "0x{:02X} -> {} | raw={}", cmd_id, game,
+                            "enable" if enable else "disable", denom,
+                            result["result"],
+                            dec["raw"].hex(" ") if dec["raw"] else "(silent)")
+                return result
+            if cmd.get("type") == "multidenom_probe":
+                # READ-ONLY bench probe for the SAS 6.02 §16.1 B0 preamble.
+                # Wraps a multi-denom-AWARE read (default LP 0x56, enabled
+                # game numbers) so we can prove the frame, the CRC and the
+                # response decode against a real machine BEFORE ever sending
+                # a B0-wrapped WRITE. Changes nothing on the cabinet.
+                #
+                # It also settles an old question honestly: "the BB2 does not
+                # support LP09" was concluded from SILENCE on a bare LP09, and
+                # §16.1 says a wrapped poll answers EXPLICITLY — base-command
+                # byte 00 plus a Table 16.1c code, or (for ACK/NACK polls) the
+                # address / address|0x80 in the data field. Silence here means
+                # something quite different from silence there.
+                #
+                # 2026-07-25: the probe now CARRIES the base poll's own data
+                # field ("data", hex). Without it 5 of Table 16.1d's 12 polls
+                # (2F, 6F, FA, B5, and 09) could not be sent correctly at all —
+                # and our data-less B5 attempt drew a Table 16.1c error 04 that
+                # was OUR malformed frame, not the machine's verdict, yet was
+                # nearly recorded as evidence about the machine. The
+                # MULTIDENOM_BASE_MIN_DATA guard in build_multidenom_poll now
+                # refuses to emit such a frame; this is the honest path to
+                # sending the spec's OWN worked example, Table 16.2c
+                #: 01 B0 06 04 2F 03 0000 00 + CRC.
+                base = cmd.get("baseCommand", 0x56)
+                denom = cmd.get("denom", 0x00)
+                data_hex = cmd.get("data")
+                if isinstance(base, bool) or not isinstance(base, int) \
+                        or base not in MULTIDENOM_AWARE_POLLS:
+                    result["ok"] = False
+                    result["result"] = (
+                        f"rejected: base command {base!r} is not multi-denom "
+                        "aware (Table 16.1d) — the machine would answer "
+                        "error 03")
+                    return result
+                if isinstance(denom, bool) or not isinstance(denom, int) \
+                        or not 0x00 <= denom <= 0x3F:
+                    result["ok"] = False
+                    result["result"] = ("rejected: denom must be a Table C-4 "
+                                        "code 0x00-0x3F (00 = default)")
+                    return result
+                probe_data = b""
+                if data_hex is not None:
+                    if not isinstance(data_hex, str) or len(data_hex) > 128:
+                        result["ok"] = False
+                        result["result"] = ("rejected: data must be a hex "
+                                            "string of at most 32 bytes")
+                        return result
+                    try:
+                        probe_data = bytes.fromhex(data_hex.replace(" ", ""))
+                    except ValueError:
+                        result["ok"] = False
+                        result["result"] = (f"rejected: data {data_hex!r} is "
+                                            "not valid hex")
+                        return result
+                    if len(probe_data) > 32:
+                        result["ok"] = False
+                        result["result"] = ("rejected: data exceeds 32 bytes")
+                        return result
+                need = MULTIDENOM_BASE_MIN_DATA.get(base, 0)
+                if len(probe_data) < need:
+                    # REFUSE rather than emit a frame whose refusal we could
+                    # not interpret. This is the 2026-07-25 B5 lesson encoded.
+                    result["ok"] = False
+                    result["result"] = (
+                        f"rejected: base 0x{base:02X} needs at least {need} "
+                        f"data byte(s) behind the preamble, got "
+                        f"{len(probe_data)} — sending it short would be a "
+                        "MALFORMED frame and any error the machine returned "
+                        "would be OUR bug, not its verdict")
+                    return result
+                mi = stats.get("machineInfo") or {}
+                supported = mi.get("multiDenom")
+                frame = poller.protocol.build_multidenom_poll(
+                    args.address, denom, base, probe_data)
+                reply = poller.transport.transact(frame)
+                dec = poller.protocol.parse_multidenom_response(
+                    args.address, reply)
+                result["ok"] = dec["outcome"] in ("ack", "data")
+                result["multidenom"] = {
+                    "sent": frame.hex(" "),
+                    "baseCommand": f"0x{base:02X}",
+                    "denomCode": f"0x{denom:02X}",
+                    "denomCents": denom_code_cents(denom),
+                    "advertised": supported,
+                    "outcome": dec["outcome"],
+                    "errorCode": (f"0x{dec['error']:02X}"
+                                  if dec["error"] is not None else None),
+                    "error": dec["errorText"],
+                    "echoedDenom": dec["denom"],
+                    "echoedBase": (f"0x{dec['baseCommand']:02X}"
+                                   if dec["baseCommand"] is not None else None),
+                    "data": dec["data"].hex(" ") if dec["data"] else "",
+                    "raw": dec["raw"].hex(" ") if dec["raw"] else "",
+                }
+                result["result"] = (
+                    f"{dec['outcome']}"
+                    + (f" — {dec['errorText']}" if dec["errorText"] else "")
+                    + (" (machine does NOT advertise multi-denom extensions "
+                       "in its A0 census — a silent ignore is spec-correct)"
+                       if supported is False else ""))
+                logger.info("🎰 hub command {}: B0 probe base=0x{:02X} "
+                            "denom=0x{:02X} data={} | sent={} -> {} | raw={}",
+                            cmd_id, base, denom,
+                            probe_data.hex(" ") or "(none)", frame.hex(" "),
+                            dec["outcome"],
+                            dec["raw"].hex(" ") if dec["raw"] else "(silent)")
+                return result
+            if cmd.get("type") == "sas_read_player_denoms":
+                # READ-ONLY. LP B1 (§16.3, Table 16.3) = the denomination the
+                # PLAYER currently has selected; LP B2 (§16.4, Table 16.4) =
+                # the set currently available to the player. Both are bare
+                # type-R polls (Appendix B Table B-1: "B1 R 16-6", "B2 R 16-6").
+                #
+                # ⚠️ NEITHER IS THE 0x1F DENOMINATION. 0x1F byte 8 is the
+                # ACCOUNTING denomination — the unit every credit meter is
+                # reported in, fixed at RAM clear, unmoved by enabling or
+                # disabling play denominations (§16). On
+                # the BB2 both currently read code 01 (1c), which is precisely
+                # how a conflation stays invisible. They are published under
+                # separate keys and must stay that way.
+                #
+                # This replaces a 31-poll B0+56 inference with the machine's
+                # own one-poll answer, and it is the evidence the per-denom
+                # DISABLE guard prefers. NEVER been on a wire as of 2026-07-25:
+                # zero B1/B2 frames have ever left this host, so an unanswered
+                # poll is a REAL finding — report it as "unanswered", never as
+                # "unsupported" (§4.4 makes those indistinguishable).
+                b1_frame = build_meter_poll(args.address, 0xB1)
+                time.sleep(SAS_POLL_FLOOR)
+                r1 = poller.transport.transact(b1_frame)
+                out = {"b1Sent": b1_frame.hex(" "),
+                       "b1Raw": r1.hex(" ") if r1 else ""}
+                current = None
+                if r1:
+                    p1 = poller.protocol.parse_packet(r1)
+                    if p1 and p1.address == args.address and p1.command == 0xB1:
+                        try:
+                            current = parse_current_player_denom(p1.data)
+                        except ValueError as e:
+                            out["b1Detail"] = f"parse failed: {e}"
+                    else:
+                        out["b1Detail"] = "reply is not a B1 frame"
+                else:
+                    out["b1Detail"] = "unanswered (silence)"
+                codes, b2_detail = read_enabled_player_denoms(
+                    poller.transport, args.address, poller.protocol)
+                out["b2Detail"] = b2_detail
+                out["currentPlayerDenom"] = current
+                out["currentPlayerDenomCents"] = denom_code_cents(current)
+                out["playerDenoms"] = codes
+                out["playerDenomsCents"] = ([denom_code_cents(c)
+                                             for c in codes]
+                                            if codes is not None else None)
+                if current is not None or codes is not None:
+                    # copy-then-swap: the report thread may be serializing the
+                    # published dict (same law as the 0x56 read-back path).
+                    mi2 = dict(stats.get("machineInfo") or {})
+                    if current is not None:
+                        mi2["currentPlayerDenom"] = current
+                    if codes is not None:
+                        mi2["playerDenoms"] = codes
+                    mi2["denomsAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    stats["machineInfo"] = mi2
+                result["ok"] = current is not None or codes is not None
+                result["playerDenoms"] = out
+                result["result"] = (
+                    f"B1 -> {'0x%02X' % current if current is not None else 'unanswered'}"
+                    f"; B2 -> "
+                    + (", ".join(f"0x{c:02X}" for c in codes) if codes
+                       else ("none enabled" if codes == [] else "unanswered")))
+                logger.info("🎰 hub command {}: player denoms | B1={} B2={} "
+                            "({})", cmd_id, out["b1Raw"] or "(silent)",
+                            codes, b2_detail)
+                return result
+            if cmd.get("type") == "sas_read_game_info":
+                # READ-ONLY. Bare LP B5 (§7.23, Tables 7.23a/b) — the ONLY
+                # human-readable game name and paytable name anywhere in SAS,
+                # plus a 2-byte-BCD max bet (larger values than 1F/53 can
+                # carry), the SAS progressive group and a 32-bit enabled-level
+                # bitmap.
+                #
+                # game 0000 = the gaming machine, and uniquely it CONSIDERS
+                # DISABLED GAMES too — the one poll that
+                # can tell us what the BB2's 12 "implemented" games (LP51) are
+                # when LP56 only ever names game 12. If they turn out to be
+                # paytable/denomination configurations of one title (§7.6.3,
+                #, requires multi-game extensions for a
+                # machine with several operator paytables "incluso si solo un
+                # juego puede estar disponible para el jugador a la vez"), then
+                # per-denom control may be a BARE LP09 to a different game
+                # number and the whole B0 error-04 line is a detour.
+                # NEVER SENT as of 2026-07-25 — bare or wrapped.
+                game = cmd.get("game", 0)
+                if isinstance(game, bool) or not isinstance(game, int) \
+                        or not 0 <= game <= 9999:
+                    result["ok"] = False
+                    result["result"] = ("rejected: game must be 0..9999 "
+                                        "(0 = the gaming machine)")
+                    return result
+                time.sleep(SAS_POLL_FLOOR)
+                frame = build_extended_game_info_poll(args.address, game)
+                reply = poller.transport.transact(frame)
+                info = {"sent": frame.hex(" "), "game": game,
+                        "raw": reply.hex(" ") if reply else ""}
+                pkt = poller.protocol.parse_packet(reply) if reply else None
+                if reply and len(reply) == 2 and reply[1] == 0x00:
+                    result["ok"] = False
+                    result["result"] = "busy (§4.1 [addr][00]) — retry"
+                elif pkt and pkt.address == args.address \
+                        and pkt.command == 0xB5:
+                    try:
+                        gi = parse_extended_game_info(pkt.data)
+                        info.update(
+                            gameNumber=gi.game_number, maxBet=gi.max_bet,
+                            progressiveGroup=gi.progressive_group,
+                            progressiveLevels=gi.progressive_levels,
+                            progressiveLevelsRaw=(
+                                gi.progressive_levels_raw.hex(" ")),
+                            gameName=gi.game_name,
+                            paytableName=gi.paytable_name,
+                            wagerCategories=gi.wager_categories)
+                        result["ok"] = True
+                        result["result"] = (
+                            f"B5 game {gi.game_number}: "
+                            f"name={gi.game_name!r} "
+                            f"paytable={gi.paytable_name!r} "
+                            f"maxBet={gi.max_bet} "
+                            f"wagerCategories={gi.wager_categories}")
+                    except ValueError as e:
+                        result["ok"] = False
+                        result["result"] = f"B5 parse failed: {e}"
+                else:
+                    # §4.4: an unsupported long poll is IGNORED, never NACKed,
+                    # so silence cannot be distinguished from "not
+                    # implemented". Say UNANSWERED and nothing more.
+                    result["ok"] = False
+                    result["result"] = (
+                        f"OUR ATTEMPT FAILED — sent {frame.hex(' ')}, got "
+                        f"{reply.hex(' ') if reply else '(silence)'}; "
+                        "unanswered, mechanism unknown")
+                result["gameInfo"] = info
+                logger.info("🎰 hub command {}: bare B5 game {} | sent={} "
+                            "raw={} -> {}", cmd_id, game, frame.hex(" "),
+                            reply.hex(" ") if reply else "(silent)",
+                            result["result"])
+                return result
             if cmd.get("type") == "set_validation_id":
                 # Manual counterpart to the auto-seed off exception 0x3F: force
                 # the enhanced-validation ID seed (0x4C) so a tilted (unseeded)
@@ -1501,6 +2331,26 @@ def main():
                 logger.info("🎟️ hub command {}: set validation id (sid={}) "
                             "-> {}", cmd_id, tito_host.system_id,
                             result["result"])
+                return result
+            if cmd.get("type") == "read_machine_info":
+                # Hub/operator-invoked machine-info + games-census re-read
+                # (the GR-30 refresh-button class — a button, never a
+                # timer; also enqueued hub-side after an accepted G2S
+                # denom write on a linked cabinet, where SAS is the denom
+                # authority and must not stay stale while the G2S leg
+                # changes the menu). NO wire traffic here: just re-arm the
+                # paced census in stop_or_heartbeat, which does the
+                # SAS_POLL_FLOOR-paced work in this same between-polls
+                # window; the refreshed machineInfo rides later reports.
+                machine_info_read["at"] = 0.0
+                result["ok"] = True
+                result["outcome"] = "rearmed"
+                result["detail"] = ("machine-info + games census re-read "
+                                    "armed; refreshed data rides the next "
+                                    "reports")
+                result["result"] = "ack"
+                logger.info("📖 hub command {}: machine-info/census re-read "
+                            "armed", cmd_id)
                 return result
             if cmd.get("type") != "legacy_bonus":
                 result["result"] = "rejected: unknown type"
@@ -1742,6 +2592,170 @@ def main():
                 }
             except Exception as e:                            # noqa: BLE001
                 logger.warning("AFT status read failed (ignored): {}", e)
+        if not poller.state.online:
+            machine_info_read["at"] = 0.0       # re-read after a reconnect
+        # Machine-info + games-census read (identity 0x1F + A0/51/56 census).
+        # A SAS machine reports its ACCOUNTING DENOMINATION on the 0x1F frame;
+        # the satellite NEVER decodes code->cents — that table (SAS spec C-4)
+        # is bench-gated, so a guess would swap a visible assumption for a
+        # silent misread. Gated ONLINE and only reachable ENABLED (the park
+        # loop holds first), so a dark/parked machine stays wire-silent.
+        # LIFECYCLE ("at" = next-attempt time, None = idle): armed at bringup;
+        # re-armed by an offline drop (above), an LP09 toggle, a 0x3C/0x8C
+        # machine event (on_typed_event, settle-delayed), or the hub's
+        # read_machine_info command — event/operator-driven, never a
+        # free-running refresh timer (dormancy law). A FAILED attempt retries
+        # on MACHINE_INFO_RETRY_SEC (busy frame: MACHINE_INFO_BUSY_SEC)
+        # instead of latching — the old one-shot latched done BEFORE the try,
+        # so a single boot-busy/short/CRC-failed 0x1F meant a whole online
+        # session with no machineInfo, no Games button, and no census at all.
+        if reporter is not None and poller.state.online \
+                and machine_info_read["at"] is not None \
+                and now >= machine_info_read["at"]:
+            # the retry is pre-set BEFORE the wire try: no outcome (data,
+            # silence, malformed, transport error) may hot-loop the wire
+            machine_info_read["at"] = now + MACHINE_INFO_RETRY_SEC
+            try:
+                # Carry PREVIOUS values forward: a silent single on a re-read
+                # must NOT wipe a known field (that would yank the UI's 🎲
+                # Games button right after a successful toggle). Copy, then
+                # overwrite only fields with fresh data, publish once at the
+                # end (never mutate the published dict — the report thread
+                # may be serializing it).
+                mi = dict(stats.get("machineInfo") or {})
+                fresh = set()
+                # Frame 1 of the census (1F, then A0/51/56 and — on a
+                # multi-denom machine — B1/B2) — paced like the other
+                # three: SAS forbids polling one machine faster than 200ms,
+                # and this fires milliseconds after a general poll. An
+                # over-polled machine answers silence, which here reads as
+                # "unsupported" (the LP09 read-back's lesson).
+                time.sleep(SAS_POLL_FLOOR)
+                resp = port.transact(build_meter_poll(args.address, 0x1F))
+                if resp and len(resp) == 2 and resp[1] == 0x00:
+                    # §2.2 busy frame: awake but can't service the read yet
+                    # (the boot-busy chirp window rides the first online
+                    # flip — "online" precedes readiness). NOT a consumed
+                    # attempt: retry soon, and skip the census singles too
+                    # (a busy machine reads all-silent — 600ms of pacing to
+                    # learn nothing).
+                    machine_info_read["at"] = now + MACHINE_INFO_BUSY_SEC
+                else:
+                    pkt = protocol.parse_packet(resp) if resp else None
+                    if pkt and pkt.address == args.address \
+                            and pkt.command == 0x1F:
+                        gc = parse_machine_id(pkt.data)
+                        mi.update(
+                            denomCode=gc.denomination_code,  # RAW, undecoded
+                            gameId=gc.game_id or None,
+                            paytableId=gc.paytable_id or None,
+                            rtpRaw=gc.rtp_raw or None,
+                            maxBet=gc.max_bet,
+                            # identity staleness stamp — only a PARSED 0x1F
+                            # earns one, so carried-forward data can never
+                            # render as present-tense truth
+                            readAt=time.strftime("%Y-%m-%dT%H:%M:%S"))
+                        fresh.add("identity")
+                        machine_info_read["at"] = None  # idle until re-armed
+                        logger.info("📖 machine-info: denomCode={} game={} "
+                                    "paytable={} rtp={} maxBet={} (RAW — hub "
+                                    "surfaces; C-4 decode is bench-gated)",
+                                    gc.denomination_code, gc.game_id,
+                                    gc.paytable_id, gc.rtp_raw, gc.max_bet)
+                    # Games census — three more paced best-effort singles,
+                    # run UNCONDITIONALLY: their machine support is
+                    # independent of 0x1F, so a silent/short/CRC-failed
+                    # identity read must not suppress the census (the old
+                    # nesting did exactly that — one bad 0x1F = no Games
+                    # button and no denomSuggest all session). §4.4: an
+                    # unsupported poll is IGNORED, never NACKed, so silence
+                    # just leaves the prior value in place.
+                    #   0xA0 game-0000 = enabled features; Features2 bit 7
+                    #     is the multi-denom-extensions gate the FUTURE
+                    #     per-denom control (B0 preamble, bytes off-disk)
+                    #     will be gated on. NOT a bare type-R — Table 7.14a
+                    #     wants [addr][A0][game# BCD][CRC].
+                    #   0x51 = total games implemented (2-BCD count).
+                    #   0x56 = game numbers enabled AT THE CURRENT DENOM
+                    #     (the LP09 write's read-back).
+                    def _census(cmd_b, frame, fold):
+                        # THE PARK PROMISE outranks the census: zero frames
+                        # leave the port while parked. The park loop can only
+                        # hold BEFORE stop_or_heartbeat's body, so a census
+                        # already in flight when the operator parks would
+                        # otherwise keep polling for the rest of its paced
+                        # sequence — and the sequence grew from four frames to
+                        # six when B1/B2 joined it (2026-07-25). Re-check the
+                        # flag between frames; an aborted census just leaves
+                        # "at" on its retry and carries prior values forward.
+                        if not sas_enabled.is_set():
+                            return
+                        try:
+                            time.sleep(SAS_POLL_FLOOR)
+                            r = port.transact(frame)
+                            p = protocol.parse_packet(r) if r else None
+                            if p and p.address == args.address \
+                                    and p.command == cmd_b:
+                                fold(p.data)
+                                fresh.add("census")
+                        except Exception as ce:       # noqa: BLE001
+                            logger.debug("census {:02X} skipped: {}",
+                                         cmd_b, ce)
+                    _census(0xA0, protocol.build_packet(
+                                args.address, 0xA0, b"\x00\x00"),
+                            lambda d: mi.__setitem__(
+                                "multiDenom",
+                                parse_enabled_features(d)
+                                .multi_denom_extensions))
+                    _census(0x51, build_meter_poll(args.address, 0x51),
+                            lambda d: mi.__setitem__(
+                                "totalGames", parse_total_games(d)))
+                    _census(0x56, build_meter_poll(args.address, 0x56),
+                            lambda d: mi.__setitem__(
+                                "enabledGames",
+                                [g for g in parse_enabled_game_numbers(d)
+                                 if g]))
+                    #   0xB1/0xB2 = the PLAYER denominations (§16.3 / §16.4) —
+                    #     current selection and the enabled set. Kept in keys
+                    #     of their own: denomCode above is the ACCOUNTING
+                    #     denomination from 0x1F and the two must never be
+                    #     conflated (on the BB2 they coincidentally both read
+                    #     01 today, which is exactly how that hides). Skipped
+                    #     only on a machine that positively says it has no
+                    #     multi-denom extensions — such a machine IGNORES both
+                    #     polls (§16.3/§16.4), so asking would burn 400 ms of
+                    #     pacing to learn nothing. Exception 0x3C names B2 among
+                    #     the polls an operator config change invalidates
+                    #, and 0x3C already re-arms this
+                    #     whole census — so B1/B2 refresh with it for free.
+                    if mi.get("multiDenom") is not False:
+                        _census(0xB1, build_meter_poll(args.address, 0xB1),
+                                lambda d: mi.__setitem__(
+                                    "currentPlayerDenom",
+                                    parse_current_player_denom(d)))
+                        _census(0xB2, build_meter_poll(args.address, 0xB2),
+                                lambda d: mi.__setitem__(
+                                    "playerDenoms",
+                                    parse_enabled_player_denoms(d)))
+                    if "census" in fresh:
+                        # separate stamp from readAt on purpose: the singles
+                        # carry prev forward on silence, so only a parsed
+                        # frame proves the GAMES data is current
+                        mi["censusAt"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    if fresh:
+                        stats["machineInfo"] = mi         # publish once
+                        logger.info("📖 games census: multiDenom={} total={} "
+                                    "enabled={} playerDenoms={} "
+                                    "currentPlayerDenom={} (accounting denom "
+                                    "is denomCode={}, a DIFFERENT thing)",
+                                    mi.get("multiDenom"),
+                                    mi.get("totalGames"),
+                                    mi.get("enabledGames"),
+                                    mi.get("playerDenoms"),
+                                    mi.get("currentPlayerDenom"),
+                                    mi.get("denomCode"))
+            except Exception as e:                      # noqa: BLE001
+                logger.warning("machine-info read failed (ignored): {}", e)
         # C2 ticket-header push (poll thread — the only transport toucher).
         # Gated machine-ONLINE, and only reachable while ENABLED (the park
         # loop above holds first), so a parked or dark machine defers with
