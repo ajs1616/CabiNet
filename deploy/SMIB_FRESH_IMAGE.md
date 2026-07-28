@@ -4,7 +4,7 @@ Turn a blank Raspberry Pi into a CabiNet SMIB (satellite by a slot machine).
 Two SMIB flavors, same image, same scripts:
 
 - **SAS SMIB** — serial-wired to a SAS machine (WMS Bluebird, etc.). Needs a PL011
-  UART + an RS-232 level shifter. `deploy/zero2w_sas_setup.sh`.
+  UART + an RS-232 level shifter. `deploy/smib_setup.sh`.
 - **Companion** — RFID-only, no serial (the slot's own glass is the UI, e.g. the IGT
   AVP). Needs a PN532 reader. `Companion/` + `deploy/cabinet-companion.service`.
 
@@ -82,7 +82,7 @@ ssh-copy-id <user>@<host>.local
 From the **dev box**, in the repo root:
 
 ```bash
-deploy/zero2w_sas_setup.sh <you>@<host>.local --address 1
+deploy/smib_setup.sh <you>@<host>.local --address 1
 ```
 
 It is idempotent and does, over SSH:

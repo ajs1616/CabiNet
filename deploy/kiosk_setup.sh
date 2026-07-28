@@ -39,7 +39,7 @@ fi
 
 # WHOSE Pi is this? The shipped units carry a PLACEHOLDER account (`owner`) and
 # something has to replace it with the real one — companion_setup.sh and
-# zero2w_sas_setup.sh have always done this rewrite; this script never did, so
+# smib_setup.sh have always done this rewrite; this script never did, so
 # both units landed verbatim and systemd answered `status=217/USER — Failed to
 # determine user credentials`, restart-looping forever on every Pi whose login
 # was not literally "owner". Nobody's login is "owner".

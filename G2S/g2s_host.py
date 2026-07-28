@@ -19093,7 +19093,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             self._send(200 if pub else 404, json.dumps(
                 {"publicKey": pub,
                  "hint": "append to ~/.ssh/authorized_keys on each satellite; "
-                         "deploy/zero2w_sas_setup.sh does it for you"}),
+                         "deploy/smib_setup.sh does it for you"}),
                 "application/json", soap=False)
         elif path.startswith("/api/accounts"):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.

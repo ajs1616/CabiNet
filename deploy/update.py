@@ -457,6 +457,50 @@ def online_machines(status):
                   if isinstance(v, dict) and v.get("commsState") == "onLine")
 
 
+def find_companions(status):
+    """Companion (RFID reader) daemons self-report too — the hub's status
+    carries each one's source IP. They are part of the fleet: a stale
+    Companion/ tree is a broken tap path, and a broken tap path is a broken
+    floor. A combined SMIB+reader Pi appears in BOTH this list and
+    find_satellites' — its SAS tree and its Companion tree each ship."""
+    out, seen = [], set()
+    for cid, ent in (status.get("companions") or {}).items():
+        peer = str((ent or {}).get("peer") or "").strip()
+        if not peer or peer in seen:
+            continue
+        seen.add(peer)
+        out.append({"companionId": cid, "peer": peer,
+                    "fresh": not (ent or {}).get("stale")})
+    return out
+
+
+def sat_companion_dir(peer, key, user=None):
+    """The companion's install dir, read from ITS cabinet-companion unit —
+    never guessed. Returns (dir, None) or (None, why): companions update
+    best-effort, LOUDLY, because a powered-off or never-keyed reader must not
+    hold the money-path update hostage the way a SAS satellite (rightly)
+    does."""
+    try:
+        rc, out = sat_ssh(peer, key,
+                          "grep -h '^WorkingDirectory=' "
+                          "/etc/systemd/system/cabinet-companion.service "
+                          "2>/dev/null || true",
+                          check=False, user=user)
+    except Exception as e:      # TimeoutExpired: a wedged box, not a dead one
+        return None, "hung while probing (%s)" % e
+    if rc != 0:
+        return None, ("unreachable — is the hub's key authorized there? "
+                      "re-run deploy/companion_setup.sh from a current clone")
+    wd = ""
+    for line in out.splitlines():
+        if line.startswith("WorkingDirectory="):
+            wd = line.split("=", 1)[1].strip()
+    if not wd:
+        return None, ("no cabinet-companion unit (pre-rename install?) — "
+                      "re-run deploy/companion_setup.sh from a current clone")
+    return wd, None
+
+
 #: Login used on the satellites. NEVER hardcode a person's username in shipped
 #: code — this said "aj" and would simply have failed for everyone else. The
 #: hub's own login is the right default (the same operator builds both boxes,
@@ -832,7 +876,7 @@ def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
             say("   ⚠️  hub not answering at %s (%s)"
                 % (hub_url, status["__error__"]))
             say("      continuing, but the floor cannot be verified afterwards")
-            return status, [], []
+            return status, [], [], []
         # Satellites are discovered THROUGH the hub. Updating with the hub
         # down would leave every satellite on old SAS code and report success
         # — the quiet hub-new/satellite-old split this tool exists to prevent,
@@ -855,6 +899,7 @@ def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
 
     sats = find_satellites(status)
     machines = online_machines(status)
+    comps = find_companions(status)
     say("   tournament : %s" % (phase or "idle"))
     say("   machines   : %s" % (", ".join(machines) or "none joined"))
     for s in sats:
@@ -862,7 +907,11 @@ def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
             % (s["smibId"], s["peer"], "online" if s["online"] else "OFFLINE"))
     if not sats:
         say("   satellite  : none reporting (nothing to push)")
-    return status, sats, machines
+    for c in comps:
+        say("   companion  : %-14s %-15s %s"
+            % (c["companionId"], c["peer"],
+               "reporting" if c["fresh"] else "STALE"))
+    return status, sats, machines, comps
 
 
 def incoming(root):
@@ -1072,7 +1121,50 @@ def push_satellites(root, sats, key, dry, touched=None):
         run(cmd, timeout=600)
 
 
-def restart_fleet(sats, key, dry, touched=None):
+def push_companions(root, comps, key, dry, touched=None):
+    """Rsync Companion/ to every reporting reader Pi. Best-effort PER BOX and
+    loud about every skip — a reader that cannot be reached is NAMED, never
+    silently left behind, but it also never aborts the hub+machine update.
+    Returns the entries actually pushed; rollback pushes the old tree back to
+    exactly these."""
+    if not comps:
+        return []
+    step("Pushing the Companion tree to %d reader(s)" % len(comps))
+    src = os.path.join(root, "Companion") + "/"
+    done = []
+    for c in comps:
+        u = sat_user(c)   # companions don't self-report a login (yet) —
+        #                   sat_user falls back to --ssh-user / the hub's own
+        cdir, why = sat_companion_dir(c["peer"], key, user=u)
+        if not cdir:
+            say("   ⚠️  %s (%s) NOT updated — %s"
+                % (c["companionId"], c["peer"], why))
+            continue
+        say("   %s -> %s:%s" % (c["companionId"], c["peer"], cdir))
+        cmd = ["rsync", "-a", "--no-owner", "--no-group",
+               "-e", "ssh -i %s -o BatchMode=yes "
+                     "-o StrictHostKeyChecking=accept-new" % key]
+        for ex in SAT_EXCLUDES:
+            cmd += ["--exclude", ex]
+        if dry:
+            cmd.append("--dry-run")
+        cmd += [src, "%s@%s:%s/" % (u, c["peer"], cdir.rstrip("/"))]
+        if touched is not None and not dry:
+            touched["pushed"] = True
+        try:
+            rc, out = run(cmd, timeout=600, check=False)
+        except Exception as e:  # TimeoutExpired etc. — best-effort means it
+            rc, out = 1, str(e)  # never escalates a reader into a rollback
+        if rc != 0:
+            say("   ⚠️  %s (%s) NOT updated — rsync failed: %s"
+                % (c["companionId"], c["peer"],
+                   ((out or "").strip().splitlines() or ["?"])[-1][:120]))
+            continue
+        done.append(dict(c, dir=cdir, user=u))
+    return done
+
+
+def restart_fleet(sats, comps, key, dry, touched=None):
     step("Restarting services")
     if dry:
         say("   (dry run — nothing restarted)")
@@ -1088,6 +1180,21 @@ def restart_fleet(sats, key, dry, touched=None):
             touched["sat_restarted"] = True
         sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
                 user=sat_user(s))
+    for c in comps:
+        say("   companion %s" % c["companionId"])
+        if touched is not None:
+            touched["sat_restarted"] = True
+        try:
+            rc, _ = sat_ssh(c["peer"], key,
+                            "sudo systemctl restart cabinet-companion",
+                            check=False, user=c.get("user") or sat_user(c))
+        except Exception:       # TimeoutExpired — a hung reader stays soft
+            rc = 1
+        if rc != 0:
+            # best-effort, loudly: the new tree is already on its disk and
+            # loads on the service's next start
+            say("   ⚠️  companion %s restart failed — new code is on disk "
+                "and loads on its next service start" % c["companionId"])
     say("   hub cabinet-g2s")
     # THIS is the moment the new code runs on the hub: it opens hub.db and
     # _migrate() runs. Only from here does rollback need a data restore.
@@ -1096,23 +1203,29 @@ def restart_fleet(sats, key, dry, touched=None):
     run(["sudo", "systemctl", "restart", "cabinet-g2s"], timeout=120)
 
 
-def verify(hub_url, sats, machines, dry):
+def verify(hub_url, sats, machines, comps, dry):
     step("Verifying the floor came back")
     if dry:
         say("   (dry run — nothing to verify)")
         return True
     deadline = time.time() + REJOIN_TIMEOUT
     want_m, want_s = set(machines), {s["smibId"] for s in sats if s["online"]}
+    # readers that were reporting before the update must report again after
+    want_c = {c["companionId"] for c in comps if c.get("fresh")}
     last = ""
     while time.time() < deadline:
         st = hub_status(hub_url)
         if "__error__" not in st:
             back_m = set(online_machines(st))
             back_s = {x["smibId"] for x in find_satellites(st) if x["online"]}
-            last = ("machines %d/%d back, satellites %d/%d online"
+            back_c = {x["companionId"] for x in find_companions(st)
+                      if x.get("fresh")}
+            last = ("machines %d/%d back, satellites %d/%d online, "
+                    "readers %d/%d reporting"
                     % (len(back_m & want_m), len(want_m),
-                       len(back_s & want_s), len(want_s)))
-            if want_m <= back_m and want_s <= back_s:
+                       len(back_s & want_s), len(want_s),
+                       len(back_c & want_c), len(want_c)))
+            if want_m <= back_m and want_s <= back_s and want_c <= back_c:
                 say("   ✅ %s" % last)
                 return True
         time.sleep(6)
@@ -1120,7 +1233,7 @@ def verify(hub_url, sats, machines, dry):
     return False
 
 
-def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
+def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
              touched=None):
     """Undo exactly as much as was actually done — no more, no less.
 
@@ -1215,10 +1328,11 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
 
         if pushed:
             push_satellites(root, sats, key, dry=False)
+            push_companions(root, comps, key, dry=False)
         if restarted:
-            restart_fleet(sats, key, dry=False)
+            restart_fleet(sats, comps, key, dry=False)
             hub_stopped = False
-            ok = verify(hub_url, sats, machines, dry=False)
+            ok = verify(hub_url, sats, machines, comps, dry=False)
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted, but the floor did not "
                    "fully return — check `journalctl -u cabinet-g2s -n 50`",
@@ -1232,7 +1346,15 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
                 say("   satellite %s" % s["smibId"])
                 sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
                         user=sat_user(s))
-            ok = verify(hub_url, sats, machines, dry=False)
+            for c in comps:
+                say("   companion %s" % c["companionId"])
+                try:
+                    sat_ssh(c["peer"], key,
+                            "sudo systemctl restart cabinet-companion",
+                            check=False, user=sat_user(c))
+                except Exception:   # hung reader must not abort a rollback
+                    pass
+            ok = verify(hub_url, sats, machines, comps, dry=False)
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted the satellites, but the "
                    "floor did not fully return — check the satellite journals",
@@ -1396,13 +1518,14 @@ def main():
         git(["fetch", "--prune"], root, check=False, quiet=True)
         self_update(root, sys.argv)
 
-    status, sats, machines = preflight(root, a.hub_url, a.allow_dirty,
-                                       a.dry_run, a.no_satellites)
+    status, sats, machines, comps = preflight(root, a.hub_url, a.allow_dirty,
+                                              a.dry_run, a.no_satellites)
     if a.no_satellites:
-        say("\n   ⚠️  --no-satellites: they will keep running OLD SAS code "
-            "against your new hub. Only do this if you have none.")
-        sats = []
-    if sats and not os.path.isfile(a.ssh_key):
+        say("\n   ⚠️  --no-satellites: satellites AND companions will keep "
+            "running OLD code against your new hub. Only do this if you "
+            "have none.")
+        sats, comps = [], []
+    if (sats or comps) and not os.path.isfile(a.ssh_key):
         # The hub mints ~/.ssh/smib itself at startup and satellites authorize
         # it during setup, so this is the "upgraded from an older build" case.
         # Mint it here rather than dead-ending, and say exactly what to run.
@@ -1477,6 +1600,7 @@ def main():
         for l in diff.strip().splitlines():
             say("   " + l)
         push_satellites(root, sats, a.ssh_key, dry=True)
+        push_companions(root, comps, a.ssh_key, dry=True)
         say("\n✅ Dry run complete — nothing was changed.")
         return 0
 
@@ -1498,8 +1622,11 @@ def main():
     try:
         gates(root, venv_python(root))
         push_satellites(root, sats, a.ssh_key, dry=False, touched=touched)
-        restart_fleet(sats, a.ssh_key, dry=False, touched=touched)
-        if not verify(a.hub_url, sats, machines, dry=False):
+        pushed_comps = push_companions(root, comps, a.ssh_key, dry=False,
+                                       touched=touched)
+        restart_fleet(sats, pushed_comps, a.ssh_key, dry=False,
+                      touched=touched)
+        if not verify(a.hub_url, sats, machines, comps, dry=False):
             raise Fail("the floor did not come back")
         # The host has now opened hub.db, so any migration has already run.
         # Prove the database survived it before calling this a success.
@@ -1517,7 +1644,7 @@ def main():
             say("\n   schema unchanged (v%s)" % (after_schema or "?"))
     except Fail as e:
         say("\n❌ %s" % e)
-        rollback(root, old, sats, a.ssh_key, a.hub_url, machines, snapshot,
+        rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
                  touched=touched)
         return 2
     except KeyboardInterrupt:
@@ -1526,12 +1653,12 @@ def main():
         # hub is fast-forwarded and satellites may already carry new code.
         say("\n\n❌ interrupted mid-update — rolling back rather than leaving "
             "the fleet split")
-        rollback(root, old, sats, a.ssh_key, a.hub_url, machines, snapshot,
+        rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
                  touched=touched)
         return 130
     except Exception as e:
         say("\n❌ unexpected error: %r" % (e,))
-        rollback(root, old, sats, a.ssh_key, a.hub_url, machines, snapshot,
+        rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
                  touched=touched)
         return 2
 

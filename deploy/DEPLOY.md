@@ -234,7 +234,7 @@ Plug the machine's Ethernet into the slot switch.
 ### SAS machines (the SMIB path)
 
 Wire a SAS SMIB Pi (flash it per [`deploy/SMIB_FRESH_IMAGE.md`](SMIB_FRESH_IMAGE.md),
-or run `deploy/zero2w_sas_setup.sh`) between the machine's SAS port and the
+or run `deploy/smib_setup.sh`) between the machine's SAS port and the
 switch. Then set these in the operator menu
 — **these are the one-shot fields**:
 
@@ -373,7 +373,7 @@ the preview before you confirm, and the snapshot has your copy.
 The updater pushes the SAS tree to every satellite Pi itself, so the **hub**
 needs an SSH key to them. **On a current build this is automatic** — the hub
 mints `~/.ssh/smib` on startup and publishes the public half at `/api/hubkey`,
-and `zero2w_sas_setup.sh` authorizes it while building each satellite. Nothing
+and `smib_setup.sh` authorizes it while building each satellite. Nothing
 to do.
 
 Only if you are adopting an OLDER deployment whose satellites were built before
@@ -385,7 +385,7 @@ ssh-copy-id -i ~/.ssh/smib.pub <you>@192.168.50.102  # once per satellite
 ssh -i ~/.ssh/smib <you>@192.168.50.102 hostname     # must print its name
 ```
 
-Or just re-run `deploy/zero2w_sas_setup.sh` against that satellite — it does the
+Or just re-run `deploy/smib_setup.sh` against that satellite — it does the
 same thing and brings its code current at the same time.
 
 Satellite IPs come from the hub itself — they self-report. If you are not sure:
@@ -434,12 +434,16 @@ python3 deploy/update.py --dry-run    # see exactly what would happen
 python3 deploy/update.py              # do it, after confirming
 ```
 
-It updates the **whole fleet** — hub *and* every satellite Pi — because they
-are not independent. `SAS/core/*.py` has to be identical on both, and a hub-only
-`git pull` breaks a satellite in one of two ways: loudly, with an `ImportError`
-crash-loop, or **silently**, where the service reports `active`, logs nothing at
-all, and the SAS link is simply dead. The silent one is why this script exists
-instead of a line in these docs telling you to `git pull`.
+It updates the **whole fleet** — hub, every SAS satellite Pi, *and* every
+companion reader Pi — because they are not independent. `SAS/core/*.py` has to
+be identical on both, and a hub-only `git pull` breaks a satellite in one of
+two ways: loudly, with an `ImportError` crash-loop, or **silently**, where the
+service reports `active`, logs nothing at all, and the SAS link is simply dead.
+The silent one is why this script exists instead of a line in these docs
+telling you to `git pull`. Readers are updated best-effort: one that is
+powered off or unreachable is **named** in the output (never silently skipped)
+but does not block the rest of the fleet — re-run the update, or
+`deploy/companion_setup.sh`, when it is back.
 
 **Your data is protected, and that is not optional.** Before anything is
 touched, the updater takes a full snapshot of `G2S/data/` — `hub.db` (via

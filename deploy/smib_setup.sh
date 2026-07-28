@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# zero2w_sas_setup.sh — turn a freshly-flashed Raspberry Pi into a SAS SMIB.
+# smib_setup.sh — turn a freshly-flashed Raspberry Pi into a SAS SMIB.
 #
 # DESPITE THE NAME this works on ANY Pi-family board with a PL011 UART —
 # Zero 2 W, Zero W, 3A+, 3B/3B+, 4B (all use the SAME disable-bt recipe;
@@ -11,7 +11,7 @@
 # the host box; boards with Ethernet may just be plugged in). Idempotent —
 # safe to re-run.
 #
-#   deploy/zero2w_sas_setup.sh <you>@smib-bb2.local [-i ~/.ssh/cabinet] \
+#   deploy/smib_setup.sh <you>@smib-bb2.local [-i ~/.ssh/cabinet] \
 #       [--port /dev/ttyAMA0] [--address 1] [--hub auto|http://192.168.50.2:8081]
 #
 # TWO GOLDEN IMAGES (2026-07-13): a satellite is either a G2S COMPANION (Pi +

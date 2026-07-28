@@ -16,14 +16,14 @@ Group=owner
 # unit robust if the login groups ever change).
 SupplementaryGroups=dialout
 WorkingDirectory=/home/owner/CabiNet/SAS
-# The out-of-tree venv from deploy/zero2w_sas_setup.sh carries pyserial/crcmod/loguru
+# The out-of-tree venv from deploy/smib_setup.sh carries pyserial/crcmod/loguru
 # (system python has only pyserial). /dev/ttyAMA0 = the Pi 5 GPIO14/15 PL011
 # (dtparam=uart0=on) — NEVER /dev/serial0, which is the ttyAMA10 debug
 # connector on Pi 5. SAS wakeup = mark/space parity; PL011 only.
 # --hub: report machine state into the G2S host's floor registry
 # (/api/sas/report) so the ONE Home UI shows the whole mixed-protocol floor.
 # 127.0.0.1 = a SAS host co-located on the host box. A Zero SMIB reports to
-# the host's wired slot-net IP http://192.168.50.2:8081 (zero2w_sas_setup.sh's
+# the host's wired slot-net IP http://192.168.50.2:8081 (smib_setup.sh's
 # default). Satellites are wired-only — the Wi-Fi path is retired.
 ExecStart=/home/owner/venvs/cabinet/bin/python -u sas_host.py /dev/ttyAMA0 --address 1 --hub http://127.0.0.1:8081
 Restart=on-failure

@@ -158,6 +158,31 @@ else
     "${SSH[@]}" "$HOST" 'sudo systemctl restart cabinet-companion || true'
 fi
 
+say "authorize the hub's update key (so deploy/update.py can refresh this reader)"
+# The hub mints an ed25519 keypair at startup, publishes the PUBLIC half at
+# /api/hubkey, and we install it here — same step smib_setup.sh does for SAS
+# satellites. Companions are part of the update fleet: a stale Companion/
+# tree is a broken tap path. The companion finds the hub the way the daemon
+# does — its default gateway — so this needs nothing from the operator.
+# Non-fatal by design: an unreachable hub must not fail a reader build.
+"${SSH[@]}" "$HOST" '
+  GW=$(ip route 2>/dev/null | awk "/^default/{print \$3; exit}")
+  [ -n "$GW" ] || { echo "  (no default gateway — skipped)"; exit 0; }
+  KEY=$(curl -fsS --max-time 8 "http://$GW:8081/api/hubkey" 2>/dev/null \
+        | sed -n "s/.*\"publicKey\": *\"\([^\"]*\)\".*/\1/p")
+  case "$KEY" in
+    ssh-*) : ;;
+    *) echo "  (hub at $GW published no key yet — skipped; see DEPLOY.md)"; exit 0 ;;
+  esac
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+  if grep -qF "$KEY" ~/.ssh/authorized_keys; then
+    echo "  hub key already authorized"
+  else
+    printf "%s\n" "$KEY" >> ~/.ssh/authorized_keys
+    echo "  hub key authorized — updates can reach this reader"
+  fi'
+
 say "verify"
 "${SSH[@]}" "$HOST" "ls -la $BUS 2>/dev/null || echo 'NOTE: $BUS not present yet — check wiring/DIP after the reader is plugged in'; systemctl is-active cabinet-companion; journalctl -u cabinet-companion --no-pager | tail -4"
 

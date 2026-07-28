@@ -49,7 +49,7 @@ done
 
 # ── whose hub is this? ──────────────────────────────────────────────────────
 # The shipped units carry a PLACEHOLDER account (`owner`). Same recipe as
-# kiosk_setup.sh / companion_setup.sh / zero2w_sas_setup.sh: the human who
+# kiosk_setup.sh / companion_setup.sh / smib_setup.sh: the human who
 # typed sudo is the operator, overridable with CABINET_USER=<login>.
 # ($HOME is /root under sudo — useless here; getent gives the real home.)
 RUSER="${CABINET_USER:-${SUDO_USER:-$(id -un)}}"

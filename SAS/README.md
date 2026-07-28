@@ -54,7 +54,7 @@ validation modes".
 
 ## Running it
 
-Normally you don't run this by hand — `deploy/zero2w_sas_setup.sh` (works on
+Normally you don't run this by hand — `deploy/smib_setup.sh` (works on
 any PL011 Pi despite the name) installs it as the `cabinet-sas` unit on the
 SMIB Pi (see `deploy/SMIB_FRESH_IMAGE.md`).
 Manually:
