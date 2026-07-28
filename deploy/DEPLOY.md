@@ -96,10 +96,10 @@ Requirements:
 ## Host install
 
 1. **Clone the repo** (adjust the path to taste — the units below assume
-   `/home/<you>/CasinoNet`):
+   `/home/<you>/CabiNet`):
 
    ```bash
-   git clone <the CabiNet repo> ~/CasinoNet
+   git clone <the CabiNet repo> ~/CabiNet
    ```
 
 2. **Give the slot NIC a static IP — it must be `192.168.50.2/24`.** This
@@ -116,23 +116,24 @@ Requirements:
 3. **Install the systemd units** from `deploy/`:
 
    ```bash
-   cd ~/CasinoNet
-   # If your user/path/NIC differ from the units' defaults (user aj,
-   # /home/aj/CasinoNet, eth0), fix them in one pass:
-   mkdir -p /tmp/cab-units && cp deploy/casinonet-{g2s,dhcp,dns,ntp,tftp}.service /tmp/cab-units/
-   sed -i "s|/home/aj/CasinoNet|$HOME/CasinoNet|g; s|User=aj|User=$USER|g; s|--interface eth0|--interface <slotNIC>|g" /tmp/cab-units/*.service
+   cd ~/CabiNet
+   # The shipped units carry PLACEHOLDER user/home values (owner,
+   # /home/owner/CabiNet) and assume eth0. This PULLS your real ones
+   # from the shell rather than assuming — no editing by hand:
+   mkdir -p /tmp/cab-units && cp deploy/cabinet-{g2s,dhcp,dns,ntp,tftp}.service /tmp/cab-units/
+   sed -i "s|/home/owner/CabiNet|$HOME/CabiNet|g; s|^User=owner|User=$USER|; s|^Group=owner|Group=$USER|; s|--interface eth0|--interface <slotNIC>|g" /tmp/cab-units/*.service
    sudo cp /tmp/cab-units/*.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now casinonet-dhcp casinonet-g2s casinonet-dns casinonet-ntp casinonet-tftp
+   sudo systemctl enable --now cabinet-dhcp cabinet-g2s cabinet-dns cabinet-ntp cabinet-tftp
    ```
 
-   (`casinonet-kiosk` / `casinonet-console` are Pi-5-DSI-touchscreen extras —
+   (`cabinet-kiosk` / `cabinet-console` are Pi-5-DSI-touchscreen extras —
    skip them on a generic box; the web UI is the same thing in any browser.)
 
 4. **Check it's alive:**
 
    ```bash
-   systemctl is-active casinonet-dhcp casinonet-g2s
+   systemctl is-active cabinet-dhcp cabinet-g2s
    curl -s http://192.168.50.2:8081/api/status | head -5
    ```
 
@@ -237,7 +238,7 @@ download, so this is a one-time adoption. Do it in this order.
 mkdir -p ~/cabinet-backups
 python3 - <<'PY'
 import os, shutil, sqlite3, time
-src = os.path.expanduser("~/CasinoNet/G2S/data")
+src = os.path.expanduser("~/CabiNet/G2S/data")
 dst = os.path.expanduser("~/cabinet-backups/pre-adopt-" + time.strftime("%Y%m%d-%H%M%S"))
 os.makedirs(dst, exist_ok=True)
 for f in sorted(os.listdir(src)):
@@ -268,7 +269,7 @@ it**. SSH to the hub and grab the one file — you only ever do this once, becau
 from then on it updates itself:
 
 ```sh
-cd ~/CasinoNet                     # wherever your install lives (holds G2S/ and SAS/)
+cd ~/CabiNet                     # wherever your install lives (holds G2S/ and SAS/)
 mkdir -p deploy
 curl -fsSL https://raw.githubusercontent.com/ajs1616/CabiNet/main/deploy/update.py \
   -o deploy/update.py
@@ -288,7 +289,7 @@ download, or set up any way other than `git clone`, just run the updater — it
 notices, offers to adopt the tree in place, and only then updates:
 
 ```sh
-cd ~/CasinoNet
+cd ~/CabiNet
 python3 deploy/update.py
 ```
 
@@ -316,8 +317,8 @@ that existed, authorize it once per satellite:
 
 ```sh
 # on the hub (the key already exists; the updater will also make one if not)
-ssh-copy-id -i ~/.ssh/smib.pub aj@192.168.50.102     # once per satellite
-ssh -i ~/.ssh/smib aj@192.168.50.102 hostname        # must print its name
+ssh-copy-id -i ~/.ssh/smib.pub <you>@192.168.50.102  # once per satellite
+ssh -i ~/.ssh/smib <you>@192.168.50.102 hostname     # must print its name
 ```
 
 Or just re-run `deploy/zero2w_sas_setup.sh` against that satellite — it does the
@@ -335,7 +336,7 @@ No satellites at all (every machine on G2S)? Then pass `--no-satellites`.
 ### 5. Dry-run, then do it
 
 ```sh
-cd ~/CasinoNet
+cd ~/CabiNet
 python3 deploy/update.py --dry-run     # changes nothing
 python3 deploy/update.py
 ```
@@ -349,7 +350,7 @@ It is designed to refuse rather than guess. The common ones:
 | `has no G2S/ and SAS/` | you are in the wrong folder — `cd` to your CabiNet install |
 | `on a DETACHED HEAD` | `git checkout main` |
 | `no upstream configured` | `git branch --set-upstream-to=origin/main main` |
-| `NOT the one the hub runs from` | you are in a second clone — `cd` to the one in `casinonet-g2s.service`'s `WorkingDirectory` |
+| `NOT the one the hub runs from` | you are in a second clone — `cd` to the one in `cabinet-g2s.service`'s `WorkingDirectory` |
 | `refusing to pull over local edits` | `git stash`, or `--allow-dirty` if the edits are disposable |
 | `a tournament is armed/running` | finish or cancel the round |
 | `hub.db fails PRAGMA quick_check` | your database was already damaged — restore a snapshot from `G2S/data/_backups/` before updating |
@@ -364,7 +365,7 @@ together.
 Run this **on the hub, from inside your clone**:
 
 ```sh
-cd ~/CasinoNet
+cd ~/CabiNet
 python3 deploy/update.py --dry-run    # see exactly what would happen
 python3 deploy/update.py              # do it, after confirming
 ```
@@ -391,7 +392,7 @@ and which snapshot predates it.
 What it does, in order:
 
 1. refuses if a tournament is armed, counting down, or running
-2. refuses if this clone is not the one your `casinonet-g2s` service runs from
+2. refuses if this clone is not the one your `cabinet-g2s` service runs from
 3. snapshots your data, after checking `hub.db` passes `PRAGMA quick_check`
 4. pulls, then runs the full gate suite — **if a gate fails, nothing restarts**
 5. pushes the SAS tree to every satellite (never `data/`), restarts them, then the hub
@@ -418,7 +419,7 @@ read-only, works even when the services are down:
 python3 deploy/support_bundle.py
 
 # on a satellite Pi (SAS SMIB / reader), same script:
-python3 ~/CasinoNet/deploy/support_bundle.py
+python3 ~/CabiNet/deploy/support_bundle.py
 ```
 
 It prints the file it wrote. Run it with `sudo` if it says it couldn't read

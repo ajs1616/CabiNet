@@ -4,7 +4,7 @@ DNS discovery server for the slot network.
 
 Runs the DNS half of python/network/dhcp_dns_server.py ONLY (DHCP stays with
 the enhanced server). It resolves the AVP's discovery names — g2shost.local,
-g2s.local, casinonet.local, etc. — to the slot-net host IP so the AVP can find
+g2s.local, cabinet.local, etc. — to the slot-net host IP so the AVP can find
 the G2S host. Forces the slot interface and host IP explicitly so it can never
 auto-detect to loopback (cloud-init's 127.0.1.1) or the Wi-Fi/home-LAN NIC.
 
@@ -19,14 +19,14 @@ import argparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'python', 'network'))
 
-from dhcp_dns_server import CasinoNetDHCPDNSServer
+from dhcp_dns_server import CabiNetDHCPDNSServer
 
-ap = argparse.ArgumentParser(description="CasinoNet slot-network DNS discovery server")
+ap = argparse.ArgumentParser(description="CabiNet slot-network DNS discovery server")
 ap.add_argument("--interface", default="eth0", help="slot NIC to pin DNS to")
 ap.add_argument("--server-ip", default="192.168.50.2", help="slot-net host IP the names resolve to")
 args = ap.parse_args()
 
-srv = CasinoNetDHCPDNSServer()
+srv = CabiNetDHCPDNSServer()
 
 # DNS-only — the enhanced DHCP server owns port 67.
 srv.config['dhcp']['enabled'] = False

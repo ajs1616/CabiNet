@@ -4,10 +4,10 @@
 Run it on whichever box is misbehaving and attach the .tar.gz it prints:
 
     python3 deploy/support_bundle.py            # on the host box
-    python3 ~/CasinoNet/deploy/support_bundle.py    # on a satellite Pi
+    python3 ~/CabiNet/deploy/support_bundle.py    # on a satellite Pi
 
 It auto-detects what this box is (host / SAS SMIB / Companion — a box can be
-several at once) from the installed casinonet-* units, falling back to the
+several at once) from the installed cabinet-* units, falling back to the
 repo layout when no units are installed. It gathers only facts: unit
 journals, the host's rotating wire/host logs, state snapshots from the live
 API, the SQLite spine, network/system/hardware info. Read-only by design —
@@ -42,11 +42,11 @@ import urllib.request
 
 VERSION = "1.1"
 UNITS = [
-    "casinonet-g2s", "casinonet-dhcp", "casinonet-dns", "casinonet-ntp",
-    "casinonet-tftp", "casinonet-console", "casinonet-sas",
-    "casinonet-companion", "casinonet-smibui", "casinonet-kiosk",
+    "cabinet-g2s", "cabinet-dhcp", "cabinet-dns", "cabinet-ntp",
+    "cabinet-tftp", "cabinet-console", "cabinet-sas",
+    "cabinet-companion", "cabinet-smibui", "cabinet-kiosk",
 ]
-HOST_UNIT = "casinonet-g2s"
+HOST_UNIT = "cabinet-g2s"
 UNIT_DIRS = ("/etc/systemd/system", "/usr/lib/systemd/system",
              "/lib/systemd/system")
 API_SNAPSHOTS = [
@@ -150,7 +150,7 @@ class Bundle:
 
 
 def detect_roles():
-    """casinonet units installed on this box (installed, not just active)."""
+    """cabinet units installed on this box (installed, not just active)."""
     present = []
     for u in UNITS:
         for d in UNIT_DIRS:
@@ -161,7 +161,7 @@ def detect_roles():
 
 
 def repo_root():
-    """The CasinoNet/CabiNet checkout this script lives in, or None."""
+    """The CabiNet/CabiNet checkout this script lives in, or None."""
     here = os.path.dirname(os.path.realpath(__file__))
     for cand in (os.path.dirname(here), here):
         if any(os.path.isdir(os.path.join(cand, d))
@@ -363,7 +363,7 @@ def collect(b, args, roles, roles_inferred, root):
             break
 
     units_txt = run(["systemctl", "list-units", "--all", "--no-pager",
-                     "casinonet-*"])
+                     "cabinet-*"])
     for u in roles if not roles_inferred else []:
         units_txt += f"\n{'='*60}\n"
         units_txt += run(["systemctl", "status", u, "--no-pager", "-l"])
@@ -387,8 +387,8 @@ def collect(b, args, roles, roles_inferred, root):
 
     is_host = HOST_UNIT in roles or (roles_inferred and root
                                      and os.path.isdir(os.path.join(root, "G2S")))
-    is_sat = any(u in roles for u in ("casinonet-sas", "casinonet-companion",
-                                      "casinonet-smibui")) or \
+    is_sat = any(u in roles for u in ("cabinet-sas", "cabinet-companion",
+                                      "cabinet-smibui")) or \
         (roles_inferred and root and os.path.isdir(os.path.join(root, "SAS")))
 
     if is_host and root:
@@ -429,7 +429,7 @@ def collect(b, args, roles, roles_inferred, root):
 
     if not roles and not root:
         b.add_text("NOTE.txt",
-                   "No casinonet-* units and no CabiNet repo found from this "
+                   "No cabinet-* units and no CabiNet repo found from this "
                    "script's location.\nIf this box should be running "
                    "CabiNet, that IS the finding. System info still applies.\n")
 
@@ -453,7 +453,7 @@ def main():
         if os.path.isdir(os.path.join(root, "G2S")):
             roles.append(HOST_UNIT)
         if os.path.isdir(os.path.join(root, "SAS")):
-            roles.append("casinonet-sas")
+            roles.append("cabinet-sas")
 
     hostn = socket.gethostname()
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

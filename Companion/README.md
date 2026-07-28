@@ -1,7 +1,7 @@
 # Companion — the RFID tap daemon
 
 Turns PN532 card taps into hub knowledge. Runs on the SMIB Pi **beside**
-`casinonet-sas` (one Pi = SAS + NFC, proven 2026-07-10), or alone on a
+`cabinet-sas` (one Pi = SAS + NFC, proven 2026-07-10), or alone on a
 reader-only Pi (3B+ recommended — built-in Ethernet). A single thread
 polls the reader at ~5Hz, debounces a held card into one tap, and POSTs
 `{tapId, uid, at}` to the hub's `/api/companion/report`. Everything smart —
@@ -13,7 +13,7 @@ dumb satellite on purpose.
   bring-up script; first card read: UID `6CB16F06`, S50 1K) + `MockRfidReader`.
 - `companion_host.py` — the daemon: debounce, bounded tap queue (64), ack
   watermark, edge-logged hub reporting.
-- `casinonet-companion.service` — systemd unit for the Pi.
+- `cabinet-companion.service` — systemd unit for the Pi.
 - `tests/test_companion.py` — `pytest Companion/ -q` (no hardware needed).
 
 ## Wiring recap (PN532 V3)
@@ -50,7 +50,7 @@ enables the i2c-gpio overlay, rsyncs this directory, and installs the unit
 (see `deploy/SMIB_FRESH_IMAGE.md` for the full fresh-SD runbook). Then:
 
 ```sh
-journalctl -u casinonet-companion -f     # expect: PN532 ready, then 💳 taps
+journalctl -u cabinet-companion -f     # expect: PN532 ready, then 💳 taps
 ```
 
 Stdlib-only — the Pi's system `python3` is enough, no venv. With zero-config

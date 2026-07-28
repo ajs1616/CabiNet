@@ -5,7 +5,7 @@ sas_host.py — the SAS backup-channel host service.
 The missing production runner for the validated SAS stack: opens the serial
 loop, runs SASPoller with the TITO host (ticket capture/redemption ledger)
 wired in, and logs machine-state edges to stderr (journald when run as
-casinonet-sas.service). Mirrors G2S/g2s_host.py's role for the SAS side —
+cabinet-sas.service). Mirrors G2S/g2s_host.py's role for the SAS side —
 one file, stdlib + the three pinned deps (pyserial, crcmod, loguru).
 
 Built for the "backup channel" reality: the RS232 HAT and the machine may
@@ -28,6 +28,7 @@ mini-UART: the SAS wakeup bit is mark/space parity per byte.
 
 import argparse
 import collections
+import getpass
 import json
 import signal
 import socket
@@ -81,7 +82,7 @@ WEDGE_REOPEN_SEC = 15.0      # RX silence -> port reopen (fast phase). The
 #                              the PL011 RX side while TX keeps flowing —
 #                              the machine answers unheard until the port
 #                              is closed+reopened. This watchdog makes the
-#                              manual `systemctl restart casinonet-sas`
+#                              manual `systemctl restart cabinet-sas`
 #                              cure automatic within one cadence.
 WEDGE_SLOW_AFTER = 20        # dry reopens (~5 min) before deciding "machine
 #                              is OFF, not wedged" and backing off the churn
@@ -707,6 +708,12 @@ class HubReporter:
             # in every state once wired (null on bare constructions).
             "ticketData": (self.ticket_header.snapshot()
                            if self.ticket_header is not None else None),
+            # WHO WE RUN AS. deploy/update.py (on the hub) rsyncs the SAS tree
+            # here during an update and needs an SSH login — hardcoding one was
+            # wrong and assuming the hub's own is only a guess: an operator may
+            # well have renamed the account before deploying. So report it and
+            # let the hub use the truth. Old hubs simply ignore the extra key.
+            "sshUser": getpass.getuser(),
             "startedAt": self.started_at,
         }
 

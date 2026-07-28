@@ -1,5 +1,5 @@
 {
-  "_comment": "Slot-net ground truth (2026-07-01): interface eth0 on the Pi 5, server/G2S host = 192.168.50.2, pool .100-.200, VLAN 50 = 192.168.50.0/24. LIVE CONFIG for the running casinonet-dns unit: tools/run_dns_discovery.py loads this exact file (default config_path, unit WorkingDirectory=G2S/) and its CLI overrides ONLY dhcp.enabled/interface/server_ip and the 'auto' hostname targets - every other key here, notably forward_dns, is live, not a fallback. Do NOT set interface to 'auto' - auto-detect can leak the home-LAN IP (rogue-DHCP hazard, see project notes 2026-06-15).",
+  "_comment": "Slot-net ground truth (2026-07-01): interface eth0 on the Pi 5, server/G2S host = 192.168.50.2, pool .100-.200, VLAN 50 = 192.168.50.0/24. LIVE CONFIG for the running cabinet-dns unit: tools/run_dns_discovery.py loads this exact file (default config_path, unit WorkingDirectory=G2S/) and its CLI overrides ONLY dhcp.enabled/interface/server_ip and the 'auto' hostname targets - every other key here, notably forward_dns, is live, not a fallback. Do NOT set interface to 'auto' - auto-detect can leak the home-LAN IP (rogue-DHCP hazard, see project notes 2026-06-15).",
   "dhcp": {
     "enabled": true,
     "interface": "eth0",
@@ -16,7 +16,7 @@
     },
     "options": {
       "dns_servers": ["192.168.50.2"],
-      "domain_name": "casinonet.local"
+      "domain_name": "cabinet.local"
     }
   },
   "dns": {
@@ -25,7 +25,7 @@
     "hostname_mappings": {
       "g2s.local": "auto",
       "g2shost.local": "auto",
-      "casinonet.local": "auto",
+      "cabinet.local": "auto",
       "slothost.local": "auto",
       "casino.local": "auto",
       "openg2s.local": "auto"

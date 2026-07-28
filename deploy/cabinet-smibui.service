@@ -8,7 +8,7 @@ Description=CabiNet SMIB player screen (gameroom glass on the 1024x600 HDMI pane
 # never touches the AVP-only mediaDisplay sequencer). This unit just parks a
 # cog-drm browser on the panel pointed at G2S/webui/smib.html.
 #
-# Rides BESIDE casinonet-sas + casinonet-companion on the same Zero and must
+# Rides BESIDE cabinet-sas + cabinet-companion on the same Zero and must
 # NEVER starve the money-critical SAS loop (424Mi board) -> see the memory
 # safety block in [Service] (OOMScoreAdjust + MemoryMax).
 After=network-online.target
@@ -20,7 +20,7 @@ Conflicts=getty@tty1.service
 After=getty@tty1.service
 # Cap restart storms exactly like every sibling unit (GR-20). cog exits nonzero
 # if the panel / DRM master is momentarily unavailable; Restart=always + this
-# cap is the same shape as casinonet-companion.service.
+# cap is the same shape as cabinet-companion.service.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -29,7 +29,7 @@ Type=simple
 # Runs as ROOT on purpose (no User=): cog-drm needs DRM master, which on this
 # board (no seatd/logind seat) comes from owning an ACTIVE VT. Root owning tty1
 # is the low-risk, proven default for a cog-drm kiosk. (aj is in video/render/
-# input so User=aj is theoretically possible, but root is the simplest path.)
+# input so User=owner is theoretically possible, but root is the simplest path.)
 WorkingDirectory=/root
 
 # --- Hub URL = the hub's WIRED slot-net IP (the Ethernet-HAT move, #8) -----
@@ -38,7 +38,7 @@ WorkingDirectory=/root
 # Wi-Fi by the 60.0/24 link route. The glass POSTs /api/glass/action as a
 # RELATIVE url, so it inherits THIS origin -- on Wi-Fi that surfaced as
 # intermittent wallet-transfer HTTP 400s. Moved to wired 2026-07-13 to match
-# casinonet-sas. (Relocating the hub again = one-line change here + restart.)
+# cabinet-sas. (Relocating the hub again = one-line change here + restart.)
 # The ?egm= value is the BB2's egmId with its colons %-encoded (%3A). Each % is
 # DOUBLED to %% so systemd's specifier expander passes a literal % through
 # (Environment values undergo %-specifier expansion; %%3A -> %3A on the wire).
@@ -68,11 +68,11 @@ RestartSec=5
 
 # --- memory safety: the kiosk dies before the money-critical SAS loop -----
 # HARD RULE: under memory pressure the OOM killer takes the KIOSK, never
-# casinonet-sas / casinonet-companion.
+# cabinet-sas / cabinet-companion.
 # 1) OOMScoreAdjust makes the kernel pick the kiosk FIRST. This is honored
 #    TODAY independent of cgroups -- the memory cgroup controller is disabled by
 #    the Pi firmware default `cgroup_disable=memory`. Pair it with
-#    OOMScoreAdjust=-800 on casinonet-sas + casinonet-companion (see runbook).
+#    OOMScoreAdjust=-800 on cabinet-sas + cabinet-companion (see runbook).
 OOMScoreAdjust=1000
 # 2) MemoryMax/High cap the kiosk once the memory cgroup is enabled (append
 #    `cgroup_enable=memory cgroup_memory=1` to /boot/firmware/cmdline.txt and

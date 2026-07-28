@@ -35,7 +35,7 @@ The mechanism is **LOCKED**, not a guess:
   `EGM_TO_HOST`; unarmed → do nothing → the machine's own default prints a
   ticket. Disarm on logout/card-out just clears the hub flag (no wire write).
 
-- **SMIB:** the Zero-2W SAS SMIB `smib-bb2` (see `reference_casinonet_zero_smib_access`).
+- **SMIB:** the Zero-2W SAS SMIB `smib-bb2` (see `reference_cabinet_zero_smib_access`).
 - **Money safety:** load only a small cashable balance and card in the test
   player before you begin; every press is against that balance only.
 
@@ -78,7 +78,7 @@ The mechanism is **LOCKED**, not a guess:
   - `entry["sasCashoutReady"]` on `/api/status` is the **derived** from-EGM state
     (display-only, honest).
 
-## 0.1 Start order (run from `/home/aj/CasinoNet/`)
+## 0.1 Start order (run from your install, e.g. `~/CabiNet/`)
 
 Three surfaces — the satellite (serial), the hub (the money authority), and the
 wire tap. The satellite prints the loud `🏦` lines this runbook keys on; the hub
@@ -87,7 +87,7 @@ settles the credit and owns the books.
 ```bash
 # T1 — the SAS satellite on smib-bb2 (serial loop; single writer). It POSTs
 # reports to the hub and picks up hub commands in the report reply (~1s).
-ssh smib-bb2 'sudo systemctl restart casinonet-sas && journalctl -u casinonet-sas -f'
+ssh smib-bb2 'sudo systemctl restart cabinet-sas && journalctl -u cabinet-sas -f'
 #   watch this console for:  💵 diag 0x74/FF …   🏦 addr … host-cashout …
 #                            🏦 0x72 REQ … | RESP …   🏦 host-cashout Nc -> …
 
@@ -107,7 +107,7 @@ watch -n1 'curl -s localhost:8081/api/pnl      | python3 -m json.tool | grep -i 
 
 Host-cashout is **not** a long-poll toggle. Enable it in the BB2 operator menu
 (the "AFT cash-out to host" / cashless-to-host item — the same in-house-AFT
-family a RAM clear turns OFF, `reference_casinonet_sas_aft_transfer`), set to
+family a RAM clear turns OFF, `reference_cabinet_sas_aft_transfer`), set to
 **"fail to ticket"** so an unanswered request prints a ticket. Then capture
 **`0x74/FF`** (the report cache reads it every `AFT_STATUS_SEC`; the satellite
 line is `💵 diag 0x74/FF: … availXfers=0x__ …`).

@@ -13,9 +13,9 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=aj
-Group=aj
-WorkingDirectory=/home/aj/CasinoNet/G2S
+User=owner
+Group=owner
+WorkingDirectory=/home/owner/CabiNet/G2S
 ExecStart=/usr/bin/python3 -u g2s_host.py --harvest
 Restart=on-failure
 RestartSec=3

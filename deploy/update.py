@@ -37,6 +37,7 @@ WHAT IT WILL NOT DO
 """
 
 import argparse
+import getpass
 import json
 import os
 import subprocess
@@ -93,6 +94,7 @@ SKIP_SUFFIXES = ("-wal", "-shm")
 
 class Fail(Exception):
     """A step failed in a way that should trigger rollback."""
+
 
 
 def say(msg=""):
@@ -242,7 +244,7 @@ def hub_status(hub_url, timeout=8):
 def venv_python(root):
     """The interpreter that has pytest, if there is one. The hub's own service
     runs on stdlib system python, so pytest usually lives in a venv."""
-    for cand in (os.path.expanduser("~/venvs/casinonet/bin/python"),
+    for cand in (os.path.expanduser("~/venvs/cabinet/bin/python"),
                  os.path.join(root, "venv/bin/python"),
                  os.path.join(root, ".venv/bin/python")):
         if os.path.isfile(cand):
@@ -269,7 +271,10 @@ def find_satellites(status):
             continue
         seen.add(peer)
         out.append({"smibId": (ent or {}).get("smibId") or key.split("/")[0],
-                    "peer": peer, "online": bool((ent or {}).get("online"))})
+                    "peer": peer, "online": bool((ent or {}).get("online")),
+                    # the satellite REPORTS the account it runs as — never
+                    # guess it. None on older satellites; sat_user() falls back.
+                    "user": (ent or {}).get("sshUser") or None})
     return out
 
 
@@ -281,20 +286,40 @@ def online_machines(status):
                   if isinstance(v, dict) and v.get("commsState") == "onLine")
 
 
-def sat_ssh(peer, key, remote_cmd, check=True, timeout=120):
+#: Login used on the satellites. NEVER hardcode a person's username in shipped
+#: code — this said "aj" and would simply have failed for everyone else. The
+#: hub's own login is the right default (the same operator builds both boxes,
+#: and the setup scripts already take user@host), overridable with --ssh-user.
+SAT_USER = getpass.getuser()
+SAT_USER_OVERRIDE = None   # set only by --ssh-user
+
+
+def sat_user(sat):
+    """The login for THIS satellite, in order of authority:
+      1. an explicit --ssh-user (the operator overriding us)
+      2. what the satellite REPORTED about itself — the truth, and the reason
+         this is not a guess: an operator may have renamed the pi account long
+         before deploying
+      3. the hub's own login, for satellites too old to report it"""
+    return SAT_USER_OVERRIDE or (sat or {}).get("user") or SAT_USER
+
+
+def sat_ssh(peer, key, remote_cmd, check=True, timeout=120, user=None):
     return run(["ssh", "-i", key, "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "ConnectTimeout=8", "aj@" + peer, remote_cmd],
+                "-o", "ConnectTimeout=8",
+                "%s@%s" % (user or SAT_USER, peer), remote_cmd],
                check=check, timeout=timeout)
 
 
-def sat_sas_dir(peer, key):
+def sat_sas_dir(peer, key, user=None):
     """Read the satellite's own service file for its working directory rather
     than guessing the path — a wrong guess would 'succeed' into nowhere."""
     rc, out = sat_ssh(peer, key,
                       "grep -h '^WorkingDirectory=' "
-                      "/etc/systemd/system/casinonet-sas.service 2>/dev/null "
-                      "|| true", check=False)
+                      "/etc/systemd/system/cabinet-sas.service "
+                      "/etc/systemd/system/cabinet-sas.service 2>/dev/null "
+                      "|| true", check=False, user=user)
     for line in out.splitlines():
         if line.startswith("WorkingDirectory="):
             d = line.split("=", 1)[1].strip()
@@ -485,8 +510,8 @@ def preflight(root, hub_url, allow_dirty, dry=False):
     # easy mistake (someone clones again to "have a look"), and updating it
     # would report success while the live floor stayed on old code forever.
     served = None
-    for unit in ("/etc/systemd/system/casinonet-g2s.service",
-                 "/lib/systemd/system/casinonet-g2s.service"):
+    for unit in ("/etc/systemd/system/cabinet-g2s.service",
+                 "/lib/systemd/system/cabinet-g2s.service"):
         if os.path.isfile(unit):
             for line in open(unit, encoding="utf-8", errors="replace"):
                 if line.startswith("WorkingDirectory="):
@@ -508,7 +533,7 @@ def preflight(root, hub_url, allow_dirty, dry=False):
         else:
             say("   clone      : %s (matches the running service)" % root)
     else:
-        say("   clone      : %s (no casinonet-g2s unit found — not a hub?)"
+        say("   clone      : %s (no cabinet-g2s/cabinet-g2s unit — not a hub?)"
             % root)
 
     status = hub_status(hub_url)
@@ -632,10 +657,12 @@ def push_satellites(root, sats, key, dry):
     src = os.path.join(root, "SAS") + "/"
     for s in sats:
         peer = s["peer"]
-        dest = sat_sas_dir(peer, key)
+        u = sat_user(s)
+        dest = sat_sas_dir(peer, key, u)
         if not dest:
             raise Fail("%s: could not read WorkingDirectory from its "
-                       "casinonet-sas.service — is it a CabiNet satellite?"
+                       "cabinet-sas.service (or the legacy cabinet-sas) — "
+                       "is it a CabiNet satellite?"
                        % peer)
         say("   %s -> %s:%s" % (s["smibId"], peer, dest))
         cmd = ["rsync", "-a", "--no-owner", "--no-group",
@@ -645,7 +672,7 @@ def push_satellites(root, sats, key, dry):
             cmd += ["--exclude", ex]
         if dry:
             cmd.append("--dry-run")
-        cmd += [src, "aj@%s:%s/" % (peer, dest.rstrip("/"))]
+        cmd += [src, "%s@%s:%s/" % (u, peer, dest.rstrip("/"))]
         run(cmd, timeout=600)
 
 
@@ -656,9 +683,13 @@ def restart_fleet(sats, key, dry):
         return
     for s in sats:
         say("   satellite %s" % s["smibId"])
-        sat_ssh(s["peer"], key, "sudo systemctl restart casinonet-sas")
-    say("   hub casinonet-g2s")
-    run(["sudo", "systemctl", "restart", "casinonet-g2s"], timeout=120)
+        # the satellite may still carry the legacy unit name
+        sat_ssh(s["peer"], key,
+                "sudo systemctl restart cabinet-sas 2>/dev/null "
+                "|| sudo systemctl restart cabinet-sas",
+                user=sat_user(s))
+    say("   hub cabinet-g2s")
+    run(["sudo", "systemctl", "restart", "cabinet-g2s"], timeout=120)
 
 
 def verify(hub_url, sats, machines, dry):
@@ -703,7 +734,7 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None):
         ok = verify(hub_url, sats, machines, dry=False)
         say("\n   rollback %s. You are back on %s."
             % ("succeeded" if ok else "restarted, but the floor did not "
-               "fully return — check `journalctl -u casinonet-g2s -n 50`",
+               "fully return — check `journalctl -u cabinet-g2s -n 50`",
                old[:12]))
         say("   NOTE: the checkout left you on a detached HEAD. Re-attach with:")
         say("     git -C %s checkout main" % root)
@@ -711,7 +742,7 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None):
         say("\n   ⚠️  ROLLBACK ITSELF FAILED: %s" % e)
         say("   Recover by hand:")
         say("     git -C %s reset --hard %s" % (root, old))
-        say("     sudo systemctl restart casinonet-g2s")
+        say("     sudo systemctl restart cabinet-g2s")
 
 
 def self_update(root, argv):
@@ -751,12 +782,17 @@ def self_update(root, argv):
 
 
 def main():
+    global SAT_USER_OVERRIDE
     ap = argparse.ArgumentParser(
         description="Bring a CabiNet hub and its satellites current.")
     ap.add_argument("--hub-url", default=DEFAULT_HUB,
                     help="hub API base (default %s)" % DEFAULT_HUB)
     ap.add_argument("--ssh-key", default=os.path.expanduser("~/.ssh/smib"),
                     help="key the hub uses to reach satellites")
+    ap.add_argument("--ssh-user", default=None,
+                    help="force the login on every satellite (default: each "
+                         "satellite reports its own; falls back to %r)"
+                         % SAT_USER)
     ap.add_argument("--dry-run", action="store_true",
                     help="show everything, change nothing")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
@@ -771,6 +807,7 @@ def main():
                     help="repo to adopt/track (default %s)" % DEFAULT_REMOTE)
     a = ap.parse_args()
 
+    SAT_USER_OVERRIDE = a.ssh_user
     root = repo_root()
     say("CabiNet updater — %s" % root)
 
@@ -815,8 +852,8 @@ def main():
             "this ONCE per satellite and then re-run the update:\n"
             "     %s"
             % (a.ssh_key,
-               "\n     ".join("ssh-copy-id -i %s.pub aj@%s   # %s"
-                              % (a.ssh_key, s["peer"], s["smibId"])
+               "\n     ".join("ssh-copy-id -i %s.pub %s@%s   # %s"
+                              % (a.ssh_key, sat_user(s), s["peer"], s["smibId"])
                               for s in sats)))
 
     n, log = incoming(root)

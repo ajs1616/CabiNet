@@ -57,7 +57,7 @@ IDLE_EXCEPTIONS = frozenset({0x00, 0x1F})
 # machine is NOT locked; a stale unserviced queue entry re-asks forever). This
 # is NOT cleared by a handpay reset (LP 0x94 returns code 02 "not currently in
 # a handpay condition" on an unlocked machine, §7.9). See
-# [[reference_casinonet_sas_adjudication]].
+# [[reference_cabinet_sas_adjudication]].
 HANDPAY_INFO_PENDING = 0x51
 CMD_SEND_HANDPAY_INFO = 0x1B
 # SAS_POLL_FLOOR: SAS forbids polling a single machine faster than once per
@@ -94,7 +94,7 @@ DEFAULT_METERS: List[MeterSpec] = [
 class HandpayInfo:
     """One LP 0x1B "Send Handpay Information" response, captured when the poller
     services an exception 0x51. The record byte layout is NOT yet adjudicated on
-    real hardware (memory: reference_casinonet_sas_adjudication) — we hand back
+    real hardware (memory: reference_cabinet_sas_adjudication) — we hand back
     the RAW bytes for capture and never fabricate an amount. `empty` is True when
     the machine returns an all-zero record (queue already reported/drained,
     §7.8.1: "1B returns all zeros if a handpay record has been reported and

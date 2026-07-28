@@ -1,17 +1,17 @@
 [Unit]
 Description=CabiNet debug console (tty2 — Ctrl+Alt+F2 from the kiosk)
-After=multi-user.target casinonet-dhcp.service casinonet-g2s.service
+After=multi-user.target cabinet-dhcp.service cabinet-g2s.service
 # Moved from tty1 to tty2: the DSI touchscreen's VT1 now belongs to
-# casinonet-kiosk.service (cage + chromium Home UI). The curses cockpit
+# cabinet-kiosk.service (cage + chromium Home UI). The curses cockpit
 # stays reachable on VT2 — Ctrl+Alt+F2 (the kiosk's cage runs with -s so VT
 # switching works) or `sudo chvt 2`; Ctrl+Alt+F1 / `sudo chvt 1` goes back.
 Conflicts=getty@tty2.service
 
 [Service]
 Type=simple
-User=aj
-Group=aj
-WorkingDirectory=/home/aj/CasinoNet/G2S
+User=owner
+Group=owner
+WorkingDirectory=/home/owner/CabiNet/G2S
 Environment=TERM=linux
 # NOTE: no ExecStartPre chvt here anymore. On tty1 this unit had to yank the
 # VT to the foreground to be seen; on tty2 it must NOT — a chvt at boot would

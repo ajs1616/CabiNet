@@ -949,7 +949,7 @@ def main():
                 'g2s:voucherHoldTime="15000" g2s:printOffLine="true" '
                 'g2s:expireCashPromo="30" g2s:printExpCashPromo="true" '
                 'g2s:expireNonCash="30" g2s:printExpNonCash="true" '
-                'g2s:propName="CasinoNet" g2s:propLine1="The Game Room" '
+                'g2s:propName="CabiNet" g2s:propLine1="The Game Room" '
                 'g2s:propLine2="Home Floor" g2s:titleCash="CASHOUT TICKET" '
                 'g2s:titlePromo="PROMO" g2s:titleNonCash="NONCASH" '
                 'g2s:titleLargeWin="JACKPOT" g2s:titleBonusCash="BONUS" '
@@ -1845,7 +1845,7 @@ def main():
     # rides the FIFO behind the set.
     cs, cbody = post_command({"action": "setGamePlayState", "deviceId": 2,
                               "enable": False,
-                              "disableText": "CasinoNet game hold",
+                              "disableText": "CabiNet game hold",
                               "egmId": EGM_ID})
     check("setGamePlayState disable command accepted",
           cs == 200 and cbody.get("ok"))
@@ -1862,7 +1862,7 @@ def main():
               "+ disableText, nothing else)",
               m.get("commandAttrs", {}) == {
                   "enable": "false",
-                  "disableText": "CasinoNet game hold"},
+                  "disableText": "CabiNet game hold"},
               f"got {m.get('commandAttrs')}")
     time.sleep(0.3)
     with urllib.request.urlopen(STATUS_URL, timeout=5) as resp:
@@ -1873,7 +1873,7 @@ def main():
           "before the response; dev 1 has NO stateChange",
           sc.get("result") in ("sent", "acked")
           and sc.get("enable") == "false"
-          and sc.get("disableText") == "CasinoNet game hold"
+          and sc.get("disableText") == "CabiNet game hold"
           and "stateChange" not in gp_all.get("1", {}),
           f"got dev2={sc} dev1={gp_all.get('1', {}).get('stateChange')}")
     if m:
@@ -2422,7 +2422,7 @@ def main():
           and mi.get("enabledGames") == [7], f"got {mi}")
 
     # Hub-side census carry-forward (D8, the lockState treatment): the
-    # satellite reports machineInfo:null after a casinonet-sas restart
+    # satellite reports machineInfo:null after a cabinet-sas restart
     # (its stats are memory-only) — and an old satellite omits the key
     # entirely. Either shape must carry the LAST census forward instead
     # of wiping it (pre-fix the wholesale entry replace erased it within
@@ -4497,7 +4497,7 @@ def main():
         '<g2s:voucherProfile g2s:configurationId="0" g2s:maxValIds="20" '
         'g2s:minLevelValIds="15" g2s:voucherHoldTime="15000" '
         'g2s:printOffLine="true" g2s:expireCashPromo="30" '
-        'g2s:propName="CasinoNet" g2s:propLine1="Home Game Room" '
+        'g2s:propName="CabiNet" g2s:propLine1="Home Game Room" '
         'g2s:propLine2="AJ" g2s:titleCash="CASHOUT VOUCHER"/>',
         "530", vp_sid, "G2S_response")))
     cs, cbody = post_command({"action": "setVoucherState", "enable": False,
@@ -4691,7 +4691,7 @@ def main():
     # + the disableText. A getCabinetStatus refresh must ride the FIFO right
     # behind the set (both acked-then-ignored pre-ownership on the real AVP).
     cs, cbody = post_command({"action": "setCabinetState", "enable": False,
-                              "disableText": "CasinoNet bench hold",
+                              "disableText": "CabiNet bench hold",
                               "egmId": EGM_ID})
     check("setCabinetState disable command accepted",
           cs == 200 and cbody.get("ok"))
@@ -4709,7 +4709,7 @@ def main():
               m.get("commandAttrs", {}) == {
                   "enable": "false", "enableGamePlay": "true",
                   "enableMoneyIn": "true", "enableMoneyOut": "true",
-                  "disableText": "CasinoNet bench hold"},
+                  "disableText": "CabiNet bench hold"},
               f"got {m.get('commandAttrs')}")
     m_refresh = expect_host_post("getCabinetStatus (post-disable refresh)")
     if m_refresh:
@@ -4725,7 +4725,7 @@ def main():
           "before the response",
           csc.get("result") in ("sent", "acked")
           and csc.get("enable") == "false"
-          and csc.get("disableText") == "CasinoNet bench hold",
+          and csc.get("disableText") == "CabiNet bench hold",
           f"got {csc}")
     if m:
         # The application response to setCabinetState is cabinetStatus (§3.7)
@@ -4952,7 +4952,7 @@ def main():
             'g2s:voucherHoldTime="15000" g2s:printOffLine="true" '
             'g2s:expireCashPromo="30" g2s:printExpCashPromo="true" '
             'g2s:expireNonCash="30" g2s:printExpNonCash="true" '
-            'g2s:propName="CasinoNet" g2s:propLine1="The Game Room" '
+            'g2s:propName="CabiNet" g2s:propLine1="The Game Room" '
             'g2s:propLine2="Home Floor" g2s:titleCash="CASHOUT TICKET" '
             'g2s:titlePromo="PROMO" g2s:titleNonCash="NONCASH" '
             'g2s:titleLargeWin="JACKPOT" g2s:titleBonusCash="BONUS" '
@@ -6225,7 +6225,7 @@ def main():
     # egmId is explicit: the 6.995 ghost makes this a 2-association host.
     cs, cbody = post_command({"action": "setNoteAcceptorState",
                               "enable": False,
-                              "disableText": "CasinoNet bench hold",
+                              "disableText": "CabiNet bench hold",
                               "egmId": EGM_ID})
     check("setNoteAcceptorState disable command accepted",
           cs == 200 and cbody.get("ok"))
@@ -6243,7 +6243,7 @@ def main():
               "(Table 13.2)",
               m.get("commandAttrs", {}) == {
                   "enable": "false",
-                  "disableText": "CasinoNet bench hold"},
+                  "disableText": "CabiNet bench hold"},
               f"got {m.get('commandAttrs')}")
         # Point-to-point setNoteAcceptorState MUST get a noteAcceptorStatus
         # back (§13.8); the EGM reports hostEnabled=false (NAE003 fired).

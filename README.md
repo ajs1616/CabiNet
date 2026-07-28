@@ -49,7 +49,7 @@ whole casino *experience*, at home, for friends.
 ## ⬆️ Already running CabiNet? Updating is one command
 
 ```sh
-cd ~/CasinoNet && python3 deploy/update.py
+cd ~/CabiNet && python3 deploy/update.py
 ```
 
 It updates the **whole fleet** — hub *and* every satellite Pi, which are not
@@ -61,7 +61,7 @@ rather not use a terminal (it never contacts the internet unless you ask).
 **Installed before July 2026?** Your copy predates the updater, so grab it once:
 
 ```sh
-cd ~/CasinoNet && mkdir -p deploy
+cd ~/CabiNet && mkdir -p deploy
 curl -fsSL https://raw.githubusercontent.com/ajs1616/CabiNet/main/deploy/update.py \
   -o deploy/update.py
 python3 deploy/update.py --dry-run     # shows what it would do, changes nothing

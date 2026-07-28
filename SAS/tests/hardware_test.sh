@@ -9,7 +9,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "=== CasinoNet SAS Hardware Test Suite ==="
+echo "=== CabiNet SAS Hardware Test Suite ==="
 echo "Testing on: $(uname -a)"
 echo "Date: $(date)"
 echo
@@ -106,7 +106,7 @@ python3 -m pytest tests/test_sas_protocol.py -v --tb=short || echo "Unit tests f
 echo
 echo "For first contact with a real machine on the wire, use:"
 echo "  python3 tools/sas_bench_poll.py /dev/ttyAMA0 --credits"
-echo "(stop casinonet-sas first — the service holds the port)" 
+echo "(stop cabinet-sas first — the service holds the port)" 
 
 echo
 echo "Hardware test completed"

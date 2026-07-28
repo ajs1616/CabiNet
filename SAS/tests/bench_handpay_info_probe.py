@@ -10,7 +10,7 @@ bench_handpay_info_probe.py — ONE live pass on the BB2 (addr 1) to test AJ's
     "Send Handpay Information"; the re-report should stop once read (and a
     0x1E-style ack cycle is NOT believed required — the read is the ack).
 
-This probe, run with casinonet-sas STOPPED (it owns the port):
+This probe, run with cabinet-sas STOPPED (it owns the port):
   1. opens the REAL transport (9-bit wakeup, the b7f8677 timing fix),
   2. general-polls a few times — expect the familiar 0x51 chirps,
   3. sends LP 0x1B as a bare 2-byte R poll (the bench-proven no-CRC family:
@@ -21,9 +21,9 @@ This probe, run with casinonet-sas STOPPED (it owns the port):
      as [addr][1B][CRC] once.
 
 Run on the Zero:
-  sudo systemctl stop casinonet-sas
-  ~/venvs/casinonet/bin/python tests/bench_handpay_info_probe.py
-  sudo systemctl restart casinonet-sas
+  sudo systemctl stop cabinet-sas
+  ~/venvs/cabinet/bin/python tests/bench_handpay_info_probe.py
+  sudo systemctl restart cabinet-sas
 """
 
 import sys

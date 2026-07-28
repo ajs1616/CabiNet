@@ -14,7 +14,7 @@ import os
 import sys
 import json
 
-ap = argparse.ArgumentParser(description="CasinoNet slot-network DHCP server")
+ap = argparse.ArgumentParser(description="CabiNet slot-network DHCP server")
 ap.add_argument("--interface", default="eno1",
                 help="NIC to serve on (bench: eno1; Pi AP: wlan0; Pi wired: eth0)")
 ap.add_argument("--server-ip", default="192.168.50.2",
@@ -42,7 +42,7 @@ config = {
     'end_ip': 200,
     'lease_time': 3600,
     'dns_servers': [args.server_ip],
-    'domain': 'casinonet.local',
+    'domain': 'cabinet.local',
     'g2s_host': args.server_ip,
     'g2s_port': 8081,
     'g2s_https_port': 8334,

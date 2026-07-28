@@ -164,7 +164,7 @@ class TFTPServer:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="CasinoNet TFTP server (slot-net config files)")
+    ap = argparse.ArgumentParser(description="CabiNet TFTP server (slot-net config files)")
     ap.add_argument("root_dir", nargs="?", default="tftp-root")
     ap.add_argument("--interface", default=None, help="pin to this NIC (e.g. eth0); slot-net only")
     a = ap.parse_args()

@@ -7,7 +7,7 @@ spec-correct host validated against the AVP's captured bytes by
 `tools/avp_replay.py` (must end "0 failed"; the assertion count grows —
 218 as of 2026-07-01).
 
-## 1. Server box pre-flight (run from `/home/aj/CasinoNet/G2S/`)
+## 1. Server box pre-flight (run from your install's `G2S/`, e.g. `~/CabiNet/G2S/`)
 
 **One command checks everything** (NIC/IP, port squatters, legacy-server traps,
 firewall, config sanity) and prints GO/NO-GO with fix commands:

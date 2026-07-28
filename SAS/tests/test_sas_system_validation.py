@@ -1,7 +1,7 @@
 """
 Tests for the SAS system-validation ticket-OUT responder (SAS 6.02 §15.8,
 cross-verified 2026-07-08 — see the memory reference
-reference_casinonet_sas_system_validation). CasinoNet is the HOST that mints
+reference_cabinet_sas_system_validation). CabiNet is the HOST that mints
 the validation number in real time when a SYSTEM-mode EGM raises exception
 0x57 at cash-out.
 

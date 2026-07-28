@@ -31,7 +31,7 @@ This guide explains how CabiNet's DHCP server provides vendor-specific configura
 | 1 | Subnet Mask | 255.255.255.0 |
 | 3 | Router | DHCP server IP |
 | 6 | DNS Servers | DHCP server IP, 8.8.8.8 |
-| 15 | Domain Name | casinonet.local |
+| 15 | Domain Name | cabinet.local |
 | 42 | NTP Servers | DHCP server IP |
 | 51 | Lease Time | 3600 seconds |
 | 54 | DHCP Server | Server IP |
@@ -45,7 +45,7 @@ This guide explains how CabiNet's DHCP server provides vendor-specific configura
 | 66 | TFTP Server | Server IP |
 | 67 | Boot File | igt/g2s.xml |
 | 72 | WWW Server | Server IP as a raw 4-byte IPv4 (RFC 2132 — not a URL string) |
-| 119 | Domain Search | casinonet.local, g2s.local |
+| 119 | Domain Search | cabinet.local, g2s.local |
 
 #### IGT Option 43 — wire-proven single-TLV format (2026-07-01, real AVP)
 
@@ -114,13 +114,13 @@ The DHCP server detects vendors using:
 
 ### Test DHCP Configuration
 ```bash
-# Start the DHCP/DNS server by hand (normally the casinonet-dhcp unit)
+# Start the DHCP/DNS server by hand (normally the cabinet-dhcp unit)
 sudo python3 G2S/start-dhcp-enhanced.py --interface <slotNIC>
 ```
 
 ### Verify Machine Configuration
 
-1. **Watch the lease log**: `journalctl -u casinonet-dhcp -f` shows each
+1. **Watch the lease log**: `journalctl -u cabinet-dhcp -f` shows each
    DISCOVER/OFFER/ACK and the option-43 payload handed to the machine.
 
 2. **Monitor G2S Connections**:

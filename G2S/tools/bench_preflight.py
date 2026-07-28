@@ -49,7 +49,7 @@ def sh(cmd):
         return ""
 
 
-print("CasinoNet bench pre-flight\n" + "=" * 40)
+print("CabiNet bench pre-flight\n" + "=" * 40)
 
 print(f"\n[1] Slot VLAN NIC ({NIC})")
 ip_out = sh(f"ip addr show {NIC} 2>/dev/null")

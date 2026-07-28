@@ -102,7 +102,7 @@ class SASSerialPort:
         PL011's RX side while TX keeps flowing, so the link looks dead from
         the host while the machine answers unheard (fingerprint:
         /proc/tty/driver/ttyAMA tx climbing, rx frozen). A fresh open()
-        restores RX — this is the manual `systemctl restart casinonet-sas`
+        restores RX — this is the manual `systemctl restart cabinet-sas`
         fix, in-process. Raises on failure (device vanished); callers
         catch and retry on their own cadence."""
         try:

@@ -21,12 +21,12 @@ all pinned to eth0:
 
 | Unit | What | Notes |
 |---|---|---|
-| `casinonet-dhcp` | `start-dhcp-enhanced.py --interface eth0` | leases .100–.200; logs **opt55 param-request + opt60 vendor-class + opt43-requested verdict** on every DISCOVER/REQUEST |
-| `casinonet-dns` | discovery DNS on :53 | resolves `g2s.local` / `g2shost.local` / `casinonet.local` → .2 |
-| `casinonet-ntp` | NTP on :123, stratum 1 | origin-echo fixed 2026-07-01; disciplined the AVP |
-| `casinonet-tftp` | serves `G2S/tftp-root/` on :69 | any fetch is logged — a WMS fetch is a capture event |
-| `casinonet-g2s` | `g2s_host.py --harvest` on **:8081**, path `/G2S`, HTTP, cert-less | logs EVERY inbound POST raw to `logs/g2s_wire_*.log` **before** parsing |
-| `casinonet-console` | tty1 cockpit on the DSI screen | parses the DHCP host-discovery lines live |
+| `cabinet-dhcp` | `start-dhcp-enhanced.py --interface eth0` | leases .100–.200; logs **opt55 param-request + opt60 vendor-class + opt43-requested verdict** on every DISCOVER/REQUEST |
+| `cabinet-dns` | discovery DNS on :53 | resolves `g2s.local` / `g2shost.local` / `cabinet.local` → .2 |
+| `cabinet-ntp` | NTP on :123, stratum 1 | origin-echo fixed 2026-07-01; disciplined the AVP |
+| `cabinet-tftp` | serves `G2S/tftp-root/` on :69 | any fetch is logged — a WMS fetch is a capture event |
+| `cabinet-g2s` | `g2s_host.py --harvest` on **:8081**, path `/G2S`, HTTP, cert-less | logs EVERY inbound POST raw to `logs/g2s_wire_*.log` **before** parsing |
+| `cabinet-console` | tty1 cockpit on the DSI screen | parses the DHCP host-discovery lines live |
 
 Also known:
 
@@ -76,9 +76,9 @@ Every row below is a question the first bench session should answer.
 
 | # | Unknown | How we'll know |
 |---|---|---|
-| U1 | Does BB2E DHCP at all on the G2S config, and does it **request option 43** (opt55 list)? What exact **opt60 vendor-class** string does it send? | `casinonet-dhcp` journal prints opt55/opt60/verdict per DISCOVER; Phase 1 pcap |
+| U1 | Does BB2E DHCP at all on the G2S config, and does it **request option 43** (opt55 list)? What exact **opt60 vendor-class** string does it send? | `cabinet-dhcp` journal prints opt55/opt60/verdict per DISCOVER; Phase 1 pcap |
 | U2 | **WMS option-43 payload format.** Single-TLV IP like IGT? Full URL string? Sub-option numbering? Our current 6-sub-option blob is design fiction — and two of its sub-options (5 and 10) are **malformed by a code bug** (`encode_wms_bluebird_options` clobbers `protocol` with `b'G2S_v1.0.3'` before building the URLs). Per the IGT lesson the whole option may be discarded. | Machine takes/ignores the host; try shrinking to `01 04 <ip4>` as first fallback experiment |
-| U3 | **Does BB2E TFTP?** (The AVP never did.) If yes — which filename, and what file format does it expect? Our `wms/{bluebird.cfg,g2s.xml,wms.ini}` are unverified scaffolds. | `casinonet-tftp` journal + Phase 2 pcap (UDP 69 RRQ names) |
+| U3 | **Does BB2E TFTP?** (The AVP never did.) If yes — which filename, and what file format does it expect? Our `wms/{bluebird.cfg,g2s.xml,wms.ini}` are unverified scaffolds. | `cabinet-tftp` journal + Phase 2 pcap (UDP 69 RRQ names) |
 | U4 | **WMS SOAP wrapping.** Same gSOAP double-wrap/escaped-inner as IGT? Raw `g2sMessage`? Different SOAPAction / WSDL ns? (WMS also builds on gSOAP-era tooling, but that's an inference, not evidence.) | Phase 3: wire log `IN <<< POST ... SOAPAction=...` + raw body |
 | U5 | **Operator-menu host entry.** Where does a BB2E take its G2S host URL — DHCP toggle? manual URL fields? default port (one real IGT field-sheet EXAMPLE used `:65501/g2s_6` — a site-specific config, NOT a documented factory default; AJ's own AVP shows `127.0.0.1` when unset)? Per-OS-version menu differences across the 5+ versions? | Menu walk + photos, §4; SYN-scan watch, Phase 3 |
 | U6 | **Identity + callback:** WMS `egmId` format (IGT = `IGT_<12-hex MAC>`; `WMS_...`?) and the `egmLocation` callback URL/port (IGT uses `:8080`). The host POSTs the join responses there — a different scheme shows up as outbound connect failures. | First parsed `commsOnLine`, or raw body if unparsed |
@@ -95,7 +95,7 @@ cabinet's MAC first (label, or it'll show in the DHCP journal).
 ### Phase 0 — preflight (2 min)
 
 ```bash
-systemctl is-active casinonet-dhcp casinonet-dns casinonet-ntp casinonet-tftp casinonet-g2s
+systemctl is-active cabinet-dhcp cabinet-dns cabinet-ntp cabinet-tftp cabinet-g2s
 ip -4 addr show eth0                      # expect 192.168.50.2/24
 curl -s http://127.0.0.1:8081/api/status | python3 -m json.tool
 ```
@@ -106,9 +106,9 @@ answer on 127.0.0.1. Unit status + journals are the health check.
 ### Umbrella capture — one pcap per cabinet per cold boot (run FIRST, leave running)
 
 ```bash
-mkdir -p ~/CasinoNet/G2S/logs
+mkdir -p ~/CabiNet/G2S/logs
 sudo tcpdump -i eth0 -s0 \
-  -w ~/CasinoNet/G2S/logs/wms_<cab#>_<osver>_$(date +%Y%m%d_%H%M%S).pcap \
+  -w ~/CabiNet/G2S/logs/wms_<cab#>_<osver>_$(date +%Y%m%d_%H%M%S).pcap \
   'ether host <MAC> or udp port 67 or udp port 68'
 ```
 
@@ -128,7 +128,7 @@ The phase filters below are extra terminals for *live watching* only.
 # live view
 sudo tcpdump -i eth0 -nn -vvv -e 'udp and (port 67 or port 68)'
 # server's own analysis (opt55 / opt60 / opt43-requested verdict)
-journalctl -u casinonet-dhcp -f
+journalctl -u cabinet-dhcp -f
 ```
 
 Record: exact opt60 string, opt55 code list, `opt43_requested=yes/no`,
@@ -139,7 +139,7 @@ list needs the real string), leased IP.
 
 ```bash
 sudo tcpdump -i eth0 -nn 'host <EGM-IP> and (udp port 53 or udp port 69 or udp port 123)'
-journalctl -u casinonet-tftp -u casinonet-dns -u casinonet-ntp -f
+journalctl -u cabinet-tftp -u cabinet-dns -u cabinet-ntp -f
 ```
 
 Record: DNS names queried (if any), **TFTP RRQ filenames** (if any — served
@@ -156,8 +156,8 @@ sudo tcpdump -i eth0 -nn 'host <EGM-IP> and tcp[tcpflags] & tcp-syn != 0'
 # the conversation itself, ASCII
 sudo tcpdump -i eth0 -nn -A 'host <EGM-IP> and tcp port 8081'
 # host's view — raw bytes of every POST land here BEFORE parsing
-tail -f ~/CasinoNet/G2S/logs/g2s_wire_*.log     # newest file
-journalctl -u casinonet-g2s -f
+tail -f ~/CabiNet/G2S/logs/g2s_wire_*.log     # newest file
+journalctl -u cabinet-g2s -f
 ```
 
 Record: destination port SYN'd, POST path, `SOAPAction`, `User-Agent`

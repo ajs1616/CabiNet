@@ -1,11 +1,11 @@
 [Unit]
 Description=CabiNet TFTP config server (slot network, pinned to eth0)
-After=network.target casinonet-dhcp.service
+After=network.target cabinet-dhcp.service
 Wants=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/aj/CasinoNet/G2S
+WorkingDirectory=/home/owner/CabiNet/G2S
 ExecStart=/usr/bin/python3 -u python/web/tftp_server.py tftp-root --interface eth0
 Restart=on-failure
 RestartSec=3

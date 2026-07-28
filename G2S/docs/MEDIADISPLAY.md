@@ -230,5 +230,5 @@ join, and the class stays out of SPOKEN_CLASSES.
 Status/captured state surfaces at `GET /api/status` under each machine's `mediaDisplay`
 block.
 
-See `reference_casinonet_mediadisplay` (session memory) for the blow-by-blow; the
+See `reference_cabinet_mediadisplay` (session memory) for the blow-by-blow; the
 authoritative schema copies are in the session scratchpad.

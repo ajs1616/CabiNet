@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# companion_setup.sh — turn a fresh Pi into a CasinoNet Companion: the RFID
+# companion_setup.sh — turn a fresh Pi into a CabiNet Companion: the RFID
 # tap daemon for a cabinet that uses its OWN glass for the player UI (the IGT
 # AVP) or to add tap-to-identify to any machine.
 #
 # RFID-ONLY tier — no SAS, no UART, no touchscreen. The Companion is
 # stdlib-only (system python3 is enough, no venv). This installs Companion/ +
-# casinonet-companion.service, enables I2C for the PN532, and points the daemon
+# cabinet-companion.service, enables I2C for the PN532, and points the daemon
 # at the hub's WIRED slot-net IP by default. Idempotent — safe to re-run.
 #
 #   ZERO-CONFIG (v11) — no bindings needed; assign the machine in the hub UI:
-#     deploy/companion_setup.sh aj@smib-avp [-i ~/.ssh/casinonet]
+#     deploy/companion_setup.sh <you>@smib-avp [-i ~/.ssh/cabinet]
 #   MANUAL OVERRIDE — bake a binding into the unit (co-located / advanced):
-#     deploy/companion_setup.sh aj@smib-avp.local --g2s-egm IGT_<egmId> \
+#     deploy/companion_setup.sh <you>@smib-avp.local --g2s-egm IGT_<egmId> \
 #       [--companion-id companion-avp] [--hub http://127.0.0.1:8081] \
 #       [--hw-i2c] [--sas-smib smib-bb2 --sas-address 1]
 #
@@ -30,14 +30,14 @@
 #      the hardware bus (GPIO2/3 -> /dev/i2c-1) instead — rarely needed.
 #      `i2c-dev` is ensured in /etc/modules so the node appears.
 #   2. rsyncs Companion/ (stdlib-only; no venv, no SAS tree).
-#   3. Installs + enables casinonet-companion.service with THIS cabinet's
+#   3. Installs + enables cabinet-companion.service with THIS cabinet's
 #      bindings (--g2s-egm / --companion-id / --hub / optional --sas-*).
 #   4. Reboots ONLY if config.txt changed (I2C overlay), then verifies the
 #      I2C bus + the service.
 #
 # After it finishes: set the PN532 DIP switches to I2C (answers at 0x24), wire
 # it per Companion/README.md, tap a fob, and watch the HUB journal
-# (journalctl -u casinonet-g2s -f) for `💳 card IN`. A board that isn't wired
+# (journalctl -u cabinet-g2s -f) for `💳 card IN`. A board that isn't wired
 # yet is fine — the daemon reports readerOk=false and keeps retrying; the unit
 # stays active.
 
@@ -51,7 +51,7 @@ G2S_EGM="" ; COMPANION_ID="" ; SAS_SMIB="" ; SAS_ADDRESS="" ; I2C_MODE="gpio"
 # installs FLAGLESS and the daemon self-configures — id from the Pi serial, hub
 # from the default gateway — and the collector binds the machine from the hub
 # UI (the machine's ⚙️ Options). Pass flags only for a co-located/manual
-# override; a bare `companion_setup.sh aj@host` is the normal path.
+# override; a bare `companion_setup.sh <you>@host` is the normal path.
 while [ $# -gt 0 ]; do
     case "$1" in
         -i) SSHKEY="$2"; shift 2 ;;
@@ -66,7 +66,7 @@ while [ $# -gt 0 ]; do
                echo "unknown arg: $1" >&2; exit 2; fi ;;
     esac
 done
-[ -n "$HOST" ] || { echo "usage: $0 aj@<pi-host> [-i key] [--hub url] [--g2s-egm egmId] [--companion-id id] [--hw-i2c] [--sas-smib id --sas-address n]" >&2; echo "  (all bindings optional — omit for zero-config: serial id + gateway hub, assign in the UI)" >&2; exit 2; }
+[ -n "$HOST" ] || { echo "usage: $0 <user>@<pi-host> [-i key] [--hub url] [--g2s-egm egmId] [--companion-id id] [--hw-i2c] [--sas-smib id --sas-address n]" >&2; echo "  (all bindings optional — omit for zero-config: serial id + gateway hub, assign in the UI)" >&2; exit 2; }
 
 # The bus node depends on the I2C layout: the UNIVERSAL software i2c-gpio bus
 # (GPIO23/24 -> /dev/i2c-11, the default) vs the hardware bus (--hw-i2c).
@@ -112,20 +112,20 @@ sudo usermod -aG i2c \"\$USER\" 2>/dev/null || true
 echo "$I2C_OUT"
 
 say "rsync Companion/ (stdlib-only, no venv)"
-"${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet/deploy'
+"${SSH[@]}" "$HOST" 'mkdir -p ~/CabiNet/deploy'
 rsync -a -e "$RSYNC_SSH" --exclude '__pycache__' --exclude '.pytest_cache' \
-      "$REPO/Companion/" "$HOST:CasinoNet/Companion/"
+      "$REPO/Companion/" "$HOST:CabiNet/Companion/"
 # support_bundle.py rides along so "grab a bundle on the satellite" works
-rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CasinoNet/deploy/"
+rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CabiNet/deploy/"
 
 say "import check (proves stdlib deps resolve on the Pi)"
-"${SSH[@]}" "$HOST" 'cd ~/CasinoNet/Companion && python3 -c "import companion_host, reader; print(\"companion import OK\")"'
+"${SSH[@]}" "$HOST" 'cd ~/CabiNet/Companion && python3 -c "import companion_host, reader; print(\"companion import OK\")"'
 
 # Build the ExecStart from ONLY the flags explicitly passed — flagless by
 # default (zero-config: the daemon derives id from the Pi serial + hub from the
 # gateway, and the binding is assigned in the UI). --bus is added ONLY for the
 # non-default hardware bus; the universal gpio bus is the daemon's own default.
-EXEC="/usr/bin/python3 -u $RHOME/CasinoNet/Companion/companion_host.py"
+EXEC="/usr/bin/python3 -u $RHOME/CabiNet/Companion/companion_host.py"
 [ -n "$HUB" ]          && EXEC="$EXEC --hub $HUB"
 [ -n "$COMPANION_ID" ] && EXEC="$EXEC --companion-id $COMPANION_ID"
 [ -n "$G2S_EGM" ]      && EXEC="$EXEC --g2s-egm \"$G2S_EGM\""
@@ -133,16 +133,16 @@ EXEC="/usr/bin/python3 -u $RHOME/CasinoNet/Companion/companion_host.py"
 [ -n "$SAS_ADDRESS" ]  && EXEC="$EXEC --sas-address $SAS_ADDRESS"
 [ "$I2C_MODE" = "hw" ] && EXEC="$EXEC --bus $BUS"
 
-say "install casinonet-companion.service"
+say "install cabinet-companion.service"
 echo "  ExecStart=$EXEC"
 # Swap the whole ExecStart= line for our generated one, and rewrite the
 # placeholder user/home for the actual remote account.
 awk -v exec="ExecStart=$EXEC" '/^ExecStart=/{print exec; next} {print}' \
-    "$REPO/Companion/casinonet-companion.service" | \
+    "$REPO/Companion/cabinet-companion.service" | \
     sed -e "s|^User=.*|User=$RUSER|" -e "s|^Group=.*|Group=$RUSER|" \
-        -e "s|/home/aj|$RHOME|g" | \
-    "${SSH[@]}" "$HOST" 'sudo tee /etc/systemd/system/casinonet-companion.service >/dev/null
-sudo systemctl daemon-reload && sudo systemctl enable casinonet-companion >/dev/null 2>&1
+        -e "s|/home/owner|$RHOME|g" | \
+    "${SSH[@]}" "$HOST" 'sudo tee /etc/systemd/system/cabinet-companion.service >/dev/null
+sudo systemctl daemon-reload && sudo systemctl enable cabinet-companion >/dev/null 2>&1
 echo "service installed + enabled"'
 
 if echo "$I2C_OUT" | grep -q i2c-changed; then
@@ -155,11 +155,11 @@ if echo "$I2C_OUT" | grep -q i2c-changed; then
     done
 else
     say "no config.txt change — starting the service (no reboot)"
-    "${SSH[@]}" "$HOST" 'sudo systemctl restart casinonet-companion || true'
+    "${SSH[@]}" "$HOST" 'sudo systemctl restart cabinet-companion || true'
 fi
 
 say "verify"
-"${SSH[@]}" "$HOST" "ls -la $BUS 2>/dev/null || echo 'NOTE: $BUS not present yet — check wiring/DIP after the reader is plugged in'; systemctl is-active casinonet-companion; journalctl -u casinonet-companion --no-pager | tail -4"
+"${SSH[@]}" "$HOST" "ls -la $BUS 2>/dev/null || echo 'NOTE: $BUS not present yet — check wiring/DIP after the reader is plugged in'; systemctl is-active cabinet-companion; journalctl -u cabinet-companion --no-pager | tail -4"
 
 say "DONE — set the PN532 DIPs to I2C (0x24), wire per Companion/README.md, tap a fob"
-echo "watch the HUB: journalctl -u casinonet-g2s -f   (expect: 💳 card IN)"
+echo "watch the HUB: journalctl -u cabinet-g2s -f   (expect: 💳 card IN)"

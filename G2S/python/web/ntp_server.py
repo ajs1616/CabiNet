@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple NTP Server for CasinoNet
+Simple NTP Server for CabiNet
 Provides time synchronization for slot machines
 """
 import socket
@@ -121,7 +121,7 @@ class NTPServer:
 # Standalone mode
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="CasinoNet NTP server (slot-net time sync)")
+    ap = argparse.ArgumentParser(description="CabiNet NTP server (slot-net time sync)")
     ap.add_argument("--interface", default=None, help="pin to this NIC (e.g. eth0)")
     a = ap.parse_args()
     server = NTPServer(interface=a.interface)

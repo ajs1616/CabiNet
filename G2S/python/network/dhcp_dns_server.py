@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CasinoNet Built-In DNS and DHCP Server
+CabiNet Built-In DNS and DHCP Server
 Lightweight DNS and DHCP server for plug-and-play G2S host discovery
 Works offline without internet access or manual configuration
 """
@@ -17,7 +17,7 @@ import struct
 from datetime import datetime, timedelta
 from pathlib import Path
 
-class CasinoNetDHCPDNSServer:
+class CabiNetDHCPDNSServer:
     def __init__(self, config_path='config/network_config.json', data_dir='data'):
         self.config_path = config_path
         self.data_dir = Path(data_dir)
@@ -60,7 +60,7 @@ class CasinoNetDHCPDNSServer:
                 },
                 "options": {
                     "dns_servers": ["192.168.77.1"],  # Point to our DNS
-                    "domain_name": "casinonet.local"
+                    "domain_name": "cabinet.local"
                 }
             },
             "dns": {
@@ -69,7 +69,7 @@ class CasinoNetDHCPDNSServer:
                 "hostname_mappings": {
                     "g2s.local": "auto",  # auto = use server IP
                     "g2shost.local": "auto",
-                    "casinonet.local": "auto",
+                    "cabinet.local": "auto",
                     "slothost.local": "auto"
                 },
                 # Intentionally EMPTY: the slot net is offline by design.
@@ -133,9 +133,9 @@ class CasinoNetDHCPDNSServer:
         """Setup logging configuration"""
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - CasinoNet - %(levelname)s - %(message)s'
+            format='%(asctime)s - CabiNet - %(levelname)s - %(message)s'
         )
-        self.logger = logging.getLogger('CasinoNet')
+        self.logger = logging.getLogger('CabiNet')
     
     def get_server_ip(self):
         """Get the server's slot-network IP. Never loopback, never the
@@ -277,7 +277,7 @@ class CasinoNetDHCPDNSServer:
             self.logger.warning("Server already running")
             return False
         
-        self.logger.info("🌐 Starting CasinoNet DNS/DHCP Server")
+        self.logger.info("🌐 Starting CabiNet DNS/DHCP Server")
         self.running = True
         
         # Detect server IP
@@ -307,8 +307,8 @@ class CasinoNetDHCPDNSServer:
                 success = False
         
         if success:
-            self.log_event('system', f'CasinoNet server started on {server_ip}')
-            self.logger.info(f"🎰 CasinoNet ready - Machines can now discover G2S host at {server_ip}")
+            self.log_event('system', f'CabiNet server started on {server_ip}')
+            self.logger.info(f"🎰 CabiNet ready - Machines can now discover G2S host at {server_ip}")
         
         return success
     
@@ -392,7 +392,7 @@ class CasinoNetDHCPDNSServer:
         dns_config = self.config['dns']
         
         config = [
-            "# CasinoNet dnsmasq configuration",
+            "# CabiNet dnsmasq configuration",
             "# Auto-generated - do not edit manually",
             "",
             "# Interface binding",
@@ -882,7 +882,7 @@ class CasinoNetDHCPDNSServer:
         if not self.running:
             return
         
-        self.logger.info("🛑 Stopping CasinoNet DNS/DHCP Server")
+        self.logger.info("🛑 Stopping CabiNet DNS/DHCP Server")
         self.running = False
         
         # Stop dnsmasq if running
@@ -899,8 +899,8 @@ class CasinoNetDHCPDNSServer:
         if self.dns_socket:
             self.dns_socket.close()
         
-        self.log_event('system', 'CasinoNet server stopped')
-        self.logger.info("✅ CasinoNet DNS/DHCP Server stopped")
+        self.log_event('system', 'CabiNet server stopped')
+        self.logger.info("✅ CabiNet DNS/DHCP Server stopped")
     
     def get_status(self):
         """Get server status for API endpoint"""
@@ -940,7 +940,7 @@ def main():
     """Main function for standalone execution"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='CasinoNet DNS/DHCP Server')
+    parser = argparse.ArgumentParser(description='CabiNet DNS/DHCP Server')
     parser.add_argument('--config', default='config/network_config.json',
                        help='Configuration file path')
     parser.add_argument('--data-dir', default='data',
@@ -950,11 +950,11 @@ def main():
     
     args = parser.parse_args()
     
-    server = CasinoNetDHCPDNSServer(args.config, args.data_dir)
+    server = CabiNetDHCPDNSServer(args.config, args.data_dir)
     
     try:
         if server.start():
-            print("🎰 CasinoNet DNS/DHCP Server started successfully")
+            print("🎰 CabiNet DNS/DHCP Server started successfully")
             print(f"🌐 Server IP: {server.get_server_ip()}")
             print("🎮 Slot machines can now discover G2S host automatically")
             print("\nPress Ctrl+C to stop")

@@ -21,7 +21,7 @@ TWO validation regimes, TWO id sources:
   see core/sas_tito_host.py).
 
 * SYSTEM validation (SAS 6.02 §15.8, cross-verified 2026-07-08 — see the
-  memory reference reference_casinonet_sas_system_validation): the HOST mints
+  memory reference reference_cabinet_sas_system_validation): the HOST mints
   the validation number in real time when the EGM raises exception 0x57. For
   that regime this store IS the mint — mint_validation_number() hands out a
   monotonic, persisted, system-ID-prefixed number and tracks it as a pending

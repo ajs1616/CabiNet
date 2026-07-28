@@ -1,8 +1,8 @@
 [Unit]
-Description=CabiNet Companion (PN532 RFID taps -> hub, rides beside casinonet-sas)
+Description=CabiNet Companion (PN532 RFID taps -> hub, rides beside cabinet-sas)
 After=network-online.target
 Wants=network-online.target
-# GR-20 storm cap, same rationale as casinonet-sas.service. companion_host.py
+# GR-20 storm cap, same rationale as cabinet-sas.service. companion_host.py
 # tolerates a missing/mute PN532 INTERNALLY (readerOk=false, lazy retry — the
 # unit stays active), so a board that isn't wired yet never trips this limit.
 StartLimitIntervalSec=60
@@ -10,12 +10,12 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=aj
-Group=aj
+User=owner
+Group=owner
 # /dev/i2c-11 (the software i2c-gpio bus on GPIO23/24) is root:i2c; aj is a
 # member, SupplementaryGroups makes the unit robust if login groups change.
 SupplementaryGroups=i2c
-WorkingDirectory=/home/aj/CasinoNet/Companion
+WorkingDirectory=/home/owner/CabiNet/Companion
 # Stdlib-only on purpose — system python3 is enough on the Zero (no venv).
 # ZERO-CONFIG (v11): FLAGLESS by design so ONE identical image boots on every
 # card and self-configures — the daemon IDs itself by the Pi's hardware serial
@@ -26,7 +26,7 @@ WorkingDirectory=/home/aj/CasinoNet/Companion
 # re-assign takes effect live with no restart. companion_setup.sh can still
 # inject explicit flags (--hub / --companion-id / --g2s-egm / --sas-*) for a
 # co-located or manual override; a bare flag-free start is the collector path.
-ExecStart=/usr/bin/python3 -u /home/aj/CasinoNet/Companion/companion_host.py
+ExecStart=/usr/bin/python3 -u /home/owner/CabiNet/Companion/companion_host.py
 Restart=always
 RestartSec=5
 

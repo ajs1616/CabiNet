@@ -7,7 +7,7 @@
   it is NOT from any WMS document, and it is UNKNOWN whether a BB2E ever
   TFTP-fetches a file by this name (the IGT AVP never TFTP'd anything).
   This file exists so that IF a BB2E asks TFTP for wms/g2s.xml, the fetch is
-  served and logged (journalctl -u casinonet-tftp) instead of timing out.
+  served and logged (journalctl -u cabinet-tftp) instead of timing out.
   Treat a fetch of this file as a capture event, not a configuration event.
   See G2S/BENCH_BRINGUP_WMS.md.
 
@@ -31,7 +31,7 @@
             <DNSNames>
                 <Name>g2s.local</Name>
                 <Name>g2shost.local</Name>
-                <Name>casinonet.local</Name>
+                <Name>cabinet.local</Name>
             </DNSNames>
         </HostDiscovery>
 

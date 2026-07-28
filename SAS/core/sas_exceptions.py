@@ -40,7 +40,7 @@ and in the flow modules — never promote an unproven code into EXCEPTIONS.
 Denomination mapping: the guide gives an explicit code->denomination mapping
 for 0x47-0x4A only; those entries carry `denom_cents`.
 
-Category assignment is CasinoNet's own layer (the guide has no category
+Category assignment is CabiNet's own layer (the guide has no category
 column); the code/name pairs are the cited part.
 """
 
@@ -172,7 +172,7 @@ BENCH_EXCEPTIONS: Dict[int, SASExceptionInfo] = {e.code: e for e in [
     # once the handpay is also reset. LP 0x94 does NOT clear this: on an
     # unlocked machine it returns reset-code 02 "not currently in a handpay
     # condition" (§7.9). §7.8.2 gives the operator config to disable the 15s
-    # re-issue / enable legacy reporting. See [[reference_casinonet_sas_adjudication]].
+    # re-issue / enable legacy reporting. See [[reference_cabinet_sas_adjudication]].
     SASExceptionInfo(0x51, "handpay pending (queued; re-issued per §7.8.1)",
                      _C.HANDPAY, "handpay_pending"),
     SASExceptionInfo(0x52, "handpay was reset", _C.HANDPAY,

@@ -4,7 +4,7 @@ Host-side TITO — ticket-out capture and ticket-in redemption for the SAS host.
 Built on the core/sas_handpay_reset.py template: pure transport-driven
 functions returning typed results, a poller-integration wrapper
 (SASTITOHost), callbacks, and MockSASSerialPort tests
-(tests/test_sas_tito_host.py). CasinoNet is the HOST — it polls, records and
+(tests/test_sas_tito_host.py). CabiNet is the HOST — it polls, records and
 adjudicates tickets; it never answers polls (the old EGM-side core/tito.py
 was retired to attic/sas-20260707/ for exactly that role confusion).
 
@@ -117,7 +117,7 @@ VALIDATION_ID_NOT_CONFIGURED_EXCEPTION = 0x3F
 # --------------------------------------------------------------------------
 # System-validation ticket-out (SAS 6.02 §15.8, cross-verified 2026-07-08 —
 # NOT in the on-disk Montana guide; see the memory reference
-# reference_casinonet_sas_system_validation). CasinoNet is the HOST that mints
+# reference_cabinet_sas_system_validation). CabiNet is the HOST that mints
 # the validation number in real time when a SYSTEM-mode EGM raises 0x57.
 # --------------------------------------------------------------------------
 SYSTEM_VALIDATION_REQUEST_EXCEPTION = 0x57   # EGM: "system validation request"

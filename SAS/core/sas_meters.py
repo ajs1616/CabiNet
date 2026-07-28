@@ -17,7 +17,7 @@ Framing recap (guide §2, and core/sas_protocol.py):
     the `data` arguments to the parsers here are the bytes BETWEEN the
     command byte and the CRC (i.e. SASPacket.data).
 
-Units: 1 credit = 1 cent in the guide's jurisdiction (§4.2); CasinoNet keeps
+Units: 1 credit = 1 cent in the guide's jurisdiction (§4.2); CabiNet keeps
 meters in raw credit units and leaves cents/dollars to the caller.
 """
 
@@ -101,7 +101,7 @@ def _bcd2(byte: int) -> int:
 # System-validation ticket-out (cash-out) long polls. NOT in the Montana
 # guide on disk — cross-verified 2026-07-08 against saspy, ArduinoTITO, the
 # SAS 6.02 §15.8 spec text and the Montana Implementation Guide (see the
-# memory reference reference_casinonet_sas_system_validation). 0x57 "Send
+# memory reference reference_cabinet_sas_system_validation). 0x57 "Send
 # Pending Cashout Information" is a Type-R read (bare [addr][0x57], no
 # outbound CRC); 0x58 "Receive Validation Number" is a data-bearing Type-S
 # poll (WITH CRC).

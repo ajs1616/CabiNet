@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced DHCP/DNS Server for CasinoNet
+Enhanced DHCP/DNS Server for CabiNet
 Improved support for IGT Slimeline AVP and WMS BlueBird 2
 """
 
@@ -157,7 +157,7 @@ class EnhancedDHCPServer:
             'lease_retention': 7 * 24 * 3600,
             'lease_file': 'data/dhcp_leases.json',
             'dns_servers': [],  # Will be auto-populated with server IP
-            'domain': 'casinonet.local',
+            'domain': 'cabinet.local',
             'g2s_host': self.get_local_ip(),
             'g2s_port': 8081,
             'g2s_https_port': 8334,
@@ -300,7 +300,7 @@ class EnhancedDHCPServer:
                        AVP fell back to last valid config, Override=NO)
           ip_port      01 04 <ip> 02 02 <port>
         Flip: echo segments > data/igt_opt43_fmt on the Pi + restart
-        casinonet-dhcp. Revert: rm data/igt_opt43_fmt."""
+        cabinet-dhcp. Revert: rm data/igt_opt43_fmt."""
         host = self.config['g2s_host']
         port = int(self.get_g2s_port())
         fmt = 'ip'
@@ -445,12 +445,12 @@ class EnhancedDHCPServer:
     
     def encode_domain_name(self):
         """Encode domain name (Option 15)"""
-        return self.config.get('domain', 'casinonet.local').encode('utf-8')
+        return self.config.get('domain', 'cabinet.local').encode('utf-8')
     
     def encode_domain_search(self):
         """Encode domain search list (Option 119)"""
         # DNS search domains in RFC3397 format
-        domains = ['casinonet.local', 'g2s.local', 'local']
+        domains = ['cabinet.local', 'g2s.local', 'local']
         encoded = b''
         
         for domain in domains:
@@ -554,7 +554,7 @@ class EnhancedDHCPServer:
             'siaddr': self.config['network']['server_ip'],
             'giaddr': '0.0.0.0',
             'chaddr': request['chaddr'],
-            'sname': b'CasinoNet-G2S',
+            'sname': b'CabiNet-G2S',
             'file': b'',
             'options': {}
         }
@@ -751,7 +751,7 @@ class EnhancedDHCPServer:
                 response[28:28+min(16, len(chaddr))] = chaddr[:16]
             
             # Server hostname (64 bytes)
-            sname = packet.get('sname', b'CasinoNet-G2S')
+            sname = packet.get('sname', b'CabiNet-G2S')
             if isinstance(sname, str):
                 sname = sname.encode('utf-8')
             response[44:44+min(64, len(sname))] = sname[:64]
@@ -802,7 +802,7 @@ class EnhancedDHCPServer:
             traceback.print_exc()
     
     # A clock below this (2023-11) is NOT trusted for expiry math: the Pi has no
-    # battery RTC and casinonet-ntp starts AFTER dhcp, so a boot can read
+    # battery RTC and cabinet-ntp starts AFTER dhcp, so a boot can read
     # fake-hwclock's stale value. Expiring against an untrusted clock could
     # mass-prune LIVE leases and re-hand their in-use IPs — the exact collision
     # this whole change exists to kill. So expiry requires BOTH the clock and

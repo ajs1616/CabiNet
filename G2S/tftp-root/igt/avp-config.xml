@@ -15,7 +15,7 @@
             <DNSNames>
                 <Name>g2s.local</Name>
                 <Name>g2shost.local</Name>
-                <Name>casinonet.local</Name>
+                <Name>cabinet.local</Name>
             </DNSNames>
         </HostDiscovery>
         
@@ -72,7 +72,7 @@
         <DNS>
             <UseDHCP>true</UseDHCP>
             <SearchDomains>
-                <Domain>casinonet.local</Domain>
+                <Domain>cabinet.local</Domain>
                 <Domain>g2s.local</Domain>
             </SearchDomains>
         </DNS>

@@ -11,7 +11,7 @@
 # the host box; boards with Ethernet may just be plugged in). Idempotent —
 # safe to re-run.
 #
-#   deploy/zero2w_sas_setup.sh aj@smib-bb2.local [-i ~/.ssh/casinonet] \
+#   deploy/zero2w_sas_setup.sh <you>@smib-bb2.local [-i ~/.ssh/cabinet] \
 #       [--port /dev/ttyAMA0] [--address 1] [--hub auto|http://192.168.50.2:8081]
 #
 # TWO GOLDEN IMAGES (2026-07-13): a satellite is either a G2S COMPANION (Pi +
@@ -45,18 +45,18 @@
 #      then pass --port /dev/ttyAMA1). Also strips console=serial0 from
 #      cmdline.txt and masks the serial getty — with BT off, serial0 IS
 #      ttyAMA0 and a console there would eat the SAS line.
-#   2. ~/venvs/casinonet venv with pyserial/crcmod/loguru/pytest.
+#   2. ~/venvs/cabinet venv with pyserial/crcmod/loguru/pytest.
 #   3. rsyncs the SAS tree (excludes /data — the ticket-money ledger never
 #      travels; same GR-04 rule as the G2S voucher store).
-#   4. Installs + enables casinonet-sas.service (port/address from args).
+#   4. Installs + enables cabinet-sas.service (port/address from args).
 #   5. Reboots (config.txt changes) and verifies /dev/ttyAMA0 + service.
 #
 # After it finishes: wire the RS232 level shifter to the BB2E's SAS port
 # (TX->RX, RX->TX, GND), set SAS address (default 1) + enable the SAS
 # channel in the WMS operator menu. First contact:
-#   sudo systemctl stop casinonet-sas       # the service holds the port
-#   ~/venvs/casinonet/bin/python tools/sas_bench_poll.py /dev/ttyAMA0 --credits
-#   sudo systemctl start casinonet-sas      # then watch: journalctl -u casinonet-sas -f
+#   sudo systemctl stop cabinet-sas       # the service holds the port
+#   ~/venvs/cabinet/bin/python tools/sas_bench_poll.py /dev/ttyAMA0 --credits
+#   sudo systemctl start cabinet-sas      # then watch: journalctl -u cabinet-sas -f
 # A CRC-BAD answer is GOOD news (machine alive; capture it for
 # COMPATIBILITY.md — it settles Kermit-vs-XMODEM for the WMS fleet).
 
@@ -79,7 +79,7 @@ while [ $# -gt 0 ]; do
                echo "unknown arg: $1" >&2; exit 2; fi ;;
     esac
 done
-[ -n "$HOST" ] || { echo "usage: $0 aj@<zero-host> [-i key] [--port dev] [--address n] [--hub url] [--smib-id name]" >&2; echo "  (--smib-id: PIN an existing hostname-named SMIB, e.g. --smib-id smib-bb2, so a redeploy keeps its leg name)" >&2; exit 2; }
+[ -n "$HOST" ] || { echo "usage: $0 <user>@<zero-host> [-i key] [--port dev] [--address n] [--hub url] [--smib-id name]" >&2; echo "  (--smib-id: PIN an existing hostname-named SMIB, e.g. --smib-id smib-bb2, so a redeploy keeps its leg name)" >&2; exit 2; }
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 [ -n "$SSHKEY" ] && SSH+=(-i "$SSHKEY")
@@ -123,16 +123,16 @@ say "python venv + deps"
 "${SSH[@]}" "$HOST" '
 set -e
 sudo apt-get -qq update && sudo apt-get -qq install -y python3-venv rsync >/dev/null
-python3 -m venv ~/venvs/casinonet 2>/dev/null || true
-~/venvs/casinonet/bin/pip -q install pyserial crcmod loguru pytest
-~/venvs/casinonet/bin/python -c "import serial, crcmod, loguru; print(\"deps OK\")"'
+python3 -m venv ~/venvs/cabinet 2>/dev/null || true
+~/venvs/cabinet/bin/pip -q install pyserial crcmod loguru pytest
+~/venvs/cabinet/bin/python -c "import serial, crcmod, loguru; print(\"deps OK\")"'
 
 say "rsync SAS tree (data excluded)"
 rsync -a -e "$RSYNC_SSH" --exclude '/data' --exclude '__pycache__' \
-      --exclude '.pytest_cache' "$REPO/SAS/" "$HOST:CasinoNet/SAS/"
+      --exclude '.pytest_cache' "$REPO/SAS/" "$HOST:CabiNet/SAS/"
 # support_bundle.py rides along so "grab a bundle on the satellite" works
-"${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet/deploy'
-rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CasinoNet/deploy/"
+"${SSH[@]}" "$HOST" 'mkdir -p ~/CabiNet/deploy'
+rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CabiNet/deploy/"
 
 say "authorize the hub's update key"
 # WHY: deploy/update.py runs ON THE HUB and pushes the SAS tree to every
@@ -164,18 +164,18 @@ say "authorize the hub's update key"
   fi'
 
 say "gate: pytest SAS/ on the Zero"
-"${SSH[@]}" "$HOST" 'cd ~/CasinoNet && ~/venvs/casinonet/bin/python -m pytest SAS/ -q 2>&1 | tail -1'
+"${SSH[@]}" "$HOST" 'cd ~/CabiNet && ~/venvs/cabinet/bin/python -m pytest SAS/ -q 2>&1 | tail -1'
 
-say "install casinonet-sas.service (port=$PORT address=$ADDRESS, hub=$HUB${SMIB_ID:+, smib-id=$SMIB_ID})"
+say "install cabinet-sas.service (port=$PORT address=$ADDRESS, hub=$HUB${SMIB_ID:+, smib-id=$SMIB_ID})"
 # Append --smib-id ONLY when pinning an existing name; otherwise the daemon's
 # default (smib-<pi-serial-tail>) stands so a golden image self-names per board.
 sed -e "s|/dev/ttyAMA0|$PORT|" -e "s|--address 1|--address $ADDRESS|" \
     -e "s|--hub http://127.0.0.1:8081|--hub $HUB${SMIB_ID:+ --smib-id $SMIB_ID}|" \
     -e "s|^User=.*|User=$RUSER|" -e "s|^Group=.*|Group=$RUSER|" \
-    -e "s|/home/aj|$RHOME|g" \
-    "$REPO/deploy/casinonet-sas.service" | \
-    "${SSH[@]}" "$HOST" 'sudo tee /etc/systemd/system/casinonet-sas.service >/dev/null
-sudo systemctl daemon-reload && sudo systemctl enable casinonet-sas >/dev/null 2>&1
+    -e "s|/home/owner|$RHOME|g" \
+    "$REPO/deploy/cabinet-sas.service" | \
+    "${SSH[@]}" "$HOST" 'sudo tee /etc/systemd/system/cabinet-sas.service >/dev/null
+sudo systemctl daemon-reload && sudo systemctl enable cabinet-sas >/dev/null 2>&1
 echo "service installed + enabled"'
 
 say "rebooting the Zero (config.txt changes)"
@@ -187,8 +187,8 @@ for i in $(seq 1 20); do
 done
 
 say "verify"
-"${SSH[@]}" "$HOST" "ls -la $PORT; systemctl is-active casinonet-sas; journalctl -u casinonet-sas --no-pager | tail -3"
+"${SSH[@]}" "$HOST" "ls -la $PORT; systemctl is-active cabinet-sas; journalctl -u cabinet-sas --no-pager | tail -3"
 
 say "DONE — wire the level shifter to the BB2E SAS port, set address $ADDRESS"
-echo "first contact: sudo systemctl stop casinonet-sas, then"
-echo "  cd ~/CasinoNet/SAS && ~/venvs/casinonet/bin/python tools/sas_bench_poll.py $PORT --credits"
+echo "first contact: sudo systemctl stop cabinet-sas, then"
+echo "  cd ~/CabiNet/SAS && ~/venvs/cabinet/bin/python tools/sas_bench_poll.py $PORT --credits"

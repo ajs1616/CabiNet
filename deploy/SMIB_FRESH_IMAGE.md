@@ -6,7 +6,7 @@ Two SMIB flavors, same image, same scripts:
 - **SAS SMIB** — serial-wired to a SAS machine (WMS Bluebird, etc.). Needs a PL011
   UART + an RS-232 level shifter. `deploy/zero2w_sas_setup.sh`.
 - **Companion** — RFID-only, no serial (the slot's own glass is the UI, e.g. the IGT
-  AVP). Needs a PN532 reader. `Companion/` + `deploy/casinonet-companion.service`.
+  AVP). Needs a PN532 reader. `Companion/` + `deploy/cabinet-companion.service`.
 
 One Pi can be **both** at once (proven on the BB2 Zero 2026-07-10: SAS + PN532 together).
 
@@ -82,7 +82,7 @@ ssh-copy-id <user>@<host>.local
 From the **dev box**, in the repo root:
 
 ```bash
-deploy/zero2w_sas_setup.sh aj@<host>.local --address 1
+deploy/zero2w_sas_setup.sh <you>@<host>.local --address 1
 ```
 
 It is idempotent and does, over SSH:
@@ -91,9 +91,9 @@ It is idempotent and does, over SSH:
    disables `hciuart`, strips the serial console, masks the serial getty, adds `aj` to
    `dialout`. (Board auto-detected; Pi 4 keeping BT: add `dtoverlay=uart3` yourself and
    pass `--port /dev/ttyAMA1`.)
-2. **venv** `~/venvs/casinonet` with pyserial / crcmod / loguru / pytest.
+2. **venv** `~/venvs/cabinet` with pyserial / crcmod / loguru / pytest.
 3. **rsync** the SAS tree (excludes `/data` — the ticket ledger never travels, GR-04).
-4. Installs + enables **`casinonet-sas.service`** (`--port` / `--address` from args;
+4. Installs + enables **`cabinet-sas.service`** (`--port` / `--address` from args;
    `--hub` defaults to the wired host `http://192.168.50.2:8081` — pass `--hub` to
    override for a co-located `127.0.0.1`).
 5. **Reboots** (config.txt changed) and verifies `/dev/ttyAMA0` + the service.
@@ -108,10 +108,10 @@ operator menu.
 **First contact** (the service holds the port, so stop it first):
 
 ```bash
-sudo systemctl stop casinonet-sas
-~/venvs/casinonet/bin/python tools/sas_bench_poll.py /dev/ttyAMA0 --credits
-sudo systemctl start casinonet-sas
-journalctl -u casinonet-sas -f
+sudo systemctl stop cabinet-sas
+~/venvs/cabinet/bin/python tools/sas_bench_poll.py /dev/ttyAMA0 --credits
+sudo systemctl start cabinet-sas
+journalctl -u cabinet-sas -f
 ```
 
 A **CRC-BAD** answer is good news — the machine is alive and framing; capture it for
@@ -123,7 +123,7 @@ machine's own SAS version, not our code.)
 ## 3b. Companion (RFID) — add a reader
 
 For a slot that uses its OWN glass for the UI (the AVP) or to add tap-to-identify to any
-cabinet. Runs standalone OR alongside `casinonet-sas` on the same Pi. Stdlib-only — no
+cabinet. Runs standalone OR alongside `cabinet-sas` on the same Pi. Stdlib-only — no
 venv.
 
 ### Zero-config (v11) — the collector path: flash → boot → appears → assign
@@ -178,7 +178,7 @@ deploy/companion_setup.sh <user>@<zero-host>.local \
   derived automatically from the bound machine's live SAS link.
 
 Then set the PN532 DIP switches to I2C (answers at `0x24`), wire it, tap a fob → watch
-the HUB journal (`journalctl -u casinonet-g2s -f` on the hub) for `💳 card IN`. A board
+the HUB journal (`journalctl -u cabinet-g2s -f` on the hub) for `💳 card IN`. A board
 that isn't wired yet is fine — the daemon reports `readerOk=false` and retries; the unit
 stays active. First-ever tap on our hardware read UID `6CB16F06` (an S50 1K).
 `companion_host.py http://127.0.0.1:8081 --mock` is the no-hardware smoke test.
@@ -197,8 +197,8 @@ adds MACHINE / TICKETS / HANDPAY / GAMES / SETTINGS) runs on the SMIB's **own**
 1024×600 landscape HDMI panel. The page (`G2S/webui/smib.html`) is a thin client
 of the same `/api/glass/*` hub endpoints the IGT glass uses (it polls `src=smib`,
 so it never touches the AVP-only mediaDisplay sequencer) — no new hub logic. This
-step parks a browser on the panel; it rides **beside** `casinonet-sas` +
-`casinonet-companion` and must never starve them.
+step parks a browser on the panel; it rides **beside** `cabinet-sas` +
+`cabinet-companion` and must never starve them.
 
 **Prereqs:** the SAS SMIB (§3a) and/or Companion (§3b) already live on this Zero; a
 1024×600 HDMI panel is connected (`fb0` = `vc4drmfb 1024,600`, HDMI-A-1 connected).
@@ -218,7 +218,7 @@ sudo apt-get install -y cog
 `libepoxy0`, `libdrm2`, `libsoup-3.0-0`, …). **Do NOT install
 seatd/libseat/cage/chromium** — cog-drm needs none of them.
 
-**Install the unit** (`deploy/casinonet-smibui.service`):
+**Install the unit** (`deploy/cabinet-smibui.service`):
 
 1. Edit `Environment=SMIB_URL=` for THIS cabinet — the hub URL + the machine's
    egmId in the `?egm=` param, colons `%`-encoded (`%3A`) and each `%` **doubled**
@@ -228,14 +228,14 @@ seatd/libseat/cage/chromium** — cog-drm needs none of them.
    Moving a SMIB to another cabinet is this one line.
 2. Copy + enable:
    ```bash
-   sudo cp ~/CasinoNet/deploy/casinonet-smibui.service /etc/systemd/system/
-   sudo systemctl enable --now casinonet-smibui
+   sudo cp ~/CabiNet/deploy/cabinet-smibui.service /etc/systemd/system/
+   sudo systemctl enable --now cabinet-smibui
    ```
 3. Verify — the panel shows the attract, titled with the collector's GAMEROOM NAME
    (the hub substitutes it at serve time; neutral fallback "GAME ROOM"), and from
    the SMIB Pi itself:
    ```bash
-   systemctl is-active casinonet-smibui                                     # active
+   systemctl is-active cabinet-smibui                                     # active
    curl -s -o /dev/null -w '%{http_code}\n' \
      "http://192.168.50.2:8081/webui/smib.html?egm=<egmId>"                # 200
    ```
@@ -251,9 +251,9 @@ kernel default. No `xset` / `setterm` / `unclutter` needed.
   the kernel OOM-killer's first victim. `oom_score_adj` is honored **independent of
   cgroups**. Protect the money-critical pair with a matching drop-in — it takes
   effect at the next start, so batch it with the cgroup reboot below rather than
-  restarting `casinonet-sas` / `-companion` mid-session:
+  restarting `cabinet-sas` / `-companion` mid-session:
   ```bash
-  for u in casinonet-sas casinonet-companion; do
+  for u in cabinet-sas cabinet-companion; do
     sudo mkdir -p /etc/systemd/system/$u.service.d
     printf '[Service]\nOOMScoreAdjust=-800\n' | \
       sudo tee /etc/systemd/system/$u.service.d/oom.conf >/dev/null
@@ -273,16 +273,16 @@ kernel default. No `xset` / `setterm` / `unclutter` needed.
 2026-07-12 (14 samples over 209s, cog live): satellite `polls` monotonic ~4.3/s (no
 counter reset ⇒ no SAS restart), hub `reportAgeSec` 0–1s throughout, `online=true`
 `stale=false`, `MemAvailable` 221–250MB (>60MB gate — 3–4×), cog RSS flat over
-3.5min (no leak), zero `casinonet-sas` / `-companion` restarts. Read the numbers off
-the hub floor registry + `free -m` and `journalctl -u casinonet-sas` on the Zero.
+3.5min (no leak), zero `cabinet-sas` / `-companion` restarts. Read the numbers off
+the hub floor registry + `free -m` and `journalctl -u cabinet-sas` on the Zero.
 
-**Redeploy:** edit the page and `sudo systemctl restart casinonet-smibui` (cog
+**Redeploy:** edit the page and `sudo systemctl restart cabinet-smibui` (cog
 re-reads the URL fresh). The page deliberately **ignores `uiBuild`** — that mtime is
 the AVP's `glass.html`, not this file — so redeploys restart the unit; the page
 never self-reloads off another file's mtime.
 
-**Rollback:** `sudo systemctl disable --now casinonet-smibui` → `getty@tty1` returns
-and the panel shows the login prompt again; `casinonet-sas` + `casinonet-companion`
+**Rollback:** `sudo systemctl disable --now cabinet-smibui` → `getty@tty1` returns
+and the panel shows the login prompt again; `cabinet-sas` + `cabinet-companion`
 are untouched throughout. Full removal: `sudo apt-get remove --purge cog`, then
 delete the two `oom.conf` drop-ins + `sudo systemctl daemon-reload`.
 
@@ -330,7 +330,7 @@ urgent on the 424Mi board.
 - **Co-located satellite** (a SAS host running on the hub Pi itself): `--hub
   http://127.0.0.1:8081`.
 - **SSH gotcha:** use the explicit key form in scripts —
-  `ssh -o BatchMode=yes aj@<host>` — the bare alias needs an
+  `ssh -o BatchMode=yes <you>@<host>` — the bare alias needs an
   ssh-agent that vanishes when you re-SSH into the dev box.
 
 ---
@@ -341,12 +341,12 @@ urgent on the 424Mi board.
 |-------|-------|
 | OS | Raspberry Pi OS Lite 64-bit (Bookworm) |
 | User | `aj` |
-| Key | `~/.ssh/casinonet` |
-| venv | `~/venvs/casinonet` |
+| Key | `~/.ssh/cabinet` |
+| venv | `~/venvs/cabinet` |
 | SAS port | `/dev/ttyAMA0` (Pi 4 spare PL011: `/dev/ttyAMA1` via `dtoverlay=uart3`) |
-| SAS unit | `casinonet-sas.service` |
-| Companion unit | `casinonet-companion.service` |
-| Player-screen unit | `casinonet-smibui.service` (HDMI-panel SMIBs, e.g. the BB2) |
+| SAS unit | `cabinet-sas.service` |
+| Companion unit | `cabinet-companion.service` |
+| Player-screen unit | `cabinet-smibui.service` (HDMI-panel SMIBs, e.g. the BB2) |
 | Kiosk engine | `cog` (WPE WebKit, DRM/KMS — no X/Wayland); `apt-get install -y cog` |
 | Hub URL | **`http://192.168.50.2:8081` (wired slot segment — DEFAULT)** / `http://127.0.0.1:8081` (co-located) |
 | Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → bind from the machine's ⚙️ **Options** |

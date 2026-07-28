@@ -2,7 +2,7 @@
 hub_ticket_client.py — the satellite's handle on the HUB validation
 authority (hub.db phase 2, cross-machine TITO).
 
-CasinoNet's ticket truth moved to the hub (the g2s_host.py process on the
+CabiNet's ticket truth moved to the hub (the g2s_host.py process on the
 Pi 5): a ticket printed on the BB2 must redeem in the AVP and vice versa,
 which is only safe with ONE ledger adjudicating every redemption. This
 client duck-types the exact TicketStore surface sas_tito_host.py consumes

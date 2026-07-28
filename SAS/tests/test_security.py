@@ -11,7 +11,7 @@ lightweight stack, and asserted a 256-byte frame "including sync" — the
 
 ("Security" here is robustness for an offline hobbyist LAN — malformed
 frames, corrupt tickets, double-spends — NOT auth hardening, which is
-explicitly out of scope for CasinoNet.)
+explicitly out of scope for CabiNet.)
 """
 
 import sys

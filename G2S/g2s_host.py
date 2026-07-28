@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CabiNet G2S Host (formerly CasinoNet) — MVP "machine joins" server.
+CabiNet G2S Host (formerly CabiNet) — MVP "machine joins" server.
 
 Spec-correct two-channel architecture (G2S Message Protocol v1.0.3 + the real
 IGT AVP capture at debug-captures/igt_exchange_20250725_235016.txt):
@@ -3546,7 +3546,7 @@ class G2SHost:
         # loads are rare bench acts, never a burst).
         self._md_content_seq = itertools.count(1)
         # SAS floor registry (the shared-server layer's first slice): each
-        # sas_host.py — the Pi's own AND every Zero SMIB on the CasinoNet
+        # sas_host.py — the Pi's own AND every Zero SMIB on the CabiNet
         # AP — POSTs periodic state snapshots to /api/sas/report; the hub
         # holds the latest per machine and surfaces them in /api/status
         # under "sas" so the ONE Home UI shows the whole mixed-protocol
@@ -4098,7 +4098,7 @@ class G2SHost:
     def start_update(self):
         """Spawn the updater DETACHED and return immediately.
 
-        It must outlive us: applying an update restarts casinonet-g2s, which
+        It must outlive us: applying an update restarts cabinet-g2s, which
         kills this process mid-request. A child in our own process group would
         die with it — taking the rollback with it, exactly when it is needed
         most. start_new_session detaches it, and its whole transcript lands in
@@ -4412,6 +4412,12 @@ class G2SHost:
                     lock_seen = "locked" if r["locked"] else "enabled"
                     break
         entry["peer"] = peer
+        # The satellite reports the account it runs as, so deploy/update.py can
+        # SSH in as the RIGHT user instead of assuming one. Absent from older
+        # satellites — the updater falls back to the hub's own login.
+        _su = payload.get("sshUser")
+        if isinstance(_su, str) and _su.strip():
+            entry["sshUser"] = _su.strip()[:64]
         entry["receivedAt"] = time.time()
         # Echo the operator prefs back so /api/status carries them (the UI
         # prefers them over its local cache — kiosk and phone agree). ONE
@@ -4489,7 +4495,7 @@ class G2SHost:
                 prefs.get("lockState") or \
                 "enabled"
             # machineInfo: this report's dict wins; when the satellite sent
-            # machineInfo=null (its stats are memory-only — a casinonet-sas
+            # machineInfo=null (its stats are memory-only — a cabinet-sas
             # restart blanks them until the one-shot 0x1F/census re-lands,
             # and the one-shot is gated online+enabled, so a dark/parked
             # machine can stay census-less for the whole session), carry
@@ -4515,7 +4521,7 @@ class G2SHost:
                             self._stamp_denom_suggest_since(key, suggest)
             # aft: same wholesale-replace wipe as machineInfo — the
             # satellite reports aft:null until its own cache read lands
-            # after a casinonet-sas restart, and one such report erased
+            # after a cabinet-sas restart, and one such report erased
             # the registration face (AFT chip flapped to "registering…",
             # sasCashoutReady dropped, the Wallet picker lost the
             # machine for a beat). Carry the previous aft forward when
@@ -9896,7 +9902,7 @@ class G2SHost:
             conn.request("POST", path, body=body.encode("utf-8"), headers={
                 "Content-Type": "text/xml; charset=utf-8",
                 "SOAPAction": f'"{SOAPACTION_SEND}"',
-                "User-Agent": "CasinoNet-G2S/1.0",
+                "User-Agent": "CabiNet-G2S/1.0",
             })
             resp = conn.getresponse()
             resp_body = resp.read().decode("utf-8", errors="replace")
@@ -20649,7 +20655,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
     def _handle_sas_report(self, raw, peer):
         """POST /api/sas/report — SAS floor registry ingest. sas_host.py
         satellites (the Pi's own co-located host + Zero SMIBs on the
-        CasinoNet AP) report machine state here. Unauthenticated on the AP,
+        CabiNet AP) report machine state here. Unauthenticated on the AP,
         so the ingest is defensive: non-finite numbers are rejected (they
         would poison /api/status for every client), and sas_report() bounds
         every stored structure."""
@@ -22218,15 +22224,15 @@ def main():
     # crash-looped 39 starts in ~2 minutes — RestartSec=3 never trips the
     # default 5-per-10s start limit — littering a stub host+wire log pair
     # per attempt. One plain fatal line instead; the unit's StartLimit
-    # settings (deploy/casinonet-g2s.service) backstop any other loop.
+    # settings (deploy/cabinet-g2s.service) backstop any other loop.
     try:
         server = QuietDisconnectHTTPServer(
             (args.bind, args.port), G2SRequestHandler)
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             print(f"FATAL: {args.bind}:{args.port} is already in use — "
-                  "another g2s_host holds the port (casinonet-g2s unit or a "
-                  "manual bench run?). systemctl stop casinonet-g2s first.",
+                  "another g2s_host holds the port (cabinet-g2s unit or a "
+                  "manual bench run?). systemctl stop cabinet-g2s first.",
                   file=sys.stderr)
             sys.exit(1)
         raise

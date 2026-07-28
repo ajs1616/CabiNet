@@ -1,5 +1,5 @@
 """
-hub_store.py — the CasinoNet hub's SQLite spine.
+hub_store.py — the CabiNet hub's SQLite spine.
 
 The unified, cross-protocol store the whole floor rides on. Phase 1 (this
 file's first slice) is the MACHINE REGISTRY + server-side NICKNAMES: one row

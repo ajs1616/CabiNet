@@ -29,7 +29,7 @@ write goes through the bounds-checked safe() helper; every curses call is
 wrapped. Threaded readers + locks own all I/O so the UI thread never blocks.
 
 Data (all read-only, no sudo — 'aj' is in group adm):
-  journalctl -u casinonet-{dhcp,g2s,dns,tftp,ntp} -f -o json   (live evidence)
+  journalctl -u cabinet-{dhcp,g2s,dns,tftp,ntp} -f -o json   (live evidence)
   systemctl is-active/is-enabled <unit>                         (service health)
   ip -br -4 addr show eth0 + /sys/class/net/eth0/carrier        (slot-net link)
   http://127.0.0.1:8081/api/status                              (G2S engine)
@@ -59,21 +59,22 @@ import urllib.request
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DHCP_UNIT = "casinonet-dhcp"
-G2S_UNIT = "casinonet-g2s"
-STACK_UNITS = ["casinonet-dhcp", "casinonet-g2s", "casinonet-dns",
-               "casinonet-tftp", "casinonet-ntp"]      # the 5 readiness units
-ALL_UNITS = STACK_UNITS + ["casinonet-console"]        # console = the display
-UNIT_SHORT = {"casinonet-dhcp": "dhcp", "casinonet-g2s": "g2s",
-              "casinonet-dns": "dns", "casinonet-tftp": "tftp",
-              "casinonet-ntp": "ntp", "casinonet-console": "con"}
+DHCP_UNIT = "cabinet-dhcp"
+G2S_UNIT = "cabinet-g2s"
+STACK_UNITS = ["cabinet-dhcp", "cabinet-g2s", "cabinet-dns",
+               "cabinet-tftp", "cabinet-ntp"]      # the 5 readiness units
+ALL_UNITS = STACK_UNITS + ["cabinet-console"]        # console = the display
+UNIT_SHORT = {"cabinet-dhcp": "dhcp", "cabinet-g2s": "g2s",
+              "cabinet-dns": "dns", "cabinet-tftp": "tftp",
+              "cabinet-ntp": "ntp", "cabinet-console": "con"}
 
 API_URL = "http://127.0.0.1:8081/api/status"
 NIC = "eth0"
 SERVER_CIDR = "192.168.50.2/24"
 CARRIER_PATH = "/sys/class/net/eth0/carrier"
 HOST_URI = "http://192.168.50.2:8081/G2S"
-WIRE_GLOB = "/home/aj/CasinoNet/G2S/logs/g2s_wire_*.log"
+WIRE_GLOB = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "logs", "g2s_wire_*.log")
 WATCH_PORTS = [67, 8081, 53, 69, 123]                  # for the listen line
 MAXLOG = 3000
 MAXWIRE = 400

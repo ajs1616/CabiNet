@@ -62,7 +62,7 @@ Content-Type: text/xml
 <?xml version="1.0" encoding="UTF-8"?>
 <g2s:g2sMessage xmlns:g2s="http://www.gamingstandards.com/g2s/schemas/v1.0.3"
     egmId="IGT-001"
-    hostId="CASINONET-001"
+    hostId="CABINET-001"
     sessionId="12345"
     sessionType="G2S_request"
     dateTime="2025-07-24T10:00:00Z">
@@ -248,7 +248,7 @@ curl -X POST http://localhost:8081/G2S \
 ### 2. Check Transaction Status
 
 Every transfer lands in the web UI's Wallet ledger (and `/api/accounts`);
-SAS-side AFT state is in the smib journal (`journalctl -u casinonet-sas`).
+SAS-side AFT state is in the smib journal (`journalctl -u cabinet-sas`).
 
 ### 3. Run Automated Tests
 ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 companion_host.py — the Companion RFID daemon (runs on the Zero beside
-casinonet-sas).
+cabinet-sas).
 
 One job: turn PN532 card taps into hub knowledge. A single thread polls the
 reader at ~5Hz, debounces a held card into ONE tap, queues taps, and POSTs
