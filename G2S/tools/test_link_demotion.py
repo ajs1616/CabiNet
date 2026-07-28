@@ -48,8 +48,11 @@ Exits 0 if all checks pass. No network beyond 127.0.0.1; no host process.
 """
 
 import html
+import json
 import logging
+import os
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -146,7 +149,94 @@ class AckingEgm(BaseHTTPRequestHandler):
         pass
 
 
+def refuse_live_data():
+    """Refuse to run against a REAL deployment's data directory.
+
+    This gate is the one that builds an honest host — `G2SHost(...)` below, not
+    a `__new__` stub — and `G2SHost.__init__` hardcodes every store path to
+    `G2S/data/`. Run it inside a live hub's clone and it opens that operator's
+    actual hub.db, voucher, WAT and account stores, runs the schema migration
+    against the live database while the service holds it open, and puts the
+    auto-registration path (`_aft_autoreg` -> `aft_register`) in reach of their
+    real AFT/WAT keys. Re-registering those breaks cashless transfers with the
+    machines until they are paired again — and GR-04 already proved this class
+    of accident is not theoretical: a replay run once wrote 145 fixture voucher
+    ids into a production voucher_state.json.
+
+    FAIL-SAFE ON PURPOSE: it stops, rather than trusting a flag or a path
+    parameter that a caller might forget. A throwaway checkout (`git worktree`,
+    a fresh clone, CI) has an empty data dir and sails straight through, so the
+    honest way to run this on a hub is to run it somewhere else."""
+    data = os.path.join(os.path.dirname(os.path.abspath(gh.__file__)), "data")
+    live = []
+    db = os.path.join(data, "hub.db")
+    if os.path.isfile(db):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+            try:
+                for tbl, what in (("machines", "registered machine"),
+                                  ("aft_registrations", "AFT registration"),
+                                  ("tito_tickets", "TITO ticket")):
+                    try:
+                        n = con.execute("SELECT count(*) FROM %s" % tbl).fetchone()[0]
+                        if n:
+                            live.append("%d %s row(s)" % (n, what))
+                    except sqlite3.Error:
+                        pass
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    # CONTENT, never file size: a store that has merely been INITIALISED (an
+    # empty ledger, the default zero-balance "house" account) is what a
+    # throwaway checkout looks like after one run, and refusing on that would
+    # cry wolf until someone deleted the guard.
+    def _json(name):
+        p = os.path.join(data, name)
+        if not os.path.isfile(p):
+            return None
+        try:
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    acct = _json("account_state.json") or {}
+    accounts = acct.get("accounts") or {}
+    real_accts = [a for a in accounts if a != "house"]
+    house = accounts.get("house") or {}
+    if real_accts:
+        live.append("%d player wallet(s)" % len(real_accts))
+    elif acct.get("ledger") or any(int(house.get(k) or 0) for k in
+                                   ("cashableMillicents", "promoMillicents",
+                                    "nonCashMillicents")):
+        live.append("a funded/used House wallet")
+    for name, what in (("wat_state.json", "WAT transfer records"),
+                       ("voucher_state.json", "issued vouchers")):
+        blob = _json(name)
+        if isinstance(blob, dict) and any(
+                v for v in blob.values() if isinstance(v, (list, dict))):
+            live.append(what)
+    if live:
+        print("REFUSING TO RUN — %s looks like a LIVE deployment:" % data)
+        for l in live:
+            print("    · %s" % l)
+        print("\n  This gate constructs a real G2SHost, whose stores are "
+              "hardcoded to that\n  directory. Running here would open your "
+              "hub.db, wallets, vouchers and WAT\n  state, and can reach the "
+              "AFT auto-registration path — re-registering those\n  keys "
+              "breaks cashless transfers until the machines are paired again."
+              "\n\n  Run it against a throwaway checkout instead:\n"
+              "    git worktree add --detach /tmp/cabinet-gate HEAD\n"
+              "    cd /tmp/cabinet-gate/G2S && python3 tools/%s\n"
+              "    git worktree remove --force /tmp/cabinet-gate\n"
+              "\n  (deploy/update.py already does exactly this for you.)"
+              % os.path.basename(__file__))
+        sys.exit(2)
+
+
 def main():
+    refuse_live_data()
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s %(levelname)-7s %(message)s")
     cap = LogCapture()
