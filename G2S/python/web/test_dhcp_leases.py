@@ -171,5 +171,29 @@ sd._handle_decline({'mac': AVP})
 check("DECLINE removed the AVP's conflicting lease",
       AVP not in sd.leases)
 
+# 10 — option-12 hostname: NUL-strip, round-trip, no-wipe on bare re-DISCOVER
+print("— option-12 hostname rides the lease (NUL-stripped, never wiped)")
+check("trailing NUL + whitespace stripped from opt 12 (RFC 2132 §2)",
+      EnhancedDHCPServer._client_hostname({'options': {12: b'raspberrypi\x00'}})
+      == 'raspberrypi')
+check("absent opt 12 -> empty string, no crash",
+      EnhancedDHCPServer._client_hostname({'options': {}}) == '')
+check("non-UTF8 garbage in opt 12 never raises",
+      isinstance(EnhancedDHCPServer._client_hostname(
+          {'options': {12: b'\xff\xfe\x00'}}), str))
+sh = mk(LF)
+sh.leases = {AVP: dict(lease('192.168.50.101'), hostname='raspberrypi')}
+sh._save_leases()
+sh2 = mk(LF)
+sh2._load_leases()
+check("hostname survives the save/load round-trip",
+      sh2.leases.get(AVP, {}).get('hostname') == 'raspberrypi', sh2.leases)
+check("a re-DISCOVER WITHOUT opt 12 keeps the learned name",
+      sh2._lease_hostname(AVP, {'options': {}}) == 'raspberrypi')
+check("a re-DISCOVER WITH opt 12 takes the fresh name",
+      sh2._lease_hostname(AVP, {'options': {12: b'new-name\x00'}}) == 'new-name')
+check("an unknown mac with no opt 12 yields ''",
+      sh2._lease_hostname('de:ad:be:ef:00:01', {'options': {}}) == '')
+
 print(f"\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

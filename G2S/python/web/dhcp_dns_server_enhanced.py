@@ -487,6 +487,27 @@ class EnhancedDHCPServer:
         
         return options
     
+    @staticmethod
+    def _client_hostname(packet):
+        """The client's own hostname (DHCP option 12), or ''.
+
+        Trailing NULs are stripped along with whitespace: RFC 2132 §2 tells
+        the receiver to drop them, and the embedded stacks on this fleet
+        (QNX/VxWorks era) do null-terminate the option.
+        """
+        try:
+            raw = packet.get('options', {}).get(12)
+            return raw.decode('utf-8', errors='ignore').strip('\x00 \t\r\n') if raw else ''
+        except Exception:
+            return ''
+
+    def _lease_hostname(self, mac, packet):
+        """The name to store on this MAC's lease: the packet's opt 12 if
+        present, else whatever was already learned — a re-DISCOVER without
+        opt 12 must not wipe a known name."""
+        return self._client_hostname(packet) \
+            or self.leases.get(mac, {}).get('hostname', '')
+
     def detect_vendor(self, packet):
         """Enhanced vendor detection for slot machines"""
         # First check vendor class identifier (option 60)
@@ -663,6 +684,9 @@ class EnhancedDHCPServer:
             # Update lease state
             self.leases[mac]['state'] = 'acked'
             self.leases[mac]['timestamp'] = time.time()
+            hn = self._client_hostname(packet)
+            if hn:
+                self.leases[mac]['hostname'] = hn
             self._save_leases()
 
             print(f"[DHCP] REQUEST from {mac} - Sending ACK for {lease_ip}")
@@ -716,7 +740,11 @@ class EnhancedDHCPServer:
             'ip': offered_ip,
             'vendor': vendor,
             'state': 'offered',
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            # opt 12 — so data/dhcp_leases.json (and the support bundle that
+            # ships it) can say "raspberrypi at .114" instead of a bare MAC
+            # when sorting out which box on the slot switch is which
+            'hostname': self._lease_hostname(mac, packet),
         }
         # NOT persisted here — only an ACK commits a lease to disk. Persisting an
         # OFFER would let a declined/incomplete offer survive a restart (a
