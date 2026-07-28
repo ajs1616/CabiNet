@@ -46,6 +46,7 @@ import urllib.error
 import urllib.request
 
 DEFAULT_HUB = "http://127.0.0.1:8081"
+DEFAULT_REMOTE = "https://github.com/ajs1616/CabiNet.git"
 
 # The self-contained gates: every one of these runs with no live host and no
 # pytest. `avp_replay.py` is deliberately absent — the wire captures it replays
@@ -120,18 +121,106 @@ def git(args, cwd, **kw):
 
 
 def repo_root():
-    try:
-        rc, out = run(["git", "rev-parse", "--show-toplevel"],
-                      cwd=os.path.dirname(os.path.abspath(__file__)),
-                      quiet=True)
-    except Exception:
-        raise Fail("this does not look like a git clone — run it from inside "
-                   "your CabiNet repo")
-    root = out.strip()
+    """The CabiNet tree this script lives in — clone or not.
+
+    Deliberately does NOT require a git clone. Plenty of hubs were stood up by
+    copying files or unpacking a download, and telling those operators to go
+    read a page of `git init` incantations is exactly the "where do I put the
+    updated files?" frustration this tool exists to end. adopt() turns such a
+    tree into a clone in place, so the instruction is always the same single
+    command."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    rc, out = run(["git", "rev-parse", "--show-toplevel"], cwd=here,
+                  check=False, quiet=True)
+    root = out.strip() if rc == 0 else os.path.dirname(here)
     if not os.path.isdir(os.path.join(root, "G2S")) \
             or not os.path.isdir(os.path.join(root, "SAS")):
-        raise Fail("%s has no G2S/ and SAS/ — wrong directory?" % root)
+        raise Fail("%s has no G2S/ and SAS/ — run this from inside your "
+                   "CabiNet install (the folder holding G2S/ and SAS/)." % root)
     return root
+
+
+def is_clone(root):
+    rc, _ = run(["git", "rev-parse", "--is-inside-work-tree"], cwd=root,
+                check=False, quiet=True)
+    return rc == 0
+
+
+def adopt(root, remote, assume_yes):
+    """Turn a copied/unpacked install into a tracked clone, in place.
+
+    The dangerous step is adopting released code over files that may have been
+    edited in place, so this NEVER runs silently: it snapshots the data first,
+    proves no data file is tracked by the repo, shows exactly which local files
+    the adoption would overwrite, and asks. Untracked extras (old logs, a
+    support bundle, legacy files) are left alone — `reset --hard` does not
+    touch them."""
+    step("This install is not a git clone yet — adopting it")
+    say("   Your code will be replaced with the released version so that future")
+    say("   updates are a single command. Your DATA is not touched.")
+
+    ok, detail = db_healthy(root)
+    if not ok:
+        raise Fail("hub.db fails quick_check (%s) — fix or restore the "
+                   "database before adopting." % detail)
+    snap = backup_data(root, "pre-adopt")
+
+    run(["git", "init", "-q"], cwd=root)
+    rc, _ = run(["git", "remote", "add", "origin", remote], cwd=root,
+                check=False, quiet=True)
+    if rc != 0:
+        run(["git", "remote", "set-url", "origin", remote], cwd=root,
+            quiet=True)
+    say("   fetching %s …" % remote)
+    git(["fetch", "--prune", "origin"], root, timeout=600)
+
+    # HARD INVARIANT: the repo must not track anything under data/. If that
+    # ever stopped being true, adopting would overwrite live money state.
+    rc, tracked = run(["git", "ls-tree", "-r", "--name-only", "origin/main"],
+                      cwd=root, quiet=True)
+    dangerous = [l for l in tracked.splitlines()
+                 if "/data/" in l or l.startswith("data/")]
+    if dangerous:
+        raise Fail("the release tracks files under data/ (%s). Adopting would "
+                   "overwrite live state — refusing." % ", ".join(dangerous[:3]))
+
+    # Accurate preview. HEAD is unborn and the index empty right after
+    # `git init`, so a bare `git diff origin/main` compares against NOTHING and
+    # reports the entire release as missing. Staging the worktree first makes
+    # the comparison mean what it says: files on disk that differ from the
+    # release. (The index is thrown away by the checkout below either way.)
+    run(["git", "add", "-A"], cwd=root, quiet=True, timeout=600)
+    rc, changed = run(["git", "diff", "--cached", "--name-only", "origin/main"],
+                      cwd=root, check=False, quiet=True)
+    local = [l for l in changed.split() if l]
+    if local:
+        say("\n   %d file(s) on disk differ from the release and will be "
+            "REPLACED:" % len(local))
+        for l in local[:25]:
+            say("     · %s" % l)
+        if len(local) > 25:
+            say("     … and %d more" % (len(local) - 25))
+        say("   (your data is not among them — it is not tracked, and a copy")
+        say("    of everything is in the snapshot above)")
+
+    if not assume_yes:
+        say("")
+        if input("   Adopt the released code? [y/N] ").strip().lower() \
+                not in ("y", "yes"):
+            raise Fail("aborted — nothing was changed (your data snapshot is "
+                       "kept at %s)" % snap)
+
+    # -f is REQUIRED here, and only here: in a copied install every file is
+    # untracked, and plain `checkout` aborts rather than overwrite untracked
+    # files. That refusal is right in general and wrong for exactly this step —
+    # adopting the release IS the operation. Untracked EXTRAS (old logs, legacy
+    # files, a support bundle) are still left alone; only files the release also
+    # ships get replaced, and the snapshot above predates all of it.
+    git(["checkout", "-f", "-B", "main", "origin/main"], root)
+    git(["branch", "--set-upstream-to=origin/main", "main"], root, check=False,
+        quiet=True)
+    say("\n   ✅ adopted — now tracking origin/main. Data snapshot: %s" % snap)
+    return snap
 
 
 def hub_status(hub_url, timeout=8):
@@ -670,10 +759,21 @@ def main():
     ap.add_argument("--gates-only", action="store_true",
                     help="just run the gates against the CURRENT tree and "
                          "exit — no fetch, no pull, no restart")
+    ap.add_argument("--remote", default=DEFAULT_REMOTE,
+                    help="repo to adopt/track (default %s)" % DEFAULT_REMOTE)
     a = ap.parse_args()
 
     root = repo_root()
-    say("CabiNet updater — repo %s" % root)
+    say("CabiNet updater — %s" % root)
+
+    # An install that was copied or unpacked rather than cloned gets turned
+    # into a clone here, so "how do I apply this fix?" has ONE answer forever.
+    if not is_clone(root):
+        if a.dry_run:
+            say("\n   (dry run) this install is not a git clone; a real run "
+                "would offer to adopt it from %s" % a.remote)
+            return 0
+        adopt(root, a.remote, a.yes)
 
     if a.gates_only:
         gates(root, venv_python(root))

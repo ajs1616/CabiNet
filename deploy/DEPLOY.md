@@ -261,38 +261,27 @@ python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGM
   ~/cabinet-backups/pre-adopt-*/hub.db
 ```
 
-### 2. Is your install a git clone?
+### 2. Not a git clone? The updater fixes that itself
 
-```sh
-cd ~/CasinoNet && git rev-parse --is-inside-work-tree
-```
-
-**If that prints `true`**, skip to step 3.
-
-**If it errors** (`not a git repository`), adopt the tree in place. Nothing under
-`G2S/data/` is tracked by this repo, so your wallets, tickets and registry are
-not touched — but do check what *code* would change before committing to it:
+You do **not** need to know or care. If your install was copied, unpacked from a
+download, or set up any way other than `git clone`, just run the updater — it
+notices, offers to adopt the tree in place, and only then updates:
 
 ```sh
 cd ~/CasinoNet
-git init -q
-git remote add origin https://github.com/ajs1616/CabiNet.git
-git fetch origin
-
-# Nothing under data/ may be tracked. This MUST print 0:
-git ls-tree -r --name-only origin/main | grep -cE '(^|/)data/'
-
-# What would be overwritten? Review before you proceed — if you edited any
-# TRACKED file in place (service units, tftp configs), copy it aside now.
-git diff --stat origin/main -- . | tail -20
+python3 deploy/update.py
 ```
 
-When you are happy:
+Before it changes anything it snapshots your data, proves the release tracks
+**nothing** under `data/`, and prints exactly which files on disk differ from the
+release and will be replaced. Then it asks. Your wallets, tickets, AFT/WAT keys
+and registry are never touched — they are not tracked by the repo, and there is
+a snapshot besides. Files the release does **not** ship (old logs, a support
+bundle, anything you added) are left alone.
 
-```sh
-git checkout -B main origin/main          # adopts the released code
-git branch --set-upstream-to=origin/main main
-```
+One thing to know: if you edited a **tracked** file in place — a service unit, a
+TFTP config — adoption replaces it with the released version. It is listed in
+the preview before you confirm, and the snapshot has your copy.
 
 ### 3. Let the hub reach its satellites
 
@@ -330,12 +319,18 @@ It is designed to refuse rather than guess. The common ones:
 
 | message | what to do |
 |---|---|
+| `has no G2S/ and SAS/` | you are in the wrong folder — `cd` to your CabiNet install |
 | `on a DETACHED HEAD` | `git checkout main` |
 | `no upstream configured` | `git branch --set-upstream-to=origin/main main` |
 | `NOT the one the hub runs from` | you are in a second clone — `cd` to the one in `casinonet-g2s.service`'s `WorkingDirectory` |
 | `refusing to pull over local edits` | `git stash`, or `--allow-dirty` if the edits are disposable |
 | `a tournament is armed/running` | finish or cancel the round |
-| a gate fails | nothing was restarted and the tree is put back; open an issue with the output |
+| `hub.db fails PRAGMA quick_check` | your database was already damaged — restore a snapshot from `G2S/data/_backups/` before updating |
+| a gate fails | nothing was restarted and the tree was put back; grab a support bundle and open an issue |
+
+Nothing here is a dead end: every refusal happens **before** anything restarts,
+and a failure after that point restores your previous code *and* your data
+together.
 
 ## Updating
 
