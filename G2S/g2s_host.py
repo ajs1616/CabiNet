@@ -4180,6 +4180,19 @@ class G2SHost:
         except Exception:
             return []
 
+    def update_log_age(self):
+        """Seconds since the transcript last grew, or None. The card needs
+        this to tell "a detached updater is verifying RIGHT NOW" (fresh log,
+        no outcome line yet) from "a run died long ago" — the hub itself
+        cannot remember: applying an update restarts us and the in-memory
+        state resets to idle."""
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
+                         self.UPDATE_LOG)
+        try:
+            return round(time.time() - os.path.getmtime(p), 1)
+        except OSError:
+            return None
+
     def ticket_header(self):
         """The hub-wide ticket header (C1/C2/C4) — hub_store.ticket_header()
         behind the sysval-style TTL cache: zero extra hub.db reads on the
@@ -18995,8 +19008,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # user-initiated check found. Nothing here reaches the
                         # network; that needs the Check-now button (or the
                         # auto-check the operator opted into).
+                        # full tail, not a stub: the card narrates the run
+                        # from the transcript's own phase headers, and a
+                        # 12-line tail once reduced a finished update's
+                        # checklist to "✓ verify" alone
                         "updates": dict(engine.update_state(),
-                                        lastLog=engine.update_log_tail(12)),
+                                        lastLog=engine.update_log_tail(),
+                                        logAgeSec=engine.update_log_age()),
                         # Tournament alias roster (board v2) — the EFFECTIVE list
                         # (defaults when unset), so the admin card's textarea can
                         # prefill; write path = /api/settings tournamentNames.

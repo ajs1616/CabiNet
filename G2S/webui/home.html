@@ -5166,7 +5166,13 @@ function renderUpdates(){
      the card sat on "in progress — verify" forever after a completed
      card-triggered update, until someone reloaded the page. */
   const doneLine=tail.filter(l=>/^(✅|❌)/.test(l)).pop()||"";
-  const busy=u.state==="running"||(UPDBUSY&&!doneLine);
+  /* a FRESH transcript with no ending = the detached updater is still at
+     work. This is the NORMAL post-restart state (the page reloads on
+     uiStamp, the new hub says idle, and verify polls silently for up to
+     ~3.5 min) — only a STALE ending-less log means an interrupted run. */
+  const inflight=!doneLine&&tail.length>0
+    &&u.logAgeSec!=null&&u.logAgeSec<300;
+  const busy=u.state==="running"||inflight||(UPDBUSY&&!doneLine);
   if(doneLine) UPDBUSY=false;
   if(busy&&tail.length){
     const pct=rolling?100:Math.round(((lastIx+1)/UPD_PHASES.length)*100);
@@ -5203,10 +5209,10 @@ function renderUpdates(){
       body+=`<div class="kd" style="color:${doneLine.startsWith("✅")
         ?"var(--felt)":"var(--ruby)"}">${esc(doneLine.trim())}</div>`;
     } else {
-      // no column-0 outcome: the run never wrote its ending (interrupted, or
-      // still going in another tab's session) — say so instead of implying done
-      body+=`<div class="kd" style="color:var(--gold)">no completion line — this
-        run may still be going, or it was interrupted. Reload to re-check.</div>`;
+      // ending-less AND stale (inflight already went to the progress bar):
+      // the run was interrupted — say so instead of implying it finished
+      body+=`<div class="kd" style="color:var(--gold)">this run never wrote its
+        ending — it looks interrupted. Check data/update_last.log on the hub.</div>`;
     }
     body+=warns.map(o=>`<div class="kd" style="color:var(--gold)">${
       esc(o)}</div>`).join("");
