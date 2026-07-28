@@ -4164,9 +4164,14 @@ class G2SHost:
 
         threading.Thread(target=loop, daemon=True).start()
 
-    def update_log_tail(self, lines=40):
+    def update_log_tail(self, lines=140):
         """Last lines of the previous run's transcript — survives our restart,
-        which is the whole point."""
+        which is the whole point.
+
+        140, not 40: the card reads this back as the run's own narration, and
+        a clean run is ~60 lines — at 40 the early phase headers fell off the
+        front, so a finished update showed a checklist reading "✓ verify" as
+        if nothing before it had happened. A rollback run is longer still."""
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                          self.UPDATE_LOG)
         try:
