@@ -352,14 +352,13 @@ def parse_extended_game_info(data: bytes) -> ExtendedGameInfo:
     [prog levels 4][game-name len 1][game name ASCII][paytable-name len 1]
     [paytable name ASCII][wager categories 2 BCD].
 
-    Trailing bytes beyond the defined fields are IGNORED, per §2.2.3: "si un host recibe una respuesta válida de longitud
-    variable con más datos de los que espera, procesará la parte del mensaje
-    que comprende e ignorará los bytes adicionales."
+    Trailing bytes beyond the defined fields are IGNORED — §2.2.3 has the
+    host process the part of a valid variable-length response it understands
+    and ignore any additional bytes.
 
-    progressive_levels decodes the 4 binary bytes LSB-first per §2.2.3 ("All
-    data exchanged in binary format is sent least significant byte first") with
-    Table 7.23b's own "lsb = level 1, msb = level 32, bit set for each SAS
-    progressive level enabled". The raw bytes are kept alongside because this has
+    progressive_levels decodes the 4 binary bytes LSB-first (§2.2.3: binary
+    data travels least-significant byte first) with Table 7.23b's own "lsb =
+    level 1, msb = level 32, bit set for each SAS progressive level enabled". The raw bytes are kept alongside because this has
     never been seen on a wire — if a real machine ever contradicts the order,
     the raw field is the evidence, not a re-derivation."""
     if len(data) < 12:

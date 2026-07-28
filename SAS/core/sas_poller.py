@@ -94,11 +94,10 @@ DEFAULT_METERS: List[MeterSpec] = [
 class HandpayInfo:
     """One LP 0x1B "Send Handpay Information" response, captured when the poller
     services an exception 0x51. The record byte layout is NOT yet adjudicated on
-    real hardware (memory: reference_cabinet_sas_adjudication) — we hand back
-    the RAW bytes for capture and never fabricate an amount. `empty` is True when
-    the machine returns an all-zero record (queue already reported/drained,
-    §7.8.1: "1B returns all zeros if a handpay record has been reported and
-    acknowledged")."""
+    real hardware — we hand back the RAW bytes for capture and never fabricate
+    an amount. `empty` is True when the machine returns an all-zero record:
+    per §7.8.1 that means every queued handpay record has already been reported
+    and acknowledged (queue drained)."""
     address: int
     raw: bytes            # full frame as received: [addr][1B][data...][crc]
     data: bytes           # the record payload (between command byte and CRC)
