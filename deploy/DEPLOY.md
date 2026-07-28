@@ -128,7 +128,10 @@ Requirements:
    ```
 
    (`cabinet-kiosk` / `cabinet-console` are Pi-5-DSI-touchscreen extras —
-   skip them on a generic box; the web UI is the same thing in any browser.)
+   skip them on a generic box; the web UI is the same thing in any browser.
+   On a Pi with the touchscreen, don't install them by hand: run
+   `sudo ./deploy/kiosk_setup.sh` from your checkout and it does the same
+   placeholder substitution for you, as the login you sudo'd from.)
 
 4. **Check it's alive:**
 
@@ -293,12 +296,19 @@ cd ~/CabiNet
 python3 deploy/update.py
 ```
 
-Before it changes anything it snapshots your data, proves the release tracks
-**nothing** under `data/`, and prints exactly which files on disk differ from the
-release and will be replaced. Then it asks. Your wallets, tickets, AFT/WAT keys
-and registry are never touched — they are not tracked by the repo, and there is
-a snapshot besides. Files the release does **not** ship (old logs, a support
-bundle, anything you added) are left alone.
+Before it changes anything it snapshots your data to **`~/.cabinet-backups/`**
+(deliberately outside the install, since adoption rewrites the tree), proves the
+release tracks **nothing** under `data/`, and prints exactly which files on disk
+differ from the release and will be replaced. Then it asks. Your wallets,
+tickets, AFT/WAT keys and registry are never touched — they are not tracked by
+the repo, and there is a snapshot besides. Files the release does **not** ship
+(old logs, a support bundle, your own notes and scripts) are left alone.
+
+Adoption checks its own work rather than trusting it: it takes an inventory of
+every data file before and after, and if a single one went missing it restores
+the snapshot and fails loudly instead of reporting success. Once the tree is
+adopted the updater carries straight on into the gates and the satellite sync —
+otherwise your hub would be on new code with every satellite still on old.
 
 One thing to know: if you edited a **tracked** file in place — a service unit, a
 TFTP config — adoption replaces it with the released version. It is listed in
@@ -381,7 +391,9 @@ instead of a line in these docs telling you to `git pull`.
 touched, the updater takes a full snapshot of `G2S/data/` — `hub.db` (via
 SQLite's online backup, so a WAL database is captured consistently), plus
 wallets, vouchers, transfers, the machine registry and your nicknames — into
-`G2S/data/_backups/`. The last 5 snapshots are kept.
+`G2S/data/_backups/`. The last 5 snapshots are kept. (The one exception is
+*adoption* of a non-clone install, which rewrites the tree and so puts its
+snapshot in `~/.cabinet-backups/` instead — outside the blast radius.)
 
 That snapshot is not a formality. New code can **migrate** `hub.db` to a newer
 schema the moment it starts, so putting old code back on its own would leave it
@@ -394,14 +406,19 @@ What it does, in order:
 1. refuses if a tournament is armed, counting down, or running
 2. refuses if this clone is not the one your `cabinet-g2s` service runs from
 3. snapshots your data, after checking `hub.db` passes `PRAGMA quick_check`
-4. pulls, then runs the full gate suite — **if a gate fails, nothing restarts**
+4. pulls, then runs the full gate suite against **what will actually ship** —
+   your working tree, uncommitted edits included, in an isolated throwaway
+   checkout. **If a gate fails, nothing is pushed, nothing restarts, and your
+   data is not even touched** — the tree is simply put back.
 5. pushes the SAS tree to every satellite (never `data/`), restarts them, then the hub
 6. waits for the machines and SAS links that were up to come back
-7. any failure at all → restores the previous commit **and** the data snapshot
+7. any failure *after* that point → restores the previous commit **and** the
+   data snapshot
 
-Useful flags: `--dry-run`, `--yes` (no prompt), `--gates-only` (just test the
-current tree), `--no-satellites` (hub only — leaves satellites stale, so only if
-you have none).
+Useful flags: `--dry-run`, `--yes` (no prompt), `--gates-only` (run the gates
+against your working tree and exit — no fetch, no pull, no adopt, no restart),
+`--no-satellites` (hub only — leaves satellites stale, so only if you have
+none).
 
 If a kiosk or tablet is showing the UI, **hard-reload it** afterwards; the
 browser will be holding the old page.

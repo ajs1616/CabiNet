@@ -4063,8 +4063,17 @@ class G2SHost:
         with self.update_lock:
             st = dict(self._update)
         rc, head, _ = self._git("log", "--oneline", "--no-decorate", "-1")
-        st["current"] = head if rc == 0 else None
-        st["isClone"] = rc == 0
+        # `git log` succeeding proves we are inside SOME repo, not that this
+        # install is one. An install copied into any tree that happens to be a
+        # git repo answers yes and the card then reports the ENCLOSING repo's
+        # HEAD as your CabiNet version. Require the top of the work tree to be
+        # our own directory — the same check deploy/update.py::is_clone makes.
+        rc_top, top, _ = self._git("rev-parse", "--show-toplevel")
+        is_clone = (rc_top == 0
+                    and os.path.realpath(top or "/nonexistent")
+                    == os.path.realpath(self._repo_dir()))
+        st["current"] = head if (rc == 0 and is_clone) else None
+        st["isClone"] = is_clone
         st["autoCheck"] = self.hub_store.host_setting("update_auto_check",
                                                       "0") == "1"
         if not check:

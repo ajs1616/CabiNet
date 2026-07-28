@@ -39,8 +39,8 @@ StandardError=journal
 UtmpIdentifier=tty1
 UtmpMode=user
 # Pull VT1 to the foreground before cage starts (the '+' runs it as root even
-# though the service runs as aj) — mirrors cabinet-console.service, which
-# used to need this on tty1 and now sits on tty2 without it.
+# though the service runs as the kiosk user) — mirrors cabinet-console.service,
+# which used to need this on tty1 and now sits on tty2 without it.
 ExecStartPre=+/usr/bin/chvt 1
 # cage: bare-bones Wayland kiosk compositor.
 #   -s : allow VT switching (Ctrl+Alt+F2 reaches the tty2 debug console;
