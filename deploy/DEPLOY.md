@@ -261,7 +261,27 @@ python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGM
   ~/cabinet-backups/pre-adopt-*/hub.db
 ```
 
-### 2. Not a git clone? The updater fixes that itself
+### 2. Get the updater (your install predates it)
+
+`deploy/update.py` shipped in July 2026, so **an older install does not have
+it**. SSH to the hub and grab the one file — you only ever do this once, because
+from then on it updates itself:
+
+```sh
+cd ~/CasinoNet                     # wherever your install lives (holds G2S/ and SAS/)
+mkdir -p deploy
+curl -fsSL https://raw.githubusercontent.com/ajs1616/CabiNet/main/deploy/update.py \
+  -o deploy/update.py
+python3 deploy/update.py --dry-run
+```
+
+No `curl`? Use `wget -O deploy/update.py <same URL>`. Dropping the file in the
+install root instead of `deploy/` works too — it looks in both.
+
+The `--dry-run` changes nothing and tells you what a real run would do. When it
+looks right, drop the flag.
+
+### 3. Not a git clone? The updater fixes that itself
 
 You do **not** need to know or care. If your install was copied, unpacked from a
 download, or set up any way other than `git clone`, just run the updater — it
@@ -283,7 +303,7 @@ One thing to know: if you edited a **tracked** file in place — a service unit,
 TFTP config — adoption replaces it with the released version. It is listed in
 the preview before you confirm, and the snapshot has your copy.
 
-### 3. Let the hub reach its satellites
+### 4. Let the hub reach its satellites
 
 The updater pushes the SAS tree to every satellite Pi itself, so the **hub**
 needs a key to them (the setup scripts ran from your laptop, which is a
@@ -305,7 +325,7 @@ curl -s http://127.0.0.1:8081/api/status \
 
 No satellites at all (every machine on G2S)? Then pass `--no-satellites`.
 
-### 4. Dry-run, then do it
+### 5. Dry-run, then do it
 
 ```sh
 cd ~/CasinoNet

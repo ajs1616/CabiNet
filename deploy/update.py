@@ -132,12 +132,20 @@ def repo_root():
     here = os.path.dirname(os.path.abspath(__file__))
     rc, out = run(["git", "rev-parse", "--show-toplevel"], cwd=here,
                   check=False, quiet=True)
-    root = out.strip() if rc == 0 else os.path.dirname(here)
-    if not os.path.isdir(os.path.join(root, "G2S")) \
-            or not os.path.isdir(os.path.join(root, "SAS")):
-        raise Fail("%s has no G2S/ and SAS/ — run this from inside your "
-                   "CabiNet install (the folder holding G2S/ and SAS/)." % root)
-    return root
+    if rc == 0 and os.path.isdir(os.path.join(out.strip(), "G2S")):
+        return out.strip()
+    # Not a clone (yet). Be forgiving about WHERE this file was dropped —
+    # existing installs predate deploy/update.py, so operators bootstrap it by
+    # downloading this one file, and "put it in exactly the right folder" is
+    # the sort of instruction that makes people give up. Accept the usual
+    # landing spots: <root>/deploy/update.py, <root>/update.py, or being run
+    # from inside the install.
+    for cand in (os.path.dirname(here), here, os.getcwd()):
+        if os.path.isdir(os.path.join(cand, "G2S")) \
+                and os.path.isdir(os.path.join(cand, "SAS")):
+            return cand
+    raise Fail("can't find your CabiNet install from %s — it should hold G2S/ "
+               "and SAS/. cd into it and run this again." % here)
 
 
 def is_clone(root):
