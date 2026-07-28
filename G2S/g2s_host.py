@@ -1041,6 +1041,13 @@ OPTION_CHANGE_ABANDON_SEC = 120
 # window (self-disable -> CBE205 in ~3s) with generous headroom.
 OPTION_VERIFY_BACKOFF = (3, 8, 20)
 
+# How long to wait before re-reading a wat device the EGM rejected during the
+# join window. A tester's cabinets answered G2S_APX003 "Invalid Device
+# Identifier" for their OWN active, host-owned wat/1+2 for a moment after
+# commsOnLine, then served the identical reads happily — this only has to
+# clear that window.
+WAT_REPROBE_DELAY_SEC = 8
+
 # The denom ceremony's enterOptionConfigMode timeToLive, in ms (§1.17). The
 # 30 s builder default was reaping a BB2E that was lawfully holding the request
 # (§9.7 has the EGM wait for credits=0 then cabinet idleTimePeriod) and came
@@ -1106,6 +1113,7 @@ class EgmAssociation:
         # deliberately NOT reset in new_epoch, so a bouncing link can't turn
         # silence-tolerant one-shots into a per-rejoin ask storm.
         self.denom_backfill_epoch = -1
+        self.wat_reprobe_epoch = -1     # one deferred wat re-read per epoch
         self.denom_backfill_at = 0.0
         self.denom_backfill_asked = {}
         # Ticket-header re-push (2026-07-26): the epoch whose harvest already
@@ -10636,6 +10644,60 @@ class G2SHost:
                                           int(i) if i.isdigit() else i)) \
             or ["1"]
 
+    def _known_wat_ids(self, assoc):
+        """The ACTIVE wat deviceIds this machine reported in its last
+        descriptorList harvest. Empty before the first harvest — callers fall
+        back to the ("1","2") guess every IGT cabinet has answered to."""
+        out = []
+        with assoc.lock:
+            descs = list(assoc.descriptors or [])
+        for d in descs:
+            if d.get("deviceClass") == "G2S_wat":
+                did = str(d.get("deviceId") or "").strip()
+                # inactive devices are noise, and a GUEST personality device
+                # (the AVP's SAS-6.02 wat/3) is never ours to drive — G2S-40.
+                if did and str(d.get("active")).lower() in ("true", "1"):
+                    out.append(did)
+        return out
+
+    def _arm_wat_reprobe(self, assoc):
+        """A wat read was rejected G2S_APX003 in the join window — arm ONE
+        deferred re-read for this epoch (however many of the four join reads
+        were rejected). Timer thread, never the FIFO worker (the ce2602f
+        deadlock rule); the delay IS the fix, since the machine refuses for a
+        moment and then serves the identical read."""
+        with assoc.lock:
+            if assoc.wat_reprobe_epoch == assoc.epoch:
+                return
+            assoc.wat_reprobe_epoch = assoc.epoch
+            epoch = assoc.epoch
+        t = threading.Timer(WAT_REPROBE_DELAY_SEC, self._wat_reprobe_now,
+                            kwargs={"assoc": assoc, "epoch": epoch})
+        t.daemon = True
+        t.start()
+
+    def _wat_reprobe_now(self, assoc, epoch):
+        """Read status+profile for every active wat device we still have no
+        picture of. Prefers the ids the harvest revealed (right on any vendor),
+        falling back to ("1","2") if the descriptorList has not landed. Epoch
+        gated: a re-handshake in the delay window makes this a no-op, and that
+        epoch's own rejection arms a fresh one."""
+        with assoc.lock:
+            if assoc.epoch != epoch:
+                return
+        ids = self._known_wat_ids(assoc) or ["1", "2"]
+        with assoc.lock:
+            missing = [d for d in ids if not (assoc.wat_devices.get(d) or {})]
+        if not missing:
+            return                      # the answers landed after all
+        log.info("🏦 [%s] WAT re-probe — the join-window read was rejected "
+                 "(G2S_APX003) for %s; re-reading now that the machine has "
+                 "settled", assoc.egm_id,
+                 ", ".join("wat/" + d for d in missing))
+        for dev in missing:
+            self.enqueue_get_wat_status(assoc, dev, epoch=epoch)
+            self.enqueue_get_wat_profile(assoc, dev, epoch=epoch)
+
     def _start_game_play_sweep(self, assoc):
         """Staggered join-sequence gamePlay sweep (G2S-21, un-gated
         2026-07-02). One background thread per epoch that enqueues the
@@ -14736,6 +14798,18 @@ class G2SHost:
             log.warning("[%s] %s.%s carried class-level errorCode=%s — the EGM "
                         "REJECTED our request%s", assoc.egm_id, req["class"],
                         cmd, rerr, f' (errorText="{rtext}")' if rtext else "")
+            # wat + "Invalid Device Identifier" = the join-window rejection. A
+            # cabinet can refuse reads for its OWN active, host-owned wat
+            # devices for a moment after commsOnLine (a tester's floor,
+            # 2026-07-23: 88 rejections in a day, the identical reads served
+            # fine later, and its descriptors carried wat/1+2
+            # deviceActive=true ownerId=1 the whole time). Nothing retried, so
+            # /api/status.wat stayed empty for a healthy device and the Wallet
+            # page had nothing to show. Arm ONE deferred re-read. Triggered by
+            # the REJECTION itself, never by "we have no data yet" — absence
+            # races with an answer still in flight.
+            if req["class"] == "wat" and rerr == "G2S_APX003":
+                self._arm_wat_reprobe(assoc)
             # Glass sequencer fail-fast (live-hit 2026-07-10: MDX003 "Must
             # release loaded content." rejected the load itself): a
             # mediaDisplay-class rejection while a push still sits at
@@ -15418,13 +15492,15 @@ class G2SHost:
                     self.enqueue_get_cabinet_status(assoc, epoch=epoch)
                     self.enqueue_get_meter_info(assoc, epoch=epoch)
                     self.enqueue_get_event_handler_log(assoc, epoch=epoch)
-                    # G2S-39 WAT join probe: status+profile for the two wat
-                    # devices the live AVP exposes (G2S_wat/1 and /2), so
+                    # G2S-39 WAT join probe: status+profile per wat device, so
                     # /api/status.wat populates with zero operator action.
-                    # Four cheap silence-tolerant reads per epoch — nothing
-                    # like the 357-read gamePlay sweep this ordering rule
-                    # exists for.
-                    for wat_dev in ("1", "2"):
+                    # Cheap silence-tolerant reads — nothing like the 357-read
+                    # gamePlay sweep this ordering rule exists for. A REJOIN
+                    # already knows the machine's real inventory from the last
+                    # harvest, so it uses that; only a first-ever join falls
+                    # back to the ("1","2") every IGT cabinet has answered to,
+                    # and a join-window refusal arms the deferred re-probe.
+                    for wat_dev in (self._known_wat_ids(assoc) or ("1", "2")):
                         self.enqueue_get_wat_status(assoc, wat_dev,
                                                     epoch=epoch)
                         self.enqueue_get_wat_profile(assoc, wat_dev,
