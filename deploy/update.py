@@ -617,6 +617,42 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None):
         say("     sudo systemctl restart casinonet-g2s")
 
 
+def self_update(root, argv):
+    """Re-exec from the INCOMING version of this script, if it differs.
+
+    ⚠️ THE UPDATER UPDATES ITSELF, and without this the old copy can never
+    install its own fixes: the running script is the one already on disk, so a
+    release that FIXES the updater is applied by the buggy updater. That is not
+    hypothetical — the first live run hit three defects, pushed the fixes, and
+    then hit the same three again because the old script was still driving.
+
+    Done BEFORE anything is touched, so nothing has to survive the hand-off:
+    the new script simply runs the whole update from the top. The env flag
+    bounds it to one hop, so a broken new version cannot loop."""
+    if os.environ.get("CABINET_UPDATER_FRESH"):
+        return
+    try:
+        p = subprocess.run(["git", "show", "@{u}:deploy/update.py"], cwd=root,
+                           capture_output=True, text=True, timeout=60)
+        if p.returncode != 0 or not p.stdout.strip():
+            return                      # no upstream copy — carry on as-is
+        incoming_src = p.stdout
+        mine = open(os.path.abspath(__file__), encoding="utf-8").read()
+        if incoming_src == mine:
+            return
+    except Exception:
+        return                          # never block an update on this check
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="cabinet-update-", suffix=".py")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(incoming_src)
+    say("\n\033[1m== The updater itself has changed — re-running the new "
+        "one\033[0m")
+    say("   (%s)" % tmp)
+    env = dict(os.environ, CABINET_UPDATER_FRESH="1")
+    os.execve(sys.executable, [sys.executable, tmp] + list(argv[1:]), env)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Bring a CabiNet hub and its satellites current.")
@@ -643,6 +679,12 @@ def main():
         gates(root, venv_python(root))
         say("\n✅ Gates pass on the current tree.")
         return 0
+
+    # Fetch first so @{u} is current, then hand off to the incoming updater if
+    # this release changes it. Both are cheap and read-only.
+    if not a.dry_run:
+        git(["fetch", "--prune"], root, check=False, quiet=True)
+        self_update(root, sys.argv)
 
     status, sats, machines = preflight(root, a.hub_url, a.allow_dirty, a.dry_run)
     if a.no_satellites:
