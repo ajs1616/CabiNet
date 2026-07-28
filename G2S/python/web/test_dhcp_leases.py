@@ -44,7 +44,7 @@ def mk(lease_file, retention=7 * 24 * 3600, start=100, end=200, reservations=Non
 
 tmp = tempfile.mkdtemp()
 LF = os.path.join(tmp, 'leases.json')
-AVP, ZERO = '00:01:2e:49:28:15', '00:e0:4c:5c:19:30'
+AVP, ZERO = '00:11:22:33:44:55', '00:11:22:33:44:66'
 
 
 def lease(ip, ts=None):

@@ -26,7 +26,7 @@ all pinned to eth0:
 | `cabinet-ntp` | NTP on :123, stratum 1 | origin-echo fixed 2026-07-01; disciplined the AVP |
 | `cabinet-tftp` | serves `G2S/tftp-root/` on :69 | any fetch is logged — a WMS fetch is a capture event |
 | `cabinet-g2s` | `g2s_host.py --harvest` on **:8081**, path `/G2S`, HTTP, cert-less | logs EVERY inbound POST raw to `logs/g2s_wire_*.log` **before** parsing |
-| `cabinet-console` | tty1 cockpit on the DSI screen | parses the DHCP host-discovery lines live |
+| `cabinet-console` | tty2 cockpit on the DSI screen (Ctrl+Alt+F2; the kiosk owns tty1) | parses the DHCP host-discovery lines live |
 
 Also known:
 
@@ -89,7 +89,7 @@ Every row below is a question the first bench session should answer.
 
 ## 3. Bench-day capture plan (all commands run ON the Pi)
 
-SSH in over Wi-Fi (SSH to the host) or use the tty1 cockpit. Get the
+SSH in over Wi-Fi (SSH to the host) or use the tty2 cockpit (Ctrl+Alt+F2). Get the
 cabinet's MAC first (label, or it'll show in the DHCP journal).
 
 ### Phase 0 — preflight (2 min)

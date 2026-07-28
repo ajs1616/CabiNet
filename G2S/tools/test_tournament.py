@@ -130,8 +130,8 @@ from hub_store import HubStore  # noqa: E402
 
 logging.disable(logging.CRITICAL)   # the checks print, the engine doesn't
 
-EGM = "IGT_00012E492815"            # the AVP's real egmId (never a theme)
-WMS = "WMS_00:a0:a5:79:2d:a8"       # the BB2's real egmId
+EGM = "IGT_001122334455"            # example egmId — a MAC, never a game/theme name
+WMS = "WMS_00:11:22:33:44:55"       # example egmId — a MAC, never a game/theme name
 SAS = "smib-bb2/1"                  # the BB2's SAS leg (satellite key)
 
 _p = _f = 0

@@ -80,7 +80,7 @@ EGM acked commsOnLineAck(cid=1)
 EGM is in SYNC state (commsDisabled heartbeat) — commsOnLineAck WAS ACCEPTED 🎉
 EGM acked commsDisabledAck(cid=2)
 setCommsState enable=true sent — expecting commsStatus G2S_onLine back
-🎰🎰🎰  [IGT_00012E492815] MACHINE JOINED — commsState=G2S_onLine  🎰🎰🎰
+🎰🎰🎰  [IGT_001122334455] MACHINE JOINED — commsState=G2S_onLine  🎰🎰🎰
 ```
 
 With `--harvest` and keepAlive on (the recommended flags) you'll additionally see:

@@ -48,7 +48,7 @@ from hub_store import HubStore  # noqa: E402
 
 logging.disable(logging.CRITICAL)   # the checks print, the engine doesn't
 
-EGM = "WMS_00:a0:a5:79:2d:a8"       # the BB2's real egmId (never a theme)
+EGM = "WMS_00:11:22:33:44:55"       # example egmId — a MAC, never a game/theme name
 SAS = "smib-bb2/1"                  # its SAS leg (satellite key)
 
 _p = _f = 0
@@ -191,13 +191,13 @@ def main():
     # Two G2S cards claiming the same leg would double-face that leg's
     # credits (two tiles, one machine) — the floor double-count linking
     # exists to kill. Second claimant is refused before anything is written.
-    code, body = settings(eng, {"machineKey": "IGT_00012E492815",
+    code, body = settings(eng, {"machineKey": "IGT_001122334455",
                                 "sasLink": SAS})
     check("second claimant of a linked leg -> 400 naming the owner",
           code == 400 and EGM in body.get("error", ""), (code, body))
     check("refused claim wrote NOTHING (map + hub.db untouched)",
           eng.sas_links == {EGM: SAS} and
-          (eng.hub_store.machine_prefs("IGT_00012E492815") or {}
+          (eng.hub_store.machine_prefs("IGT_001122334455") or {}
            ).get("sasLink") is None, eng.sas_links)
     code, body = settings(eng, {"machineKey": EGM, "sasLink": SAS})
     check("the owner re-posting its own link stays a 200 (idempotent)",

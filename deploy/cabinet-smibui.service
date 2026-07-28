@@ -28,7 +28,8 @@ StartLimitBurst=5
 Type=simple
 # Runs as ROOT on purpose (no User=): cog-drm needs DRM master, which on this
 # board (no seatd/logind seat) comes from owning an ACTIVE VT. Root owning tty1
-# is the low-risk, proven default for a cog-drm kiosk. (aj is in video/render/
+# is the low-risk, proven default for a cog-drm kiosk. (the service user is
+# in video/render/
 # input so User=owner is theoretically possible, but root is the simplest path.)
 WorkingDirectory=/root
 

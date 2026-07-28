@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-EGM_ID = "IGT_00012E492815"
+EGM_ID = "IGT_001122334455"
 EGM_PORT = 8080
 SLOW_SECONDS = 0.4          # make each host->EGM POST take this long
 

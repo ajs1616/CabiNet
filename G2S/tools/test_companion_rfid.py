@@ -46,7 +46,7 @@ import g2s_host as gh  # noqa: E402
 
 logging.disable(logging.CRITICAL)   # the checks print, the engine doesn't
 
-EGM = "WMS_00:a0:a5:79:2d:a8"       # the BB2's real egmId (never a theme)
+EGM = "WMS_00:11:22:33:44:55"       # example egmId — a MAC, never a game/theme name
 UID = "6CB16F06"                    # first live card (S50 1K, 2026-07-10)
 
 _p = _f = 0

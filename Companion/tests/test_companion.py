@@ -63,7 +63,7 @@ def hub():
 def make_host(hub_url, script=()):
     return CompanionHost(
         MockRfidReader(script), hub_url, "companion-test",
-        g2s_egm="WMS_00:a0:a5:79:2d:a8", sas_smib="smib-bb2",
+        g2s_egm="WMS_00:11:22:33:44:55", sas_smib="smib-bb2",
         sas_address=1, report_sec=1.0)
 
 
@@ -141,7 +141,7 @@ def test_report_body_shape_and_ack_drop(hub):
     assert body["startedAt"] == h.started_at
     assert isinstance(body["uptimeSec"], (int, float))
     assert body["readerOk"] is True
-    assert body["g2sEgmId"] == "WMS_00:a0:a5:79:2d:a8"
+    assert body["g2sEgmId"] == "WMS_00:11:22:33:44:55"
     assert body["sasSmib"] == "smib-bb2"
     assert body["sasAddress"] == "1"               # string, per contract
     assert body["lastError"] is None

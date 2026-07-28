@@ -63,7 +63,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import g2s_host as gh  # noqa: E402
 
-EGM_ID = "IGT_00012E492815"
+EGM_ID = "IGT_001122334455"
 
 PASS = 0
 FAIL = 0

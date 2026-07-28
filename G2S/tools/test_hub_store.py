@@ -38,21 +38,21 @@ def main():
     hs = HubStore(path)
 
     print("— registry + names")
-    hs.touch_machine("IGT_00012E492815", "G2S", {"vendor": "IGT",
+    hs.touch_machine("IGT_001122334455", "G2S", {"vendor": "IGT",
                                                   "product": "AVP"})
     hs.touch_machine("smib-bb2/1", "SAS", {"port": "/dev/ttyAMA0"})
     check("no names until set", hs.names() == {}, hs.names())
     check("machines registered", len(hs.machines()) == 2)
 
     print("— set / get / clear")
-    hs.set_nickname("IGT_00012E492815", "Corner cab")
+    hs.set_nickname("IGT_001122334455", "Corner cab")
     check("get_nickname returns the set name",
-          hs.get_nickname("IGT_00012E492815") == "Corner cab")
+          hs.get_nickname("IGT_001122334455") == "Corner cab")
     check("names() lists only named machines",
-          hs.names() == {"IGT_00012E492815": "Corner cab"}, hs.names())
-    hs.set_nickname("IGT_00012E492815", "")
+          hs.names() == {"IGT_001122334455": "Corner cab"}, hs.names())
+    hs.set_nickname("IGT_001122334455", "")
     check("empty name clears the nickname",
-          hs.get_nickname("IGT_00012E492815") is None)
+          hs.get_nickname("IGT_001122334455") is None)
     check("cleared name drops out of names()", hs.names() == {})
 
     print("— nickname on an unseen machine (pre-assign) + creation")
@@ -80,7 +80,7 @@ def main():
     except ValueError:
         check("oversize machine_key rejected", True)
     try:
-        hs.set_nickname("IGT_00012E492815", 123)
+        hs.set_nickname("IGT_001122334455", 123)
         check("non-string name rejected (no AttributeError)", False)
     except ValueError:
         check("non-string name rejected (no AttributeError)", True)
@@ -1121,14 +1121,14 @@ def main():
           err is None and row["satId"] == "companion-a3f2b1"
           and row["kind"] == "companion" and row["label"] == "Bar-top AVP"
           and row["g2sEgmId"] is None, err)
-    row, err = hsat.sat_set("companion-a3f2b1", egm_id="IGT_00012E492815")
+    row, err = hsat.sat_set("companion-a3f2b1", egm_id="IGT_001122334455")
     check("partial update keeps label, sets egm (COALESCE None = keep)",
           err is None and row["label"] == "Bar-top AVP"
-          and row["g2sEgmId"] == "IGT_00012E492815")
+          and row["g2sEgmId"] == "IGT_001122334455")
     check("sat_get round-trips + sat_bindings maps by id",
-          hsat.sat_get("companion-a3f2b1")["g2sEgmId"] == "IGT_00012E492815"
+          hsat.sat_get("companion-a3f2b1")["g2sEgmId"] == "IGT_001122334455"
           and hsat.sat_bindings()["companion-a3f2b1"]["g2sEgmId"]
-              == "IGT_00012E492815")
+              == "IGT_001122334455")
     row, err = hsat.sat_set("companion-a3f2b1", egm_id="")
     check("empty egm clears the binding (unassign), label preserved",
           row["g2sEgmId"] is None and row["label"] == "Bar-top AVP")

@@ -11,7 +11,8 @@ StartLimitBurst=5
 Type=simple
 User=owner
 Group=owner
-# /dev/ttyAMA0 is root:dialout (aj is a member; SupplementaryGroups makes the
+# /dev/ttyAMA0 is root:dialout (the service user is a member;
+# SupplementaryGroups makes the
 # unit robust if the login groups ever change).
 SupplementaryGroups=dialout
 WorkingDirectory=/home/owner/CabiNet/SAS

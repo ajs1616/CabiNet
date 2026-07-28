@@ -56,7 +56,7 @@ from pathlib import Path
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-EGM_ID = "IGT_00012E492815"
+EGM_ID = "IGT_001122334455"
 # Defaults stay LOCAL (GR-04). Overridable via --host-url/--data-dir in
 # main() — the globals are rebound there before any traffic is sent.
 HOST_BASE = "http://127.0.0.1:8081"

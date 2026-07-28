@@ -12,7 +12,8 @@ StartLimitBurst=5
 Type=simple
 User=owner
 Group=owner
-# /dev/i2c-11 (the software i2c-gpio bus on GPIO23/24) is root:i2c; aj is a
+# /dev/i2c-11 (the software i2c-gpio bus on GPIO23/24) is root:i2c; the
+# service user is a
 # member, SupplementaryGroups makes the unit robust if login groups change.
 SupplementaryGroups=i2c
 WorkingDirectory=/home/owner/CabiNet/Companion

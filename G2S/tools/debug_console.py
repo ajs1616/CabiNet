@@ -4,7 +4,8 @@ CabiNet BRING-UP COCKPIT (evidence-ladder build)
 ==================================================
 
 A dependency-free (stdlib curses) full-screen "bring-up cockpit" for the SMIB's
-7" DSI framebuffer console (tty1), running as user 'aj' with NO sudo. Its job:
+7" DSI framebuffer console (tty1), running as the CabiNet service user with
+NO sudo. Its job:
 when the operator powers on an IGT AVP slot machine, everything needed to SEE it
 join (or diagnose why it won't) is visible at a glance — passively, with no
 keyboard attached.
@@ -28,7 +29,7 @@ Everything degrades on small/narrow screens and never crashes on resize: every
 write goes through the bounds-checked safe() helper; every curses call is
 wrapped. Threaded readers + locks own all I/O so the UI thread never blocks.
 
-Data (all read-only, no sudo — 'aj' is in group adm):
+Data (all read-only, no sudo — the service user is in group adm):
   journalctl -u cabinet-{dhcp,g2s,dns,tftp,ntp} -f -o json   (live evidence)
   systemctl is-active/is-enabled <unit>                         (service health)
   ip -br -4 addr show eth0 + /sys/class/net/eth0/carrier        (slot-net link)

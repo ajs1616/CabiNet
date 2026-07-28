@@ -87,9 +87,6 @@ vlan50-dhcp.conf
 slot-dhcp.conf
 generated-dhcp.conf
 
-# Test files
-casinonet-universal-final.py
-
 # IDE and temp files
 .vscode/
 .idea/

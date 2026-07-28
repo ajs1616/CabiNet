@@ -88,7 +88,7 @@ deploy/zero2w_sas_setup.sh <you>@<host>.local --address 1
 It is idempotent and does, over SSH:
 
 1. **UART** — `dtoverlay=disable-bt` + `enable_uart=1` (PL011 → `/dev/ttyAMA0`),
-   disables `hciuart`, strips the serial console, masks the serial getty, adds `aj` to
+   disables `hciuart`, strips the serial console, masks the serial getty, adds your login to
    `dialout`. (Board auto-detected; Pi 4 keeping BT: add `dtoverlay=uart3` yourself and
    pass `--port /dev/ttyAMA1`.)
 2. **venv** `~/venvs/cabinet` with pyserial / crcmod / loguru / pytest.
@@ -223,8 +223,8 @@ seatd/libseat/cage/chromium** — cog-drm needs none of them.
 1. Edit `Environment=SMIB_URL=` for THIS cabinet — the hub URL + the machine's
    egmId in the `?egm=` param, colons `%`-encoded (`%3A`) and each `%` **doubled**
    to `%%` (systemd specifier escaping — a single `%3A` is dropped as an "Invalid
-   slot"; the shipped file already carries the BB2's
-   `WMS_00%%3Aa0%%3Aa5%%3A79%%3A2d%%3Aa8` as an example — swap in YOUR machine's id).
+   slot"; the shipped file carries the placeholder
+   `WMS_00%%3A11%%3A22%%3A33%%3A44%%3A55` — swap in YOUR machine's id).
    Moving a SMIB to another cabinet is this one line.
 2. Copy + enable:
    ```bash
@@ -340,7 +340,9 @@ urgent on the 424Mi board.
 | Thing | Value |
 |-------|-------|
 | OS | Raspberry Pi OS Lite 64-bit (Bookworm) |
-| User | `aj` |
+| User | your Pi login (whatever you set when imaging — the setup script
+reads it and rewrites the unit; the shipped units carry `owner` as a
+placeholder) |
 | Key | `~/.ssh/cabinet` |
 | venv | `~/venvs/cabinet` |
 | SAS port | `/dev/ttyAMA0` (Pi 4 spare PL011: `/dev/ttyAMA1` via `dtoverlay=uart3`) |
