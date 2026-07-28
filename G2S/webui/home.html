@@ -5135,7 +5135,8 @@ function renderUpdates(){
     body+=(u.commits||[]).slice(0,8).map(c=>
       `<div class="kd" style="font-family:var(--mono);color:var(--faint)">${esc(c)}</div>`).join("");
   } else if(u.checkedAt){
-    body+=`<p class="none">Up to date as of ${esc(clock(u.checkedAt))}.</p>`;
+    body+=`<p class="none">Up to date as of ${esc(clock(u.checkedAt))} — when new
+      commits are available, an <b>Update now</b> button appears here.</p>`;
   } else {
     body+=`<p class="none">Not checked yet — the hub doesn't contact the
       update server unless you ask it to.</p>`;
