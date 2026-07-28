@@ -313,12 +313,21 @@ def prune_backups(src):
 
 def restore_data(root, snapshot):
     """Put the snapshot back — used by rollback, because the new code may have
-    already migrated hub.db and old code cannot be trusted against it."""
+    already migrated hub.db and old code cannot be trusted against it.
+
+    ⚠️ MUST NEVER ABORT PART-WAY. Some data files belong to root: the DHCP
+    service writes dhcp_leases.json as root, and a plain copy from the service
+    user dies with EPERM. The first version of this raised there and left the
+    rollback half-done — the worst possible state, and the loudest lesson from
+    the first live run. Now every file is attempted, root-owned ones retry
+    through sudo, and anything still unrestorable is NAMED at the end rather
+    than silently skipped."""
     import shutil
     if not snapshot or not os.path.isdir(snapshot):
         say("   ⚠️  no snapshot to restore — data left as-is")
         return False
     dst = data_dir(root)
+    failed = []
     for name in sorted(os.listdir(snapshot)):
         s = os.path.join(snapshot, name)
         if not os.path.isfile(s):
@@ -328,11 +337,30 @@ def restore_data(root, snapshot):
         if name in SQLITE_FILES:
             for suf in SKIP_SUFFIXES:
                 side = os.path.join(dst, name + suf)
-                if os.path.exists(side):
-                    os.remove(side)
-        shutil.copy2(s, os.path.join(dst, name))
-    say("   restored data from %s" % snapshot)
-    return True
+                try:
+                    if os.path.exists(side):
+                        os.remove(side)
+                except PermissionError:
+                    run(["sudo", "rm", "-f", side], check=False, quiet=True)
+        target = os.path.join(dst, name)
+        try:
+            shutil.copy2(s, target)
+        except PermissionError:
+            # root-owned (e.g. dhcp_leases.json) — preserve that ownership
+            rc, _ = run(["sudo", "cp", "-p", s, target], check=False,
+                        quiet=True)
+            if rc != 0:
+                failed.append(name)
+        except Exception as e:
+            failed.append("%s (%s)" % (name, e))
+    if failed:
+        say("   ⚠️  restored data from %s, EXCEPT: %s"
+            % (snapshot, ", ".join(failed)))
+        say("      those files are still in the snapshot — copy them back by "
+            "hand if they matter (leases regenerate on their own).")
+    else:
+        say("   restored data from %s" % snapshot)
+    return not failed
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +440,23 @@ def preflight(root, hub_url, allow_dirty, dry=False):
 def incoming(root):
     step("Fetching")
     git(["fetch", "--prune"], root)
+    # A DETACHED HEAD has no upstream, and the rev-list below would fail and be
+    # read as "nothing to install" — silently telling someone they are current
+    # when they are stranded. Fail loudly instead. (Rollback now uses
+    # `reset --hard` precisely so it never leaves you here, but a hand-run
+    # `git checkout <sha>` still can.)
+    rc, br = git(["rev-parse", "--abbrev-ref", "HEAD"], root, check=False,
+                 quiet=True)
+    if br.strip() == "HEAD":
+        raise Fail("this clone is on a DETACHED HEAD, so there is no branch to "
+                   "update. Re-attach first:\n"
+                   "     git -C %s checkout main" % root)
     rc, out = git(["rev-list", "--count", "HEAD..@{u}"], root, check=False,
                   quiet=True)
+    if rc != 0:
+        raise Fail("no upstream configured for branch %r. Set one:\n"
+                   "     git -C %s branch --set-upstream-to=origin/main %s"
+                   % (br.strip(), root, br.strip()))
     try:
         n = int(out.strip() or "0")
     except ValueError:
@@ -426,7 +469,38 @@ def incoming(root):
 
 
 def gates(root, py):
-    step("Gates (before anything restarts)")
+    """Run the gate suite in a THROWAWAY WORKTREE, never in the live tree.
+
+    ⚠️ THIS ISOLATION IS NOT OPTIONAL. Some gates build a REAL host —
+    `test_link_demotion.py` calls `G2SHost(keepalive_ms=15000)` outright — and
+    G2SHost.__init__ hardcodes its store paths to G2S/data/. Run in the live
+    tree, that opens the operator's REAL hub.db, voucher, WAT and account
+    stores, runs _migrate() against the live database, and does it while the
+    running service has the same file open. That is precisely how GR-04 put 145
+    fixture voucher ids into a production voucher_state.json.
+
+    A `git worktree` checkout carries only tracked files, and data/ is
+    gitignored — so the gates get a clean empty data dir of their own and can
+    write whatever they like into it. Removed when we are done."""
+    import tempfile
+    step("Gates (in an isolated worktree — never against your live data)")
+    wt = tempfile.mkdtemp(prefix="cabinet-gate-")
+    try:
+        run(["git", "worktree", "add", "--detach", "--force", wt, "HEAD"],
+            cwd=root, quiet=True)
+        _gates_in(wt, py)
+    finally:
+        run(["git", "worktree", "remove", "--force", wt], cwd=root,
+            check=False, quiet=True)
+        shutil_rmtree(wt)
+
+
+def shutil_rmtree(path):
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _gates_in(root, py):
     for g in G2S_GATES:
         path = os.path.join(root, "G2S", "tools", g)
         if not os.path.isfile(path):
@@ -517,7 +591,11 @@ def verify(hub_url, sats, machines, dry):
 def rollback(root, old, sats, key, hub_url, machines, snapshot=None):
     step("ROLLING BACK to %s" % old[:12])
     try:
-        git(["checkout", "--force", old], root)
+        # reset --hard, NOT checkout <sha>: checkout detaches HEAD, which
+        # strands the clone with no upstream so the NEXT run cannot tell it is
+        # behind. reset keeps you on your branch, tracking intact, and a retry
+        # simply fast-forwards again.
+        git(["reset", "--hard", old], root)
         # Data BEFORE services: the new code may already have migrated hub.db
         # to a newer schema, and the old code we are restoring was never
         # written to read it. Code and data go back together or not at all.
@@ -535,7 +613,7 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None):
     except Exception as e:
         say("\n   ⚠️  ROLLBACK ITSELF FAILED: %s" % e)
         say("   Recover by hand:")
-        say("     git -C %s checkout --force %s" % (root, old))
+        say("     git -C %s reset --hard %s" % (root, old))
         say("     sudo systemctl restart casinonet-g2s")
 
 
