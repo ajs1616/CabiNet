@@ -46,6 +46,7 @@ import random
 import re
 import secrets
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -3598,6 +3599,13 @@ class G2SHost:
         # a companion posts: no companions, no sessions, no traffic.
         self.companions = {}
         self.companion_lock = threading.Lock()
+        # Settings ▸ Updates. Purely local until the operator asks: `behind`
+        # and `commits` stay empty until a Check-now (or an auto-check they
+        # switched on) actually fetches.
+        self.update_lock = threading.Lock()
+        self._update = {"behind": 0, "commits": [], "checkedAt": None,
+                        "error": None, "state": "idle"}
+        self._update_auto_at = 0.0
         self.card_sessions = {}
         # Admin overlay tap (#?): a transient SUPERVISOR layer stacked OVER a
         # carded player's session — an admin taps their fob on a machine a
@@ -3977,6 +3985,138 @@ class G2SHost:
         nudge. Read straight (only the low-rate Players ▸ Fund path uses it —
         no per-second hot loop, so no cache needed)."""
         return self.hub_store.host_setting("house_allow_negative", "on") != "off"
+
+    # ── Updates (Settings ▸ Updates) ──────────────────────────────────────
+    #
+    # ⚖️ NO OUTBOUND TRAFFIC UNLESS THE OPERATOR ASKS. A hub often lives on a
+    # deliberately isolated slot VLAN, so "phone GitHub on a timer" is not a
+    # default we get to pick for someone (AJ 2026-07-27). `git fetch` runs ONLY
+    # from the Check-now button, or from the periodic sweep when the operator
+    # has switched auto-check ON. Everything else here is local: reading our own
+    # HEAD costs nothing and leaks nothing.
+    UPDATE_AUTO_CHECK_SEC = 6 * 3600
+    UPDATE_LOG = "update_last.log"
+
+    def _repo_dir(self):
+        """The clone this host runs from — the parent of G2S/."""
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _git(self, *args, timeout=120):
+        try:
+            p = subprocess.run(("git",) + args, cwd=self._repo_dir(),
+                               capture_output=True, text=True, timeout=timeout)
+            return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+        except Exception as e:
+            return 1, "", str(e)
+
+    def update_state(self, check=False):
+        """The Settings ▸ Updates payload. `check=True` is the only path that
+        touches the network."""
+        with self.update_lock:
+            st = dict(self._update)
+        rc, head, _ = self._git("log", "--oneline", "--no-decorate", "-1")
+        st["current"] = head if rc == 0 else None
+        st["isClone"] = rc == 0
+        st["autoCheck"] = self.hub_store.host_setting("update_auto_check",
+                                                      "0") == "1"
+        if not check:
+            return st
+        rc, _, err = self._git("fetch", "--prune", timeout=300)
+        if rc != 0:
+            st["error"] = ("could not reach the update server: %s"
+                           % (err.splitlines()[-1] if err else "fetch failed"))
+            st["checkedAt"] = now_iso()
+        else:
+            rc2, log, err2 = self._git("log", "--oneline", "--no-decorate",
+                                       "HEAD..@{u}")
+            if rc2 != 0:
+                # No upstream (detached HEAD, or a branch that tracks nothing).
+                # Reporting behind=0 here would tell the operator they are
+                # CURRENT when we simply cannot tell — the same silent-zero
+                # trap deploy/update.py hit. Say so instead.
+                st.update(behind=0, commits=[], checkedAt=now_iso(),
+                          error="cannot tell — this clone has no upstream "
+                                "branch (detached HEAD?). Fix with: "
+                                "git checkout main")
+            else:
+                commits = [l for l in log.splitlines() if l.strip()]
+                st.update(behind=len(commits), commits=commits[:20],
+                          checkedAt=now_iso(), error=None)
+        with self.update_lock:
+            self._update.update({k: st.get(k) for k in
+                                 ("behind", "commits", "checkedAt", "error")})
+        return st
+
+    def start_update(self):
+        """Spawn the updater DETACHED and return immediately.
+
+        It must outlive us: applying an update restarts casinonet-g2s, which
+        kills this process mid-request. A child in our own process group would
+        die with it — taking the rollback with it, exactly when it is needed
+        most. start_new_session detaches it, and its whole transcript lands in
+        data/update_last.log so the UI can show what happened AFTER the service
+        comes back."""
+        script = os.path.join(self._repo_dir(), "deploy", "update.py")
+        if not os.path.isfile(script):
+            return {"ok": False, "error": "deploy/update.py is missing from "
+                                          "this install"}
+        with self.update_lock:
+            if self._update.get("state") == "running":
+                return {"ok": False, "error": "an update is already running"}
+            self._update.update(state="running", startedAt=now_iso())
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "data", self.UPDATE_LOG)
+        try:
+            fh = open(log_path, "w", encoding="utf-8")
+            subprocess.Popen([sys.executable, script, "--yes"],
+                             cwd=self._repo_dir(), stdout=fh,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception as e:
+            with self.update_lock:
+                self._update.update(state="failed", error=str(e))
+            return {"ok": False, "error": str(e)}
+        log.warning("⬆️  UPDATE STARTED by the operator — detached %s; this "
+                    "service will restart. Transcript: %s", script, log_path)
+        return {"ok": True, "started": True, "log": self.UPDATE_LOG}
+
+    def start_update_auto_check(self):
+        """Optional background update check — OFF unless the operator turned it
+        on, and it re-reads that setting every pass so switching it off takes
+        effect without a restart. Deliberately a slow heartbeat: this is the
+        only thing in the host that ever reaches the internet, and a hub on an
+        isolated slot VLAN must be able to sit here forever doing nothing."""
+        def loop():
+            # a short settle so a boot burst never coincides with a fetch
+            time.sleep(90)
+            while True:
+                try:
+                    on = self.hub_store.host_setting("update_auto_check",
+                                                     "0") == "1"
+                    if on and time.time() - self._update_auto_at \
+                            >= self.UPDATE_AUTO_CHECK_SEC:
+                        self._update_auto_at = time.time()
+                        st = self.update_state(check=True)
+                        if st.get("behind"):
+                            log.info("⬆️  update check: %d new commit(s) "
+                                     "available (Settings ▸ Updates)",
+                                     st["behind"])
+                except Exception as e:      # never let this kill the thread
+                    log.debug("update auto-check skipped: %s", e)
+                time.sleep(300)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def update_log_tail(self, lines=40):
+        """Last lines of the previous run's transcript — survives our restart,
+        which is the whole point."""
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
+                         self.UPDATE_LOG)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                return [l.rstrip() for l in fh.readlines()[-lines:]]
+        except Exception:
+            return []
 
     def ticket_header(self):
         """The hub-wide ticket header (C1/C2/C4) — hub_store.ticket_header()
@@ -18782,6 +18922,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                                 or {}).get("cashableMillicents", 0)
                                                or 0),
                         "houseAllowNegative": engine.house_allow_negative(),
+                        # Settings ▸ Updates. LOCAL ONLY on this path — it
+                        # reports our own HEAD and whatever a previous
+                        # user-initiated check found. Nothing here reaches the
+                        # network; that needs the Check-now button (or the
+                        # auto-check the operator opted into).
+                        "updates": dict(engine.update_state(),
+                                        lastLog=engine.update_log_tail(12)),
                         # Tournament alias roster (board v2) — the EFFECTIVE list
                         # (defaults when unset), so the admin card's textarea can
                         # prefill; write path = /api/settings tournamentNames.
@@ -19380,6 +19527,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # tournament actions; the same early-return block routes them
             "floorLock": engine.floor_set_locked,
             "floorUnlock": engine.floor_set_locked,
+            # Settings ▸ Updates — hub-wide, routed by the same early-return
+            # block. checkUpdates is the ONLY operator-triggered outbound call
+            # in the whole host; applyUpdate detaches deploy/update.py and
+            # returns at once, because applying an update restarts THIS
+            # service out from under the request.
+            "checkUpdates": engine.update_state,
+            "applyUpdate": engine.start_update,
         }
         if action not in actions:
             return self._send(400, json.dumps({
@@ -19394,6 +19548,16 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         # engine. Bounds: creditsCents is the SAS 5-byte-BCD wire max (the
         # only money cap post-de-cage), the clocks are sanity bounds for a
         # home floor, not policy.
+        if action in ("checkUpdates", "applyUpdate"):
+            if action == "checkUpdates":
+                st = engine.update_state(check=True)
+                return self._send(200, json.dumps(
+                    dict(st, ok=not st.get("error"), action=action)),
+                    "application/json", soap=False)
+            res = engine.start_update()
+            return self._send(200 if res.get("ok") else 409,
+                              json.dumps(dict(res, action=action)),
+                              "application/json", soap=False)
         if action in ("floorLock", "floorUnlock"):
             result = engine.floor_set_locked(action == "floorLock")
             payload = {"ok": True, "action": action}
@@ -21271,6 +21435,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 engine.hub_store.set_host_setting(
                     "board_enabled", "1" if be else "0")
                 out["boardEnabled"] = be
+            if "updateAutoCheck" in req:
+                # Settings ▸ Updates ▸ "check automatically". OFF unless the
+                # operator turns it on — a hub often sits on an isolated slot
+                # VLAN and reaching out uninvited is not ours to assume. The
+                # manual Check-now button never depends on this.
+                ua = req.get("updateAutoCheck")
+                if not isinstance(ua, bool):
+                    raise ValueError("updateAutoCheck must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "update_auto_check", "1" if ua else "0")
+                out["updateAutoCheck"] = ua
             if "tournamentNames" in req:
                 # Tournament alias roster (board v2) — the funny names for
                 # seats whose player didn't card in. STRICT list of strings
@@ -22051,6 +22226,10 @@ def main():
             log.error("registered-machine seed failed: %s", e)
 
     threading.Thread(target=watchdog, args=(engine,), daemon=True).start()
+    # Update check heartbeat. Starting it is unconditional; DOING anything is
+    # not — it re-reads update_auto_check every pass and stays silent while
+    # that is off, which is the shipped default.
+    engine.start_update_auto_check()
 
     log.info("CabiNet G2S host listening on %s:%d (endpoint /G2S, "
              "host-id=%s, cert-less, %s)", args.bind, args.port, args.host_id,

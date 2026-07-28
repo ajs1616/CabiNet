@@ -265,6 +265,15 @@ def make_engine():
     eng.status_cache_building = {}
     eng.status_cache_lock = threading.Lock()
     eng.status_state_seq = 0
+    # Settings ▸ Updates state — do_GET reads it on every status fetch too.
+    # Same lesson as the quartet above, hit again the day the feature landed:
+    # a __new__ stub only fails once production READS a new attribute, and the
+    # gate is what catches it. Empty/idle here means the tests never touch the
+    # network (update_state only fetches when explicitly asked to check).
+    eng.update_lock = threading.Lock()
+    eng._update = {"behind": 0, "commits": [], "checkedAt": None,
+                   "error": None, "state": "idle"}
+    eng._update_auto_at = 0.0
     # the tournament state quartet __init__ owns in production
     eng.tournament = eng._tournament_idle_state()
     eng.tournament_lock = threading.Lock()

@@ -662,6 +662,12 @@
            is a piece of hardware bolted to a machine, so it belongs with the
            other equipment switches. Cards stay in The Players, because a card
            is a person. -->
+      <!-- Updates. The hub does NOT phone home on its own: checking is a
+           button, and the automatic option ships OFF. A game room often runs
+           a deliberately isolated slot VLAN, so reaching out is the
+           operator's call, not ours. -->
+      <div class="card"><h2>Updates <span class="hn" id="st-upd-n"></span></h2>
+        <div class="body" id="st-updates"></div></div>
       <div class="card wide"><h2>Card readers</h2>
         <div class="body" id="st-readers"></div></div>
       <p class="none" style="grid-column:1/-1;margin:0">Cards and fobs live in
@@ -4508,6 +4514,7 @@ function hintToggle(id){
   renderSettings();   // re-renders host options, tournament and floor lock
 }
 function renderSettings(){
+  renderUpdates();
   // Card readers repaint on their OWN guards (armed-node + focused reader
   // input), ahead of this function's early returns — otherwise a half-typed
   // ticket-header field would also freeze the reader list, which has nothing
@@ -5069,6 +5076,95 @@ function fobAcctSel(id, cur){
    A reader is hardware bolted to a machine; a card is a person. They used to
    share one card here, which is why this is now two functions over two tabs
    sharing the same companions/fobs poll data. */
+/* ---- Settings ▸ Updates ------------------------------------------------
+   The hub never phones home by itself: "Check now" is a button, and the
+   automatic option ships OFF (a game room may run an isolated slot VLAN —
+   reaching out is the operator's call). "Update now" hands off to
+   deploy/update.py, which snapshots data, gates in a throwaway worktree,
+   updates satellites too, and rolls BOTH code and data back on any failure.
+   That script restarts this very service, so the button intentionally shows
+   "the page will go quiet" rather than pretending to stream progress. */
+let UPDBUSY = false;
+async function updCheck(btn){
+  UPDBUSY = true; renderUpdates();
+  const r = await cmd({action:"checkUpdates"}, "Check for updates");
+  UPDBUSY = false;
+  if(r && r.error) toast(r.error, false);
+  else if(r && r.behind) toast(r.behind+" update(s) available", true);
+  else if(r && r.ok) toast("Already up to date", true);
+  flash(btn, !!(r && r.ok));
+  tickStatus();
+}
+async function updApply(btn){
+  const u = (((S.status||{}).hostOptions||{}).updates)||{};
+  const n = Number(u.behind||0);
+  if(!armCheck(btn, "Update now — "+n+" commit"+(n===1?"":"s")
+      +". The floor restarts and briefly drops out.")) return;
+  const r = await cmd({action:"applyUpdate"}, "Apply update");
+  if(r && r.ok){
+    UPDBUSY = true; renderUpdates();
+    toast("Updating — the hub restarts, so this page will go quiet for a "
+          +"minute. Reload after that.", true);
+  } else toast((r&&r.error)||"Could not start the update", false);
+}
+async function updAutoToggle(btn){
+  const cur = !!((((S.status||{}).hostOptions||{}).updates)||{}).autoCheck;
+  const ok = await settingsPost({updateAutoCheck:!cur},
+    !cur ? "Automatic update checks ON" : "Automatic update checks OFF");
+  flash(btn, ok);
+}
+function renderUpdates(){
+  const box=$("st-updates"); if(!box) return;
+  if(ARM && box.contains(ARM.btn)) return;
+  const u=(((S.status||{}).hostOptions||{}).updates)||null;
+  if(!u){ setHTML(box, pendChip("Updates")); setHTML($("st-upd-n"),""); return; }
+  const behind=Number(u.behind||0);
+  setHTML($("st-upd-n"), behind?(behind+" available"):"");
+  const cur=esc(String(u.current||"unknown"));
+  let body=`<div class="kd" style="color:var(--faint)">running</div>
+    <div class="nm" style="font:600 13px var(--mono);margin:2px 0 10px">${cur}</div>`;
+  if(u.isClone===false){
+    body+=`<p class="none">This install isn't tracked yet, so it can't check
+      for updates. Running <span style="font-family:var(--mono)">python3
+      deploy/update.py</span> on the hub once will adopt it — your data is
+      snapshotted and untouched.</p>`;
+  } else if(u.error){
+    body+=`<p class="none" style="color:var(--bad)">${esc(u.error)}</p>`;
+  } else if(behind){
+    body+=`<div class="kd" style="margin-bottom:4px">${behind} new commit${behind===1?"":"s"}:</div>`;
+    body+=(u.commits||[]).slice(0,8).map(c=>
+      `<div class="kd" style="font-family:var(--mono);color:var(--faint)">${esc(c)}</div>`).join("");
+  } else if(u.checkedAt){
+    body+=`<p class="none">Up to date as of ${esc(clock(u.checkedAt))}.</p>`;
+  } else {
+    body+=`<p class="none">Not checked yet — the hub doesn't contact the
+      update server unless you ask it to.</p>`;
+  }
+  const busy=UPDBUSY||u.state==="running";
+  body+=`<div class="btnrow" style="margin-top:12px">
+      <button class="btn slim" onclick="updCheck(this)" ${busy?"disabled":""}>
+        <span class="bl">${busy?"Working…":"Check now"}</span>
+        <span class="ba">asks the update server</span></button>
+      ${behind?`<button class="btn slim gold" onclick="updApply(this)" ${busy?"disabled":""}>
+        <span class="bl">Update now</span>
+        <span class="ba">floor restarts briefly</span></button>`:""}
+    </div>
+    <div class="btnrow" style="margin-top:8px">
+      <button class="btn slim" onclick="updAutoToggle(this)">
+        <span class="bl">Check automatically: ${u.autoCheck?"ON":"OFF"}</span>
+        <span class="ba">${u.autoCheck?"contacts the server every few hours"
+          :"off — nothing leaves your network"}</span></button>
+    </div>`;
+  const tail=(u.lastLog||[]).filter(Boolean);
+  if(tail.length){
+    body+=`<div style="margin-top:12px;border-top:1px solid var(--line2);padding-top:8px">
+      <div class="kd" style="color:var(--faint)">last update run</div>
+      <div class="kd" style="font-family:var(--mono);white-space:pre-wrap;color:var(--faint)">${
+        esc(tail.join("\n"))}</div></div>`;
+  }
+  setHTML(box, body);
+}
+
 function renderReaders(){
   const box=$("st-readers"); if(!box) return;
   if(ARM && box.contains(ARM.btn)) return;

@@ -110,7 +110,14 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # the collector's GAMEROOM name (Settings tab) painted in
                      # lights on the player-facing glass/kiosk; absent/"" =
                      # neutral fallback. CabiNet is the product; this is theirs.
-                     "gameroom_name")
+                     "gameroom_name",
+                     # "1" = the hub may check GitHub for updates on its own.
+                     # ABSENT/"0" IS THE DEFAULT AND MEANS NEVER: a hub sits on
+                     # a deliberately isolated slot VLAN in plenty of game
+                     # rooms, and reaching out uninvited is not ours to assume
+                     # (AJ 2026-07-27). Manual "Check now" always works and is
+                     # user-initiated by definition.
+                     "update_auto_check")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
 MAX_TICKET_FIELD_LEN = 64
