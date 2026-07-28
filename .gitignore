@@ -130,3 +130,4 @@ Companion/data/
 *.db-shm
 .openg2s_pids
 .cabinet-adopt-pending
+.cabinet-update.lock

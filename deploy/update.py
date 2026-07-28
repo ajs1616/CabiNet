@@ -507,6 +507,7 @@ def sat_companion_dir(peer, key, user=None):
 #: and the setup scripts already take user@host), overridable with --ssh-user.
 SAT_USER = getpass.getuser()
 SAT_USER_OVERRIDE = None   # set only by --ssh-user
+_RUN_LOCK = None           # the single-instance flock — held for process life
 
 
 def sat_user(sat):
@@ -1487,6 +1488,23 @@ def main():
 
     root = repo_root()
     say("CabiNet updater — %s" % root)
+
+    # ONE updater at a time, across every entry point (Settings card, CLI,
+    # cron). The hub's own "already running" memory dies with the restart the
+    # updater itself performs, so the guard lives on disk: an exclusive flock
+    # held for this process's whole life. CLOEXEC drops it across the
+    # self-update re-exec and the incoming updater re-takes it right here.
+    # (Not for --dry-run/--gates-only: read-only requests never conflict.)
+    global _RUN_LOCK
+    if not (a.dry_run or a.gates_only):
+        import fcntl
+        try:
+            _RUN_LOCK = open(os.path.join(root, ".cabinet-update.lock"), "w")
+            fcntl.flock(_RUN_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Fail("another update run is already active on this hub — "
+                       "wait for it to finish (its transcript: "
+                       "G2S/data/update_last.log)")
 
     # --gates-only is a READ-ONLY request and must stay one. This used to sit
     # below the adopt block, so `--gates-only --yes` on a copied install would

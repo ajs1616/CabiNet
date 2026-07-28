@@ -148,6 +148,9 @@
   .btn .bl{display:block;font-size:13.5px;font-weight:600}
   .btn .ba{display:block;font:10.5px var(--mono);color:var(--faint);margin-top:2px}
   .btn:hover{border-color:var(--gold-deep)}
+  /* a disabled button must LOOK disabled — it rendered pixel-identical to a
+     live one, so "Update now" appeared tappable mid-update */
+  .btn[disabled]{opacity:.45;cursor:default;pointer-events:none}
   .btn:active{transform:translateY(1px)}
   .btn.gold{border-color:var(--gold-deep);
     background:linear-gradient(180deg,#33260f,#291e0d)}
@@ -5192,7 +5195,7 @@ function renderUpdates(){
         <span class="bl">${busy?"Working…":"Check now"}</span>
         <span class="ba">asks the update server</span></button>
       ${behind?`<button class="btn slim gold" onclick="updApply(this)" ${busy?"disabled":""}>
-        <span class="bl">Update now</span>
+        <span class="bl">${busy?"Updating…":"Update now"}</span>
         <span class="ba">floor restarts briefly</span></button>`:""}
     </div>
     <div class="btnrow" style="margin-top:8px">
