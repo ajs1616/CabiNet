@@ -5205,8 +5205,12 @@ function renderUpdates(){
           :"off — nothing leaves your network"}</span></button>
     </div>`;
   if(!busy&&tail.length){
-    // the narrated version: outcome + phase checklist; raw transcript folded
-    const warns=tail.map(l=>l.trim()).filter(l=>l.startsWith("⚠️")).slice(-3);
+    // the narrated version: outcome + phase checklist; raw transcript folded.
+    // ⚠️ lines stay OUT of the card (they read as "something broke" right
+    // after a successful update — operator feedback) with ONE exception: a
+    // fleet member that was NOT updated must never be buried in the fold.
+    const warns=tail.map(l=>l.trim())
+      .filter(l=>l.startsWith("⚠️")&&l.includes("NOT updated")).slice(-3);
     const done=[...new Set(heads.map(h=>updPhaseIx(h)).filter(i=>i>=0))]
       .sort((a,b)=>a-b).map(i=>UPD_PHASES[i][1]);
     body+=`<div style="margin-top:12px;border-top:1px solid var(--line2);padding-top:8px">
