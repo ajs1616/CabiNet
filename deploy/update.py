@@ -769,8 +769,38 @@ def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
         else:
             say("   clone      : %s (matches the running service)" % root)
     else:
-        say("   clone      : %s (no cabinet-g2s unit here — not a hub?)"
-            % root)
+        # No cabinet-g2s unit. If the OLD name is installed instead, this is
+        # a pre-rename (casinonet-*) hub — and every step below targets the
+        # cabinet-* names: the restart would fail AFTER the push, and the
+        # rollback's stopped-hub check would watch cabinet-g2s while the real
+        # hub.db sits open under casinonet-g2s. Refuse while nothing has been
+        # touched, and point at the migration that fixes it in one command.
+        old_unit = None
+        for unit in ("/etc/systemd/system/casinonet-g2s.service",
+                     "/lib/systemd/system/casinonet-g2s.service"):
+            if os.path.isfile(unit):
+                old_unit = unit
+                break
+        if old_unit and not dry:
+            raise Fail(
+                "this hub still runs the pre-rename casinonet-* services "
+                "(%s).\n"
+                "   The updater manages the cabinet-* names, so updating now "
+                "would fail after the\n"
+                "   push and roll back against the wrong service. Migrate "
+                "once, then update:\n"
+                "     sudo ./deploy/hub_setup.sh\n"
+                "   (it retires the casinonet-* units, keeps your data, and "
+                "installs the current\n"
+                "   services — the satellites get the same rename from their "
+                "own setup scripts)" % old_unit)
+        if old_unit:
+            say("   ⚠️  pre-rename casinonet-* hub detected — a real run "
+                "will refuse until\n      sudo ./deploy/hub_setup.sh has "
+                "migrated the services")
+        else:
+            say("   clone      : %s (no cabinet-g2s unit here — not a hub?)"
+                % root)
 
     # The restart step runs `sudo systemctl restart cabinet-g2s`. From the
     # Settings ▸ Updates card there is NO terminal for a password prompt, so
