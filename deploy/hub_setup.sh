@@ -88,6 +88,14 @@ if ! command -v git >/dev/null; then
         say "       deploy/update.py needs git — install it before updating."
     fi
 fi
+# Every unit about to be installed must EXIST before anything is retired.
+# A checkout that predates the rename carries only casinonet-* sources, and
+# discovering that AFTER stopping the old hub leaves the floor dark
+# (live-hit on the dev floor, 2026-07-28).
+for u in "${UNITS[@]}"; do
+    [[ -f "$REPO/deploy/$u.service" ]] || fail \
+        "$REPO/deploy/$u.service is missing — this checkout predates the current release. git -C $REPO pull first, then re-run me."
+done
 
 # ── pick the slot-side port ─────────────────────────────────────────────────
 # Wired ports only. Wi-Fi is the operator's management path, never the slot

@@ -1344,6 +1344,14 @@ def main():
                     help="repo to adopt/track (default %s)" % DEFAULT_REMOTE)
     a = ap.parse_args()
 
+    # Everything below IS git. A curl-fetched update.py on a git-less box
+    # (the README's "installed before July 2026" path) must say so plainly,
+    # not die in a traceback on the first subprocess call.
+    import shutil as _sh
+    if not _sh.which("git"):
+        raise Fail("git is required (the update IS a git pull) — install it "
+                   "first:\n     sudo apt-get install -y git")
+
     SAT_USER_OVERRIDE = a.ssh_user
 
     # If self_update() re-exec'd us, we ARE the temp copy. Clean it up on the
