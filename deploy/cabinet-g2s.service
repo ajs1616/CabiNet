@@ -19,6 +19,13 @@ WorkingDirectory=/home/owner/CabiNet/G2S
 ExecStart=/usr/bin/python3 -u g2s_host.py --harvest
 Restart=on-failure
 RestartSec=3
+# Settings ▸ Updates spawns deploy/update.py DETACHED, and that updater's
+# last act is restarting this very service. Default (control-group) killing
+# would take the updater down with the restart — mid-run, before it verifies
+# the floor came back or can roll back a failure (live-hit: the first
+# card-triggered update's log ends at the restart line). Kill only the main
+# process; the updater is the one child that must outlive us.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
