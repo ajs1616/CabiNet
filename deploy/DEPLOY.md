@@ -306,15 +306,22 @@ the preview before you confirm, and the snapshot has your copy.
 ### 4. Let the hub reach its satellites
 
 The updater pushes the SAS tree to every satellite Pi itself, so the **hub**
-needs a key to them (the setup scripts ran from your laptop, which is a
-different machine):
+needs an SSH key to them. **On a current build this is automatic** — the hub
+mints `~/.ssh/smib` on startup and publishes the public half at `/api/hubkey`,
+and `zero2w_sas_setup.sh` authorizes it while building each satellite. Nothing
+to do.
+
+Only if you are adopting an OLDER deployment whose satellites were built before
+that existed, authorize it once per satellite:
 
 ```sh
-# on the hub — skip ssh-keygen if ~/.ssh/smib already exists
-ssh-keygen -t ed25519 -f ~/.ssh/smib -N ""
+# on the hub (the key already exists; the updater will also make one if not)
 ssh-copy-id -i ~/.ssh/smib.pub aj@192.168.50.102     # once per satellite
 ssh -i ~/.ssh/smib aj@192.168.50.102 hostname        # must print its name
 ```
+
+Or just re-run `deploy/zero2w_sas_setup.sh` against that satellite — it does the
+same thing and brings its code current at the same time.
 
 Satellite IPs come from the hub itself — they self-report. If you are not sure:
 

@@ -134,6 +134,35 @@ rsync -a -e "$RSYNC_SSH" --exclude '/data' --exclude '__pycache__' \
 "${SSH[@]}" "$HOST" 'mkdir -p ~/CasinoNet/deploy'
 rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CasinoNet/deploy/"
 
+say "authorize the hub's update key"
+# WHY: deploy/update.py runs ON THE HUB and pushes the SAS tree to every
+# satellite during an update — the hub therefore needs SSH to this Pi. Nothing
+# used to create that key, so every operator had to ssh-keygen + ssh-copy-id by
+# hand before their fleet could update at all. The hub now mints its own key and
+# publishes the PUBLIC half at /api/hubkey, and we install it here.
+#
+# The satellite finds the hub the same way the daemon does — its default
+# gateway — so this works with --hub auto and needs nothing from the operator.
+# Non-fatal by design: a hub that is unreachable right now (or has no key yet)
+# must not fail a satellite build; DEPLOY.md documents the manual fallback.
+"${SSH[@]}" "$HOST" '
+  GW=$(ip route 2>/dev/null | awk "/^default/{print \$3; exit}")
+  [ -n "$GW" ] || { echo "  (no default gateway — skipped)"; exit 0; }
+  KEY=$(curl -fsS --max-time 8 "http://$GW:8081/api/hubkey" 2>/dev/null \
+        | sed -n "s/.*\"publicKey\": *\"\([^\"]*\)\".*/\1/p")
+  case "$KEY" in
+    ssh-*) : ;;
+    *) echo "  (hub at $GW published no key yet — skipped; see DEPLOY.md)"; exit 0 ;;
+  esac
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+  if grep -qF "$KEY" ~/.ssh/authorized_keys; then
+    echo "  hub key already authorized"
+  else
+    printf "%s\n" "$KEY" >> ~/.ssh/authorized_keys
+    echo "  hub key authorized — updates can reach this satellite"
+  fi'
+
 say "gate: pytest SAS/ on the Zero"
 "${SSH[@]}" "$HOST" 'cd ~/CasinoNet && ~/venvs/casinonet/bin/python -m pytest SAS/ -q 2>&1 | tail -1'
 

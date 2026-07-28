@@ -800,8 +800,24 @@ def main():
             "against your new hub. Only do this if you have none.")
         sats = []
     if sats and not os.path.isfile(a.ssh_key):
-        raise Fail("no satellite key at %s — pass --ssh-key, or --no-satellites "
-                   "if this hub has none" % a.ssh_key)
+        # The hub mints ~/.ssh/smib itself at startup and satellites authorize
+        # it during setup, so this is the "upgraded from an older build" case.
+        # Mint it here rather than dead-ending, and say exactly what to run.
+        say("\n   no satellite key at %s — creating one now" % a.ssh_key)
+        os.makedirs(os.path.dirname(a.ssh_key), mode=0o700, exist_ok=True)
+        rc, _ = run(["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                     "-C", "cabinet-hub", "-f", a.ssh_key], check=False)
+        if rc != 0 or not os.path.isfile(a.ssh_key):
+            raise Fail("could not create %s — make one by hand, or re-run with "
+                       "--no-satellites if this hub has none" % a.ssh_key)
+        raise Fail(
+            "created %s. Your satellite(s) have not authorized it yet, so run "
+            "this ONCE per satellite and then re-run the update:\n"
+            "     %s"
+            % (a.ssh_key,
+               "\n     ".join("ssh-copy-id -i %s.pub aj@%s   # %s"
+                              % (a.ssh_key, s["peer"], s["smibId"])
+                              for s in sats)))
 
     n, log = incoming(root)
     if not n:

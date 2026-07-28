@@ -3997,6 +3997,54 @@ class G2SHost:
     UPDATE_AUTO_CHECK_SEC = 6 * 3600
     UPDATE_LOG = "update_last.log"
 
+    #: The hub's OWN key to its satellites. deploy/update.py needs it to push
+    #: the SAS tree during an update, and nothing used to create it — so every
+    #: operator had to ssh-keygen + ssh-copy-id by hand before the fleet could
+    #: update at all. A freshly deployed hub should be update-capable with no
+    #: manual work, so the hub mints this itself and publishes the PUBLIC half
+    #: at /api/hubkey; the satellite setup script installs it.
+    HUB_KEY = os.path.expanduser("~/.ssh/smib")
+
+    def ensure_hub_key(self):
+        """Mint ~/.ssh/smib if absent. Idempotent, best-effort, never fatal —
+        a hub with no satellites simply never uses it."""
+        pub = self.HUB_KEY + ".pub"
+        if os.path.isfile(pub):
+            return pub
+        try:
+            os.makedirs(os.path.dirname(self.HUB_KEY), mode=0o700,
+                        exist_ok=True)
+            rc, _, err = self._git_free_run(
+                ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+                 "-C", "cabinet-hub", "-f", self.HUB_KEY])
+            if rc == 0 and os.path.isfile(pub):
+                log.info("🔑 minted the hub's satellite key (%s) — satellites "
+                         "authorize it automatically at setup", self.HUB_KEY)
+                return pub
+            log.warning("could not mint %s (%s) — satellite pushes will need a "
+                        "key made by hand", self.HUB_KEY, err[:200])
+        except Exception as e:
+            log.warning("hub key setup skipped: %s", e)
+        return None
+
+    def hub_public_key(self):
+        """The PUBLIC key text, or None. Public keys are meant to be published;
+        the private half never leaves this box."""
+        pub = self.HUB_KEY + ".pub"
+        try:
+            with open(pub, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except Exception:
+            return None
+
+    def _git_free_run(self, cmd, timeout=60):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+        except Exception as e:
+            return 1, "", str(e)
+
     def _repo_dir(self):
         """The clone this host runs from — the parent of G2S/."""
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19021,6 +19069,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(200, body, "application/json", soap=False,
                        etag=etag)
+        elif path.startswith("/api/hubkey"):
+            # The hub's PUBLIC ssh key, so a satellite can authorize it during
+            # setup without the operator generating and copying keys by hand.
+            # Publishing a public key is what public keys are for; the private
+            # half never leaves this box, and this endpoint is read-only.
+            pub = self.host_engine.hub_public_key()
+            self._send(200 if pub else 404, json.dumps(
+                {"publicKey": pub,
+                 "hint": "append to ~/.ssh/authorized_keys on each satellite; "
+                         "deploy/zero2w_sas_setup.sh does it for you"}),
+                "application/json", soap=False)
         elif path.startswith("/api/accounts"):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
             self._send(200, json.dumps(
@@ -22230,6 +22289,9 @@ def main():
     # not — it re-reads update_auto_check every pass and stays silent while
     # that is off, which is the shipped default.
     engine.start_update_auto_check()
+    # Mint the hub's satellite key if it has none, so a freshly deployed hub is
+    # update-capable with zero manual key work. Idempotent and never fatal.
+    engine.ensure_hub_key()
 
     log.info("CabiNet G2S host listening on %s:%d (endpoint /G2S, "
              "host-id=%s, cert-less, %s)", args.bind, args.port, args.host_id,

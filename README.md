@@ -15,6 +15,8 @@ whole casino *experience*, at home, for friends.
 > your own machines at your own risk — double-check pinouts before powering
 > anything; no warranty of any kind (see [LICENSE](LICENSE)).
 
+### 📦 [New install](deploy/DEPLOY.md)  ·  ⬆️ [**Updating an existing hub**](deploy/DEPLOY.md#updating)  ·  🛠 [Something broken?](deploy/DEPLOY.md#when-something-breaks--grab-a-support-bundle)
+
 ## What works today (live-proven on real iron)
 
 - **Direct G2S over Ethernet** — the host is the DHCP server and hands each
@@ -43,6 +45,30 @@ whole casino *experience*, at home, for friends.
   [`deploy/TOURNAMENT.md`](deploy/TOURNAMENT.md).
 - **Floor lock** — one switch in Settings locks or unlocks every machine on
   the floor at once.
+
+## ⬆️ Already running CabiNet? Updating is one command
+
+```sh
+cd ~/CasinoNet && python3 deploy/update.py
+```
+
+It updates the **whole fleet** — hub *and* every satellite Pi, which are not
+independent — snapshots your data first, runs the full test suite before
+anything restarts, and puts both code *and* data back if the floor doesn't come
+up. There's also an **Updates** card in Settings with a Check-now button if you'd
+rather not use a terminal (it never contacts the internet unless you ask).
+
+**Installed before July 2026?** Your copy predates the updater, so grab it once:
+
+```sh
+cd ~/CasinoNet && mkdir -p deploy
+curl -fsSL https://raw.githubusercontent.com/ajs1616/CabiNet/main/deploy/update.py \
+  -o deploy/update.py
+python3 deploy/update.py --dry-run     # shows what it would do, changes nothing
+```
+
+Didn't install with `git clone`? Doesn't matter — it offers to fix that itself.
+Full details: **[Updating](deploy/DEPLOY.md#updating)**.
 
 ## Getting started
 
