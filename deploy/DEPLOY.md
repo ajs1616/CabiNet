@@ -223,6 +223,52 @@ power it from the cabinet's USB. That's the whole install:
   that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to that
   SMIB's machine.
 
+## Updating
+
+Run this **on the hub, from inside your clone**:
+
+```sh
+cd ~/CasinoNet
+python3 deploy/update.py --dry-run    # see exactly what would happen
+python3 deploy/update.py              # do it, after confirming
+```
+
+It updates the **whole fleet** — hub *and* every satellite Pi — because they
+are not independent. `SAS/core/*.py` has to be identical on both, and a hub-only
+`git pull` breaks a satellite in one of two ways: loudly, with an `ImportError`
+crash-loop, or **silently**, where the service reports `active`, logs nothing at
+all, and the SAS link is simply dead. The silent one is why this script exists
+instead of a line in these docs telling you to `git pull`.
+
+**Your data is protected, and that is not optional.** Before anything is
+touched, the updater takes a full snapshot of `G2S/data/` — `hub.db` (via
+SQLite's online backup, so a WAL database is captured consistently), plus
+wallets, vouchers, transfers, the machine registry and your nicknames — into
+`G2S/data/_backups/`. The last 5 snapshots are kept.
+
+That snapshot is not a formality. New code can **migrate** `hub.db` to a newer
+schema the moment it starts, so putting old code back on its own would leave it
+reading a database it was never written for. A rollback therefore restores
+**code and data together**, and the updater tells you when a migration happened
+and which snapshot predates it.
+
+What it does, in order:
+
+1. refuses if a tournament is armed, counting down, or running
+2. refuses if this clone is not the one your `casinonet-g2s` service runs from
+3. snapshots your data, after checking `hub.db` passes `PRAGMA quick_check`
+4. pulls, then runs the full gate suite — **if a gate fails, nothing restarts**
+5. pushes the SAS tree to every satellite (never `data/`), restarts them, then the hub
+6. waits for the machines and SAS links that were up to come back
+7. any failure at all → restores the previous commit **and** the data snapshot
+
+Useful flags: `--dry-run`, `--yes` (no prompt), `--gates-only` (just test the
+current tree), `--no-satellites` (hub only — leaves satellites stale, so only if
+you have none).
+
+If a kiosk or tablet is showing the UI, **hard-reload it** afterwards; the
+browser will be holding the old page.
+
 ## When something breaks — grab a support bundle
 
 Open a GitHub issue with **what went wrong and roughly when** (clock time
