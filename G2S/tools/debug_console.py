@@ -69,7 +69,7 @@ UNIT_SHORT = {"cabinet-dhcp": "dhcp", "cabinet-g2s": "g2s",
               "cabinet-dns": "dns", "cabinet-tftp": "tftp",
               "cabinet-ntp": "ntp", "cabinet-console": "con"}
 
-API_URL = "http://127.0.0.1:8081/api/status"
+API_URL = "http://127.0.0.1:8081/api/status?slim=1"
 NIC = "eth0"
 SERVER_CIDR = "192.168.50.2/24"
 CARRIER_PATH = "/sys/class/net/eth0/carrier"

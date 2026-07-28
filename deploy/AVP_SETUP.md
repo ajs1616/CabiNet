@@ -76,6 +76,20 @@ set to taste:
 
 ![Voucher In/Out options](img/avp-voucher-options-1.jpg)
 
+> ⚠️ **Remote Configuration — Advanced is NOT optional either.** Two settings
+> on that page decide whether the host can change denominations at all. Both
+> were wrong out of the box and cost a full day of bench time:
+>
+> | Setting | Set to | Why |
+> |---|---|---|
+> | Protocol that controls **LEGACY METER CHANGE** | **Not Required** | Left at Required, every denom change is aborted by the machine with `G2S_APX999 "Legacy protocols are unable to collect the meters. Therefore the change is aborted."` |
+> | **Door status disallows machine idle state** | **No** | Left on, a door icon keeps the machine from being "idle", so it never opens the remote-configuration window and host config commands sit unprocessed. Verified: with this off, a visible door icon no longer blocks anything. |
+
+> ⚠️ **Disabling and re-enabling G2S DUMPS every setting on this page.** If you
+> toggle the protocol off and on for any reason, come back here and re-set the
+> whole "Protocol that controls" list — otherwise the host gets
+> `"G2S is not controlling remote configuration"` and nothing configures.
+
 ## 3. Enable the glass (on-machine UI)
 
 Operator menu: **Setup > Machine > Media Display**. Two settings:
