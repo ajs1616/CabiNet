@@ -15,7 +15,7 @@ whole casino *experience*, at home, for friends.
 > your own machines at your own risk — double-check pinouts before powering
 > anything; no warranty of any kind (see [LICENSE](LICENSE)).
 
-### 📦 [New install](deploy/DEPLOY.md)  ·  ⬆️ [**Updating an existing hub**](deploy/DEPLOY.md#updating)  ·  🛠 [Something broken?](deploy/DEPLOY.md#when-something-breaks--grab-a-support-bundle)
+### 📦 [New install](deploy/DEPLOY.md#host-install)  ·  ⬆️ [**Updating an existing hub**](deploy/DEPLOY.md#updating)  ·  🛠 [Something broken?](deploy/DEPLOY.md#when-something-breaks--grab-a-support-bundle)
 
 ## What works today (live-proven on real iron)
 
@@ -75,10 +75,18 @@ Full details: **[Updating](deploy/DEPLOY.md#updating)**.
 **Read [`deploy/DEPLOY.md`](deploy/DEPLOY.md).** The short
 version: the host + your machines + the companion Pis go on a **basic
 unmanaged Ethernet switch of their own** (the host runs the whole network),
-the host is any Linux box at static `192.168.50.2/24` on that segment, and
-the core stack is dependency-free Python 3 — clone, install the systemd
-units, done. Machine-side setup (G2S flavor, media display enable) is in the
-same doc.
+the host is any Linux box with a spare Ethernet port, and the core stack is
+dependency-free Python 3. Standing the host up is one command:
+
+```sh
+git clone https://github.com/ajs1616/CabiNet.git ~/CabiNet
+cd ~/CabiNet && sudo ./deploy/hub_setup.sh
+```
+
+It picks the slot-side port with you, sets the hub address
+(`192.168.50.2/24`), and installs + starts the five hub services — it even
+retires and carries data over from an old hand-installed hub. Machine-side
+setup (G2S flavor, host URL, media display enable) is in the same doc.
 
 - `G2S/` — the host: G2S engine, web UI, DHCP/DNS/NTP/TFTP bootstrap servers,
   the SQLite hub spine, test gates under `G2S/tools/`

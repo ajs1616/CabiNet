@@ -95,11 +95,37 @@ Requirements:
 
 ## Host install
 
+One command. On the hub-to-be:
+
+```bash
+git clone https://github.com/ajs1616/CabiNet.git ~/CabiNet
+cd ~/CabiNet && sudo ./deploy/hub_setup.sh
+```
+
+The script picks the slot-side Ethernet port with you (live link state shown,
+and it warns you off the port that is your house LAN), gives it the hub
+address `192.168.50.2/24`, retires an old hand-installed hub (`casinonet-*`
+services) if it finds one — carrying your floor data forward — and installs
+the five hub services: the G2S host runs as **you**; the four network
+bootstrap services (DHCP/DNS/NTP/TFTP) run as root because they bind
+privileged ports. Then it starts everything and waits until the *whole* hub
+answers. Wi-Fi and your other ports are never reconfigured (when the script
+has to *ask* which port faces the slots, it briefly raises wired links to
+read their cable state — `--nic` skips even that), the hub never reaches the
+internet (the script may `apt-get install git` once, if it's missing), and
+it's idempotent: re-running it any time is also the repair tool.
+
+On a Pi 5 with the DSI touchscreen, also run `sudo ./deploy/kiosk_setup.sh`
+for the on-hub kiosk — the web UI is the same thing in any browser, so a
+generic box skips this.
+
+### By hand (what the script does)
+
 1. **Clone the repo** (adjust the path to taste — the units below assume
    `/home/<you>/CabiNet`):
 
    ```bash
-   git clone <the CabiNet repo> ~/CabiNet
+   git clone https://github.com/ajs1616/CabiNet.git ~/CabiNet
    ```
 
 2. **Give the slot NIC a static IP — it must be `192.168.50.2/24`.** This
@@ -145,6 +171,21 @@ Requirements:
    **http://192.168.50.2:8081/board** (the attract show and tournament
    nights: see [`TOURNAMENT.md`](TOURNAMENT.md)).
 
+5. **Let Settings ▸ Updates restart the hub** (the script does this too).
+   The Updates card runs `update.py` from inside the service — no terminal,
+   so no password prompt is possible. Grant exactly the three verbs:
+
+   ```bash
+   printf '%s ALL=(root) NOPASSWD: %s restart cabinet-g2s, %s stop cabinet-g2s, %s start cabinet-g2s\n' \
+     "$USER" "$(command -v systemctl)" "$(command -v systemctl)" "$(command -v systemctl)" \
+     | sudo tee /etc/sudoers.d/cabinet >/dev/null
+   sudo chmod 440 /etc/sudoers.d/cabinet
+   sudo visudo -cf /etc/sudoers.d/cabinet   # must say "parsed OK"
+   ```
+
+   Skip it if you'll only ever update from a terminal — interactive runs
+   can just type the sudo password.
+
 ## Slot machines
 
 First question: **is your machine G2S or SAS?** `COMPATIBILITY.md` has the
@@ -161,14 +202,18 @@ menu, it's SAS — and SAS is the *normal* case for most hobbyist machines.
 
 Plug the machine's Ethernet into the slot switch.
 
-- **IGT (AVP Family 14 etc.) — plug-and-play join:** Certificate Protocols
-  **NO** (cert-less is the only supported path), "Override DHCP Configured
-  Host" **NO**. The machine takes the host from DHCP option 43 and joins on
-  its own — nothing to type. After changing any comm settings, **re-enable
-  G2S in the debug menu** or the machine's endpoint stays dark.
-  The join is zero-config; the money features are not: **WAT (wallet
-  transfers) and TITO need their permissions enabled in the operator menu,
-  which takes your eKey.** For the on-glass UI: enable the mediaDisplay
+- **IGT (AVP families):** Certificate Protocols **NO** (cert-less is the
+  only supported path). DHCP hands the machine its network settings
+  automatically, but the **G2S host URL is a one-time manual entry**:
+  "Override DHCP Configured Host" **YES**, then the three URI segments —
+  `http://` · `192.168.50.2` · `:8081/G2S`. (Automatic host delivery over
+  DHCP option 43 is still work-in-progress: the AVP *requests* the option
+  but has never been seen to apply it — its factory `127.0.0.1` means
+  "host unset.") After changing any comm settings, **re-enable G2S in the
+  debug menu** or the machine's endpoint stays dark.
+  That host entry is the whole join — a few taps, once; the money features
+  take more: **WAT (wallet transfers) and TITO need their permissions
+  enabled in the operator menu, which takes your eKey.** For the on-glass UI: enable the mediaDisplay
   content areas in the operator menu and give them memory from the media
   pool (it's RAM-capped — enable the ones that fit).
   **Step-by-step with operator-menu photos: [`AVP_SETUP.md`](AVP_SETUP.md).**
@@ -233,6 +278,15 @@ The updater needs three things that an older install may not have: a **git
 clone**, a **branch tracking `origin/main`**, and an **SSH key from the hub to
 each satellite**. Plenty of hubs were set up by copying files or unpacking a
 download, so this is a one-time adoption. Do it in this order.
+
+> **Services named `casinonet-*`?** That's the pre-rename hand-install era —
+> don't adopt it in place. After step 1's backup, make a fresh clone and run
+> `sudo ./deploy/hub_setup.sh` from it: it stops and disables the old
+> `casinonet-*` units, carries your `G2S/data` forward into the new checkout,
+> and installs the current `cabinet-*` services. From then on you're a normal
+> git install and updating is just `python3 deploy/update.py`. (In step 1,
+> read the backup from wherever your OLD checkout lives — the path may be
+> `~/CasinoNet`, not `~/CabiNet`.)
 
 ### 1. Back up your data — before anything else
 
