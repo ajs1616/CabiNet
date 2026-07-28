@@ -2596,7 +2596,24 @@ function sasResultCheck(j){
     for(const rec of fresh.reverse()) sasVerdictToast(rec, name);
   }
 }
+/* Hub HOUSEKEEPING verdicts are not news: nobody asked for them, and on a
+   14-machine floor a hub restart would fire one toast per machine. The hub
+   already separates intent in the command id — `coarm…` is the operator
+   arming/disarming cash-out, `codis…` is the hub disarming a leg it can no
+   longer home (the boot sweep after a restart, or an arm that outlived its
+   pin). Suppress the housekeeping ones; the tile chips and the activity tape
+   still carry them for anyone looking. Operator-initiated verdicts, failures
+   and every other command type stay loud. */
+const SAS_QUIET_CMD_PREFIXES=["codis"];
+function sasVerdictQuiet(r){
+  const id=String((r&&r.id)||"");
+  // a FAILED housekeeping disarm is still news — the leg may answer a 0x6A
+  // the hub cannot home, which is the whole reason the sweep exists
+  if(r && r.ok===false) return false;
+  return SAS_QUIET_CMD_PREFIXES.some(p=>id.startsWith(p));
+}
 function sasVerdictToast(r, name){
+    if(sasVerdictQuiet(r)) return;
     if(r.type==="handpay_reset"){
       // 🔑 reset verdicts carry {ok,outcome,detail}, not the bonus's
       // "result" string — same one-shot toast, honest wording
