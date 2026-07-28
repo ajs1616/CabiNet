@@ -1107,6 +1107,14 @@ class EgmAssociation:
         self.denom_backfill_epoch = -1
         self.denom_backfill_at = 0.0
         self.denom_backfill_asked = {}
+        # Ticket-header re-push (2026-07-26): the epoch whose harvest already
+        # armed a header push. A RAM-cleared cabinet rejoins carrying FACTORY
+        # ticket text ("YOUR ESTABLISHMENT"/"YOUR CITY, STATE ZIP") while the
+        # hub still believes its saved header is live, so every rejoin must
+        # re-assert it. Per-epoch, like the denom backfill — a bouncing link
+        # re-pushes at most once per join, never per message.
+        self.ticket_push_epoch = -1
+        self.ticket_push_pending = False
         self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
         self.descriptors = []           # harvest: device inventory (getDescriptor)
         self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
@@ -14164,7 +14172,21 @@ class G2SHost:
                         ("line2", "G2S_propLine2"),
                         ("titleCash", "G2S_titleCash"))
 
-    def push_ticket_header_g2s(self):
+    #: What an UNSET ticket field pushes. Blank is right for the address and
+    #: branding lines — an empty line1/line2 means "print nothing there", and
+    #: leaving them unpushed is what let the EGM keep printing its factory
+    #: "YOUR CITY, STATE ZIP".
+    #:
+    #: The CASH TICKET TITLE is the exception, and it is not branding: it is
+    #: the functional label at the top of the printed voucher, and "CASHOUT
+    #: VOUCHER" is near-universal across manufacturers (AJ 2026-07-27 — it is
+    #: also what this AVP shipped with). Blanking it produced a titleless
+    #: ticket, which is worse than every default it replaced. So an operator
+    #: who never fills it in gets the sane industry default; one who types
+    #: their own gets theirs.
+    TICKET_PARAM_DEFAULTS = {"titleCash": "CASHOUT VOUCHER"}
+
+    def push_ticket_header_g2s(self, only=None):
         """Fan the hub ticket header to every ONLINE G2S EGM's printed
         tickets via the PROVEN option-change cycle (G2S-27 multi-param form,
         applyCondition G2S_immediate — the start_option_change_cycle
@@ -14181,15 +14203,28 @@ class G2SHost:
         not in inventory, a cycle already in flight, or the EGM refusing
         G2S_immediate later in the cycle) is recorded and STOPPED at —
         never auto-escalated to disable conditions; retry is the operator
-        re-saving. A machine that joins LATER is NOT auto-pushed (flagged
-        as skipped in the build notes) — re-save after it joins."""
+        re-saving.
+
+        `only` = one association to push to (the join path). Omitted = the
+        whole floor (the /api/settings save path).
+
+        ⭐ A LATE-JOINING MACHINE IS NOW AUTO-PUSHED (2026-07-26). This
+        docstring used to end "A machine that joins LATER is NOT auto-pushed
+        — re-save after it joins", and that is precisely the hole AJ fell
+        into: a RAM-cleared cabinet rejoins with FACTORY ticket text, the hub
+        still shows the header as saved, and nothing reconciles the two until
+        someone re-saves Options. _maybe_push_ticket_header_on_join drives
+        this per-epoch off the descriptor harvest."""
         hdr = self.ticket_header()
         if not hdr.get("propName"):
             return []
         dc, di = "G2S_voucher", "1"
         gid, oid = "G2S_voucherOptions", "G2S_voucherTextFields"
-        with self.assoc_lock:
-            assocs = list(self.associations.values())
+        if only is not None:
+            assocs = [only]
+        else:
+            with self.assoc_lock:
+                assocs = list(self.associations.values())
         verdicts = []
         for a in assocs:
             with a.lock:
@@ -14205,8 +14240,23 @@ class G2SHost:
                               "G2S_voucher/1, then re-save the header")
             else:
                 vals = option_param_values(opt.get("currentValues"))
-                targets = {pid: hdr[f] for f, pid in self.TICKET_PARAM_MAP
-                           if hdr.get(f) is not None and pid in vals}
+                # ⭐ A CONFIGURED HEADER IS AUTHORITATIVE FOR EVERY PARAM IT
+                # MAPS, INCLUDING THE BLANK ONES (2026-07-26). This used to
+                # be `hdr.get(f) is not None`, which skipped unset fields so
+                # as never to blank a machine's existing text (C1) — but the
+                # hub stores a cleared field as absent, so "blank" and "never
+                # configured" collapsed to the same thing and the EGM simply
+                # kept its FACTORY value. On the AVP that value is literally
+                # "YOUR ESTABLISHMENT" / "YOUR CITY, STATE ZIP", so leaving a
+                # line blank in Options printed the placeholder on real
+                # tickets (AJ, 2026-07-26). An empty field means "print
+                # nothing here", and only an explicit "" says that.
+                # The propName guard below still gates the whole push, so a
+                # hub that has NEVER configured a header pushes nothing at
+                # all and no machine is blanked by default.
+                targets = {pid: (hdr.get(f)
+                                 or self.TICKET_PARAM_DEFAULTS.get(f, ""))
+                           for f, pid in self.TICKET_PARAM_MAP if pid in vals}
                 if "G2S_propName" not in targets:
                     v["error"] = ("option advertises no G2S_propName param "
                                   "— refusing a header push that cannot set "
@@ -14231,6 +14281,62 @@ class G2SHost:
             verdicts.append(v)
             log.info("🎫 [ticket:%s] header push -> %s", a.egm_id, v)
         return verdicts
+
+    def _maybe_push_ticket_header_on_join(self, assoc):
+        """Re-assert the hub's ticket header on a machine that just joined.
+
+        WHY (AJ, 2026-07-26): "when a fresh machine joins they dont get the
+        ticket info so my ram cleared machine is back to the generic machine
+        default." A RAM clear restores the EGM's FACTORY voucher text, and
+        nothing on the wire announces it — the cabinet simply comes back
+        printing "YOUR ESTABLISHMENT" / "YOUR CITY, STATE ZIP" while the hub
+        still shows the operator's saved header. Until now the only push was
+        the /api/settings save, so the two never reconciled without a manual
+        re-save nobody knew to do.
+
+        Two-step, because the push needs the voucher option INVENTORY and a
+        fresh join has not read it yet: arm here + enqueue one scoped
+        getOptionList, then push when that optionList lands (the handler
+        calls back in). Armed once per EPOCH so a bouncing link cannot turn
+        this into a push storm, and gated on the hub actually having a header
+        (propName set) so a hub that never configured one touches nothing.
+
+        Safe by construction: the push itself skips params already at target
+        via option_values_equal, so the common case — a machine that did NOT
+        RAM-clear — costs one getOptionList and zero option-change cycles."""
+        if not self.ticket_header().get("propName"):
+            return
+        with assoc.lock:
+            if assoc.ticket_push_epoch == assoc.epoch:
+                return
+            assoc.ticket_push_epoch = assoc.epoch
+            assoc.ticket_push_pending = True
+        log.info("🎫 [%s] join: re-asserting the hub ticket header — reading "
+                 "G2S_voucher/1 options first (a RAM clear silently restores "
+                 "the EGM's factory ticket text)", assoc.egm_id)
+        self.enqueue_get_option_list(assoc=assoc, device_class="G2S_voucher",
+                                     device_id="1")
+
+    def _ticket_push_after_option_list(self, assoc):
+        """The voucher optionList landed — run the armed join push, if any.
+        Called from the optionList handler AFTER the inventory is folded in,
+        so push_ticket_header_g2s sees current values."""
+        with assoc.lock:
+            if not assoc.ticket_push_pending:
+                return
+            assoc.ticket_push_pending = False
+        for v in self.push_ticket_header_g2s(only=assoc):
+            if v.get("alreadyApplied"):
+                log.info("🎫 [%s] join: ticket header already matches the "
+                         "machine — nothing to push", assoc.egm_id)
+            elif v.get("ok"):
+                log.info("🎫 [%s] join: RE-APPLIED the ticket header after a "
+                         "join (params %s) — the machine was carrying "
+                         "different text, which is what a RAM clear looks "
+                         "like", assoc.egm_id, v.get("params"))
+            else:
+                log.warning("🎫 [%s] join: ticket-header re-push FAILED — %s",
+                            assoc.egm_id, v.get("error"))
 
     def push_ticket_expiration_g2s(self):
         """Fan the hub ticket-expiration setting (days, 0 = never) to every
@@ -15209,6 +15315,11 @@ class G2SHost:
                         assoc.denom_backfill_epoch = assoc.epoch
                 if start_bf:
                     self._start_game_denom_backfill(assoc, reason="harvest")
+
+            # Same harvest moment, same once-per-epoch discipline: re-assert
+            # the hub's ticket header. A RAM-cleared cabinet rejoins printing
+            # its FACTORY voucher text with nothing on the wire to say so.
+            self._maybe_push_ticket_header_on_join(assoc)
 
         elif cmd in ("printerStatus", "printerProfile",
                      "printerTemplateList", "printComplete") \
@@ -16729,6 +16840,10 @@ class G2SHost:
                 log.info("[%s] optionConfig.optionList (response to "
                          "getOptionList, sessionId=%s) — parsed, no ack "
                          "due", assoc.egm_id, req["sessionId"])
+                # The inventory is folded in by now, so an armed join-time
+                # ticket-header push can finally read current values and
+                # decide whether the machine drifted (RAM clear) or matches.
+                self._ticket_push_after_option_list(assoc)
 
         elif cmd == "optionConfigModeStatus":
             # Response to enterOptionConfigMode/getOptionConfigModeStatus
@@ -20647,21 +20762,21 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     "application/json", soap=False)
             # Game 0000 is TOLERATED here (its bare sibling above keeps Table
             # 7.6.1's literal 0001-9999) only so an operator can probe it. It is
-            # NOT the recommended value and it is NOT a fix:
-            #   * Table 7.6.1 states LP09's game number range as 0001-9999, so
+            # NOT recommended and it is NOT a fix:
+            #   * Table 7.6.1 states LP09's game-number range as 0001-9999, so
             #     0000 is out of range FOR THIS POLL. The "0000 = the gaming
-            #     machine" meaning comes from §2.2.2.3, and the "must be 0000
-            #     behind the preamble" rule in §16.2 is written specifically
-            #     about long poll 2F — neither transfers to LP09.
+            #     machine" meaning comes from §2.2.2.3, and §16.2's "must be
+            #     0000 behind the preamble" rule is written specifically about
+            #     long poll 2F — neither transfers to LP09.
             #   * Wire-tested 2026-07-26 on a WMS BB2E: game 0000 and game 0012,
             #     at denoms 00/01/02, with and without an inner length byte —
-            #     five frame forms, all answered Table 16.1c error 04. Game 0000
-            #     is not the unlock; that cabinet's firmware simply does not
+            #     five frame forms, every one answered Table 16.1c error 04.
+            #     Game 0000 is not the unlock; that firmware simply does not
             #     implement LP09 behind the preamble.
-            # Prefer a real game number. Per-denom control remains correct per
-            # §7.6.1 ("games may be enabled or disabled for a specific
-            # denomination") and is expected to work on machines that implement
-            # it — the refusal above is one cabinet's answer, not the protocol's.
+            # Prefer a real game number. Per-denom control is correct per §7.6.1
+            # ("games may be enabled or disabled for a specific denomination")
+            # and should work on machines that implement it — one cabinet's
+            # refusal is not the protocol's answer.
             game = req.get("game")
             if (not isinstance(game, int) or isinstance(game, bool)
                     or not 0 <= game <= 9999):

@@ -605,7 +605,7 @@
           <div id="w-plink"></div>
         </div>
       </div>
-      <div class="card wide"><h2>Cards &amp; readers</h2>
+      <div class="card wide"><h2>Cards <span class="hn" id="pl-fobs-n"></span></h2>
         <div class="body" id="pl-fobs"></div></div>
     </div>
   </section>
@@ -658,8 +658,14 @@
       <div class="card" id="card-floorlock" style="display:none">
         <h2>Floor lock</h2>
         <div class="body" id="st-floorlock"></div></div>
-      <p class="none" style="grid-column:1/-1;margin:0">Cards, fobs and readers
-        now live in 💳 The Players.</p>
+      <!-- Card readers live HERE, not in The Players (AJ 2026-07-27): a reader
+           is a piece of hardware bolted to a machine, so it belongs with the
+           other equipment switches. Cards stay in The Players, because a card
+           is a person. -->
+      <div class="card wide"><h2>Card readers</h2>
+        <div class="body" id="st-readers"></div></div>
+      <p class="none" style="grid-column:1/-1;margin:0">Cards and fobs live in
+        💳 The Players.</p>
     </div>
   </section>
 
@@ -1281,13 +1287,18 @@ async function fetchFobs(){
      so it self-heals. */
   try{
     const r=await fetch("/api/fobs",{cache:"no-store"});
-    if(r.status===404){S.caps.fobs=false; if(S.tab==="players") renderFobs(); return;}
+    if(r.status===404){S.caps.fobs=false;
+      if(S.tab==="players") renderFobs();
+      if(S.tab==="settings") renderReaders();   // shows the pending chip too
+      return;}
     const j=await r.json();
     S.caps.fobs=true;
     S.fobs.list=j.fobs||[];
     S.fobs.max=Number(j.maxFobs)||256;
     if(Array.isArray(j.tiers)&&j.tiers.length) S.fobs.tiers=j.tiers;
     if(S.tab==="players") renderFobs();
+    // reader rows name the last-tapped card, so they follow the fob list
+    if(S.tab==="settings") renderReaders();
   }catch(e){/* header already shows host state */}
 }
 async function fetchAccounts(){
@@ -3063,19 +3074,7 @@ function denomPendFace(pk, dc){
    getGameDenoms, setActiveDenoms, exit mode — and always exits, even on a
    refusal, so the cabinet is never left with game play locked out.
    ⚠️ Machine prerequisites live in deploy/AVP_SETUP.md (LEGACY METER CHANGE =
-   Not Required; "Door status disallows machine idle state" = No).
-   ⚠️ CABINET SUPPORT IS NOT UNIVERSAL — read this before filing a bug.
-   The ceremony's first step is optionConfig mode, and a cabinet that has no
-   LIVE config mode can never enter it. Wire-tested 2026-07-26 on a WMS
-   Bluebird (BB2E): it ACKs enterOptionConfigMode at the transport layer in
-   ~80ms, then never enters the mode, never sends optionConfigModeStatus, and
-   never errors — because on a Bluebird these settings change only during the
-   boot right after a RAM clear. The ceremony therefore waits out
-   CEREMONY_MODE_TTL_MS and reports the machine's own G2S_APX011. That is
-   expected on that hardware, not a fault: on such a cabinet the enabled
-   denominations are operator-menu-owned. Proven working on the IGT AVP
-   (~2s, read-back confirmed). If your machine reports a refusal, the UI shows
-   the EGM's own errorCode/errorText — that text is the answer. */
+   Not Required; "Door status disallows machine idle state" = No). */
 const DENOM_PUSH_ENABLED=true;
 function gmDenomTap(dev, id){
   if(!DENOM_PUSH_ENABLED) return;   // push disabled (APX011); chips are read-only
@@ -3644,7 +3643,8 @@ async function playerAdminToggle(btn, id, on){
   flash(btn,!!j);
 }
 
-/* ---- 💳 The Players page — the Players card + Cards & readers ---------- */
+/* ---- 💳 The Players page — the Players card + Cards -------------------
+   Readers moved to ⚙️ The Switchboard (renderReaders) 2026-07-27. */
 function renderPlayersPage(){
   renderPlayers();
   renderFobs();
@@ -4508,6 +4508,11 @@ function hintToggle(id){
   renderSettings();   // re-renders host options, tournament and floor lock
 }
 function renderSettings(){
+  // Card readers repaint on their OWN guards (armed-node + focused reader
+  // input), ahead of this function's early returns — otherwise a half-typed
+  // ticket-header field would also freeze the reader list, which has nothing
+  // to do with it.
+  renderReaders();
   // Hold the repaint while a two-step confirm is armed (the SAS-off
   // toggle): setHTML would replace the armed node and silently disarm it.
   if(ARM) return;
@@ -4602,7 +4607,11 @@ function renderSettings(){
       <div class="hblk">
         ${htLine("ticket","🎫 Ticket header")}
         ${HINTS.ticket?`<p class="none">Top of every machine's tickets, both protocols —
-          set once, pushed floor-wide. All blank = each keeps its own.</p>`:""}
+          set once, pushed floor-wide and re-applied whenever a machine rejoins.
+          Leave the casino name blank and nothing is pushed at all: every machine
+          keeps its own text. Fill it in and the whole header goes out, so an
+          address line left blank prints <em>empty</em> rather than leaving the
+          machine's factory placeholder showing.</p>`:""}
         <div class="tkf"><label for="st-ticket-name">Casino name</label>
           <input type="text" id="st-ticket-name" maxlength="64"
             value="${esc(tv("propName"))}" placeholder="YOUR ESTABLISHMENT"></div>
@@ -4614,7 +4623,7 @@ function renderSettings(){
             value="${esc(tv("line2"))}" placeholder="address / tagline line 2"></div>
         <div class="tkf"><label for="st-ticket-title">Cash ticket title (where supported)</label>
           <input type="text" id="st-ticket-title" maxlength="64"
-            value="${esc(tv("titleCash"))}" placeholder="CASHOUT"></div>
+            value="${esc(tv("titleCash"))}" placeholder="CASHOUT VOUCHER"></div>
         <div class="tkf"><label for="st-ticket-expire">Expiration (days &middot; 0 = never)</label>
           <input type="number" id="st-ticket-expire" min="0" max="255" step="1"
             value="${esc(String((tk&&tk.expireDays)||0))}" placeholder="0"></div>
@@ -4953,16 +4962,16 @@ function fobAddToggle(){
 /* Companion (v11 zero-config): a reader shows up unassigned and is bound to a
    machine from that MACHINE's ⚙️ Options (machineReaderSet, beside the SAS-leg
    picker — a collector thinks "what reader serves this machine", not the
-   reverse). The Players ▸ Readers row is a status + RENAME surface only.
+   reverse). The Settings ▸ Card readers row is a status + RENAME surface only.
    COMPOPEN = which reader's Rename expander is open. */
 const COMPOPEN={};       // companionId -> true while its Rename expander is open
 function companionEditToggle(id){
   if(COMPOPEN[id]) delete COMPOPEN[id]; else COMPOPEN[id]=true;
-  if(S.tab==="players") renderFobs();
+  if(S.tab==="settings") renderReaders();
 }
 function companionServes(c){ return ((c&&c.bindings)||{}).g2sEgmId||""; }
 async function companionLabel(id,btn){
-  const el=$("pl-fob-comp-l-"+id); if(!el) return;
+  const el=$("st-rdr-l-"+id); if(!el) return;
   const ok=await settingsPost({companionId:id, label:el.value.trim()},
     "reader named");
   if(ok) tickStatus();
@@ -5055,17 +5064,19 @@ function fobAcctSel(id, cur){
     opts.push(`<option value="${esc(cur)}" selected>${esc(cur)}</option>`);
   return `<select id="${esc(id)}" aria-label="Linked account">${opts.join("")}</select>`;
 }
-function renderFobs(){
-  const box=$("pl-fobs"); if(!box) return;
-  // an armed Delete must survive the repaint — freeze-while-armed, scoped
-  // to this card (the renderPlayers idiom)
+/* Readers live in ⚙️ SETTINGS, cards live in 💳 THE PLAYERS (AJ 2026-07-27:
+   "cards makes sense on the players screen but the readers are out of place").
+   A reader is hardware bolted to a machine; a card is a person. They used to
+   share one card here, which is why this is now two functions over two tabs
+   sharing the same companions/fobs poll data. */
+function renderReaders(){
+  const box=$("st-readers"); if(!box) return;
   if(ARM && box.contains(ARM.btn)) return;
-  // …and hold while one of this card's inputs/selects has focus: the tab
-  // repaints on the poll and setHTML would clobber half-typed text
+  // hold the repaint while a reader-name input has focus (the renderFobs idiom)
   const ae=document.activeElement;
   if(ae && (ae.tagName==="INPUT"||ae.tagName==="SELECT")
-     && String(ae.id).indexOf("pl-fob-")===0) return;
-  if(S.caps.fobs===false){ setHTML(box, pendChip("The card registry")); return; }
+     && String(ae.id).indexOf("st-rdr-")===0) return;
+  if(S.caps.fobs===false){ setHTML(box, pendChip("Card readers")); return; }
 
   /* Readers — one row per ASSIGNABLE Companion daemon; online = a report in
      the last 10s (they heartbeat every ~5s idle, so 10s of silence means
@@ -5119,7 +5130,7 @@ function renderFobs(){
     let assignUI="";
     if(open){
       assignUI=`<div class="mrowset" style="flex-basis:100%;flex-wrap:wrap;align-items:center;margin:8px 0 0;gap:8px">
-        <input type="text" id="pl-fob-comp-l-${esc(id)}" maxlength="64" style="width:170px"
+        <input type="text" id="st-rdr-l-${esc(id)}" maxlength="64" style="width:170px"
           value="${esc(c.label||"")}" placeholder="reader name" aria-label="Reader name">
         <button class="btn slim gold" onclick="companionLabel('${jsq(id)}',this)">
           <span class="bl">Save name</span></button>
@@ -5148,6 +5159,30 @@ function renderFobs(){
           <span class="bl">Rename ${open?"▴":"▾"}</span></button>
       </div>${assignUI}${tap}</div>`;
   }).join("");
+
+  const readersEmpty = autoCount
+    ? '<p class="none">All readers are on SAS machines — they bind to their own '
+      +'cabinet automatically, so there is nothing to assign here.</p>'
+    : '<p class="none">No card reader has checked in yet — readers appear here '
+      +'as soon as one comes online.</p>';
+  setHTML(box, `
+    <p class="none" style="margin:0 0 8px">Readers you assign to a machine —
+      tap a card on one and it shows up here.${autoCount?' (SAS-machine readers '
+      +'bind automatically and aren’t listed.)':''}</p>
+    ${compRows||readersEmpty}`);
+}
+
+function renderFobs(){
+  const box=$("pl-fobs"); if(!box) return;
+  // an armed Delete must survive the repaint — freeze-while-armed, scoped
+  // to this card (the renderPlayers idiom)
+  if(ARM && box.contains(ARM.btn)) return;
+  // …and hold while one of this card's inputs/selects has focus: the tab
+  // repaints on the poll and setHTML would clobber half-typed text
+  const ae=document.activeElement;
+  if(ae && (ae.tagName==="INPUT"||ae.tagName==="SELECT")
+     && String(ae.id).indexOf("pl-fob-")===0) return;
+  if(S.caps.fobs===false){ setHTML(box, pendChip("The card registry")); return; }
 
   /* Cards — human-first rows; every control from the old inline table
      lives EXACTLY as before inside the Edit ▾ expander (tier select,
@@ -5184,45 +5219,38 @@ function renderFobs(){
     </div>`;
   }).join("");
 
-  const readersEmpty = autoCount
-    ? '<p class="none">All readers are on SAS machines — they bind to their own '
-      +'cabinet automatically, so there is nothing to assign here.</p>'
-    : '<p class="none">No card reader has checked in yet — readers appear here '
-      +'as soon as one comes online.</p>';
+  // the count rides the CARD HEADER now (the Tournament idiom) — the inner
+  // "Cards" sub-heading only existed to divide this from the Readers block
+  // that used to share the card, and reads as a duplicate without it.
+  setHTML($("pl-fobs-n"), `${list.length} / ${S.fobs.max}`);
   setHTML(box, `
-    <div class="nm" style="font:600 14.5px var(--sans)">Readers</div>
-    <p class="none" style="margin:4px 0 6px">Readers you assign to a machine —
-      tap a card on one and it shows up here.${autoCount?' (SAS-machine readers '
-      +'bind automatically and aren’t listed.)':''}</p>
-    ${compRows||readersEmpty}
-    <div style="margin-top:14px;border-top:1px solid var(--line2);padding-top:12px">
-      <div class="nm" style="font:600 14.5px var(--sans)">Cards
-        <span class="hn" style="font:10px var(--mono);color:var(--faint)">
-          ${list.length} / ${S.fobs.max}</span></div>
-      ${fobRows||'<p class="none">No card registered yet — tap one on a reader, then click the callout that appears above.</p>'}
-      <div style="margin-top:12px">
-        <button class="btn slim" aria-expanded="${FOBADDOPEN?"true":"false"}"
-          onclick="fobAddToggle()">
-          <span class="bl">Advanced: add a card by UID ${FOBADDOPEN?"▴":"▾"}</span></button>
-        ${FOBADDOPEN?`<div class="mrowset" style="align-items:center">
-          <input type="text" id="pl-fob-new-uid" maxlength="32" style="min-width:150px"
-            placeholder="UID — tap a card to prefill" aria-label="New card UID">
-          ${fobTierSel("pl-fob-new-tier","player")}
-          <input type="text" id="pl-fob-new-label" maxlength="64" style="min-width:120px"
-            placeholder="label" aria-label="New card label">
-          ${fobAcctSel("pl-fob-new-acct","")}
-          <button class="btn slim gold" onclick="fobAdd(this)">
-            <span class="bl">Add card</span></button>
-        </div>`:""}
-      </div>
+    ${fobRows||'<p class="none">No card registered yet — tap one on a reader, then click the callout on its row in ⚙️ The Switchboard ▸ Card readers.</p>'}
+    <div style="margin-top:12px">
+      <button class="btn slim" aria-expanded="${FOBADDOPEN?"true":"false"}"
+        onclick="fobAddToggle()">
+        <span class="bl">Advanced: add a card by UID ${FOBADDOPEN?"▴":"▾"}</span></button>
+      ${FOBADDOPEN?`<div class="mrowset" style="align-items:center">
+        <input type="text" id="pl-fob-new-uid" maxlength="32" style="min-width:150px"
+          placeholder="UID — tap a card to prefill" aria-label="New card UID">
+        ${fobTierSel("pl-fob-new-tier","player")}
+        <input type="text" id="pl-fob-new-label" maxlength="64" style="min-width:120px"
+          placeholder="label" aria-label="New card label">
+        ${fobAcctSel("pl-fob-new-acct","")}
+        <button class="btn slim gold" onclick="fobAdd(this)">
+          <span class="bl">Add card</span></button>
+      </div>`:""}
     </div>`);
 }
 function fobPrefill(uid){
   /* an unknown tap's click-to-register: AUTO-OPEN the Advanced form and
      land the UID there — tap-to-register stays end-to-end even though
-     the raw form hides behind the expander by default */
+     the raw form hides behind the expander by default.
+     ⚠️ The callout that calls this lives on a READER row, which moved to
+     ⚙️ Settings (2026-07-27), while the form it fills is in 💳 The Players.
+     So HOP THE TAB first — otherwise the click silently does nothing,
+     because #pl-fob-new-uid does not exist while Settings is showing. */
   FOBADDOPEN=true;
-  if(S.tab==="players") renderFobs();
+  if(S.tab!=="players") goTab("players"); else renderFobs();
   const el=$("pl-fob-new-uid");
   if(el){ el.value=String(uid||""); el.focus(); }
   toast("Card ·"+String(uid||"").slice(-4)

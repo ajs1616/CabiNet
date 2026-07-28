@@ -359,17 +359,34 @@ class TestTicketHeaderStateGating:
         assert st.due() is None
         assert st.snapshot() == {"appliedRev": 1, "detail": "applied"}
 
-    def test_same_rev_never_resends(self):
-        """The hub echoes the same rev every REPORT_SEC forever — after
-        one applied rev the gate must stay closed no matter how many
-        echoes (or rejoins) follow."""
+    def test_same_rev_never_resends_within_one_online_session(self):
+        """The hub echoes the same rev every REPORT_SEC forever — after one
+        applied rev the gate stays closed for every echo THAT SESSION."""
         st = self._fed(rev=1)
         st.mark_attempted(1)
         st.record_result(1, True, "applied")
         for _ in range(5):
             st.on_reply(self.reply(1))
             assert st.due() is None
-        st.on_online()                       # rejoin: still applied
+
+    def test_rejoin_re_applies_even_an_already_applied_rev(self):
+        """A REJOIN must re-assert the header, same rev or not.
+
+        Nothing on the wire announces a RAM clear, and a RAM-cleared cabinet
+        comes back carrying FACTORY ticket text while the hub still believes
+        its header is live. This used to assert `due() is None` after
+        on_online() — that assertion WAS the bug (AJ, 2026-07-26: "my ram
+        cleared machine is back to the generic machine default"). One
+        idempotent re-apply per online session is the price."""
+        st = self._fed(rev=1)
+        st.mark_attempted(1)
+        st.record_result(1, True, "applied")
+        assert st.due() is None              # settled in this session
+        st.on_online()                       # rejoin
+        due = st.due()
+        assert due is not None and due["rev"] == 1
+        # ...and it is still ONE attempt per session, never a hot loop.
+        st.mark_attempted(1)
         assert st.due() is None
 
     def test_failure_burns_the_attempt_until_rev_bump(self):
@@ -516,14 +533,22 @@ class TestApplyTicketHeader:
         assert codes == [TICKET_DATA_LOCATION, TICKET_DATA_ADDRESS1,
                          TICKET_DATA_ADDRESS2]
 
-    def test_blank_lines_are_omitted_not_pushed(self):
-        """C1: never push empty over existing machine config — blank
-        line1/line2 vanish from the frame entirely."""
+    def test_blank_lines_are_pushed_as_a_single_space(self):
+        """A blank line in Options means PRINT NOTHING THERE, so it must
+        reach the wire — omitting it leaves the EGM's factory placeholder
+        ("YOUR CITY, STATE ZIP") printing on real tickets.
+
+        The value is a single SPACE, never "": per §15.3 a zero-length 7C
+        element means 'revert to default', which would re-arm the very
+        placeholder this is meant to kill."""
         ok, _, tp, _ = self._apply(
             [_resp(1, 0x7C, 0x01)], target=_target(line1="", line2=""))
         assert ok is True
-        assert _elements(tp.frames[0]) == [(TICKET_DATA_LOCATION,
-                                            b"FUNCINO")]
+        assert _elements(tp.frames[0]) == [
+            (TICKET_DATA_LOCATION, b"FUNCINO"),
+            (TICKET_DATA_ADDRESS1, b" "),
+            (TICKET_DATA_ADDRESS2, b" "),
+        ]
 
 
 # ---------------------------------------------------------------------------

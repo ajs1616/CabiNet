@@ -390,9 +390,25 @@ class TicketHeaderState:
             self.target = parsed
 
     def on_online(self) -> None:
-        """Poll thread: machine-online edge — re-arms one attempt for a
-        rev that failed in the previous online session."""
+        """Poll thread: machine-online edge — re-arms one attempt.
+
+        ⭐ ALSO CLEARS applied_rev (2026-07-26). Bumping the session alone
+        only re-armed a rev that FAILED last session; a rev that SUCCEEDED
+        stayed latched in applied_rev, and `due()` short-circuits on
+        `rev == applied_rev`. So after a machine RAM CLEAR the satellite
+        still believed the header was applied and never re-pushed it — the
+        cabinet came back up printing its factory placeholders while the hub
+        showed the header as applied (AJ, 2026-07-26: "when a fresh machine
+        joins they dont get the ticket info... my ram cleared machine is
+        back to the generic machine default").
+
+        Nothing on the wire tells us a RAM clear happened, so we cannot
+        detect it — we can only stop assuming the machine kept our text
+        across an offline edge. Re-applying is a harmless idempotent write
+        of the same text, and `_attempted` still bounds it to ONE attempt
+        per (session, rev), so this costs at most one 7C/7D per rejoin."""
         self._session += 1
+        self.applied_rev = None
 
     def due(self):
         """Poll thread: the target dict if an apply attempt is due now,
@@ -464,18 +480,43 @@ def apply_ticket_header(transport, address, target, protocol=None,
     escalation, honest failure verdict instead. titleCash has NO SAS
     mapping (6.02 offers only the restricted/debit titles, codes 10/20 —
     printing a cash title there would brand the WRONG tickets), so it is
-    reported as skipped, never guessed onto the wire. Empty line1/line2
-    are OMITTED (C1: never push empty over existing machine config).
+    reported as skipped, never guessed onto the wire.
+
+    ⭐ A BLANK line1/line2 IS SENT AS A SINGLE SPACE (changed 2026-07-26).
+    Blanks used to be OMITTED under a "never push empty over existing machine
+    config" rule (C1), and that was backwards for what operators actually
+    hit: a field left blank in Options is not "leave the machine alone", it
+    is "print nothing there". Omitting it leaves the EGM's FACTORY text
+    standing, so a blank address line printed as "YOUR CITY, STATE ZIP" on
+    real tickets (AJ, 2026-07-26).
+
+    ⚠️ THE VALUE MATTERS, AND "" IS THE WRONG ONE. Per §15.3/§15.4 a
+    ZERO-LENGTH element means "revert to default" on 7C and "do not change"
+    on 7D — so pushing "" would have re-armed the very placeholder we are
+    trying to kill, on the poll that takes precedence. `_ticket_ascii`
+    refuses "" outright for exactly this reason. A single SPACE is the
+    documented way to print an empty line, so that is what a cleared field
+    becomes here. None still means "leave untouched" and is now unreachable
+    from a configured header.
+
+    propName is guarded non-empty upstream (parse_ticket_data_reply rejects
+    a blank one), so this can never blank the whole header.
     Poll-thread only; one sleep(pace) separates consecutive polls."""
     proto = protocol or SASProtocol()
     loc = target["propName"]
-    a1 = target["line1"] or None
-    a2 = target["line2"] or None
+    # "" -> " ": print an empty line. NEVER "" — that is 7C's revert-to-
+    # default sentinel and would restore the factory placeholder.
+    a1 = target["line1"] or " "
+    a2 = target["line2"] or " "
     days = int(target.get("expireDays") or 0)
     note = (" · titleCash skipped: no SAS field for the cash ticket title "
             "(6.02 §15.3 has only restricted/debit titles)"
             if target.get("titleCash") else "")
-    sent = [f for f, v in (("propName", loc), ("line1", a1), ("line2", a2))
+    # "(blank)" is not cosmetic: a deliberately-cleared line and a line we
+    # never sent look identical in a verdict that only lists names, and that
+    # ambiguity is exactly what hid the YOUR-CITY-STATE-ZIP bug.
+    sent = [f if (v or "").strip() else f"{f}(blank)"
+            for f, v in (("propName", loc), ("line1", a1), ("line2", a2))
             if v is not None]
     fields = "+".join(sent)
 

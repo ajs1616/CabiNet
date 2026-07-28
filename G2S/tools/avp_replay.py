@@ -62,6 +62,7 @@ EGM_ID = "IGT_00012E492815"
 HOST_BASE = "http://127.0.0.1:8081"
 HOST_URL = HOST_BASE + "/G2S"
 STATUS_URL = HOST_BASE + "/api/status"
+CONSOLE_URL = HOST_BASE + "/"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 EGM_PORT = 8080
 CAPTURE = Path(__file__).resolve().parent.parent / "debug-captures" / \
@@ -246,6 +247,8 @@ def avp_class_command(cls, command_xml, command_id, session_id,
 
 
 CMD_URL = "http://127.0.0.1:8081/api/command"
+SAS_CMD_URL = HOST_BASE + "/api/sas/command"
+TICKET_QR_URL = HOST_BASE + "/api/ticket_qr"
 ACCT_URL = "http://127.0.0.1:8081/api/accounts"
 DEBUG_LOG_URL = "http://127.0.0.1:8081/api/debug/log"
 VOUCHERS_URL = "http://127.0.0.1:8081/api/vouchers"
@@ -278,7 +281,7 @@ def post_sas_command_err(payload):
     """POST /api/sas/command tolerating an expected non-2xx (e.g. the 409
     tournament freeze) — returns (status, body) instead of raising."""
     req = urllib.request.Request(
-        "http://127.0.0.1:8081/api/sas/command",
+        SAS_CMD_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"})
     try:
@@ -568,6 +571,7 @@ def expect_no_host_post(label, timeout=1.5):
 def main():
     global HOST_URL, STATUS_URL, DATA_DIR
     global CMD_URL, ACCT_URL, DEBUG_LOG_URL, VOUCHERS_URL
+    global CONSOLE_URL, SAS_CMD_URL, TICKET_QR_URL
     ap = argparse.ArgumentParser(
         description="AVP replay gate for g2s_host.py — LOCAL host only "
                     "(mutates voucher state + associations, see GR-04)")
@@ -597,6 +601,14 @@ def main():
     ACCT_URL = base + "/api/accounts"
     DEBUG_LOG_URL = base + "/api/debug/log"
     VOUCHERS_URL = base + "/api/vouchers"
+    # ...and the web-console check, which was STILL hardcoded to
+    # :8081 after the other four were fixed — a gate run on any
+    # other port reported "web console served at / status=None"
+    # as a code failure when it had simply looked at the wrong
+    # host (2026-07-25).
+    CONSOLE_URL = base + "/"
+    SAS_CMD_URL = base + "/api/sas/command"
+    TICKET_QR_URL = base + "/api/ticket_qr"
     DATA_DIR = Path(args.data_dir)
 
     # GR-04 live-host guard: a replay run against the production Pi injected
@@ -2075,7 +2087,7 @@ def main():
     print("— Step 6.9: web UI + enriched event (labels + affected meters)")
     ui_status, ui_body = None, ""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8081/", timeout=5) as resp:
+        with urllib.request.urlopen(CONSOLE_URL, timeout=5) as resp:
             ui_status = resp.status
             ui_body = resp.read().decode("utf-8", "replace")
     except Exception as e:  # noqa
@@ -5358,8 +5370,7 @@ def main():
     # barcoded tickets phones scan directly, so a UI-rendered QR is
     # redundant. /api/ticket_qr must stay GONE — a plain 404 like any
     # unknown path.
-    qr_st, _, _ = get_raw("http://127.0.0.1:8081/api/ticket_qr?vid="
-                          + vid_b)
+    qr_st, _, _ = get_raw(TICKET_QR_URL + "?vid=" + vid_b)
     check("/api/ticket_qr is GONE (owner cut 2026-07-07) — plain 404",
           qr_st == 404, f"status={qr_st}")
     # Home-UI routing: / prefers webui/home.html and FALLS BACK to the Test
@@ -8229,11 +8240,12 @@ def main():
           and body.get("ticketLine1") == "This ain't worth shit"
           and body.get("ticketTitleCash") == "CASH TICKET"
           and body.get("ticketRev") == rev_base + 1, f"{st} {body}")
-    check("the save FANNED OUT to the live G2S assoc (ok verdict, "
-          "configId, the 3 edited params — line2 NOT among them)",
+    check("the save FANNED OUT to the live G2S assoc (ok verdict, configId, "
+          "and ALL FOUR managed params — line2 among them, blanked)",
           len(push) == 1 and push[0].get("egmId") == EGM_ID
           and push[0].get("ok") is True and push[0].get("configId")
-          and push[0].get("params") == ["G2S_propLine1", "G2S_propName",
+          and push[0].get("params") == ["G2S_propLine1", "G2S_propLine2",
+                                        "G2S_propName",
                                         "G2S_titleCash"], f"got {push}")
     tk_config_id = str(push[0].get("configId")) if push else ""
     # (e) The wire: ONE setOptionChange at the voucher 4-tuple,
@@ -8255,12 +8267,12 @@ def main():
               and det["attrs"].get("applyCondition") == "G2S_immediate",
               f"got {det['option'] if det else None} / "
               f"{det['attrs'] if det else None}")
-        check("COMPLETE value set: hub values in, machine line2 KEPT, "
-              "titlePromo rides through (C1 never-blank law on the wire)",
+        check("COMPLETE value set: hub values in, machine line2 BLANKED, "
+              "titlePromo (unmanaged) rides through untouched",
               det and det["values"] == {
                   "G2S_propName": "FUNCINO",
                   "G2S_propLine1": "This ain't worth shit",
-                  "G2S_propLine2": "EXISTING LINE 2",
+                  "G2S_propLine2": "",
                   "G2S_titleCash": "CASH TICKET",
                   "G2S_titlePromo": "PROMO TICKET"},
               f"got {det['values'] if det else None}")
@@ -8303,6 +8315,12 @@ def main():
             voucher_option_list(
                 G2S_propName="FUNCINO",
                 G2S_propLine1="This ain't worth shit",
+                # The machine honoured the BLANK too — an unset hub field is
+                # now pushed as "" so the EGM stops printing its factory
+                # placeholder. A read-back still showing the old text would
+                # (correctly) be a verify mismatch, so this line is what
+                # proves the blank actually landed.
+                G2S_propLine2="",
                 G2S_titleCash="CASH TICKET"),
             "9624", tk_rb_sid, "G2S_response")))
         time.sleep(0.3)
