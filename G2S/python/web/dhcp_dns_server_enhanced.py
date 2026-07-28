@@ -701,6 +701,36 @@ class EnhancedDHCPServer:
             print(f"[DHCP] REQUEST from unknown MAC {mac}")
             return None
     
+    def handle_dhcp_inform(self, packet):
+        """DHCP INFORM — a client that already HAS an address asking for the
+        rest of its configuration (RFC 2131 §4.3.5). We answer with an ACK
+        carrying our options and NO lease: yiaddr stays 0.0.0.0 and no lease
+        time is sent, per the RFC, because we are not granting an address.
+
+        Why this exists: a tester's fam20 floor sent 24 INFORMs that this
+        server silently ignored (found in his 2026-07-24 bundle). Windows-stack
+        subsystems — the machines announce vendor class 'MSFT 5.0' — fetch
+        scoped options this way, and one of those clients is an IGT-OUI box
+        that leases an address, never speaks G2S, and INFORMs on a loop. A
+        media/service-window subsystem left un-configured is a candidate
+        explanation for on-glass content never being fetched, and ignoring a
+        MUST-answer message is wrong regardless of what it turns out to fix.
+        """
+        mac = packet['mac']
+        client_ip = packet.get('ciaddr') or '0.0.0.0'
+        vendor = self.detect_vendor(packet)
+        print(f"[DHCP] INFORM from {mac} ({vendor}) at {client_ip} — "
+              f"sending config-only ACK (no lease)")
+        # Reuse the normal option set (vendor-specific opt43 included), then
+        # strip everything that only makes sense with a lease.
+        ack = self.create_dhcp_offer(packet, '0.0.0.0', vendor)
+        ack['options'][53] = b'\x05'          # ACK
+        for lease_only in (51, 58, 59):       # lease time, renewal T1, rebind T2
+            ack['options'].pop(lease_only, None)
+        ack['ciaddr'] = client_ip             # echo it back per the RFC
+        ack['yiaddr'] = '0.0.0.0'             # we are NOT assigning an address
+        return ack
+
     def _handle_decline(self, packet):
         """Client ARP-probed its offered IP, found it already in use, and
         declined. Drop that lease so the next DISCOVER picks a DIFFERENT free
@@ -1145,7 +1175,8 @@ class EnhancedDHCPServer:
                 print(f"[DHCP] host-discovery verdict: "
                       f"opt43_requested={opt43_req} opt125_requested={opt125_req}")
 
-            # Create packet dict
+            # Create packet dict. ciaddr matters for INFORM: that client
+            # already HAS its address and the reply goes straight back to it.
             packet = {
                 'op': op,
                 'htype': htype,
@@ -1153,6 +1184,7 @@ class EnhancedDHCPServer:
                 'xid': xid,
                 'mac': mac,
                 'chaddr': mac_bytes,
+                'ciaddr': socket.inet_ntoa(data[12:16]),
                 'options': options
             }
             
@@ -1171,6 +1203,10 @@ class EnhancedDHCPServer:
                 self._handle_decline(packet)
             elif msg_type == 7:  # DHCP RELEASE — client giving up its lease
                 self._handle_release(packet)
+            elif msg_type == 8:  # DHCP INFORM — "I have an IP, send me config"
+                response = self.handle_dhcp_inform(packet)
+                if response:
+                    self.send_dhcp_response(response, addr)
                 
         except Exception as e:
             print(f"[DHCP] Error handling packet: {e}")

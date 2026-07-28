@@ -39,6 +39,12 @@ def mk(lease_file, retention=7 * 24 * 3600, start=100, end=200, reservations=Non
                 'reservations': reservations or []}
     s.lease_file = lease_file
     s.leases = {}
+    # __init__ builds this; the __new__ fixture must supply it for any path
+    # that runs vendor detection (INFORM/OFFER). Same SHAPE as the real one —
+    # IGT special-cased by vendor class, others by class/MAC-prefix lists.
+    s.vendor_options = {'IGT': {}, 'WMS': {'vendor_class': ['WMS-Gaming'],
+                                           'mac_prefixes': ['00:A0:A5'],
+                                           'options': {}}}
     return s
 
 
@@ -194,6 +200,32 @@ check("a re-DISCOVER WITH opt 12 takes the fresh name",
       sh2._lease_hostname(AVP, {'options': {12: b'new-name\x00'}}) == 'new-name')
 check("an unknown mac with no opt 12 yields ''",
       sh2._lease_hostname('de:ad:be:ef:00:01', {'options': {}}) == '')
+
+# 11 — DHCP INFORM answers with config and NEVER a lease (RFC 2131 §4.3.5)
+print("— INFORM gets a config-only ACK: no address, no lease timers")
+si = mk(LF, start=100, end=200)
+si.config.update({'network': {'base': '192.168.50', 'subnet': '255.255.255.0',
+                              'gateway': '192.168.50.1',
+                              'server_ip': '192.168.50.2'},
+                  'dns_servers': ['192.168.50.2'], 'domain': 'cabinet.local',
+                  'lease_time': 86400, 'g2s_host': '192.168.50.2',
+                  'g2s_port': 8081})
+INF = {'mac': '00:01:29:5e:f6:77', 'ciaddr': '192.168.50.102',
+       'xid': 0x1234, 'chaddr': b'\x00\x01\x29\x5e\xf6\x77',
+       'options': {53: b'\x08', 60: b'MSFT 5.0', 55: bytes([1, 3, 6, 43])}}
+ack = si.handle_dhcp_inform(INF)
+check("INFORM produces a reply at all", ack is not None)
+check("reply is an ACK (type 5)", ack and ack['options'].get(53) == b'\x05')
+check("yiaddr is 0.0.0.0 — we assign NOTHING on an INFORM",
+      ack and ack['yiaddr'] == '0.0.0.0', ack and ack.get('yiaddr'))
+check("client's own ciaddr echoed back",
+      ack and ack['ciaddr'] == '192.168.50.102')
+check("no lease-time/T1/T2 options (51/58/59) in an INFORM reply",
+      ack and not any(k in ack['options'] for k in (51, 58, 59)),
+      ack and sorted(ack['options'].keys()))
+check("config options still present (subnet 1 + router/DNS scope)",
+      ack and 1 in ack['options'])
+check("INFORM never creates or mutates a lease", si.leases == {}, si.leases)
 
 print(f"\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
