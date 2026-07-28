@@ -5102,8 +5102,11 @@ async function updCheck(btn){
   UPDBUSY = true; renderUpdates();
   const r = await cmd({action:"checkUpdates"}, "Check for updates");
   UPDBUSY = false;
+  // cmd() nests the server's payload under .data — reading r.behind made
+  // every toast say "Already up to date" while the card showed the truth
+  const d = (r&&r.data)||{};
   if(r && r.error) toast(r.error, false);
-  else if(r && r.behind) toast(r.behind+" update(s) available", true);
+  else if(Number(d.behind)) toast(d.behind+" update(s) available", true);
   else if(r && r.ok) toast("Already up to date", true);
   flash(btn, !!(r && r.ok));
   tickStatus();
