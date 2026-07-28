@@ -83,6 +83,12 @@ REJOIN_TIMEOUT = 210
 # together.
 BACKUP_DIRNAME = "_backups"
 BACKUPS_KEPT = 5
+# Written (repo root, untracked) when adoption succeeds; removed after the
+# first COMPLETE update. Its presence forces the full gate+push+restart path
+# even when incoming()==0, so a failure right after adoption (say, the
+# hub-down refusal) can never strand the satellites behind an "Already
+# current" exit on the re-run.
+ADOPT_MARKER = ".cabinet-adopt-pending"
 
 # Where adopt() puts ITS snapshot. Deliberately OUTSIDE the install: adoption
 # rewrites the tree from the release, and a snapshot that lives at
@@ -367,7 +373,13 @@ def _adopt_inner(root, remote, assume_yes, snap, before):
     if lost:
         say("\n   ⚠️  %d data file(s) went missing during adoption — restoring"
             % len(lost))
+        # the hub service (if one is running here) still has hub.db open —
+        # restoring under its live WAL connection tears the restored file
+        run(["sudo", "systemctl", "stop", "cabinet-g2s"], check=False,
+            quiet=True)
         restore_data(root, snap)
+        run(["sudo", "systemctl", "start", "cabinet-g2s"], check=False,
+            quiet=True)
         still = sorted(set(before) - set(data_inventory(root)))
         raise Fail("adoption removed data files (%s).\n"
                    "   The snapshot at %s covers G2S/data and has been put "
@@ -377,6 +389,14 @@ def _adopt_inner(root, remote, assume_yes, snap, before):
                       "" if not still else
                       "\n   STILL MISSING (not covered by the snapshot): %s"
                       % ", ".join(still[:5])))
+
+    try:
+        with open(os.path.join(root, ADOPT_MARKER), "w") as f:
+            f.write("adopted — first full gate+push+restart still pending\n")
+    except OSError as e:
+        say("   ⚠️  could not write %s (%s) — if this run fails before "
+            "finishing, make sure\n      a re-run actually pushes the "
+            "satellites (it may claim to be current)" % (ADOPT_MARKER, e))
 
     say("\n   ✅ adopted — now tracking origin/main. Data snapshot: %s" % snap)
     say("      (kept outside the install on purpose, so an adoption cannot "
@@ -501,6 +521,18 @@ def data_inventory(root):
             dirnames[:] = [d for d in dirnames
                            if d not in (BACKUP_DIRNAME, "__pycache__")]
             for name in filenames:
+                # atomic-write transients: the stores write <file>.tmp and
+                # os.replace() it away a moment later. Catching one in the
+                # BEFORE list turns that cosmetic race into a false
+                # "adoption removed data files" — and a destructive restore.
+                # ...and sqlite sidecars: -wal/-shm vanish whenever the last
+                # writer closes cleanly (or quarantine renames them), and no
+                # snapshot ever contains them (backup_data skips them; the
+                # backup API folds them in) — so counting them guarantees a
+                # false "adoption removed data files" someday
+                if name.endswith((".tmp", ".corrupt", ".restore-tmp")) \
+                        or name.endswith(SKIP_SUFFIXES):
+                    continue
                 full = os.path.join(dirpath, name)
                 found.append(os.path.relpath(full, root).replace(os.sep, "/"))
     return found
@@ -639,15 +671,45 @@ def restore_data(root, snapshot):
                 except PermissionError:
                     run(["sudo", "rm", "-f", side], check=False, quiet=True)
         target = os.path.join(dst, name)
+        # copy to a sidecar then os.replace: a disk-full mid-copy must never
+        # leave the REAL file truncated (a torn hub.db quarantines into a
+        # silent fresh database). The .restore-tmp suffix is excluded from
+        # data_inventory along with the stores' own .tmp transients.
         try:
-            shutil.copy2(s, target)
+            pre = os.stat(target)
+        except OSError:
+            pre = None
+        tmpt = target + ".restore-tmp"
+        try:
+            shutil.copy2(s, tmpt)
+            os.replace(tmpt, target)
+            # rename-over succeeds even on a root-owned file (it needs only
+            # directory write), which would silently flip e.g. the root-owned
+            # dhcp_leases.json to operator-owned — put the ownership back
+            if pre is not None and pre.st_uid != os.geteuid():
+                rc, _ = run(["sudo", "chown",
+                             "%d:%d" % (pre.st_uid, pre.st_gid), target],
+                            check=False, quiet=True)
+                if rc != 0:
+                    # scoped sudoers only grants the systemctl verbs — the
+                    # CONTENT is restored either way; just say the owner moved
+                    say("   note: %s restored, but its previous owner (uid %d)"
+                        " could not be re-applied" % (name, pre.st_uid))
         except PermissionError:
+            try:
+                os.remove(tmpt)
+            except OSError:
+                pass
             # root-owned (e.g. dhcp_leases.json) — preserve that ownership
             rc, _ = run(["sudo", "cp", "-p", s, target], check=False,
                         quiet=True)
             if rc != 0:
                 failed.append(name)
         except Exception as e:
+            try:
+                os.remove(tmpt)
+            except OSError:
+                pass
             failed.append("%s (%s)" % (name, e))
     if failed:
         say("   ⚠️  restored data from %s, EXCEPT: %s"
@@ -663,7 +725,7 @@ def restore_data(root, snapshot):
 # the phases
 # ---------------------------------------------------------------------------
 
-def preflight(root, hub_url, allow_dirty, dry=False):
+def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
     step("Pre-flight")
     # TRACKED changes only (-uno). An UNTRACKED file cannot be clobbered by a
     # fast-forward, and refusing on one would block every user who ever left a
@@ -710,11 +772,51 @@ def preflight(root, hub_url, allow_dirty, dry=False):
         say("   clone      : %s (no cabinet-g2s unit here — not a hub?)"
             % root)
 
+    # The restart step runs `sudo systemctl restart cabinet-g2s`. From the
+    # Settings ▸ Updates card there is NO terminal for a password prompt, so
+    # sudo would die mid-update — after the push, at the worst moment. Prove
+    # sudo works NOW, before anything is touched. Probe the command actually
+    # granted (hub_setup.sh's /etc/sudoers.d/cabinet allowlists exactly the
+    # three systemctl verbs on cabinet-g2s — `sudo -n true` would fail on a
+    # correctly-scoped install), falling back to a bare probe for hubs with
+    # a blanket NOPASSWD rule.
+    if not dry and not sys.stdin.isatty():
+        import shutil as _sh
+        sysctl = _sh.which("systemctl") or "/usr/bin/systemctl"
+        rc, _ = run(["sudo", "-n", "-l", sysctl, "restart", "cabinet-g2s"],
+                    check=False, quiet=True)
+        if rc != 0:
+            rc, _ = run(["sudo", "-n", "true"], check=False, quiet=True)
+        if rc != 0:
+            raise Fail(
+                "this run has no terminal and sudo needs a password — the "
+                "restart step would die mid-update.\n"
+                "   Fix once: run deploy/hub_setup.sh again (it installs a "
+                "scoped /etc/sudoers.d/cabinet\n"
+                "   allowing 'systemctl restart/stop/start cabinet-g2s' "
+                "without a password), then update again.")
+
     status = hub_status(hub_url)
     if "__error__" in status:
-        say("   ⚠️  hub not answering at %s (%s)" % (hub_url, status["__error__"]))
-        say("      continuing, but the floor cannot be verified afterwards")
-        return status, [], []
+        if dry or no_satellites:
+            say("   ⚠️  hub not answering at %s (%s)"
+                % (hub_url, status["__error__"]))
+            say("      continuing, but the floor cannot be verified afterwards")
+            return status, [], []
+        # Satellites are discovered THROUGH the hub. Updating with the hub
+        # down would leave every satellite on old SAS code and report success
+        # — the quiet hub-new/satellite-old split this tool exists to prevent,
+        # in the single most likely moment to run it (updating a crashed hub
+        # hoping the new release fixes it).
+        raise Fail(
+            "the hub is not answering at %s (%s), and satellites are "
+            "discovered through it.\n"
+            "   Updating now would leave every satellite on OLD code with no "
+            "warning. Start the hub\n"
+            "   first (sudo systemctl start cabinet-g2s) — or, if this hub "
+            "genuinely has no\n"
+            "   satellites, re-run with --no-satellites."
+            % (hub_url, status["__error__"]))
 
     phase = ((status.get("tournament") or {}).get("phase") or "").lower()
     if phase in ("armed", "countdown", "running"):
@@ -945,16 +1047,22 @@ def restart_fleet(sats, key, dry, touched=None):
     if dry:
         say("   (dry run — nothing restarted)")
         return
-    # From here on the NEW code is what is running, which is what makes a data
-    # restore necessary on rollback: the new host opens hub.db and _migrate()
-    # runs. Before this point the new code has never executed.
-    if touched is not None:
-        touched["restarted"] = True
     for s in sats:
         say("   satellite %s" % s["smibId"])
+        # new SAS code goes LIVE on this satellite — but a satellite restart
+        # never migrates the hub's database, so it must not arm a hub-side
+        # data restore. That is what `restarted` used to get wrong: it was
+        # flipped before ANY restart ran, so a hub restart that failed at the
+        # sudo prompt still triggered a restore over the live hub.db.
+        if touched is not None:
+            touched["sat_restarted"] = True
         sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
                 user=sat_user(s))
     say("   hub cabinet-g2s")
+    # THIS is the moment the new code runs on the hub: it opens hub.db and
+    # _migrate() runs. Only from here does rollback need a data restore.
+    if touched is not None:
+        touched["restarted"] = True
     run(["sudo", "systemctl", "restart", "cabinet-g2s"], timeout=120)
 
 
@@ -986,14 +1094,18 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
              touched=None):
     """Undo exactly as much as was actually done — no more, no less.
 
-    `touched` carries two facts the return codes cannot express:
+    `touched` carries three facts the return codes cannot express:
 
-      pushed    — at least one satellite's files were being written. Their
-                  SAS tree has to be put back or the fleet is split.
-      restarted — the NEW code is what is running. This is the ONLY thing that
-                  makes a data restore necessary: the new host opens hub.db and
-                  _migrate() runs the moment it starts, so old code would then
-                  be reading a database it was never written for.
+      pushed        — at least one satellite's files were being written. Their
+                      SAS tree has to be put back or the fleet is split.
+      sat_restarted — at least one satellite is RUNNING new SAS code. Those
+                      services need a restart onto the put-back files, but the
+                      hub's database was never touched by them.
+      restarted     — the NEW code ran (or began to run) on the HUB. This is
+                      the ONLY thing that makes a data restore necessary: the
+                      new host opens hub.db and _migrate() runs the moment it
+                      starts, so old code would then be reading a database it
+                      was never written for.
 
     Getting this wrong in either direction is expensive. Restoring data when
     the new code never ran copies hub.db over a database the RUNNING service
@@ -1004,7 +1116,10 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
     code."""
     touched = touched or {}
     pushed, restarted = touched.get("pushed"), touched.get("restarted")
+    sat_restarted = touched.get("sat_restarted")
     step("ROLLING BACK to %s" % old[:12])
+    restored = None       # None = never attempted, True/False = the outcome
+    hub_stopped = False   # the hub is down for OUR restore — never leave it so
     try:
         # A dirty tree is about to be discarded by `reset --hard`. That is the
         # right call — it is how we get back to known-good code — but the
@@ -1031,7 +1146,7 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
                 " git still\n   has them. Recover with:")
             say("     git -C %s stash apply %s" % (root, parked))
 
-        if not pushed and not restarted:
+        if not pushed and not restarted and not sat_restarted:
             say("\n   Nothing had been pushed and nothing restarted, so the tree"
                 " is simply back at %s." % old[:12])
             say("   Your floor was never touched, and your data was left "
@@ -1040,32 +1155,94 @@ def rollback(root, old, sats, key, hub_url, machines, snapshot=None,
                 say("   (snapshot kept anyway: %s)" % snapshot)
             return
 
-        # Data BEFORE services, and ONLY if the new code actually ran.
+        # Data BEFORE services, and ONLY if the new code actually ran — with
+        # the hub STOPPED first: restoring hub.db under the service's live WAL
+        # connection lets its checkpoints write new-schema pages straight into
+        # the freshly restored file (a torn database that hub_store then
+        # quarantines into a silent FRESH one). restart_fleet below brings the
+        # service back onto the restored data.
         if restarted and snapshot:
-            restore_data(root, snapshot)
+            try:
+                run(["sudo", "systemctl", "stop", "cabinet-g2s"], check=False,
+                    quiet=True, timeout=120)
+            except Exception as stop_err:      # TimeoutExpired: a hung service
+                say("   ⚠️  stopping cabinet-g2s failed (%s)" % stop_err)
+            rc, _ = run(["systemctl", "is-active", "--quiet", "cabinet-g2s"],
+                        check=False, quiet=True)
+            if rc == 0:
+                # STILL RUNNING (sudo refused, or the stop hung). Swapping
+                # hub.db under a live service tears it — skip the restore.
+                say("   ⚠️  cabinet-g2s is still running — SKIPPING the data "
+                    "restore rather than\n      swapping hub.db under a live "
+                    "service. Snapshot kept at %s" % snapshot)
+                restored = False
+            else:
+                hub_stopped = True
+                restored = restore_data(root, snapshot)
         elif snapshot:
-            say("   data left as-is — the new code never started, so nothing "
-                "migrated it (snapshot kept at %s)" % snapshot)
+            say("   data left as-is — the new code never started on the hub, "
+                "so nothing migrated it (snapshot kept at %s)" % snapshot)
 
         if pushed:
             push_satellites(root, sats, key, dry=False)
         if restarted:
             restart_fleet(sats, key, dry=False)
+            hub_stopped = False
             ok = verify(hub_url, sats, machines, dry=False)
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted, but the floor did not "
                    "fully return — check `journalctl -u cabinet-g2s -n 50`",
                    old[:12]))
+        elif sat_restarted:
+            # satellites ran new code but the hub never did — bounce ONLY the
+            # satellites: a hub restart here is byte-identical code for the
+            # price of a ~50 s floor rejoin and stale kiosks
+            step("Restarting satellites (the hub never ran new code)")
+            for s in sats:
+                say("   satellite %s" % s["smibId"])
+                sat_ssh(s["peer"], key, "sudo systemctl restart cabinet-sas",
+                        user=sat_user(s))
+            ok = verify(hub_url, sats, machines, dry=False)
+            say("\n   rollback %s. You are back on %s."
+                % ("succeeded" if ok else "restarted the satellites, but the "
+                   "floor did not fully return — check the satellite journals",
+                   old[:12]))
         else:
             say("\n   rollback succeeded — old code is back on the hub and on "
                 "every satellite, and nothing needed restarting because the "
                 "new code never started.")
-    except Exception as e:
-        say("\n   ⚠️  ROLLBACK ITSELF FAILED: %s" % e)
+        if restored is False:
+            # LAST line on purpose: the Updates card shows only the log tail,
+            # and an incomplete restore must be the thing the operator reads.
+            say("\n   ⚠️  BUT THE DATA RESTORE WAS INCOMPLETE — data may exist "
+                "only in the snapshot\n   at %s (anything that failed is named "
+                "above). Copy it back before\n   trusting the floor's money "
+                "state." % snapshot)
+    except BaseException as e:
+        interrupted = isinstance(e, KeyboardInterrupt)
+        say("\n   ⚠️  ROLLBACK %s: %s"
+            % ("INTERRUPTED" if interrupted else "ITSELF FAILED",
+               "Ctrl-C" if interrupted else e))
+        if hub_stopped:
+            # never leave the floor dark because the rollback tripped partway
+            run(["sudo", "systemctl", "start", "cabinet-g2s"], check=False,
+                quiet=True)
+            say("   (cabinet-g2s had been stopped for the data restore — a "
+                "start was attempted)")
         say("   Recover by hand:")
         say("     git -C %s reset --hard %s" % (root, old))
+        if restarted and snapshot and restored is not True:
+            say("     # hub.db may already be MIGRATED by the new code and the "
+                "snapshot is not")
+            say("     # fully restored — copy the files from %s" % snapshot)
+            say("     # back into G2S/data BEFORE starting old code against it")
         if restarted:
             say("     sudo systemctl restart cabinet-g2s")
+        if restored is False and snapshot:
+            say("\n   ⚠️  THE DATA RESTORE DID NOT COMPLETE — files may exist "
+                "only in the snapshot\n   at %s." % snapshot)
+        if not interrupted and not isinstance(e, Exception):
+            raise
 
 
 def self_update(root, argv):
@@ -1170,6 +1347,10 @@ def main():
             return 0
         adopt(root, a.remote, a.yes)
         adopted = True
+    if not adopted and os.path.exists(os.path.join(root, ADOPT_MARKER)):
+        say("\n   an earlier adoption never completed its first full update — "
+            "running the full gate+push+restart path")
+        adopted = True
 
     # Fetch first so @{u} is current, then hand off to the incoming updater if
     # this release changes it. Both are cheap and read-only.
@@ -1177,7 +1358,8 @@ def main():
         git(["fetch", "--prune"], root, check=False, quiet=True)
         self_update(root, sys.argv)
 
-    status, sats, machines = preflight(root, a.hub_url, a.allow_dirty, a.dry_run)
+    status, sats, machines = preflight(root, a.hub_url, a.allow_dirty,
+                                       a.dry_run, a.no_satellites)
     if a.no_satellites:
         say("\n   ⚠️  --no-satellites: they will keep running OLD SAS code "
             "against your new hub. Only do this if you have none.")
@@ -1274,7 +1456,7 @@ def main():
     # Flipped the instant we are committed to touching the fleet. Everything
     # before this point is reversible with a `reset --hard` and nothing else —
     # see rollback().
-    touched = {"pushed": False, "restarted": False}
+    touched = {"pushed": False, "restarted": False, "sat_restarted": False}
     try:
         gates(root, venv_python(root))
         push_satellites(root, sats, a.ssh_key, dry=False, touched=touched)
@@ -1315,6 +1497,10 @@ def main():
                  touched=touched)
         return 2
 
+    try:
+        os.remove(os.path.join(root, ADOPT_MARKER))
+    except OSError:
+        pass
     rc, out = git(["rev-parse", "HEAD"], root, quiet=True)
     say("\n✅ Updated to %s. Floor is back." % out.strip()[:12])
     if snapshot:

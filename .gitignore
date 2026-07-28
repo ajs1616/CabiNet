@@ -129,3 +129,4 @@ Companion/data/
 *.db-wal
 *.db-shm
 .openg2s_pids
+.cabinet-adopt-pending
