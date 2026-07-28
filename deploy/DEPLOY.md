@@ -223,6 +223,120 @@ power it from the cabinet's USB. That's the whole install:
   that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to that
   SMIB's machine.
 
+## Already running CabiNet? Read this first
+
+The updater needs three things that an older install may not have: a **git
+clone**, a **branch tracking `origin/main`**, and an **SSH key from the hub to
+each satellite**. Plenty of hubs were set up by copying files or unpacking a
+download, so this is a one-time adoption. Do it in this order.
+
+### 1. Back up your data — before anything else
+
+```sh
+# on the hub
+mkdir -p ~/cabinet-backups
+python3 - <<'PY'
+import os, shutil, sqlite3, time
+src = os.path.expanduser("~/CasinoNet/G2S/data")
+dst = os.path.expanduser("~/cabinet-backups/pre-adopt-" + time.strftime("%Y%m%d-%H%M%S"))
+os.makedirs(dst, exist_ok=True)
+for f in sorted(os.listdir(src)):
+    p = os.path.join(src, f)
+    if not os.path.isfile(p) or f.endswith(("-wal", "-shm")):
+        continue
+    if f == "hub.db":                       # WAL-safe: a plain cp can tear it
+        c = sqlite3.connect(p); o = sqlite3.connect(os.path.join(dst, f))
+        c.backup(o); o.close(); c.close()
+    else:
+        shutil.copy2(p, os.path.join(dst, f))
+print("backed up ->", dst)
+PY
+```
+
+Then copy that folder **off the Pi** (`scp -r`), because an SD card is exactly
+the thing that fails while you are busy. Sanity-check it:
+
+```sh
+python3 -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('PRAGMA quick_check').fetchone())" \
+  ~/cabinet-backups/pre-adopt-*/hub.db
+```
+
+### 2. Is your install a git clone?
+
+```sh
+cd ~/CasinoNet && git rev-parse --is-inside-work-tree
+```
+
+**If that prints `true`**, skip to step 3.
+
+**If it errors** (`not a git repository`), adopt the tree in place. Nothing under
+`G2S/data/` is tracked by this repo, so your wallets, tickets and registry are
+not touched — but do check what *code* would change before committing to it:
+
+```sh
+cd ~/CasinoNet
+git init -q
+git remote add origin https://github.com/ajs1616/CabiNet.git
+git fetch origin
+
+# Nothing under data/ may be tracked. This MUST print 0:
+git ls-tree -r --name-only origin/main | grep -cE '(^|/)data/'
+
+# What would be overwritten? Review before you proceed — if you edited any
+# TRACKED file in place (service units, tftp configs), copy it aside now.
+git diff --stat origin/main -- . | tail -20
+```
+
+When you are happy:
+
+```sh
+git checkout -B main origin/main          # adopts the released code
+git branch --set-upstream-to=origin/main main
+```
+
+### 3. Let the hub reach its satellites
+
+The updater pushes the SAS tree to every satellite Pi itself, so the **hub**
+needs a key to them (the setup scripts ran from your laptop, which is a
+different machine):
+
+```sh
+# on the hub — skip ssh-keygen if ~/.ssh/smib already exists
+ssh-keygen -t ed25519 -f ~/.ssh/smib -N ""
+ssh-copy-id -i ~/.ssh/smib.pub aj@192.168.50.102     # once per satellite
+ssh -i ~/.ssh/smib aj@192.168.50.102 hostname        # must print its name
+```
+
+Satellite IPs come from the hub itself — they self-report. If you are not sure:
+
+```sh
+curl -s http://127.0.0.1:8081/api/status \
+  | python3 -c "import sys,json;[print(v.get('smibId'),v.get('peer')) for v in json.load(sys.stdin).get('sas',{}).values()]"
+```
+
+No satellites at all (every machine on G2S)? Then pass `--no-satellites`.
+
+### 4. Dry-run, then do it
+
+```sh
+cd ~/CasinoNet
+python3 deploy/update.py --dry-run     # changes nothing
+python3 deploy/update.py
+```
+
+### If it refuses
+
+It is designed to refuse rather than guess. The common ones:
+
+| message | what to do |
+|---|---|
+| `on a DETACHED HEAD` | `git checkout main` |
+| `no upstream configured` | `git branch --set-upstream-to=origin/main main` |
+| `NOT the one the hub runs from` | you are in a second clone — `cd` to the one in `casinonet-g2s.service`'s `WorkingDirectory` |
+| `refusing to pull over local edits` | `git stash`, or `--allow-dirty` if the edits are disposable |
+| `a tournament is armed/running` | finish or cancel the round |
+| a gate fails | nothing was restarted and the tree is put back; open an issue with the output |
+
 ## Updating
 
 Run this **on the hub, from inside your clone**:
