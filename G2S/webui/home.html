@@ -5085,6 +5085,19 @@ function fobAcctSel(id, cur){
    That script restarts this very service, so the button intentionally shows
    "the page will go quiet" rather than pretending to stream progress. */
 let UPDBUSY = false;
+/* update.py's transcript is for debugging; the CARD narrates. Phase headers
+   ("== Name") become a live progress bar mid-run and a ✓-checklist after;
+   the raw transcript (ANSI stripped) lives behind a details fold. */
+const UPD_PHASES=[["Pre-flight","preflight"],["Protecting","snapshot"],
+  ["Updating the working tree","pull"],["Gates","gates"],
+  ["Pushing the SAS","satellites"],["Pushing the Companion","readers"],
+  ["Restarting","restart"],["Verifying","verify"]];
+function updStripAnsi(l){ return String(l).replace(/\x1b\[[0-9;]*m/g,""); }
+function updPhaseIx(h){
+  for(let i=0;i<UPD_PHASES.length;i++)
+    if(h.startsWith(UPD_PHASES[i][0])) return i;
+  return -1;
+}
 async function updCheck(btn){
   UPDBUSY = true; renderUpdates();
   const r = await cmd({action:"checkUpdates"}, "Check for updates");
@@ -5129,7 +5142,7 @@ function renderUpdates(){
       deploy/update.py</span> on the hub once will adopt it — your data is
       snapshotted and untouched.</p>`;
   } else if(u.error){
-    body+=`<p class="none" style="color:var(--bad)">${esc(u.error)}</p>`;
+    body+=`<p class="none" style="color:var(--ruby)">${esc(u.error)}</p>`;
   } else if(behind){
     body+=`<div class="kd" style="margin-bottom:4px">${behind} new commit${behind===1?"":"s"}:</div>`;
     body+=(u.commits||[]).slice(0,8).map(c=>
@@ -5142,6 +5155,21 @@ function renderUpdates(){
       update server unless you ask it to.</p>`;
   }
   const busy=UPDBUSY||u.state==="running";
+  const tail=(u.lastLog||[]).filter(Boolean).map(updStripAnsi);
+  const heads=tail.map(l=>l.trim()).filter(l=>l.startsWith("== "))
+    .map(l=>l.slice(3));
+  const rolling=heads.some(h=>h.startsWith("ROLLING BACK"));
+  const lastIx=heads.reduce((a,h)=>Math.max(a,updPhaseIx(h)),-1);
+  if(busy&&tail.length){
+    const pct=rolling?100:Math.round(((lastIx+1)/UPD_PHASES.length)*100);
+    const label=rolling?"rolling back":(lastIx>=0?UPD_PHASES[lastIx][1]:"starting");
+    body+=`<div class="kd" style="margin-top:12px">update in progress — <b>${esc(label)}</b></div>
+      <div style="height:6px;border-radius:3px;background:var(--line2);margin:6px 0 4px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;border-radius:3px;background:${
+          rolling?"var(--ruby)":"var(--gold)"};transition:width .6s"></div></div>
+      <div class="kd" style="color:var(--faint)">the page goes quiet at "restart"
+        while the hub bounces — it comes back on its own</div>`;
+  }
   body+=`<div class="btnrow" style="margin-top:12px">
       <button class="btn slim" onclick="updCheck(this)" ${busy?"disabled":""}>
         <span class="bl">${busy?"Working…":"Check now"}</span>
@@ -5156,12 +5184,26 @@ function renderUpdates(){
         <span class="ba">${u.autoCheck?"contacts the server every few hours"
           :"off — nothing leaves your network"}</span></button>
     </div>`;
-  const tail=(u.lastLog||[]).filter(Boolean);
-  if(tail.length){
+  if(!busy&&tail.length){
+    // the narrated version: outcome + phase checklist; raw transcript folded
+    const outcome=tail.map(l=>l.trim())
+      .filter(l=>/^(✅|❌|⚠️)/.test(l));
+    const done=[...new Set(heads.map(h=>updPhaseIx(h)).filter(i=>i>=0))]
+      .sort((a,b)=>a-b).map(i=>UPD_PHASES[i][1]);
     body+=`<div style="margin-top:12px;border-top:1px solid var(--line2);padding-top:8px">
-      <div class="kd" style="color:var(--faint)">last update run</div>
-      <div class="kd" style="font-family:var(--mono);white-space:pre-wrap;color:var(--faint)">${
-        esc(tail.join("\n"))}</div></div>`;
+      <div class="kd" style="color:var(--faint)">last update run</div>`;
+    body+=outcome.map(o=>`<div class="kd" style="color:${
+      o.startsWith("✅")?"var(--felt)":o.startsWith("❌")?"var(--ruby)":"var(--gold)"}">${
+      esc(o)}</div>`).join("");
+    if(done.length){
+      body+=`<div class="kd" style="color:var(--faint);margin-top:4px">${
+        done.map(d=>"✓ "+esc(d)).join(" · ")}${
+        rolling?` · <span style="color:var(--ruby)">rolled back</span>`:""}</div>`;
+    }
+    body+=`<details style="margin-top:6px">
+      <summary class="kd" style="cursor:pointer;color:var(--faint)">full transcript</summary>
+      <div class="kd" style="font-family:var(--mono);white-space:pre-wrap;color:var(--faint);margin-top:4px">${
+        esc(tail.join("\n"))}</div></details></div>`;
   }
   setHTML(box, body);
 }
