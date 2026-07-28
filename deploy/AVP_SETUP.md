@@ -83,7 +83,7 @@ set to taste:
 > | Setting | Set to | Why |
 > |---|---|---|
 > | Protocol that controls **LEGACY METER CHANGE** | **Not Required** | Left at Required, every denom change is aborted by the machine with `G2S_APX999 "Legacy protocols are unable to collect the meters. Therefore the change is aborted."` |
-> | **Door status disallows machine idle state** | **No** | Left on, a door icon keeps the machine from being "idle", so it never opens the remote-configuration window and host config commands sit unprocessed. Verified: with this off, a visible door icon no longer blocks anything. |
+> | **Door status disallows machine idle state** | **Not Required** | Left at Required, a door icon keeps the machine from being "idle", so it never opens the remote-configuration window and host config commands sit unprocessed. Verified: at Not Required, a visible door icon no longer blocks anything. |
 
 > ⚠️ **Disabling and re-enabling G2S DUMPS every setting on this page.** If you
 > toggle the protocol off and on for any reason, come back here and re-set the
