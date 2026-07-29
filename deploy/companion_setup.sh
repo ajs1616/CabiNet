@@ -79,6 +79,14 @@ RSYNC_SSH="${SSH[*]}"
 say() { printf '\n=== %s\n' "$*"; }
 
 say "checking SSH + passwordless sudo on $HOST"
+# Two distinct failures, two distinct fixes — a connect/auth failure used to
+# fall into the sudo hint below and send the operator to the wrong one.
+"${SSH[@]}" "$HOST" 'true' || {
+    echo "cannot SSH to $HOST (BatchMode — key-only, passwords never work here)." >&2
+    echo "  1) run this from a box on the SLOT SEGMENT (normally the hub) — the" >&2
+    echo "     home LAN can't reach the Pi (SMIB_FRESH_IMAGE.md §2)" >&2
+    echo "  2) install your key first:  ssh-copy-id ${SSHKEY:+-i $SSHKEY }$HOST" >&2
+    exit 1; }
 "${SSH[@]}" "$HOST" 'sudo -n true' || {
     echo "need passwordless sudo on the Pi first (one-time, run there):" >&2
     echo "  echo \"\$USER ALL=(ALL) NOPASSWD:ALL\" | sudo tee /etc/sudoers.d/010-\$USER-nopasswd" >&2
@@ -99,13 +107,25 @@ CFG=/boot/firmware/config.txt; [ -f \"\$CFG\" ] || CFG=/boot/config.txt
 sudo cp \"\$CFG\" \"\$CFG.bak-companion\" 2>/dev/null || true
 CHANGED=0
 if [ '$I2C_MODE' = 'gpio' ]; then
-  # SAS HAT owns the hardware I2C pins -> software bus on GPIO23/24 = /dev/i2c-11
-  grep -q '^dtoverlay=i2c-gpio.*bus=11' \"\$CFG\" || { printf '\n# Companion PN532: universal software i2c-gpio bus on GPIO23/24 (matches the BB2)\ndtoverlay=i2c-gpio,i2c_gpio_sda=23,i2c_gpio_scl=24,bus=11,i2c_gpio_delay_us=2\n' | sudo tee -a \"\$CFG\" >/dev/null; CHANGED=1; }
+  # SAS HAT owns the hardware I2C pins -> software bus on GPIO23/24 = /dev/i2c-11.
+  # ANY existing GPIO23/24 i2c-gpio line counts as PRESENT: a hand-built board
+  # from before this script may lack bus=11, and an exact-match grep here once
+  # meant a re-run APPENDED A DUPLICATE overlay and force-rebooted a live SAS
+  # box. Never rewrite the legacy line in place either — an edit means a reboot
+  # for nothing; the bus node is verified at the end of the run regardless.
+  if grep -q '^dtoverlay=i2c-gpio.*i2c_gpio_sda=23.*i2c_gpio_scl=24' \"\$CFG\"; then
+    grep -q '^dtoverlay=i2c-gpio.*bus=11' \"\$CFG\" || echo 'legacy i2c-gpio overlay (no bus=11) — left as-is, bus number is dynamic on this board' >&2
+  else
+    printf '\n# Companion PN532: universal software i2c-gpio bus on GPIO23/24 (matches the BB2)\ndtoverlay=i2c-gpio,i2c_gpio_sda=23,i2c_gpio_scl=24,bus=11,i2c_gpio_delay_us=2\n' | sudo tee -a \"\$CFG\" >/dev/null; CHANGED=1
+  fi
 else
   # RFID-only board -> hardware I2C on GPIO2/3 = /dev/i2c-1
   grep -q '^dtparam=i2c_arm=on' \"\$CFG\" || { printf '\n# Companion PN532: hardware I2C (GPIO2/3) -> /dev/i2c-1\ndtparam=i2c_arm=on\n' | sudo tee -a \"\$CFG\" >/dev/null; CHANGED=1; }
 fi
-grep -q '^i2c-dev' /etc/modules 2>/dev/null || { echo i2c-dev | sudo tee -a /etc/modules >/dev/null; CHANGED=1; }
+# i2c-dev may already load from /etc/modules-load.d/ (the modern location on a
+# hand-prepped board) — check BOTH before appending, or a re-run flags a
+# gratuitous CHANGED and reboots a box that was already correct.
+grep -q '^i2c-dev' /etc/modules 2>/dev/null || grep -qs '^i2c-dev' /etc/modules-load.d/*.conf || { echo i2c-dev | sudo tee -a /etc/modules >/dev/null; CHANGED=1; }
 sudo usermod -aG i2c \"\$USER\" 2>/dev/null || true
 [ \"\$CHANGED\" = 1 ] && echo i2c-changed || echo i2c-nochange
 ")
@@ -120,6 +140,36 @@ rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CabiNet/deploy/
 
 say "import check (proves stdlib deps resolve on the Pi)"
 "${SSH[@]}" "$HOST" 'cd ~/CabiNet/Companion && python3 -c "import companion_host, reader; print(\"companion import OK\")"'
+
+say "adopting any older install (pre-rename unit / legacy tree)"
+# Older readers may still run the pre-rename casinonet-companion unit — left
+# enabled it would fight the new unit over one PN532 — or a cabinet-companion
+# unit pointing at a pre-rename tree. Retire the old unit (file kept as
+# .retired) and NARRATE a tree migration; the old tree stays on disk, unused,
+# so nothing is deleted out from under an operator.
+"${SSH[@]}" "$HOST" '
+  # Narrate BEFORE retiring: on a pre-rename box the legacy tree path lives in
+  # the OLD unit file, and after the mv below no later run could read it.
+  OLD=$(grep -h "^WorkingDirectory=" /etc/systemd/system/cabinet-companion.service \
+                /etc/systemd/system/casinonet-companion.service 2>/dev/null | head -1 | cut -d= -f2)
+  case "$OLD" in
+    ""|*/CabiNet/Companion) : ;;
+    *) echo "  migrating unit off legacy tree $OLD (left on disk; unused after this run)" ;;
+  esac
+  # Zombie-proof: stop by NAME on every run, OUTSIDE the one-shot [ -f ] guard.
+  # If a past run failed the disable transiently after the unit file was moved,
+  # this line is the only thing that can still kill the old daemon before it
+  # fights the new one over the PN532 (systemd keeps a running unit stoppable
+  # by name even after its file is gone).
+  sudo systemctl stop casinonet-companion >/dev/null 2>&1 || true
+  if [ -f /etc/systemd/system/casinonet-companion.service ]; then
+    sudo systemctl disable casinonet-companion >/dev/null 2>&1 || true
+    sudo mv /etc/systemd/system/casinonet-companion.service \
+            /etc/systemd/system/casinonet-companion.service.retired
+    sudo systemctl daemon-reload
+    echo "  retired pre-rename casinonet-companion unit (file kept as .retired)"
+  fi
+  exit 0'
 
 # Build the ExecStart from ONLY the flags explicitly passed — flagless by
 # default (zero-config: the daemon derives id from the Pi serial + hub from the
@@ -184,7 +234,9 @@ say "authorize the hub's update key (so deploy/update.py can refresh this reader
   fi'
 
 say "verify"
-"${SSH[@]}" "$HOST" "ls -la $BUS 2>/dev/null || echo 'NOTE: $BUS not present yet — check wiring/DIP after the reader is plugged in'; systemctl is-active cabinet-companion; journalctl -u cabinet-companion --no-pager | tail -4"
+# A missing bus NODE is an overlay/module problem (or a pending reboot) — never
+# wiring or DIP switches, which only decide whether 0x24 ANSWERS on the bus.
+"${SSH[@]}" "$HOST" "ls -la $BUS 2>/dev/null || echo 'NOTE: $BUS missing — overlay/i2c-dev not active yet (reboot pending? legacy no-bus=11 board landing elsewhere? see ls /dev/i2c-*). Wiring/DIP affect whether 0x24 answers, not whether the node exists'; systemctl is-active cabinet-companion; journalctl -u cabinet-companion --no-pager | tail -4"
 
 say "DONE — set the PN532 DIPs to I2C (0x24), wire per Companion/README.md, tap a fob"
 echo "watch the HUB: journalctl -u cabinet-g2s -f   (expect: 💳 card IN)"

@@ -44,8 +44,10 @@ proven Zero-2-W / 3 / 4 set.
   - **Wi-Fi: leave it OFF** — SMIBs are wired-only (Wi-Fi satellites are retired;
     set it only temporarily if you need headless first-boot SSH before the wire).
   - Locale/timezone.
-  - Services → **Enable SSH** → *password authentication* (the setup script installs
-    your key afterward).
+  - Services → **Enable SSH** → *password authentication* is fine at flash time —
+    but install your key in step 2 **before** running a setup script: the scripts
+    connect with `BatchMode=yes` (key-only, no password prompt), and the only key
+    they install on the Pi is the hub's own update key, never yours.
 - Write, boot the Pi wired to the slot-segment switch, wait ~60 s for first boot.
   Confirm: `ping <hostname>.local`.
 
@@ -60,6 +62,12 @@ proven Zero-2-W / 3 / 4 set.
 
 ## 2. One-time on the Pi: passwordless sudo + your key
 
+> **Where do the setup scripts run?** The "dev box" throughout this doc is any
+> machine that holds the CabiNet clone **and can reach the slot segment** —
+> normally **the hub itself** (it has both), or a laptop plugged into the slot
+> switch. A machine on your home LAN cannot reach the Pi: the slot segment
+> deliberately doesn't route there (`deploy/DEPLOY.md`, ground rules).
+
 The setup script drives the Pi over SSH and needs passwordless sudo. Once, on the Pi
 (or via `ssh <host>`):
 
@@ -67,13 +75,15 @@ The setup script drives the Pi over SSH and needs passwordless sudo. Once, on th
 echo "$USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/010-$USER-nopasswd
 ```
 
-Install your key from the dev box so later runs are non-interactive:
+Install your key from the dev box — the setup scripts are key-only
+(`BatchMode=yes`), so this step is what lets them connect at all:
 
 ```bash
 ssh-copy-id <user>@<host>.local
 ```
 
-(Use one dedicated key for the whole fleet — agent-free with `-i`.)
+(No key yet? `ssh-keygen -t ed25519` first. Use one dedicated key for the whole
+fleet — agent-free with `-i`.)
 
 ---
 
@@ -123,30 +133,40 @@ machine's own SAS version, not our code.)
 ## 3b. Companion (RFID) — add a reader
 
 For a slot that uses its OWN glass for the UI (the AVP) or to add tap-to-identify to any
-cabinet. Runs standalone OR alongside `cabinet-sas` on the same Pi. Stdlib-only — no
-venv.
+cabinet. Runs standalone OR alongside `cabinet-sas` on the same Pi. **Placement rule:**
+on a **SAS cabinet the reader rides that cabinet's SMIB Pi** (same board — that's what
+auto-binds it); a **standalone reader-only Pi is for G2S cabinets**, which have no
+satellite Pi of their own. Stdlib-only — no venv.
 
 ### Zero-config (v11) — the collector path: flash → boot → appears → assign
 
 The golden image ships the Companion unit **flag-free**, so the *same image bytes* boot on
 every card and self-configure — no per-device file to edit:
 
-1. **Flash** the golden image to any SD card (identical for every reader).
+1. **Flash** the golden image to any SD card (identical for every reader). *No image
+   is published yet* — today "the golden image" is §1's plain card + the **flagless**
+   `companion_setup.sh` run below; same result, one extra command.
 2. **Boot** it on the slot-VLAN switch. The daemon IDs itself by the **Pi's hardware
    serial** (`companion-<serial-tail>`) and finds the hub at the **DHCP default gateway**
    (the host is the gateway + DHCP server on the slot segment — no host IP
    to configure).
-3. **It appears** in the hub UI under **The Players ▸ Cards & readers** as
-   `New Companion (<serial-tail>)`, `unassigned`.
-4. **Bind it**: open the machine's ⚙️ **Options** on The Floor and pick it under
-   **🎴 Card reader** (the Players row is where you *rename* it). The hub owns the
-   binding from then on — routing is live, **no restart**, and re-assigning to a
-   different machine takes effect on the next tap.
+3. **It appears** in the hub UI under **⚙️ The Switchboard ▸ Card readers** as
+   `New Companion (<serial-tail>)`, `unassigned` (cards themselves live in
+   **💳 The Players**; a reader riding a SAS SMIB skips this list — it auto-binds,
+   see step 4).
+4. **Bind it** — *pure-G2S machine only*: open the machine's ⚙️ **Options** on The
+   Floor and pick it under **🎴 Card reader** (the readers row is where you *rename*
+   it). The hub owns the binding from then on — routing is live, **no restart**, and
+   re-assigning to a different machine takes effect on the next tap.
+   **On a SAS machine there is nothing to pick**: a reader riding that machine's SAS
+   SMIB Pi (same board or same IP) **binds itself by co-location** — no 🎴 picker
+   appears on a SAS tile and the auto-bound reader is deliberately not listed.
 
 That's it. Wire the PN532 (below), tap a fob, done. `hostname` at flash time no longer
 matters for identity — use anything (or nothing); the reader is found by serial + named in
 the UI. (Reaching a *specific* card by SSH: its source IP shows next to its id on the
-Readers row, since identical images share a hostname.)
+Readers row, since identical images share a hostname. Auto-bound SAS readers aren't on
+that row — but they share the SAS SMIB Pi, so its IP *is* the SMIB's own.)
 
 ### Manual override (co-located / advanced) — bake a binding into the unit
 
@@ -301,14 +321,18 @@ urgent on the 424Mi board.
 - The SAS SMIB auto-appears as a floor tile once it reports (the hub's `/api/sas/report`
   registry) — name it and, for a dual-protocol cabinet, link its SAS leg, in the tile's
   Options.
-- A **Companion** auto-appears under **The Players ▸ Cards & readers** the moment it
-  reports (zero-config: serial id + gateway hub, no flags). Bind it from the machine's
-  ⚙️ **Options** on The Floor — rename it from its Players row — and the hub owns the
-  binding from then on (live, no restart). This replaces baking `--g2s-egm`/`--sas-*`
-  into the unit.
-- Register fobs and link them to players in the Home UI → **The Players ▸ Cards &
-  readers** (or the Wallet tab's Players card). An unknown fob tap shows a register-me
-  prompt.
+- A **Companion** auto-appears under **⚙️ The Switchboard ▸ Card readers** the moment
+  it reports (zero-config: serial id + gateway hub, no flags). On a **pure-G2S
+  machine**, bind it from the machine's ⚙️ **Options** on The Floor — rename it from
+  its readers row — and the hub owns the binding from then on (live, no restart). On
+  a **SAS machine there is nothing to bind**: the reader auto-binds by co-location
+  with the SAS SMIB and is deliberately not listed. This replaces baking
+  `--g2s-egm`/`--sas-*` into the unit.
+- Enroll fobs in **💳 The Players**: add (or pick) the player, hit **+ Add a card**,
+  and tap the fob on **any** reader — the offer mines the latest tap, auto-bound
+  readers included. (A manually-assignable reader's row in The Switchboard also shows
+  a one-click *register* prompt after an unknown tap; an auto-bound SAS reader has no
+  row, so the **+ Add a card** path is the one that always works.)
 - **Dual-protocol cabinet** (BB2 on SAS *and* G2S): link its G2S card to its SAS leg in
   the machine's Settings so meters/credits count once — task #20, `sasLink`.
 
@@ -351,6 +375,6 @@ placeholder) |
 | Player-screen unit | `cabinet-smibui.service` (HDMI-panel SMIBs, e.g. the BB2) |
 | Kiosk engine | `cog` (WPE WebKit, DRM/KMS — no X/Wayland); `apt-get install -y cog` |
 | Hub URL | **`http://192.168.50.2:8081` (wired slot segment — DEFAULT)** / `http://127.0.0.1:8081` (co-located) |
-| Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → bind from the machine's ⚙️ **Options** |
+| Companion (zero-config) | `deploy/companion_setup.sh <user>@<zero-host>` → boot → bind from the machine's ⚙️ **Options** (pure-G2S; a SAS machine's reader auto-binds, nothing to pick) |
 | Companion (manual bind) | `deploy/companion_setup.sh <user>@<zero-host>.local --g2s-egm IGT_<egmId> --companion-id companion-avp` |
 | Fob cards | Any ISO14443-A tag with a **fixed UID**: S50 1K "Mifare Classic" or NTAG213/215/216 fobs/cards (the $10-a-bag kind). Blank/"empty" is fine — only the UID is used. Avoid "random UID" privacy tags (UID changes every read, often starts `08`). |

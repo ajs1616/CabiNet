@@ -1,8 +1,10 @@
 # Companion — the RFID tap daemon
 
 Turns PN532 card taps into hub knowledge. Runs on the SMIB Pi **beside**
-`cabinet-sas` (one Pi = SAS + NFC, proven 2026-07-10), or alone on a
-reader-only Pi (3B+ recommended — built-in Ethernet). A single thread
+`cabinet-sas` (one Pi = SAS + NFC, proven 2026-07-10 — on a SAS cabinet the
+reader always rides that cabinet's SMIB Pi; same board is what auto-binds it),
+or alone on a reader-only Pi for a **G2S** cabinet, which has no satellite Pi
+of its own (3B+ recommended — built-in Ethernet). A single thread
 polls the reader at ~5Hz, debounces a held card into one tap, and POSTs
 `{tapId, uid, at}` to the hub's `/api/companion/report`. Everything smart —
 fob lookup, tiers, G2S `setIdValidation` carded sessions, reset-tier SAS
@@ -45,9 +47,12 @@ silently deaf).
 
 ## Deploy
 
-Use `deploy/companion_setup.sh <user>@<zero-host>` from the repo root — it
-enables the i2c-gpio overlay, rsyncs this directory, and installs the unit
-(see `deploy/SMIB_FRESH_IMAGE.md` for the full fresh-SD runbook). Then:
+Use `deploy/companion_setup.sh <user>@<zero-host>` from the repo root, on a
+box that can reach the slot segment — normally the hub itself; the home LAN
+can't reach the Pi. It enables the i2c-gpio overlay, rsyncs this directory,
+and installs the unit (see `deploy/SMIB_FRESH_IMAGE.md` for the full fresh-SD
+runbook). Re-running it is also the refresh/repair path for an older reader —
+it adopts legacy layouts in place instead of stacking a second install. Then:
 
 ```sh
 journalctl -u cabinet-companion -f     # expect: PN532 ready, then 💳 taps
@@ -55,7 +60,9 @@ journalctl -u cabinet-companion -f     # expect: PN532 ready, then 💳 taps
 
 Stdlib-only — the Pi's system `python3` is enough, no venv. With zero-config
 onboarding the reader self-IDs to the host and you bind it to a machine from
-the web UI (**the machine's ⚙️ Options on The Floor**); `--g2s-egm` /
+the web UI (**the machine's ⚙️ Options on The Floor** — pure-G2S machines
+only; a reader riding a SAS SMIB **binds itself by co-location**, so no
+picker appears on a SAS tile and there is nothing to do); `--g2s-egm` /
 `--sas-smib` flags on the `ExecStart` line are the manual-bind fallback.
 
 No-hardware smoke test: `python3 companion_host.py http://127.0.0.1:8081 --mock`.

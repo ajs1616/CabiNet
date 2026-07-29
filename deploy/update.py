@@ -1142,6 +1142,14 @@ def push_companions(root, comps, key, dry, touched=None):
                 % (c["companionId"], c["peer"], why))
             continue
         say("   %s -> %s:%s" % (c["companionId"], c["peer"], cdir))
+        if not cdir.rstrip("/").endswith("/CabiNet/Companion"):
+            # A pre-rename install: the unit still points at an old tree. It
+            # updates fine (the dir came from the unit itself), but say so —
+            # the operator should know the reader is on a legacy layout and
+            # how to migrate it, not discover the old path years later.
+            say("   ⚠️  %s runs from a LEGACY tree (%s) — updating it in "
+                "place; re-run deploy/companion_setup.sh %s@%s to migrate it "
+                "to ~/CabiNet" % (c["companionId"], cdir, u, c["peer"]))
         cmd = ["rsync", "-a", "--no-owner", "--no-group",
                "-e", "ssh -i %s -o BatchMode=yes "
                      "-o StrictHostKeyChecking=accept-new" % key]

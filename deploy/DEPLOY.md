@@ -268,9 +268,17 @@ power it from the cabinet's USB. That's the whole install:
 
 - The Pi self-identifies by its hardware serial and finds the hub via its DHCP
   default gateway (the host) — **no per-device config, no flags**.
-- It appears in the UI as an unassigned reader; assign it to a machine from
-  that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to that
-  SMIB's machine.
+- On a G2S machine it appears in the UI as an unassigned reader; assign it
+  from that machine's ⚙️ Options. A reader riding a SAS SMIB auto-binds to
+  that SMIB's machine instead and is deliberately **not listed** — no picker
+  appears on a SAS tile, nothing to do.
+- Run the setup script **from the hub** (it holds the clone and sits on the
+  slot segment) or from a laptop plugged into the slot switch — a home-LAN
+  machine cannot reach the Pi. The same re-run is the **refresh path for an
+  older reader**: it adopts legacy layouts in place (pre-rename
+  `casinonet-companion` unit, old I2C overlay form, a tree outside
+  `~/CabiNet`), and `deploy/update.py` names any reader it cannot update and
+  points you back at it.
 
 ## Already running CabiNet? Read this first
 
