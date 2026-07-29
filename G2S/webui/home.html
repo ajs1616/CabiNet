@@ -2043,12 +2043,24 @@ function floorTile(s){
       <div class="ja">${esc(fmtAmt(amt))}</div>
       <div class="js">txn ${esc(h.transactionId||"—")} · ${clock(h.seenAt)}</div>
       ${h.remoteCredit==="false"
-        /* born before remote key-off was armed — Table 11.6 says the stamp
-           is for life, so a remote clear can only earn a JPX002; say so
-           instead of offering a doomed button (2026-07-29) */
-        ?`<button class="btn" disabled>
+        /* Decide the wording on what the MACHINE actually ruled out, from
+           this lockup's own birth flags (Table 11.6) — not on our arm
+           state (2026-07-29 ×2: first wording blamed "born before armed",
+           then a $926k lockup arrived fully armed but localCredit=false —
+           the machine had ruled out the METER, credit-limit, not the host):
+           - localCredit=false → over the credit meter's ceiling. It CAN
+             still be cleared (key, or the machine's celebration reset) —
+             the key-off just poofs it to the handpay meter, it cannot
+             land on credits. A working outcome, not an error.
+           - localCredit=true → the key still puts it on the meter; only
+             the REMOTE 🔑 is off for this one (born before the arm). */
+        ?(h.localCredit==="false"
+          ?`<button class="btn" disabled>
+        <span class="bl">🗝️ Clears to handpay</span>
+        <span class="ba">over the credit meter's limit — a key-off (or the machine's reset) clears this jackpot to the handpay meter, it can't land on credits</span></button>`
+          :`<button class="btn" disabled>
         <span class="bl">🗝️ Physical key only</span>
-        <span class="ba">born before remote key-off was armed — the machine will refuse a remote clear</span></button>`
+        <span class="ba">the key still clears this to credits — only the remote 🔑 is off for this lockup</span></button>`)
         :`<button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
         onclick="hpClear(this)">
         <span class="bl">🔑 Reset to Credits</span>
