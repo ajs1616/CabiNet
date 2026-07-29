@@ -18906,8 +18906,15 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
     # occurrences inside JSON string values can't match — their quotes
     # arrive as \". The optional space keeps the match working over the
     # compact (separators) serialization the polled endpoints now use.
+    # Wire-proven on the live floor 2026-07-29: the first five came from the
+    # perf sweep, but a real G2S association busts the hash every 10 s
+    # keepAlive (lastKeepAlive/lastSeen timestamps, hostCommandId/outboundOk
+    # send counters, egmClockSkewSec jitter) and the updates card's logAgeSec
+    # ticks every rebuild. All are heartbeat noise; outboundFail is DELIBERATELY
+    # absent so a delivery failure still repaints the tile.
     _ETAG_CLOCK_NOISE = re.compile(
-        r'"(serverNow|reportAgeSec|idleSec|polls|lastSeenAgoSec)": ?'
+        r'"(serverNow|reportAgeSec|idleSec|polls|lastSeenAgoSec|logAgeSec'
+        r'|lastKeepAlive|lastSeen|egmClockSkewSec|hostCommandId|outboundOk)": ?'
         r'-?[0-9][0-9.eE+-]*')
 
     def log_message(self, fmt, *args):
