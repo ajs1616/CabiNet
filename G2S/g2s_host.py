@@ -1066,15 +1066,37 @@ CEREMONY_MODE_TTL_MS = 300000
 # THE gate — it permits setRemoteKeyOff keyOffType=G2S_remoteCredit while
 # handpay.hostEnabled=true (our host never disables handpay, so this is the
 # operative flag). G2S_disabledRemoteCredit is belt-and-braces so a reset
-# still works if the device is ever host-disabled. The remoteHandpay/
-# remoteVoucher/remoteWat families are deliberately NOT touched: the EGM
-# validates the whole set atomically (a single refused param draws
-# OCX013/OCX015 for EVERYTHING, §9.15), so fewer changed params = less
-# surface for the critical flag to be rejected alongside a companion.
+# still works if the device is ever host-disabled. 2026-07-29 (the $926k
+# lockup): the remoteHandpay pair joins the set — an over-limit jackpot is
+# born localCredit=false so NO credit path can take it, but a remoteHandpay
+# key-off clears it exactly as the attendant key would (paid off the meter).
+# AJ: "the machine tells us whats available when the handpay hits, we just
+# need to allow it to happen." Both pairs armed; each lockup's own birth
+# flags (Table 11.6) decide which type a reset uses. remoteVoucher/remoteWat
+# stay untouched. The change cycle only carries params NOT already at
+# target, so on a floor whose credit pair is already true this adds a
+# handpay-pair-only cycle — the proven flags are never rebundled.
 REMOTE_CREDIT_ENABLE_PARAMS = {
     "G2S_enabledRemoteCredit": "true",
     "G2S_disabledRemoteCredit": "true",
+    "G2S_enabledRemoteHandpay": "true",
+    "G2S_disabledRemoteHandpay": "true",
 }
+
+
+def pick_remote_key_off_type(rec):
+    """The lockup's own birth flags (Table 11.6) pick the reset type:
+    credits when the machine offered them, else the attendant-key
+    equivalent (over-limit jackpots are born localCredit=false — the meter
+    can't take them, the reset still can). Falls back to remoteCredit when
+    neither is offered so a refusal draws the machine's own honest JPX002."""
+    def _t(k):
+        return str(rec.get(k) or "false").strip().lower() == "true"
+    if _t("remoteCredit"):
+        return "G2S_remoteCredit"
+    if _t("remoteHandpay"):
+        return "G2S_remoteHandpay"
+    return "G2S_remoteCredit"
 
 
 # ----------------------------------------------------------------------------
@@ -13743,14 +13765,17 @@ class G2SHost:
     # ---------------------------------------- handpay reset-to-credits — G2S-25
 
     def enqueue_set_remote_key_off(self, assoc, txn_id=None,
-                                   key_off_type="G2S_remoteCredit"):
+                                   key_off_type=None):
         """handpay.setRemoteKeyOff (spec §11.14, Table 11.10) — THE reset
         command: authorize the EGM to key off a pending handpay lockup
-        remotely, defaulting to keyOffType=G2S_remoteCredit (Table 11.21 —
-        pay the win straight to the credit meter, no paper). txn_id defaults
-        to the OLDEST pending handpay; key_off_type may be overridden
-        (G2S_remoteVoucher/G2S_remoteHandpay) for completeness — the EGM is
-        the enforcer and answers G2S_JPX002 for a type it did not offer.
+        remotely. key_off_type=None (the default) obeys the lockup's OWN
+        birth flags (Table 11.6): G2S_remoteCredit when the machine offered
+        it (straight to the meter, no paper), else G2S_remoteHandpay (clears
+        exactly as the attendant key would — an over-limit jackpot is born
+        localCredit=false and can never reach the meter, but it can still
+        be reset). txn_id defaults to the OLDEST pending handpay; an
+        explicit key_off_type still overrides — the EGM is the enforcer
+        and answers G2S_JPX002 for a type it did not offer.
         keyOff*Amt = request*Amt − egmPaid*Amt (the un-paid remainder; the
         host MAY adjust per §11.14 — a shortfall makes the EGM issue a fresh
         handpayRequest). Owner-only; pre-ownership the AVP just g2sAcks then
@@ -13769,61 +13794,68 @@ class G2SHost:
                             "(hpId=%s) — nothing sent", a.egm_id,
                             txn_id if txn_id is not None else "oldest")
                 return None
+            kt = key_off_type or pick_remote_key_off_type(rec)
             sid = a.next_session_id()
             cmd = (f'<g2s:setRemoteKeyOff '
                    f'g2s:transactionId="{rec["transactionId"]}" '
-                   f'g2s:keyOffType="{key_off_type}" '
+                   f'g2s:keyOffType="{kt}" '
                    f'g2s:keyOffCashableAmt="{rec["pendingCashableAmt"]}" '
                    f'g2s:keyOffPromoAmt="{rec["pendingPromoAmt"]}" '
                    f'g2s:keyOffNonCashAmt="{rec["pendingNonCashAmt"]}"/>')
             inner, cid = self.build_inner_request(
                 a, "handpay", rec.get("deviceId", "1"), cmd, str(sid), "30000")
             rec["state"] = "keyOffSent"
-            rec["keyOffType"] = key_off_type
+            rec["keyOffType"] = kt
             rec["keyOffSentAt"] = now_iso()
             rec["keyOffSentTs"] = time.time()
             log.info("💰 [%s] setRemoteKeyOff txn=%s type=%s cash=%s promo=%s "
                      "nonCash=%s — expecting remoteKeyOffAck then keyedOff",
-                     a.egm_id, rec["transactionId"], key_off_type,
+                     a.egm_id, rec["transactionId"], kt,
                      rec["pendingCashableAmt"], rec["pendingPromoAmt"],
                      rec["pendingNonCashAmt"])
             return inner, (f"setRemoteKeyOff(txn={rec['transactionId']},"
-                           f"type={key_off_type},cid={cid})")
+                           f"type={kt},cid={cid})")
         self._enqueue(assoc, build)
 
     def reset_newest_handpay(self, assoc):
-        """/api/command resetHandpay — the Floor UI 🔑 button: key the
-        NEWEST pending lockup off to the credit meter (clearHandpay's
-        default is the OLDEST; the operator tapping the tile means the
-        lockup that just lit up). Unlike clearHandpay — whose empty-map
-        miss is log-only because the record lookup defers to build time —
-        this checks the pending map up front and answers an honest
-        {"ok": false} the UI can show. The reply also surfaces the per-
-        transaction remoteCredit permission (Table 11.6): a lockup raised
-        while G2S_enabledRemoteCredit was false carries remoteCredit=
-        "false" for life and will draw G2S_JPX002 — the fix is
-        enableRemoteHandpay then a FRESH handpay (flipping the option
-        cannot retro-permit this one, see enable_remote_handpay), so the
-        gate is reported, not auto-fired. The key-off is still sent either
-        way — the EGM is the enforcer. Returns a dict merged into the
-        /api/command reply."""
+        """/api/command resetHandpay — the Floor UI 🔑 button: reset the
+        NEWEST pending lockup (clearHandpay's default is the OLDEST; the
+        operator tapping the tile means the lockup that just lit up). The
+        key-off type obeys the lockup's own birth flags via
+        pick_remote_key_off_type — credits when offered, else the
+        attendant-key equivalent for over-limit jackpots. Unlike
+        clearHandpay — whose empty-map miss is log-only because the record
+        lookup defers to build time — this checks the pending map up front
+        and answers an honest {"ok": false} the UI can show. A lockup
+        born offering NEITHER remote path (raised before the join
+        re-assert armed them) will draw G2S_JPX002 — that gate is
+        reported, the key-off still sent — the EGM is the enforcer.
+        Returns a dict merged into the /api/command reply."""
         with assoc.lock:
             if not assoc.handpays_pending:
                 return {"ok": False, "error": "no pending handpay"}
             # dict insertion order == arrival order -> last key is newest
             txn = next(reversed(assoc.handpays_pending))
-            remote_credit = (assoc.handpays_pending[txn]
-                             .get("remoteCredit") or "false")
+            rec = dict(assoc.handpays_pending[txn])
+        kt = pick_remote_key_off_type(rec)
         self.enqueue_set_remote_key_off(assoc, txn_id=txn)
-        reply = {"hpId": txn, "keyOffType": "G2S_remoteCredit",
-                 "remoteCredit": remote_credit}
+        reply = {"hpId": txn, "keyOffType": kt,
+                 "remoteCredit": rec.get("remoteCredit") or "false",
+                 "remoteHandpay": rec.get("remoteHandpay") or "false"}
+        if kt == "G2S_remoteHandpay":
+            reply["note"] = ("credits not offered for this lockup (over "
+                            "the meter limit) — resetting as paid; the win "
+                            "lands in the carded-in wallet, House if "
+                            "nobody's carded")
         # Case-folded like option_values_equal — an EGM may legally spell
         # the xs:boolean True/TRUE.
-        if remote_credit.strip().lower() != "true":
+        if str(reply["remoteCredit"]).strip().lower() != "true" and \
+                str(reply["remoteHandpay"]).strip().lower() != "true":
             reply["gate"] = (
-                "this lockup was raised with remoteCredit=false — the EGM "
-                "will refuse (G2S_JPX002); run enableRemoteHandpay, then "
-                "raise a FRESH handpay")
+                "this lockup offers NO remote key-off — the EGM will "
+                "refuse (G2S_JPX002); physical key only for this one "
+                "(handpays born after the join re-assert carry both "
+                "remote paths)")
         return reply
 
     # ------------------------------------- voucher redemption — G2S-26 tier 2
@@ -15208,19 +15240,19 @@ class G2SHost:
                                       "authoritative",
                         "G2S_JPX004": "invalid key-off amount",
                     }.get(rerr, "")
-                    # Own the config gap instead of blaming the enforcer
-                    # (2026-07-29): a JPX002 on a lockup whose own record
-                    # says remoteCredit=false is the machine correctly
-                    # holding the Table 11.6 birth-stamp against us.
+                    # Own the gap instead of blaming the enforcer
+                    # (2026-07-29): a JPX002 on a lockup that offered
+                    # neither remote path is the machine correctly holding
+                    # its Table 11.6 birth-stamp against us — the flags
+                    # are stamped at birth and never retro-permit.
                     if rerr == "G2S_JPX002" and \
-                            target.get("remoteCredit") == "false":
-                        hint = ("this lockup was born while "
-                                "G2S_enabledRemoteCredit was false and is "
-                                "key-only for LIFE (Table 11.6) — OUR "
-                                "config gap, not the machine misbehaving; "
-                                "clear it with the physical key (the join "
-                                "re-assert arms handpays born after the "
-                                "next join)")
+                            target.get("remoteCredit") == "false" and \
+                            target.get("remoteHandpay") == "false":
+                        hint = ("this lockup was born offering NO remote "
+                                "key-off (Table 11.6 — birth-stamped, "
+                                "can't retro-permit); physical key only "
+                                "for this one. Handpays born after the "
+                                "join re-assert carry both remote paths")
                     log.warning("[%s] 💰 REMOTE KEY-OFF REJECTED txn=%s — "
                                 "%s%s", assoc.egm_id, txn, rerr,
                                 f" ({hint})" if hint else "")
@@ -17943,6 +17975,47 @@ class G2SHost:
                          "${:,.2f}".format((kcash + kpromo + knon) / 100000),
                          txn, ko_type, pending_left)
                 log.info("=" * 64)
+                # A hand-paid key-off is the attendant moment, and the hub
+                # IS the attendant (AJ 2026-07-29): the win lands in the
+                # carded-in player's wallet — House when nobody's carded —
+                # instead of poofing off the meters. Both hand-pay types:
+                # the remote reset and the physical W2G key are the same
+                # payout, only the hand on the key differs. once=True on
+                # the txn-scoped ref keeps EGM keyedOff retries single-pay
+                # (belt to the dup re-ack's braces). An unknown/refused
+                # destination folds to the House LOUDLY — hand-paid money
+                # must land somewhere auditable, never vanish.
+                if ko_type in ("G2S_remoteHandpay", "G2S_localHandpay") \
+                        and (kcash + kpromo + knon) > 0:
+                    with self.companion_lock:
+                        sess = self.card_sessions.get(assoc.egm_id) or {}
+                        hp_dest = sess.get("accountId") or "house"
+                        hp_who = sess.get("name") or "the House"
+                    hp_ref = f"hp:{assoc.egm_id}:{txn}"
+                    _, aerr = self.account_store.adjust(
+                        hp_dest, kcash, kpromo, knon,
+                        note=f"handpay paid ({ko_type}) txn {txn}",
+                        ref=hp_ref, once=True)
+                    if aerr:
+                        _, aerr2 = self.account_store.adjust(
+                            "house", kcash, kpromo, knon,
+                            note=(f"handpay paid txn {txn} — "
+                                  f"{hp_dest!r} refused ({aerr}), "
+                                  "folded to House"),
+                            ref=hp_ref, once=True)
+                        log.warning("💰 [%s] handpay payout: %r refused "
+                                    "(%s) — %s to the HOUSE instead%s",
+                                    assoc.egm_id, hp_dest, aerr,
+                                    "${:,.2f}".format(
+                                        (kcash + kpromo + knon) / 100000),
+                                    f" (AND THAT FAILED: {aerr2})"
+                                    if aerr2 else "")
+                    else:
+                        log.info("💰 [%s] HANDPAY PAID — %s → %s's wallet "
+                                 "(txn %s, ref %s)", assoc.egm_id,
+                                 "${:,.2f}".format(
+                                     (kcash + kpromo + knon) / 100000),
+                                 hp_who, txn, hp_ref)
             self.enqueue_class_response(
                 assoc, req, f'<g2s:keyedOffAck g2s:transactionId="{txn}"/>',
                 "keyedOffAck")
