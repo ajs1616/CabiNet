@@ -1159,6 +1159,9 @@ class EgmAssociation:
         # this, so every join re-asserts it. Per-epoch, read-probe first.
         self.handpay_arm_epoch = -1
         self.handpay_arm_pending = False
+        # Lockup recovery: the epoch whose join already pulled the EGM's
+        # handpay log (once per join, like the ticket/arm re-asserts).
+        self.handpay_log_epoch = -1
         self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
         self.descriptors = []           # harvest: device inventory (getDescriptor)
         self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
@@ -14196,6 +14199,26 @@ class G2SHost:
                            f"txn={txn_id},cid={cid})")
         self._enqueue(assoc, build)
 
+    def enqueue_get_handpay_log(self, assoc, entries=20):
+        """handpay.getHandpayLog (§11.20, Table 11.15) — pull the EGM's
+        persistent handpay transaction log. §11.3 REQUIRES the EGM to keep
+        handpay data in persistent memory, which makes this the recovery
+        path for the 2026-07-29 bug: handpays_pending is in-memory, so a
+        hub restart under a live lockup forgot it entirely (the EGM had
+        already acked JPE101 and never re-announces), leaving a locked
+        machine with a hub that believed nothing was pending and a Reset
+        button that sent nothing. lastSequence=0 means 'default to the
+        last transaction'; totalEntries bounds the read."""
+        def build(a):
+            sid = a.next_session_id()
+            inner, cid = self.build_inner_request(
+                a, "handpay", "1",
+                f'<g2s:getHandpayLog g2s:lastSequence="0" '
+                f'g2s:totalEntries="{int(entries)}"/>',
+                str(sid), "30000")
+            return inner, f"getHandpayLog(entries={int(entries)},cid={cid})"
+        self._enqueue(assoc, build)
+
     def enqueue_cancel_option_change(self, assoc, config_id, txn_id):
         """optionConfig.cancelOptionChange (§9.16) — initiator-owner abort,
         valid ONLY while the set is pending. Response: optionChangeStatus
@@ -15815,6 +15838,17 @@ class G2SHost:
             # born key-only stays key-only (Table 11.6) — arming on join
             # is the only window that helps.
             self._maybe_arm_remote_handpay_on_join(assoc)
+            # And recover any lockup that outlived us: handpays_pending is
+            # in-memory, so a restart under a live handpay forgot it and
+            # the EGM never re-announces an acked JPE101 (hit live
+            # 2026-07-29 — a $926k lockup went invisible across a deploy).
+            # The EGM's persistent log (§11.3) is the source of truth.
+            with assoc.lock:
+                pull_log = assoc.handpay_log_epoch != assoc.epoch
+                if pull_log:
+                    assoc.handpay_log_epoch = assoc.epoch
+            if pull_log:
+                self.enqueue_get_handpay_log(assoc)
 
         elif cmd in ("printerStatus", "printerProfile",
                      "printerTemplateList", "printComplete") \
@@ -17813,6 +17847,99 @@ class G2SHost:
                 f'<g2s:commitVoucherAck '
                 f'g2s:transactionId="{rec["transactionId"]}"/>',
                 "commitVoucherAck")
+
+        elif cmd == "handpayLogList":
+            # Join-time lockup recovery (2026-07-29, §11.21/Table 11.17):
+            # rebuild handpays_pending from the EGM's PERSISTENT log so a
+            # hub restart under a live lockup does not lose it. An entry is
+            # still open when its handpayState is not G2S_handpayAck and it
+            # carries no real keyOffType — the EGM stamps G2S_unknown until
+            # a key-off happens (Table 11.21). Every field the reset path
+            # needs (amounts + the per-txn key-off permission flags) is in
+            # the log entry, so a recovered record drives the 🔑 exactly
+            # like a live handpayRequest. Never overwrites a record we
+            # already hold: a live JPE101 is fresher than any log read.
+            el = req["commandEl"]
+            recovered, closed = [], 0
+            for lg in el:
+                if localname(lg.tag) != "handpayLog":
+                    continue
+                txn = attr(lg, "transactionId") or "0"
+                ko = (attr(lg, "keyOffType") or "G2S_unknown").strip()
+                state = (attr(lg, "handpayState") or "").strip()
+                open_hp = (state != "G2S_handpayAck"
+                           and ko in ("", "G2S_unknown"))
+
+                def lg_amt(name, _lg=lg):
+                    try:
+                        return max(0, int(attr(_lg, name) or "0"))
+                    except ValueError:
+                        return 0
+                if not open_hp:
+                    closed += 1
+                    continue
+                with assoc.lock:
+                    known = txn in assoc.handpays_pending or any(
+                        h.get("transactionId") == txn for h in assoc.handpays)
+                    if not known:
+                        assoc.handpays_pending[txn] = {
+                            "transactionId": txn,
+                            "deviceId": attr(lg, "deviceId") or "1",
+                            "handpayType": attr(lg, "handpayType"),
+                            "handpayDateTime": attr(lg, "handpayDateTime"),
+                            "pendingCashableAmt":
+                                lg_amt("requestCashableAmt")
+                                - min(lg_amt("egmPaidCashableAmt"),
+                                      lg_amt("requestCashableAmt")),
+                            "pendingPromoAmt":
+                                lg_amt("requestPromoAmt")
+                                - min(lg_amt("egmPaidPromoAmt"),
+                                      lg_amt("requestPromoAmt")),
+                            "pendingNonCashAmt":
+                                lg_amt("requestNonCashAmt")
+                                - min(lg_amt("egmPaidNonCashAmt"),
+                                      lg_amt("requestNonCashAmt")),
+                            "requestCashableAmt": lg_amt("requestCashableAmt"),
+                            "requestPromoAmt": lg_amt("requestPromoAmt"),
+                            "requestNonCashAmt": lg_amt("requestNonCashAmt"),
+                            "egmPaidCashableAmt": lg_amt("egmPaidCashableAmt"),
+                            "localHandpay": attr(lg, "localHandpay") or "false",
+                            "localCredit": attr(lg, "localCredit") or "false",
+                            "localVoucher": attr(lg, "localVoucher") or "false",
+                            "remoteHandpay": attr(lg, "remoteHandpay") or "false",
+                            "remoteCredit": attr(lg, "remoteCredit") or "false",
+                            "remoteVoucher": attr(lg, "remoteVoucher") or "false",
+                            "state": "pending",
+                            "seenAt": now_iso(),
+                            "source": "handpayLogRecovery",
+                        }
+                        assoc.handpay_count += 1
+                        recovered.append(txn)
+            if recovered:
+                for t in recovered:
+                    with assoc.lock:
+                        r = dict(assoc.handpays_pending.get(t) or {})
+                    log.info("=" * 64)
+                    log.info("💰 [%s] RECOVERED OPEN LOCKUP txn=%s — %s "
+                             "(from the EGM's handpay log after a hub "
+                             "restart; remoteCredit=%s remoteHandpay=%s)",
+                             assoc.egm_id, t,
+                             "${:,.2f}".format(
+                                 (r.get("pendingCashableAmt", 0)
+                                  + r.get("pendingPromoAmt", 0)
+                                  + r.get("pendingNonCashAmt", 0)) / 100000),
+                             r.get("remoteCredit"), r.get("remoteHandpay"))
+                    log.info("=" * 64)
+                # a recovered lockup must repaint the floor immediately —
+                # the tile/banner is how the operator learns it is back
+                self.status_state_seq += 1
+            else:
+                log.info("💰 [%s] handpay log: no open lockups (%d closed "
+                         "entries read)", assoc.egm_id, closed)
+            if stype == "G2S_request":
+                self.enqueue_class_response(
+                    assoc, req, "<g2s:handpayLogListAck/>",
+                    "handpayLogListAck")
 
         elif cmd == "handpayRequest" and stype == "G2S_request":
             # THE lockup (G2S-25, spec §11.12): the EGM needs a handpay and
@@ -19830,6 +19957,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # Takes "validationId" in the body.
             "voidValidationId": engine.void_validation_id,
             # commConfig read (G2S-18)
+            # handpay log read (§11.20) — the join pulls this automatically
+            # to recover a lockup that outlived a hub restart; exposed as an
+            # action so it can be re-run without bouncing the association.
+            "getHandpayLog": engine.enqueue_get_handpay_log,
             "getCommConfigProfile": engine.enqueue_get_comm_config_profile,
             "getCommConfigModeStatus": engine.enqueue_get_comm_config_mode_status,
             # commConfig ownership cycle (G2S-19). claimOwnership runs the full
