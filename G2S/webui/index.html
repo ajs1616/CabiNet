@@ -1266,13 +1266,30 @@ function render(data){
   }
 }
 
+let statusInFlight=false, lastEtag=null;
 async function tick(){
+  // guard against a slow phone/Pi: never let polls stack up behind each other
+  if(statusInFlight) return;
+  statusInFlight=true;
+  const ac=(typeof AbortController!=="undefined")?new AbortController():null;
+  const to=ac?setTimeout(()=>ac.abort(), POLL_MS*5):null;
   try{
-    const r=await fetch("/api/status",{cache:"no-store"});
-    render(await r.json());
+    /* cache:"no-cache" (revalidate, NOT no-store) so the browser echoes the
+       hub's ETag and gets a 304 on an unchanged floor; when the reply's ETag
+       matches the last seen, skip json()+render entirely. The URL stays the
+       FULL /api/status — the bench genuinely needs the full view. */
+    const r=await fetch("/api/status",{cache:"no-cache", signal:ac?ac.signal:undefined});
+    const etag=r.headers.get("ETag");
+    if(!(etag && etag===lastEtag)){
+      lastEtag=etag;
+      render(await r.json());
+    }
     const el=$("poll"); el.className=""; el.textContent="updated "+hhmmss(new Date());
   }catch(e){
     const el=$("poll"); el.className="err"; el.textContent="HOST UNREACHABLE";
+  }finally{
+    clearTimeout(to);
+    statusInFlight=false;
   }
 }
 buildPanel();

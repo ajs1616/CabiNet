@@ -35,18 +35,18 @@ SYNC_RETRY_SEC while there is unsynced state. The transport-owning poll
 thread NEVER blocks on sync — its HTTP calls carry a short timeout and
 every failure path is immediate.
 
-Stdlib only (urllib + json + threading), same as the rest of core/.
+Stdlib only (http.client + json + threading), same as the rest of core/.
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 import zlib
 from typing import Dict, List, Optional
 
@@ -55,7 +55,7 @@ from .sas_ticket_store import TicketStore
 log = logging.getLogger("sas.hub_client")
 
 __all__ = ["HubTicketAuthority", "FALLBACK_SYSTEM_ID",
-           "derive_fallback_sid"]
+           "derive_fallback_sid", "KeepAliveHTTPClient"]
 
 #: Base of the fallback system-ID range. Local outage mints must never
 #: collide with the hub's sid-01 sequence (vn16 embeds the sid) — NOR with
@@ -83,6 +83,77 @@ DEFAULT_JOURNAL_PATH = os.path.join(
     "data", "hub_client_journal.json")
 
 
+class KeepAliveHTTPClient:
+    """One persistent HTTP/1.1 connection per (destination, thread) — the
+    hub answers keep-alive, so re-dialing TCP for every 1 Hz report / tito
+    op was pure overhead on the Zero 2W. Per-THREAD (threading.local)
+    because http.client connections are not thread-safe and the poll
+    thread must never share a socket — or a lock — with the sync thread.
+    Any transport failure drops the connection so the next call re-dials
+    fresh; the error itself propagates unchanged, so callers' edge-logged
+    failure flags behave exactly as before."""
+
+    def __init__(self, base_url: str, timeout: float):
+        u = urllib.parse.urlsplit(base_url)
+        self._conn_cls = (http.client.HTTPSConnection if u.scheme == "https"
+                          else http.client.HTTPConnection)
+        self._netloc = u.netloc
+        self._base_path = u.path or "/"
+        self.timeout = timeout
+        self._tls = threading.local()
+
+    def _drop(self) -> None:
+        conn = getattr(self._tls, "conn", None)
+        self._tls.conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+
+    # Connection-level deaths of a REUSED socket that mean "the peer closed
+    # it while idle" — the hub's GR-16 handler timeout (120 s) does exactly
+    # this between sporadic tito ops. Safe to retry once on a fresh dial
+    # (the old per-call urlopen dialed fresh every time). Timeouts are
+    # deliberately NOT here: the peer may still be processing the request.
+    _STALE_CONN_ERRORS = (http.client.RemoteDisconnected, BrokenPipeError,
+                          ConnectionResetError, ConnectionAbortedError)
+
+    def post_json(self, body: bytes, path_suffix: str = ""):
+        """POST a JSON body to base_path + path_suffix. Returns
+        (status, response_body); the response is always fully read before
+        the connection can be reused. Raises OSError on any socket/HTTP-
+        layer failure (http.client's non-OSError exceptions are wrapped so
+        existing except-OSError fallback paths keep catching everything),
+        after dropping the connection so the next call re-dials. A reused
+        connection killed by the hub's idle timeout gets ONE fresh-dial
+        retry, so a healthy hub never looks down at the first sporadic op."""
+        path = self._base_path + path_suffix
+        headers = {"Content-Type": "application/json"}
+        for attempt in (0, 1):
+            conn = getattr(self._tls, "conn", None)
+            reused = conn is not None
+            if conn is None:
+                conn = self._conn_cls(self._netloc, timeout=self.timeout)
+                self._tls.conn = conn
+            try:
+                conn.request("POST", path, body=body, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()      # drain fully before any reuse
+            except Exception as e:
+                self._drop()
+                if (attempt == 0 and reused
+                        and isinstance(e, self._STALE_CONN_ERRORS)):
+                    continue            # idle-closed socket: re-dial once
+                if isinstance(e, http.client.HTTPException) \
+                        and not isinstance(e, OSError):
+                    raise OSError(f"http exchange failed: {e}") from e
+                raise
+            if resp.will_close:
+                self._drop()            # server opted out of keep-alive
+            return resp.status, data
+
+
 class HubTicketAuthority:
     """TicketStore-shaped facade over the hub's /api/tito/* authority."""
 
@@ -95,6 +166,7 @@ class HubTicketAuthority:
         self.smib_id = smib_id
         self.local = local_store if local_store is not None else TicketStore()
         self.timeout = timeout
+        self._http = KeepAliveHTTPClient(self.base, timeout)
         self.MAX_TICKET_CENTS = self.local.MAX_TICKET_CENTS
         self.journal_path = journal_path
         self.fallback_sid = derive_fallback_sid(smib_id)
@@ -137,6 +209,12 @@ class HubTicketAuthority:
     def state(self):
         return self.local.state
 
+    @property
+    def revision(self):
+        # mutation counter passthrough — lets the reporter's ticket-summary
+        # cache see the local store's revision through this facade
+        return self.local.revision
+
     # -- transport -----------------------------------------------------------
 
     def _post(self, op: str, payload: Dict) -> Dict:
@@ -144,18 +222,14 @@ class HubTicketAuthority:
         network, HTTP status, or an ok:false hub refusal — so every caller
         goes through its single explicit fallback path."""
         body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            self.base + op, data=body,
-            headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                out = json.loads(resp.read() or b"{}")
-        except urllib.error.HTTPError as e:
+        status, raw = self._http.post_json(body, op)
+        if not 200 <= status < 300:
             try:
-                detail = json.loads(e.read() or b"{}").get("error", "")
+                detail = json.loads(raw or b"{}").get("error", "")
             except ValueError:
                 detail = ""
-            raise OSError(f"hub {op} HTTP {e.code} {detail}".strip()) from e
+            raise OSError(f"hub {op} HTTP {status} {detail}".strip())
+        out = json.loads(raw or b"{}")
         if not isinstance(out, dict) or not out.get("ok"):
             raise ValueError(f"hub {op} refused: "
                              f"{out.get('error') if isinstance(out, dict) else out!r}")

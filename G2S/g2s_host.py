@@ -1095,6 +1095,12 @@ class EgmAssociation:
         self.epoch = 0                  # bumped on each commsOnLine; tags sends
         self.send_queue = queue.Queue() # single FIFO worker drains this in order
         self.worker_started = False
+        # Cached outbound HTTP connection, touched ONLY by this assoc's
+        # single FIFO worker (post_to_egm) — that exclusivity is what makes
+        # it lock-free. Keyed by (host, port) so an egmLocation change on a
+        # rejoin reconnects instead of talking to the old endpoint.
+        self.egm_conn = None
+        self.egm_conn_target = None
         self.host_command_id = 0        # host's own sequence; commsOnLineAck = 1
         self.host_session_id = 1000     # for host-originated requests
         self.comms_state = "closed"     # our mirror of the EGM state machine
@@ -3746,6 +3752,14 @@ class G2SHost:
         # most every TICKET_CACHE_SEC; /api/settings refreshes it on write
         # so a save lands on the very next report. Boots unread (None).
         self._ticket_cache = (None, 0.0)
+        # git HEAD/isClone TTL cache ((current, isClone), read_ts) — the
+        # sysval pattern for update_state()'s two git subprocesses, which
+        # otherwise fork on every status rebuild. Boots unread (None).
+        self._update_git_cache = (None, 0.0)
+        # update-transcript tail cache ((lines, mtime, size), tail): the
+        # full-file readlines in update_log_tail() reruns only when the
+        # transcript actually changed, not on every status rebuild.
+        self._update_log_cache = (None, [])
         # Admin-flag migration (one-time, idempotent): the fob-tier→
         # account.admin switch must not lock today's operators out of the
         # backend, so promote to admin any account currently linked by an
@@ -3971,6 +3985,12 @@ class G2SHost:
     #: (per-second report path, Settings-click write cadence, cache
     #: refreshed on /api/settings write so a save never sits in limbo).
     TICKET_CACHE_SEC = 5.0
+    #: git HEAD/isClone re-read interval — those only move when deploy/
+    #: update.py applies (which restarts this process), yet update_state()
+    #: rides every status rebuild; without the TTL that is two forked git
+    #: subprocesses per poll. check=True bypasses it so a Check-now is
+    #: never stale, and start_update() drops the cache outright.
+    UPDATE_GIT_CACHE_SEC = 30.0
 
     def sysval_fallback(self):
         """The 'sysval_fallback' host option as a bool (C2/C4): whether the
@@ -4070,18 +4090,27 @@ class G2SHost:
         touches the network."""
         with self.update_lock:
             st = dict(self._update)
-        rc, head, _ = self._git("log", "--oneline", "--no-decorate", "-1")
-        # `git log` succeeding proves we are inside SOME repo, not that this
-        # install is one. An install copied into any tree that happens to be a
-        # git repo answers yes and the card then reports the ENCLOSING repo's
-        # HEAD as your CabiNet version. Require the top of the work tree to be
-        # our own directory — the same check deploy/update.py::is_clone makes.
-        rc_top, top, _ = self._git("rev-parse", "--show-toplevel")
-        is_clone = (rc_top == 0
-                    and os.path.realpath(top or "/nonexistent")
-                    == os.path.realpath(self._repo_dir()))
-        st["current"] = head if (rc == 0 and is_clone) else None
-        st["isClone"] = is_clone
+        # HEAD/isClone only move when deploy/update.py applies — which
+        # restarts this process — so the status build must not fork two git
+        # subprocesses per rebuild (TTL cache; check=True re-reads so a
+        # Check-now is never stale).
+        now = time.time()
+        cached, ts = self._update_git_cache
+        if check or cached is None or now - ts >= self.UPDATE_GIT_CACHE_SEC:
+            rc, head, _ = self._git("log", "--oneline", "--no-decorate", "-1")
+            # `git log` succeeding proves we are inside SOME repo, not that
+            # this install is one. An install copied into any tree that
+            # happens to be a git repo answers yes and the card then reports
+            # the ENCLOSING repo's HEAD as your CabiNet version. Require the
+            # top of the work tree to be our own directory — the same check
+            # deploy/update.py::is_clone makes.
+            rc_top, top, _ = self._git("rev-parse", "--show-toplevel")
+            is_clone = (rc_top == 0
+                        and os.path.realpath(top or "/nonexistent")
+                        == os.path.realpath(self._repo_dir()))
+            cached = (head if (rc == 0 and is_clone) else None, is_clone)
+            self._update_git_cache = (cached, now)
+        st["current"], st["isClone"] = cached
         st["autoCheck"] = self.hub_store.host_setting("update_auto_check",
                                                       "0") == "1"
         if not check:
@@ -4143,6 +4172,9 @@ class G2SHost:
             return {"ok": False, "error": str(e)}
         log.warning("⬆️  UPDATE STARTED by the operator — detached %s; this "
                     "service will restart. Transcript: %s", script, log_path)
+        # the detached run may move HEAD before our restart lands — drop the
+        # git TTL cache so any poll in that gap re-reads.
+        self._update_git_cache = (None, 0.0)
         return {"ok": True, "started": True, "log": self.UPDATE_LOG}
 
     def start_update_auto_check(self):
@@ -4182,11 +4214,24 @@ class G2SHost:
         if nothing before it had happened. A rollback run is longer still."""
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
                          self.UPDATE_LOG)
+        # (mtime, size)-keyed cache: the transcript only changes while an
+        # updater runs, yet this rode every status rebuild as a full-file
+        # readlines — reread only when the file actually moved.
+        try:
+            stt = os.stat(p)
+        except OSError:
+            return []
+        key = (lines, stt.st_mtime, stt.st_size)
+        ckey, ctail = self._update_log_cache
+        if ckey == key:
+            return ctail
         try:
             with open(p, encoding="utf-8", errors="replace") as fh:
-                return [l.rstrip() for l in fh.readlines()[-lines:]]
+                tail = [l.rstrip() for l in fh.readlines()[-lines:]]
         except Exception:
             return []
+        self._update_log_cache = (key, tail)
+        return tail
 
     def update_log_age(self):
         """Seconds since the transcript last grew, or None. The card needs
@@ -7090,11 +7135,11 @@ class G2SHost:
             if leg:
                 smib, _, addr = str(leg).partition("/")
                 origin = f"sas:{smib}"
-                for t in self.hub_store.tito_list(limit=40).get("tickets", []):
-                    if t.get("origin") != origin:
-                        continue
-                    if addr and str(t.get("address")) != str(addr):
-                        continue
+                # scoped in SQL — a floor-wide page of 40 could crowd
+                # this machine's own rows out entirely on a busy floor
+                for t in self.hub_store.tito_list(
+                        limit=40, origin=origin,
+                        address=addr or None).get("tickets", []):
                     mc = t.get("amountMc")
                     tickets.append({
                         "id": t.get("canonical") or t.get("vn16"),
@@ -9916,6 +9961,49 @@ class G2SHost:
 
     # --------------------------------------------------------------- outbound
 
+    def _egm_http_post(self, assoc, url, path, body):
+        """One POST over the assoc's cached connection (worker-thread only —
+        see the egm_conn comment in EgmAssociation). The EGM's gSOAP side may
+        close per-message: a send/read failure on a REUSED socket gets ONE
+        retry on a fresh connection, so this path is never worse than the old
+        connection-per-message behavior; a fresh-connection failure raises
+        into post_to_egm's existing error handling. Returns (status, body).
+        GR-19: timeout must stay below HOST_KEEPALIVE_SEC (see the
+        EGM_POST_TIMEOUT_SEC comment)."""
+        target = (url.hostname, url.port or 80)
+        for _ in (0, 1):
+            conn = assoc.egm_conn if assoc.egm_conn_target == target else None
+            fresh = conn is None
+            if fresh:
+                if assoc.egm_conn is not None:
+                    assoc.egm_conn.close()
+                conn = http.client.HTTPConnection(
+                    target[0], target[1], timeout=EGM_POST_TIMEOUT_SEC)
+                assoc.egm_conn = conn
+                assoc.egm_conn_target = target
+            try:
+                conn.request("POST", path, body=body.encode("utf-8"), headers={
+                    "Content-Type": "text/xml; charset=utf-8",
+                    "SOAPAction": f'"{SOAPACTION_SEND}"',
+                    "User-Agent": "CabiNet-G2S/1.0",
+                })
+                resp = conn.getresponse()
+                # http.client requires the response fully read before the
+                # connection can be reused.
+                resp_body = resp.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.HTTPException):
+                assoc.egm_conn = None
+                assoc.egm_conn_target = None
+                conn.close()
+                if fresh:
+                    raise
+                continue  # stale cached socket — one retry on a fresh one
+            if resp.will_close:
+                assoc.egm_conn = None
+                assoc.egm_conn_target = None
+                conn.close()
+            return resp.status, resp_body
+
     def post_to_egm(self, assoc, inner_xml, label):
         """POST a host-originated g2sMessage to the EGM's egmLocation."""
         if not assoc.egm_location:
@@ -9926,22 +10014,11 @@ class G2SHost:
         url = urllib.parse.urlsplit(assoc.egm_location)
         path = url.path or "/"
         wire.info("OUT >>> %s to %s\n%s", label, assoc.egm_location, body)
-        conn = None
         try:
-            # GR-19: timeout must stay below HOST_KEEPALIVE_SEC (see the
-            # EGM_POST_TIMEOUT_SEC comment) and the connection is closed in
-            # the finally below — the old success-path-only close leaked the
-            # socket to refcount GC on every failed POST.
-            conn = http.client.HTTPConnection(url.hostname, url.port or 80,
-                                              timeout=EGM_POST_TIMEOUT_SEC)
-            conn.request("POST", path, body=body.encode("utf-8"), headers={
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": f'"{SOAPACTION_SEND}"',
-                "User-Agent": "CabiNet-G2S/1.0",
-            })
-            resp = conn.getresponse()
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            wire.info("OUT <<< HTTP %s for %s\n%s", resp.status, label, resp_body)
+            resp_status, resp_body = self._egm_http_post(assoc, url, path,
+                                                         body)
+            wire.info("OUT <<< HTTP %s for %s\n%s", resp_status, label,
+                      resp_body)
             assoc.outbound_ok += 1
             # GR-01: any COMPLETED keepAlive POST (regardless of ack verdict)
             # proves the transport path is up — reset the demotion streak.
@@ -9964,7 +10041,7 @@ class G2SHost:
             # would otherwise stay 0 and the watchdog would false-warn "no
             # keepAlive ever received". Refresh it on this success path. Label
             # is the pinger's own "keepAlive(...)" (never "keepAliveAck(...)").
-            if clean_ack and resp.status == 200 and label.startswith("keepAlive("):
+            if clean_ack and resp_status == 200 and label.startswith("keepAlive("):
                 assoc.last_keepalive = time.time()
                 # GR-01 recovery path B: a low-rate OFFLINE probe got a clean
                 # ack — the outbound path healed without an EGM re-handshake
@@ -9997,7 +10074,7 @@ class G2SHost:
             # application verdict is a later cabinetDateTime POST or a
             # cabinet-class error). Check-and-set under the lock so a
             # cabinetDateTime that already confirmed is never downgraded.
-            if clean_ack and resp.status == 200 and \
+            if clean_ack and resp_status == 200 and \
                     label.startswith("setDateTime("):
                 with assoc.lock:
                     if assoc.clock_sync.get("result") == "sent":
@@ -10005,7 +10082,7 @@ class G2SHost:
             # Cabinet control (G2S-20 rest): same transport-proof upgrade for
             # a setCabinetState — the application verdict is a later
             # cabinetStatus POST (sessionId-matched) or a cabinet-class error.
-            if clean_ack and resp.status == 200 and \
+            if clean_ack and resp_status == 200 and \
                     label.startswith("setCabinetState("):
                 with assoc.lock:
                     if assoc.cabinet_state_change.get("result") == "sent":
@@ -10015,7 +10092,7 @@ class G2SHost:
             # the builder), so the upgrade lands on exactly that device's
             # pending record. Wholesale replacement — snapshot()'s shallow
             # per-device copies share the nested stateChange by reference.
-            if clean_ack and resp.status == 200 and \
+            if clean_ack and resp_status == 200 and \
                     label.startswith("setGamePlayState("):
                 mdev = re.search(r"dev=([^,)]+)", label)
                 if mdev:
@@ -10027,7 +10104,7 @@ class G2SHost:
             # optionConfig change cycle (G2S-27): same transport-proof upgrade
             # for a setOptionChange — the application verdict is a later
             # optionChangeStatus POST or an optionConfig-class error.
-            if clean_ack and resp.status == 200 and \
+            if clean_ack and resp_status == 200 and \
                     label.startswith("setOptionChange("):
                 with assoc.lock:
                     oc = assoc.option_change
@@ -10077,9 +10154,6 @@ class G2SHost:
                     assoc, f"{streak} consecutive keepAlive POST failures "
                            f"(last: {e})")
             return False
-        finally:
-            if conn is not None:
-                conn.close()
 
     def mark_link_down(self, assoc, reason):
         """GR-01: demote a dead link onLine -> offline. Everything that was
@@ -13542,25 +13616,40 @@ class G2SHost:
         the folded meter count; `changed` (optional list) collects up to a
         handful of (key, old, new) actual value changes for the GR-02
         digest log line."""
-        count = 0
-        for grp in container:
-            dc = attr(grp, "deviceClass")
-            if dc is None:
-                count += self._fold_meter_groups(assoc, grp, changed)
-                continue
-            di = attr(grp, "deviceId")
-            for m in grp.iter():
-                mn = attr(m, "meterName")
-                mv = attr(m, "meterValue")
-                if mn is not None and mv is not None:
-                    key = f"{dc}/{di}/{mn}"
-                    with assoc.lock:
-                        old = assoc.meters.get(key)
-                        assoc.meters[key] = mv
+        # A periodic push folds ~2,100 meters ahead of the synchronous
+        # g2sAck, so collect lock-free in document order (duplicate keys
+        # preserved — last write wins, as before) and take assoc.lock ONCE
+        # to diff+store instead of cycling it per meter.
+        mn_key = f"{{{SCHEMA_NS}}}meterName"
+        mv_key = f"{{{SCHEMA_NS}}}meterValue"
+        pairs = []
+
+        def collect(node):
+            for grp in node:
+                dc = attr(grp, "deviceClass")
+                if dc is None:
+                    collect(grp)
+                    continue
+                prefix = f"{dc}/{attr(grp, 'deviceId')}/"
+                for m in grp.iter():
+                    mn = m.get(mn_key)
+                    if mn is None:
+                        mn = m.get("meterName")
+                    mv = m.get(mv_key)
+                    if mv is None:
+                        mv = m.get("meterValue")
+                    if mn is not None and mv is not None:
+                        pairs.append((prefix + mn, mv))
+
+        collect(container)
+        if pairs:
+            with assoc.lock:
+                for key, mv in pairs:
+                    old = assoc.meters.get(key)
+                    assoc.meters[key] = mv
                     if changed is not None and old != mv:
                         changed.append((key, old, mv))
-                    count += 1
-        return count
+        return len(pairs)
 
     # ------------------------------------------ meters subscriptions — G2S-16
 
@@ -18808,12 +18897,18 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
     # /api/status ETag hash source: neutralize the clock-DERIVED per-call
     # fields (tournament serverNow, sas/companion reportAgeSec, glass
     # idleSec) so identical DATA hashes identical across calls — without
-    # this every response hashes unique and the 304 never fires. The
-    # "stale" booleans are deliberately NOT in the list: a satellite going
-    # quiet is a data change and must bust the cache. Escaped occurrences
-    # inside JSON string values can't match — their quotes arrive as \".
+    # this every response hashes unique and the 304 never fires. polls and
+    # lastSeenAgoSec are in the list too: every satellite report ticks
+    # both, which re-keyed the hash every second and left the 304 dead
+    # even on an unchanged floor. The "stale" booleans are deliberately
+    # NOT in the list: a satellite going quiet is a data change and must
+    # bust the cache (as do events/meters/online flips). Escaped
+    # occurrences inside JSON string values can't match — their quotes
+    # arrive as \". The optional space keeps the match working over the
+    # compact (separators) serialization the polled endpoints now use.
     _ETAG_CLOCK_NOISE = re.compile(
-        r'"(serverNow|reportAgeSec|idleSec)": -?[0-9][0-9.eE+-]*')
+        r'"(serverNow|reportAgeSec|idleSec|polls|lastSeenAgoSec)": ?'
+        r'-?[0-9][0-9.eE+-]*')
 
     def log_message(self, fmt, *args):
         log.debug("http: " + fmt, *args)
@@ -19030,7 +19125,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # Server-side machine names (hub.db) — {machineKey: nickname}.
                     # The UI prefers these over its localStorage cache so the kiosk
                     # and a phone agree. Another reserved key the EGM loop skips.
-                    snap["names"] = engine.hub_store.names()
+                    # Reuses _nicks from the 'known' pass above — one db read
+                    # per rebuild, not two.
+                    snap["names"] = _nicks
                     # hub.db phase 2: cross-machine TITO ledger counts (best-effort,
                     # degrades to {} — bench/UI visibility). Reserved key.
                     snap["tito"] = engine.hub_store.tito_counts()
@@ -19138,12 +19235,18 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # already rejects them; this is the belt-and-suspenders. On the
                     # (should-be-impossible) TypeError, drop the sas section rather
                     # than 500 the poll that the whole UI depends on.
+                    # compact separators, not indent=2: indent forces the
+                    # pure-Python encoder (see snapshot()'s comment) — on a
+                    # multi-MB body polled every second that is real Pi CPU,
+                    # and no human reads this wire format.
                     try:
-                        body = json.dumps(snap, indent=2, allow_nan=False)
+                        body = json.dumps(snap, separators=(",", ":"),
+                                          allow_nan=False)
                     except ValueError:
                         snap["sas"] = {"_error": "a SAS report held a non-finite "
                                        "value and was dropped"}
-                        body = json.dumps(snap, indent=2, allow_nan=False)
+                        body = json.dumps(snap, separators=(",", ":"),
+                                          allow_nan=False)
                     # Conditional GET (2026-07-22): a content-hash ETag — correct
                     # by construction (moves exactly when the DATA moves; never
                     # keyed on uiStamp, which is only home.html's mtime). Hashed
@@ -19196,8 +19299,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 "application/json", soap=False)
         elif path.startswith("/api/accounts"):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
+            # Compact — polled endpoint, indent would force the pure-Python
+            # encoder (see the /api/status build).
             self._send(200, json.dumps(
-                self.host_engine.account_store.snapshot(), indent=2),
+                self.host_engine.account_store.snapshot(),
+                separators=(",", ":")),
                 "application/json", soap=False)
         elif path.startswith("/api/players"):
             # Player Maintenance: the Players composite (accounts ⋈ fobs
@@ -19205,8 +19311,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # pool). NEVER-500 — the Wallet tab's Players card polls this;
             # a peek must not take down a UI poll loop. Write path is POST.
             try:
+                # compact — polled endpoint, indent would force the
+                # pure-Python encoder (see the /api/status build)
                 body = json.dumps(self.host_engine.build_players(),
-                                  indent=2, allow_nan=False)
+                                  separators=(",", ":"), allow_nan=False)
             except Exception as e:  # noqa: BLE001 — never-500 endpoint
                 body = json.dumps({"ok": False,
                                    "error": str(e)[:200]

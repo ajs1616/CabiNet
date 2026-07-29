@@ -36,7 +36,6 @@ import struct
 import sys
 import threading
 import time
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,7 +58,7 @@ from core.sas_meters import (SAS_POLL_FLOOR, build_meter_poll,
                              parse_single_meter, parse_total_games)
 from core.sas_handpay_reset import (HANDPAY_PENDING_EXCEPTION,
                                     HANDPAY_RESET_EXCEPTION)
-from core.hub_ticket_client import HubTicketAuthority
+from core.hub_ticket_client import HubTicketAuthority, KeepAliveHTTPClient
 from core.sas_ticket_store import DEFAULT_SYSTEM_ID, TicketStore
 from core.sas_tito_host import (SASTITOHost, CMD_SET_EXTENDED_TICKET_DATA,
                                 CMD_SET_TICKET_DATA,
@@ -605,6 +604,10 @@ class HubReporter:
                  recent_events, store, sas_enabled=None, handpay_latch=None,
                  on_settings=None, ticket_header=None):
         self.url = hub_url.rstrip("/") + "/api/sas/report"
+        # One persistent keep-alive connection to the hub (this report
+        # thread is its sole caller) — urlopen re-dialed TCP for every
+        # 1-4 Hz report.
+        self._http = KeepAliveHTTPClient(self.url, timeout=4)
         self.smib_id = smib_id
         self.port_path = port_path
         self.address = address
@@ -647,6 +650,13 @@ class HubReporter:
         # a lost command/verdict is lost for good (see MAX_PENDING /
         # RESULTS_RING above).
         self._seen_cmd_ids = collections.deque(maxlen=64)
+        # Ticket-summary cache: recounting ~500 tickets under the store
+        # lock every report is waste — rebuild only when the store's
+        # revision moved. -1 never matches a real revision (they start at
+        # 0), so the first snapshot always builds; a store without a
+        # revision counter recounts every time, same as before.
+        self._tickets_rev = -1
+        self._tickets_summary = {"total": 0}
 
     def record_result(self, result):
         """Deposit a command result (poll thread) and wake the report thread
@@ -666,8 +676,14 @@ class HubReporter:
         enabled = (self.sas_enabled.is_set()
                    if self.sas_enabled is not None else True)
         with self.store.lock:
-            tickets = list(self.store.state.get("tickets", {}).values())
-        by_state = collections.Counter(t.get("state") for t in tickets)
+            rev = getattr(self.store, "revision", None)
+            if rev is None or rev != self._tickets_rev:
+                tickets = self.store.state.get("tickets", {})
+                by_state = collections.Counter(
+                    t.get("state") for t in tickets.values())
+                self._tickets_summary = {"total": len(tickets),
+                                         **dict(by_state)}
+                self._tickets_rev = -1 if rev is None else rev
         return {
             "protocol": "SAS",
             "smibId": self.smib_id,
@@ -685,7 +701,7 @@ class HubReporter:
                        in list(self.stats["last_meters"].items())[:64]
                        if a == self.address},
             "recentEvents": list(self.recent_events),
-            "tickets": {"total": len(tickets), **dict(by_state)},
+            "tickets": dict(self._tickets_summary),
             # AFT registration truth, cached by the poll thread (single
             # writer) and read here (single reader) — lock-free like meters.
             # None until the first cache read; the hub clamps + ingests it.
@@ -793,11 +809,11 @@ class HubReporter:
             self.result_ready.clear()
             try:
                 body = json.dumps(self.snapshot()).encode()
-                req = urllib.request.Request(
-                    self.url, data=body,
-                    headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=4) as resp:
-                    self._take_commands(resp.read())
+                status, reply = self._http.post_json(body)
+                if not 200 <= status < 300:
+                    # urlopen raised on error statuses; keep that edge
+                    raise OSError(f"HTTP {status}")
+                self._take_commands(reply)
                 if self.failing:
                     self.failing = False
                     logger.info("hub reporting RECOVERED ({})", self.url)

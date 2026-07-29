@@ -65,7 +65,7 @@ import time
 
 log = logging.getLogger("g2s.hub_store")
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Hard bounds — /api/names is unauthenticated (anyone on the floor VLAN/AP),
 # so the registry must stay bounded: without these, one hostile poster loops
@@ -609,6 +609,15 @@ class HubStore:
                           "ADD COLUMN expire_days INTEGER")
             except sqlite3.OperationalError:
                 pass    # rerun-safe (column already there)
+        if current < 13:
+            # v13: expression index serving tito_list's newest-first
+            # ORDER BY (COALESCE of the three activity stamps) — without
+            # it every ticket page sorts the whole ledger. CREATE IF NOT
+            # EXISTS keeps the step rerun-safe (the v4 DDL-autocommit
+            # landmine).
+            c.execute("CREATE INDEX IF NOT EXISTS tito_activity_idx "
+                      "ON tito_tickets("
+                      "COALESCE(redeemed_at, issued_at, minted_at) DESC)")
         if current < SCHEMA_VERSION:
             c.execute("INSERT INTO schema_meta(key,value) VALUES('version',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2273,7 +2282,8 @@ class HubStore:
             self._warn_limited("tito_counts", e)
             return {}
 
-    def tito_list(self, limit=50, offset=0, state=None, vid=None):
+    def tito_list(self, limit=50, offset=0, state=None, vid=None,
+                  origin=None, address=None):
         """GET /api/tito/tickets backend — the Cage UI's ticket list.
         vid= is an EXACT read-only lookup on the canonical OR the 16-digit
         vn (limit/offset/state ignored, total 0 or 1 — deliberately NOT
@@ -2281,7 +2291,10 @@ class HubStore:
         mutate). Otherwise newest-first by latest activity
         (COALESCE(redeemed, issued, minted)) with an exact ?state= filter
         (indexed) and limit/offset paging clamped like api_vouchers
-        (1..500 / >=0). Every state SHOWS, including 'minted' — a minted
+        (1..500 / >=0). origin=/address= scope the page to one machine's
+        rows IN SQL (the glass tickets view — a busy floor must not crowd
+        a machine's own tickets past the page); None keeps the floor-wide
+        Cage semantics. Every state SHOWS, including 'minted' — a minted
         row is a real open cash-out, there is no VoucherStore-style
         'unused' analogue to hide. BEST-EFFORT read posture (tito_counts
         template): this feeds a UI list, never a money decision, so a
@@ -2296,6 +2309,16 @@ class HubStore:
         except (TypeError, ValueError):
             offset = 0
         order = "ORDER BY COALESCE(redeemed_at, issued_at, minted_at) DESC"
+        scope, scope_args = [], []
+        if origin is not None:
+            scope.append("origin=?")
+            scope_args.append(str(origin))
+        if address is not None:
+            scope.append("address=?")
+            scope_args.append(str(address))
+        # appended after an existing WHERE (every cond above it is
+        # AND-joined, so no precedence trap)
+        scope_sql = "".join(" AND " + s for s in scope)
         try:
             with self.lock:
                 c = self._conn
@@ -2311,24 +2334,29 @@ class HubStore:
                     cond = self._EXPIRED_SQL
                     total = c.execute(
                         "SELECT COUNT(*) AS n FROM tito_tickets WHERE "
-                        + cond, (0,)).fetchone()["n"]
+                        + cond + scope_sql, (0, *scope_args)).fetchone()["n"]
                     rows = c.execute(
-                        f"SELECT * FROM tito_tickets WHERE {cond} {order} "
-                        "LIMIT ? OFFSET ?", (0, limit, offset)).fetchall()
+                        f"SELECT * FROM tito_tickets WHERE {cond}{scope_sql} "
+                        f"{order} LIMIT ? OFFSET ?",
+                        (0, *scope_args, limit, offset)).fetchall()
                 elif state is not None:
                     total = c.execute(
                         "SELECT COUNT(*) AS n FROM tito_tickets "
-                        "WHERE state=?", (state,)).fetchone()["n"]
+                        "WHERE state=?" + scope_sql,
+                        (state, *scope_args)).fetchone()["n"]
                     rows = c.execute(
-                        f"SELECT * FROM tito_tickets WHERE state=? {order} "
-                        "LIMIT ? OFFSET ?",
-                        (state, limit, offset)).fetchall()
+                        f"SELECT * FROM tito_tickets WHERE state=?{scope_sql} "
+                        f"{order} LIMIT ? OFFSET ?",
+                        (state, *scope_args, limit, offset)).fetchall()
                 else:
-                    total = c.execute("SELECT COUNT(*) AS n "
-                                      "FROM tito_tickets").fetchone()["n"]
+                    where = ("WHERE " + " AND ".join(scope)) if scope else ""
+                    total = c.execute(
+                        "SELECT COUNT(*) AS n FROM tito_tickets " + where,
+                        scope_args).fetchone()["n"]
                     rows = c.execute(
-                        f"SELECT * FROM tito_tickets {order} "
-                        "LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+                        f"SELECT * FROM tito_tickets {where} {order} "
+                        "LIMIT ? OFFSET ?",
+                        (*scope_args, limit, offset)).fetchall()
         except sqlite3.Error as e:
             self._warn_limited("tito_list", e)
             return {"total": 0, "tickets": []}

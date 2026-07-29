@@ -3,10 +3,10 @@
 companion_host.py — the Companion RFID daemon (runs on the Zero beside
 cabinet-sas).
 
-One job: turn PN532 card taps into hub knowledge. A single thread polls the
-reader at ~5Hz, debounces a held card into ONE tap, queues taps, and POSTs
-them to the hub's /api/companion/report — immediately on a new tap, else as
-a low-rate heartbeat. The hub does everything else (fob lookup, G2S
+One job: turn PN532 card taps into hub knowledge. A reader thread polls the
+reader at ~5Hz, debounces a held card into ONE tap, and queues taps; a
+reporter thread POSTs them to the hub's /api/companion/report — immediately
+on a new tap, else as a low-rate heartbeat. The hub does everything else (fob lookup, G2S
 setIdValidation carded session, reset-tier SAS handpay reset); this daemon
 knows nothing about fobs or tiers on purpose — a satellite stays dumb.
 
@@ -45,6 +45,7 @@ import logging
 import socket
 import struct
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -150,9 +151,14 @@ def resolve_hub_url(explicit, port=8081, fallback="http://192.168.50.2:8081"):
 class CompanionHost:
     """The tap pipeline: poll -> debounce -> queue -> report -> ack-drop.
 
-    Single-threaded on purpose (run() is the only loop); every method takes
-    monotonic `now` from the caller so tests drive time deterministically —
-    the same injected-clock idiom as the SAS RxWedgeWatchdog."""
+    Two threads (the same split as HubReporter in SAS/sas_host.py): run()
+    owns the reader (poll -> debounce -> queue) and never blocks on HTTP,
+    report_loop() owns the hub POST — a black-holed hub stalling a POST for
+    HTTP_TIMEOUT_SEC must not steal the ~5Hz card-detect duty, so a brief
+    tap during the stall is still DETECTED and queued; only its delivery
+    waits. Every method takes monotonic `now` from the caller so tests
+    drive time deterministically — the same injected-clock idiom as the
+    SAS RxWedgeWatchdog."""
 
     def __init__(self, reader, hub_url, companion_id, g2s_egm=None,
                  sas_smib=None, sas_address=None, report_sec=1.0,
@@ -170,6 +176,13 @@ class CompanionHost:
         self.started_at = _started_at_iso()
         self.started_mono = monotonic()
         self.taps = collections.deque(maxlen=MAX_QUEUED_TAPS)
+        # Guards multi-step taps ops across the two threads: a full-deque
+        # append EVICTS from the left, which races the ack drain's
+        # peek-then-popleft and the snapshot copy (bare append/popleft
+        # alone are safe; these compounds are not).
+        self._taps_lock = threading.Lock()
+        self.tap_ready = threading.Event()  # reader -> reporter: fresh tap,
+        #                                     report NOW (cuts the wait short)
         self._tap_counter = 0             # RAM only — restart resets to 0,
         #                                   startedAt tells the hub so
         self._uid_seen = {}               # uid -> last-sighting monotonic
@@ -223,7 +236,8 @@ class CompanionHost:
         self._uid_seen[uid] = now
         tap = {"tapId": self._tap_counter, "uid": uid, "at": now_iso()}
         self._tap_counter += 1
-        self.taps.append(tap)
+        with self._taps_lock:
+            self.taps.append(tap)
         logger.info("💳 tap uid=%s (tapId %d, %d queued)",
                     uid, tap["tapId"], len(self.taps))
         return tap
@@ -231,6 +245,8 @@ class CompanionHost:
     # ---- hub side ----------------------------------------------------------
 
     def snapshot(self, now):
+        with self._taps_lock:
+            queued = list(self.taps)
         return {
             "companionId": self.companion_id,
             "startedAt": self.started_at,
@@ -239,7 +255,7 @@ class CompanionHost:
             "g2sEgmId": self.g2s_egm,
             "sasSmib": self.sas_smib,
             "sasAddress": self.sas_address,
-            "taps": list(self.taps),
+            "taps": queued,
             "lastError": self.last_error,
         }
 
@@ -269,8 +285,9 @@ class CompanionHost:
         n = data.get("ackTapId")
         if not isinstance(n, int) or isinstance(n, bool):
             return
-        while self.taps and self.taps[0]["tapId"] <= n:
-            self.taps.popleft()
+        with self._taps_lock:
+            while self.taps and self.taps[0]["tapId"] <= n:
+                self.taps.popleft()
 
     def report(self, now):
         """One POST to the hub. Returns True on a 200 (taps <= ackTapId
@@ -309,17 +326,44 @@ class CompanionHost:
             return True
         return age >= self.report_sec * HEARTBEAT_MULT
 
-    # ---- the loop ----------------------------------------------------------
+    # ---- the loops ---------------------------------------------------------
+
+    def _report_wait(self, now):
+        """report_due's cadence, expressed as a wait: seconds until the next
+        report is due — report_sec while taps sit unacked, the heartbeat
+        when idle. tap_ready cuts any wait short for a fresh tap."""
+        if self._last_report_mono is None:
+            return 0.0
+        cadence = (self.report_sec if self.taps
+                   else self.report_sec * HEARTBEAT_MULT)
+        return max(0.0, cadence - (now - self._last_report_mono))
+
+    def report_loop(self):
+        """The reporter thread: HTTP only, never touches the reader (the
+        HubReporter split — see the class docstring)."""
+        while not self.stop:
+            # Read-then-clear: a tap landing during/after the POST re-sets
+            # the event and cuts the wait short, so no tap misses its
+            # immediate report or waits out a full cadence tick.
+            tapped = self.tap_ready.is_set()
+            self.tap_ready.clear()
+            if self.report_due(self.monotonic(), tapped):
+                self.report(self.monotonic())
+            self.tap_ready.wait(self._report_wait(self.monotonic()))
 
     def run(self):
         logger.info("companion %s -> %s (g2sEgm=%s sasSmib=%s addr=%s)",
                     self.companion_id, self.url, self.g2s_egm,
                     self.sas_smib, self.sas_address)
+        # Daemon, like sas_host's hub-reporter thread: the reader loop below
+        # keeps its ~5Hz duty no matter how long the hub black-holes a POST.
+        threading.Thread(target=self.report_loop, daemon=True,
+                         name="hub-reporter").start()
         while not self.stop:
-            tap = self.poll_reader(self.monotonic())
-            if self.report_due(self.monotonic(), tap is not None):
-                self.report(self.monotonic())
+            if self.poll_reader(self.monotonic()) is not None:
+                self.tap_ready.set()      # fresh tap -> report NOW
             time.sleep(POLL_SEC)
+        self.tap_ready.set()              # wake the reporter so stop lands
         self.reader.close()
 
 
