@@ -1582,7 +1582,14 @@ def main():
     if not a.yes and not a.dry_run and not adopted:
         say("\nThis will update the hub%s, run the gates, and restart the "
             "floor." % ("" if not sats else " and %d satellite(s)" % len(sats)))
-        if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+        try:
+            ans = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            # No terminal to ask on (ssh one-liner, cron) — refuse cleanly
+            # instead of dying in a traceback (hit live 2026-07-29).
+            say("No terminal to confirm on — rerun with --yes.")
+            return 1
+        if ans not in ("y", "yes"):
             say("Aborted — nothing changed.")
             return 1
     elif adopted:

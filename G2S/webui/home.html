@@ -2041,12 +2041,18 @@ function floorTile(s){
     return `<div class="jackpot">
       <div class="jt">${esc(T[h.handpayType]||"HANDPAY")}</div>
       <div class="ja">${esc(fmtAmt(amt))}</div>
-      <div class="js">txn ${esc(h.transactionId||"—")} · ${clock(h.seenAt)}
-        ${h.remoteCredit==="false"?" · machine did not offer remote key-off":""}</div>
-      <button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
+      <div class="js">txn ${esc(h.transactionId||"—")} · ${clock(h.seenAt)}</div>
+      ${h.remoteCredit==="false"
+        /* born before remote key-off was armed — Table 11.6 says the stamp
+           is for life, so a remote clear can only earn a JPX002; say so
+           instead of offering a doomed button (2026-07-29) */
+        ?`<button class="btn" disabled>
+        <span class="bl">🗝️ Physical key only</span>
+        <span class="ba">born before remote key-off was armed — the machine will refuse a remote clear</span></button>`
+        :`<button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
         onclick="hpClear(this)">
         <span class="bl">🔑 Reset to Credits</span>
-        <span class="ba">key off to the credit meter</span></button>
+        <span class="ba">key off to the credit meter</span></button>`}
     </div>`;
   }).join("")
   /* + the linked SAS leg's handpay lockup — the SAME banner + reset the

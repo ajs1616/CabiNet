@@ -1130,6 +1130,13 @@ class EgmAssociation:
         # re-pushes at most once per join, never per message.
         self.ticket_push_epoch = -1
         self.ticket_push_pending = False
+        # Remote-handpay re-arm (2026-07-29, the $192,500 lesson): same law
+        # as the ticket header above — a RAM clear silently resets
+        # G2S_enabledRemoteCredit to false, and every handpay born after is
+        # key-only for LIFE (Table 11.6). Public floors have no switch for
+        # this, so every join re-asserts it. Per-epoch, read-probe first.
+        self.handpay_arm_epoch = -1
+        self.handpay_arm_pending = False
         self.last_keepalive = 0.0       # last keepAlive/keepAliveAck from the EGM
         self.descriptors = []           # harvest: device inventory (getDescriptor)
         self.descriptors_rx = 0         # descriptorList responses this run (GR-30 rescan wait)
@@ -14710,6 +14717,58 @@ class G2SHost:
                 log.warning("🎫 [%s] join: ticket-header re-push FAILED — %s",
                             assoc.egm_id, v.get("error"))
 
+    def _maybe_arm_remote_handpay_on_join(self, assoc):
+        """Join twin of _maybe_push_ticket_header_on_join for the handpay
+        remote key-off enables (2026-07-29): the 07-28 RAM clear silently
+        reset G2S_enabledRemoteCredit, the next lockup was born key-only
+        for life (Table 11.6), the 🔑 fired a doomed setRemoteKeyOff and
+        the log blamed the machine. Two-step like the header: arm per
+        epoch + one scoped getOptionList, enable when the inventory lands.
+        Read-probe, never model-branch: a machine that does not advertise
+        the option is skipped on the read, one already at target costs
+        zero option-change cycles (enable_remote_handpay's no-op guard)."""
+        with assoc.lock:
+            if assoc.handpay_arm_epoch == assoc.epoch:
+                return
+            assoc.handpay_arm_epoch = assoc.epoch
+            assoc.handpay_arm_pending = True
+        log.info("💰 [%s] join: re-asserting remote handpay key-off — "
+                 "reading G2S_handpay/1 options first (a RAM clear silently "
+                 "resets G2S_enabledRemoteCredit)", assoc.egm_id)
+        self.enqueue_get_option_list(assoc=assoc, device_class="G2S_handpay",
+                                     device_id="1")
+
+    def _remote_handpay_arm_after_option_list(self, assoc):
+        """A (any) optionList landed — run the armed remote key-off
+        re-assert once the handpay inventory is actually present. Stays
+        armed across landings that did not carry it (the voucher read from
+        the ticket twin lands on this same hook), so ordering between the
+        two join reads can never lose the arm; a machine that never
+        advertises the option costs one dict probe per landing and nothing
+        on the wire."""
+        key = "G2S_handpay/1/G2S_handpayOptions/G2S_handpayOptions"
+        with assoc.lock:
+            if not assoc.handpay_arm_pending:
+                return
+            has_opt = key in assoc.config_options
+            if has_opt:
+                assoc.handpay_arm_pending = False
+        if not has_opt:
+            log.debug("💰 [%s] join: handpay options not in this optionList "
+                      "— re-assert stays armed", assoc.egm_id)
+            return
+        v = self.enable_remote_handpay(assoc)
+        if v.get("alreadyEnabled"):
+            log.info("💰 [%s] join: remote handpay key-off already armed — "
+                     "nothing to push", assoc.egm_id)
+        elif v.get("ok"):
+            log.info("💰 [%s] join: RE-ARMED remote handpay key-off (params "
+                     "%s) — the machine was carrying false, which is what "
+                     "a RAM clear looks like", assoc.egm_id, v.get("target"))
+        else:
+            log.warning("💰 [%s] join: remote key-off re-assert FAILED — %s",
+                        assoc.egm_id, v.get("error"))
+
     def push_ticket_expiration_g2s(self):
         """Fan the hub ticket-expiration setting (days, 0 = never) to every
         ONLINE G2S EGM via the same proven option-change cycle as
@@ -15149,6 +15208,19 @@ class G2SHost:
                                       "authoritative",
                         "G2S_JPX004": "invalid key-off amount",
                     }.get(rerr, "")
+                    # Own the config gap instead of blaming the enforcer
+                    # (2026-07-29): a JPX002 on a lockup whose own record
+                    # says remoteCredit=false is the machine correctly
+                    # holding the Table 11.6 birth-stamp against us.
+                    if rerr == "G2S_JPX002" and \
+                            target.get("remoteCredit") == "false":
+                        hint = ("this lockup was born while "
+                                "G2S_enabledRemoteCredit was false and is "
+                                "key-only for LIFE (Table 11.6) — OUR "
+                                "config gap, not the machine misbehaving; "
+                                "clear it with the physical key (the join "
+                                "re-assert arms handpays born after the "
+                                "next join)")
                     log.warning("[%s] 💰 REMOTE KEY-OFF REJECTED txn=%s — "
                                 "%s%s", assoc.egm_id, txn, rerr,
                                 f" ({hint})" if hint else "")
@@ -15706,6 +15778,11 @@ class G2SHost:
             # the hub's ticket header. A RAM-cleared cabinet rejoins printing
             # its FACTORY voucher text with nothing on the wire to say so.
             self._maybe_push_ticket_header_on_join(assoc)
+            # And its 2026-07-29 twin: re-assert remote handpay key-off.
+            # A RAM clear resets G2S_enabledRemoteCredit, and a lockup
+            # born key-only stays key-only (Table 11.6) — arming on join
+            # is the only window that helps.
+            self._maybe_arm_remote_handpay_on_join(assoc)
 
         elif cmd in ("printerStatus", "printerProfile",
                      "printerTemplateList", "printComplete") \
@@ -17230,6 +17307,7 @@ class G2SHost:
                 # ticket-header push can finally read current values and
                 # decide whether the machine drifted (RAM clear) or matches.
                 self._ticket_push_after_option_list(assoc)
+                self._remote_handpay_arm_after_option_list(assoc)
 
         elif cmd == "optionConfigModeStatus":
             # Response to enterOptionConfigMode/getOptionConfigModeStatus
