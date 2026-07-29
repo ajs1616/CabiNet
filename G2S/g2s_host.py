@@ -1085,18 +1085,25 @@ REMOTE_CREDIT_ENABLE_PARAMS = {
 
 
 def pick_remote_key_off_type(rec):
-    """The lockup's own birth flags (Table 11.6) pick the reset type:
-    credits when the machine offered them, else the attendant-key
-    equivalent (over-limit jackpots are born localCredit=false — the meter
-    can't take them, the reset still can). Falls back to remoteCredit when
-    neither is offered so a refusal draws the machine's own honest JPX002."""
+    """Pick the reset type from the lockup's flags — WORDING/ROUTING only,
+    never permission. Wire-proven 2026-07-29: the handpayRequest flags are
+    an advisory SNAPSHOT, not a lifetime stamp — txn 173 arrived with
+    remoteHandpay=false and still keyed off clean once the option was
+    armed, because the EGM enforces against its CURRENT options at key-off
+    time. So we always send something and let the machine adjudicate.
+
+    Routing: credits when the machine offered them; else the attendant-key
+    equivalent. When neither remote flag is set, localCredit is the honest
+    tiebreak — it reflects the PHYSICAL constraint (an over-limit jackpot
+    is born localCredit=false because no key can put it on the meter), so
+    a false there means hand-pay is the only shape that can work."""
     def _t(k):
         return str(rec.get(k) or "false").strip().lower() == "true"
     if _t("remoteCredit"):
         return "G2S_remoteCredit"
     if _t("remoteHandpay"):
         return "G2S_remoteHandpay"
-    return "G2S_remoteCredit"
+    return "G2S_remoteCredit" if _t("localCredit") else "G2S_remoteHandpay"
 
 
 # ----------------------------------------------------------------------------
@@ -13854,11 +13861,14 @@ class G2SHost:
         # the xs:boolean True/TRUE.
         if str(reply["remoteCredit"]).strip().lower() != "true" and \
                 str(reply["remoteHandpay"]).strip().lower() != "true":
-            reply["gate"] = (
-                "this lockup offers NO remote key-off — the EGM will "
-                "refuse (G2S_JPX002); physical key only for this one "
-                "(handpays born after the join re-assert carry both "
-                "remote paths)")
+            # Advisory, NOT a refusal (2026-07-29): the request's flags are
+            # a snapshot; the EGM judges against its current options, and a
+            # lockup that arrived with both false has keyed off clean on the
+            # wire once armed. Send it and let the machine answer.
+            reply["note"] = (
+                "this lockup's request offered no remote key-off — sending "
+                "anyway; the EGM judges against its CURRENT options, so an "
+                "armed machine can still take it")
         return reply
 
     # ------------------------------------- voucher redemption — G2S-26 tier 2
@@ -15264,18 +15274,21 @@ class G2SHost:
                         "G2S_JPX004": "invalid key-off amount",
                     }.get(rerr, "")
                     # Own the gap instead of blaming the enforcer
-                    # (2026-07-29): a JPX002 on a lockup that offered
-                    # neither remote path is the machine correctly holding
-                    # its Table 11.6 birth-stamp against us — the flags
-                    # are stamped at birth and never retro-permit.
-                    if rerr == "G2S_JPX002" and \
-                            target.get("remoteCredit") == "false" and \
-                            target.get("remoteHandpay") == "false":
-                        hint = ("this lockup was born offering NO remote "
-                                "key-off (Table 11.6 — birth-stamped, "
-                                "can't retro-permit); physical key only "
-                                "for this one. Handpays born after the "
-                                "join re-assert carry both remote paths")
+                    # (2026-07-29): a JPX002 almost always means the
+                    # handpay OPTION for this key-off type is off right
+                    # now — NOT that the lockup is unfixable. Wire-proven
+                    # the same night: txn 173 took a JPX002 while
+                    # enabledRemoteHandpay was false, then keyed off clean
+                    # on a retry once the option was armed. The EGM judges
+                    # against CURRENT options at key-off time, so the
+                    # remedy is arm-then-retry, never "give up".
+                    if rerr == "G2S_JPX002":
+                        hint = ("the EGM does not currently permit this "
+                                "key-off type — arm it (enableRemoteHandpay "
+                                "sets both remote pairs; the join re-asserts "
+                                "them) and RETRY this same lockup: the flags "
+                                "on the request are advisory, the EGM judges "
+                                "against its options at key-off time")
                     log.warning("[%s] 💰 REMOTE KEY-OFF REJECTED txn=%s — "
                                 "%s%s", assoc.egm_id, txn, rerr,
                                 f" ({hint})" if hint else "")

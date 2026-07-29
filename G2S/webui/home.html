@@ -2042,26 +2042,22 @@ function floorTile(s){
       <div class="jt">${esc(T[h.handpayType]||"HANDPAY")}</div>
       <div class="ja">${esc(fmtAmt(amt))}</div>
       <div class="js">txn ${esc(h.transactionId||"—")} · ${clock(h.seenAt)}</div>
-      ${h.remoteCredit==="true"
-        /* The lockup's own birth flags (Table 11.6) drive the button —
-           the machine tells us what's available when the handpay hits,
-           the hub obeys (pick_remote_key_off_type mirrors this order):
-           credits when offered; else Reset Jackpot — clears as the
-           attendant key would, an over-limit win can't reach the meter
-           but the reset still happens; disabled only when the machine
-           offered NO remote path (born before the arms). (2026-07-29) */
+      ${/* NEVER disable this button (2026-07-29, wire-proven): the
+            handpayRequest flags are an ADVISORY SNAPSHOT, not a lifetime
+            contract. txn 173 came in with remoteHandpay=false, yet once
+            the option was armed the very same lockup keyed off clean —
+            the EGM enforces against its CURRENT options at key-off time.
+            So the host always gets to try and the machine decides; the
+            flags only pick the WORDING. */
+        h.localCredit==="false"
         ?`<button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
-        onclick="hpClear(this)">
-        <span class="bl">🔑 Reset to Credits</span>
-        <span class="ba">key off to the credit meter</span></button>`
-        :(h.remoteHandpay==="true"
-          ?`<button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
         onclick="hpClear(this)">
         <span class="bl">🔑 Reset Jackpot</span>
         <span class="ba">over the credit limit — pays the win to the carded-in wallet (House if nobody's carded)</span></button>`
-          :`<button class="btn" disabled>
-        <span class="bl">🗝️ Reset Jackpot — key only</span>
-        <span class="ba">this lockup was born offering no remote key-off — use the physical key</span></button>`)}
+        :`<button class="btn" data-egm="${esc(egm)}" data-hp="${esc(h.transactionId)}"
+        onclick="hpClear(this)">
+        <span class="bl">🔑 Reset to Credits</span>
+        <span class="ba">key off to the credit meter</span></button>`}
     </div>`;
   }).join("")
   /* + the linked SAS leg's handpay lockup — the SAME banner + reset the
