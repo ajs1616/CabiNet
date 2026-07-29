@@ -3483,11 +3483,22 @@ function renderPlayers(){
         a removed player's credits fold back in.</p>`:""));
   renderPlayerLink();
 }
+function isHubReader(c){
+  /* ⚖️ HOUSE RULE (AJ): cards are registered from the HUB'S OWN reader ONLY —
+     a floor tap is always a player-currency action (card-in/out, top-up,
+     handpay reset) and must never grow a second meaning like "claim this
+     card", or an innocent tap races the register listener onto the wrong
+     account. The hub's reader is the co-located companion on the hub Pi
+     itself (--hub http://127.0.0.1:8081), so it reports from loopback. */
+  const p=String((c||{}).peer||"");
+  return p==="127.0.0.1"||p==="::1"||p.indexOf("127.0.0.1")>=0;
+}
 function renderPlayerLink(){
   /* the "add a card" offer (after Add, or a row's + Add a card): unassigned
-     player-tier fobs click-link, AND the live tap-to-link path — the same
-     companions lastTap feed the Cards & readers card mines, gated to taps
-     NEWER than the offer (the seen signature, clock-skew-proof). */
+     player-tier fobs click-link, AND the live tap-to-link path — mining the
+     HUB reader's lastTap only (isHubReader — floor taps are player actions,
+     never enrollment), gated to taps NEWER than the offer (the seen
+     signature, clock-skew-proof). */
   const box=$("w-plink"); if(!box) return;
   const lk=S.players.link;
   if(!lk){ setHTML(box,""); return; }
@@ -3501,7 +3512,9 @@ function renderPlayerLink(){
   }).join("");
   let tap="";
   const comps=(S.status||{}).companions||{};
+  const hasHub=Object.keys(comps).some(id=>isHubReader(comps[id]));
   for(const cid of Object.keys(comps).sort()){
+    if(!isHubReader(comps[cid])) continue;   // floor taps never enroll
     const lt=(comps[cid]||{}).lastTap;
     if(!lt||!lt.uid) continue;
     const uid=String(lt.uid);
@@ -3522,9 +3535,10 @@ function renderPlayerLink(){
   }
   setHTML(box, `<div style="margin-top:14px;border-top:1px solid var(--line2);padding-top:12px">
     <div class="nm" style="font:600 14.5px var(--sans)">Add a card to ${esc(lk.name)}</div>
-    <p class="none" style="margin:6px 0 8px">Tap their card on any reader —
-      or pick one below.</p>
-    <div class="chips">${chips||'<span class="chip">no unassigned player card — tap a new one on a reader</span>'}</div>
+    <p class="none" style="margin:6px 0 8px">${hasHub
+      ?"Tap their card on the hub's reader — or pick one below. (Floor readers never register cards — a tap out there is always a player action.)"
+      :"No reader is attached to the hub — pick an unassigned card below, or add it by UID in the Cards card on this tab."}</p>
+    <div class="chips">${chips||'<span class="chip">no unassigned player card'+(hasHub?" — tap a new one on the hub reader":"")+'</span>'}</div>
     ${tap}
     <div class="btnrow" style="margin-top:10px">
       <button class="btn slim" onclick="playerLinkDismiss()">
@@ -5353,10 +5367,17 @@ function renderReaders(){
       </div>`;
     }
     const lt=c.lastTap;
+    /* register-from-tap is HUB-READER-ONLY (isHubReader house rule): a floor
+       reader's unknown tap stays record-only info — no action button, so a
+       player's innocent tap can never be one-clicked onto an account. */
     const tap=(lt&&lt.uid)
       ? (lt.known===false
-        ? `<button class="fobnew" onclick="fobPrefill('${jsq(lt.uid)}')">💳 new card
-             ${esc(lt.uid)} · ${clock(lt.at)} — click to register</button>`
+        ? (isHubReader(c)
+          ? `<button class="fobnew" onclick="fobPrefill('${jsq(lt.uid)}')">💳 new card
+               ${esc(lt.uid)} · ${clock(lt.at)} — click to register</button>`
+          : `<div class="kd" style="margin-top:4px" title="${esc(lt.uid)}">last tap
+               ${esc(lt.uid)} · ${clock(lt.at)} — unregistered (cards register at
+               the hub's reader)</div>`)
         : `<div class="kd" style="margin-top:4px" title="${esc(lt.uid)}">last tap
              ${esc(cardFace(lt.uid, lt.label))}
              · ${esc(TIERWORD[lt.tier]||lt.tier||"")} · ${clock(lt.at)}</div>`)
@@ -5501,7 +5522,7 @@ async function fobDelete(uid,btn){
 }
 async function fobAdd(btn){
   const uid=($("pl-fob-new-uid").value||"").trim();
-  if(!uid){toast("Card UID first — tap a card on a reader to see it",false); return;}
+  if(!uid){toast("Card UID first — tap it on the hub's reader to see it",false); return;}
   const lbl=($("pl-fob-new-label").value||"").trim();
   const ok=await fobPost({action:"set", uid,
     tier:$("pl-fob-new-tier").value,

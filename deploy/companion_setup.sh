@@ -18,7 +18,8 @@
 # WIRED ONLY (the Wi-Fi satellite path is retired): the host serves DHCP +
 # G2S on the slot segment (192.168.50.0/24), so plug the Zero's Ethernet/USB
 # HAT into that switch and it comes up on .50.x, one local hop from the host
-# at 192.168.50.2:8081. --hub overrides (co-located = 127.0.0.1).
+# at 192.168.50.2:8081. --hub overrides (co-located = 127.0.0.1 — a reader ON
+# the hub Pi itself: the ENROLLMENT reader, the only one that registers cards).
 #
 # What it does on the Pi:
 #   1. I2C for the PN532 — the UNIVERSAL software i2c-gpio bus on GPIO23/24

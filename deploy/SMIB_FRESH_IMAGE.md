@@ -184,7 +184,8 @@ deploy/companion_setup.sh <user>@<zero-host>.local \
 ```
 
 - `--hub` (override only): omit for zero-config (derive the gateway). Pass
-  `http://127.0.0.1:8081` co-located.
+  `http://127.0.0.1:8081` co-located — a reader **on the hub Pi itself**: that's
+  the **enrollment reader**, the only reader that registers cards (§4).
 - **I2C layout** (auto-configured): the **universal software i2c-gpio bus** on
   `GPIO23/24` → `/dev/i2c-11` — ONE wiring for the whole fleet. Every Companion (SAS+RFID
   like the BB2, or RFID-only like the AVP) wires the PN532 to the **same** pins
@@ -328,11 +329,16 @@ urgent on the 424Mi board.
   a **SAS machine there is nothing to bind**: the reader auto-binds by co-location
   with the SAS SMIB and is deliberately not listed. This replaces baking
   `--g2s-egm`/`--sas-*` into the unit.
-- Enroll fobs in **💳 The Players**: add (or pick) the player, hit **+ Add a card**,
-  and tap the fob on **any** reader — the offer mines the latest tap, auto-bound
-  readers included. (A manually-assignable reader's row in The Switchboard also shows
-  a one-click *register* prompt after an unknown tap; an auto-bound SAS reader has no
-  row, so the **+ Add a card** path is the one that always works.)
+- Enroll fobs at the **hub's own reader ONLY**: add (or pick) the player in **💳 The
+  Players**, hit **+ Add a card**, and tap the card on the reader **attached to the
+  hub Pi** (install one with
+  `deploy/companion_setup.sh <you>@localhost --hub http://127.0.0.1:8081` — the
+  co-located form; same PN532 wiring as every reader). **Floor readers never
+  register cards** — out there a tap is always a *player* action (card-in/out,
+  handpay reset), so giving it a second "claim this card" meaning would race an
+  innocent tap onto the wrong account; unknown fobs on floor readers are
+  record-only. No reader on the hub? Type the card's UID into the **Cards** card
+  in 💳 The Players instead.
 - **Dual-protocol cabinet** (BB2 on SAS *and* G2S): link its G2S card to its SAS leg in
   the machine's Settings so meters/credits count once — task #20, `sasLink`.
 

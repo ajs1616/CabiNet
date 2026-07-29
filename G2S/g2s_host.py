@@ -5646,11 +5646,13 @@ class G2SHost:
 
     def _process_companion_tap(self, comp, tap):
         """One deduped tap -> the fob action. Unknown fobs are recorded in
-        lastTap (known=False — feeds the readers card's register prompt AND
-        The Players' add-a-card tap-to-link, which mines every reader incl.
-        auto-bound ones) and NOTHING else — never auto-created. Known fobs
-        dispatch by tier: player/attendant/manager = carded session, reset =
-        SAS handpay key-off (the physical attendant-key moment)."""
+        lastTap (known=False) and NOTHING else — never auto-created, and
+        register-from-tap is HUB-READER-ONLY (AJ house rule: a floor tap is
+        always a player-currency action and must never grow a second
+        "claim this card" meaning — the UI only mines the loopback-peer
+        hub reader for enrollment). Known fobs dispatch by tier:
+        player/attendant/manager = carded session, reset = SAS handpay
+        key-off (the physical attendant-key moment)."""
         raw_uid = tap.get("uid") or ""
         uid = _norm_fob_uid(raw_uid)
         if uid is None:
@@ -5665,8 +5667,9 @@ class G2SHost:
                                "tier": (fob or {}).get("tier"),
                                "label": (fob or {}).get("label")}
         if fob is None:
-            log.info("💳 [companion:%s] unknown fob %s — add it in "
-                     "💳 The Players (+ Add a card on a player, then tap)",
+            log.info("💳 [companion:%s] unknown fob %s — record-only; cards "
+                     "register at the hub's reader (💳 The Players ▸ "
+                     "+ Add a card), never from a floor tap",
                      comp.get("companionId"), uid)
             return
         tier = fob.get("tier")
