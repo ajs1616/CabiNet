@@ -166,6 +166,29 @@ say "authorize the hub's update key"
 say "gate: pytest SAS/ on the Zero"
 "${SSH[@]}" "$HOST" 'cd ~/CabiNet && ~/venvs/cabinet/bin/python -m pytest SAS/ -q 2>&1 | tail -1'
 
+say "adopting any older install (pre-rename unit / legacy tree)"
+# A pre-rename casinonet-sas unit left enabled would fight the new unit for the
+# serial port (two pollers on one SAS line = framing chaos). Same posture as
+# companion_setup.sh: narrate the legacy tree BEFORE the unit file moves, stop
+# by NAME on every run (outside the one-shot guard, so a past run that failed
+# the disable can still be cleaned up), then retire the file as .retired.
+"${SSH[@]}" "$HOST" '
+  OLD=$(grep -h "^WorkingDirectory=" /etc/systemd/system/cabinet-sas.service \
+                /etc/systemd/system/casinonet-sas.service 2>/dev/null | head -1 | cut -d= -f2)
+  case "$OLD" in
+    ""|*/CabiNet*) : ;;
+    *) echo "  migrating unit off legacy tree $OLD (left on disk; unused after this run)" ;;
+  esac
+  sudo systemctl stop casinonet-sas >/dev/null 2>&1 || true
+  if [ -f /etc/systemd/system/casinonet-sas.service ]; then
+    sudo systemctl disable casinonet-sas >/dev/null 2>&1 || true
+    sudo mv /etc/systemd/system/casinonet-sas.service \
+            /etc/systemd/system/casinonet-sas.service.retired
+    sudo systemctl daemon-reload
+    echo "  retired pre-rename casinonet-sas unit (file kept as .retired)"
+  fi
+  exit 0'
+
 say "install cabinet-sas.service (port=$PORT address=$ADDRESS, hub=$HUB${SMIB_ID:+, smib-id=$SMIB_ID})"
 # Append --smib-id ONLY when pinning an existing name; otherwise the daemon's
 # default (smib-<pi-serial-tail>) stands so a golden image self-names per board.
