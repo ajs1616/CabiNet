@@ -274,6 +274,12 @@ def make_engine():
     eng._update = {"behind": 0, "commits": [], "checkedAt": None,
                    "error": None, "state": "idle"}
     eng._update_auto_at = 0.0
+    # Third verse of the same lesson (2026-07-29, perf sweep): the status
+    # build's update_state()/update_log_tail() grew TTL caches for the git
+    # subprocesses and transcript tail, read on every fetch. Boot-unread
+    # values mean the stub behaves exactly like a fresh production host.
+    eng._update_git_cache = (None, 0.0)
+    eng._update_log_cache = (None, [])
     # the tournament state quartet __init__ owns in production
     eng.tournament = eng._tournament_idle_state()
     eng.tournament_lock = threading.Lock()
