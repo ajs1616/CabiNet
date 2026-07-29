@@ -330,13 +330,18 @@ function nightSave(r){try{localStorage.setItem(nightKey(),JSON.stringify(r));}
 
 /* ---- polling ------------------------------------------------------------ */
 async function tick(){
+  // abort watchdog: a hung socket must never freeze the loop — without it
+  // the header keeps saying "live · HH:MM" while the fetch sits for minutes
+  const ac=(typeof AbortController!=="undefined")?new AbortController():null;
+  const to=ac?setTimeout(()=>ac.abort(), POLL*5):null;
   try{
     /* D13: the board is a pure spectator — it never reads the gamePlay/
        meters/config whales, so it polls the SLIM view. cache:"no-cache"
        (revalidate, NOT no-store) so the browser echoes the hub's ETag
        and gets a 304 on a quiet floor — the body stays off the wire; an
        old hub ignores ?slim=1 and serves full. */
-    const r=await fetch("/api/status?slim=1",{cache:"no-cache"});
+    const r=await fetch("/api/status?slim=1",
+      {cache:"no-cache", signal:ac?ac.signal:undefined});
     S.status=await r.json();
     $("hdr-live").classList.remove("err");
     $("hdr-t").textContent="live · "+new Date().toLocaleTimeString([],
@@ -345,13 +350,16 @@ async function tick(){
   }catch(e){
     $("hdr-live").classList.add("err");
     $("hdr-t").textContent="hub unreachable";
-  }finally{setTimeout(tick,POLL);}
+  }finally{clearTimeout(to);setTimeout(tick,POLL);}
 }
 async function tickAccounts(){
-  try{const r=await fetch("/api/accounts",{cache:"no-store"});
+  const ac=(typeof AbortController!=="undefined")?new AbortController():null;
+  const to=ac?setTimeout(()=>ac.abort(), POLL*5):null;
+  try{const r=await fetch("/api/accounts",
+      {cache:"no-store", signal:ac?ac.signal:undefined});
     const j=await r.json(); S.accounts=(j&&j.accounts)||[];
   }catch(e){}
-  finally{setTimeout(tickAccounts,10000);}
+  finally{clearTimeout(to);setTimeout(tickAccounts,10000);}
 }
 
 /* ---- render ------------------------------------------------------------- */
@@ -590,6 +598,7 @@ function openSeatsPanel(){
 }
 
 const PANELS=[nowPlayingPanel,standingsPanel,recordPanel,openSeatsPanel];
+let lastPanelKick=null, lastPanelHtml=null;
 function renderAttract(){
   const now=Date.now();
   let flip=false;
@@ -598,8 +607,14 @@ function renderAttract(){
     panelIx=(panelIx+1)%PANELS.length; panelAt=now; flip=true;
   }
   const p=PANELS[panelIx]();
-  $("pk").textContent=p.kick;
-  $("panel").innerHTML=p.html;
+  // the poll is 2s but the panel changes only on the 12s rotation or a real
+  // data change — skip the innerHTML/textContent churn when nothing moved
+  // (a flip always rewrites so the swap animation has fresh content under it)
+  if(flip || p.kick!==lastPanelKick || p.html!==lastPanelHtml){
+    lastPanelKick=p.kick; lastPanelHtml=p.html;
+    $("pk").textContent=p.kick;
+    $("panel").innerHTML=p.html;
+  }
   if(flip) for(const id of ["pk","panel"]){
     const el=$(id);
     el.classList.remove("sw"); void el.offsetWidth; el.classList.add("sw");

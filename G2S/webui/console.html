@@ -113,6 +113,7 @@ const POLL_MS = 1500;
 let CUR_EGM = null;       // the machine the console + Test Panel currently target
 let LAST_DATA = null;     // last /api/status payload (for instant re-render on select)
 let LAST_EGM_SIG = "";    // signature of the connected-machine set (rebuild guard)
+const HTML_SIG = new WeakMap();  // element -> last innerHTML (skip no-op writes)
 
 // Test Panel command groups. `danger` => confirm (disables play / changes config).
 const GROUPS = [
@@ -136,6 +137,10 @@ const GROUPS = [
 function h(html){const d=document.createElement("div");d.innerHTML=html.trim();return d.firstChild;}
 function esc(s){return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 function timeShort(iso){if(!iso)return"";const m=String(iso).match(/T(\d\d:\d\d:\d\d)/);return m?m[1]:iso;}
+function setHTML(el, html){
+  if(!el || HTML_SIG.get(el)===html) return;
+  HTML_SIG.set(el, html); el.innerHTML = html;
+}
 
 function toast(msg,ok){
   const t=h(`<div class="t ${ok?'ok':'err'}">${esc(msg)}</div>`);
@@ -210,7 +215,9 @@ function render(data){
     LAST_EGM_SIG="";
     document.getElementById("egm-select").innerHTML="<option>—</option>";
     document.getElementById("mcount-h").textContent="";
-    document.getElementById("c-conn").innerHTML='<p class="none">Waiting for an EGM to join…</p>';
+    // routed through setHTML so the WeakMap signature stays coherent with the
+    // populated-branch writes below (a raw innerHTML would leave a stale sig)
+    setHTML(document.getElementById("c-conn"),'<p class="none">Waiting for an EGM to join…</p>');
     return;
   }
   CUR_EGM = CUR_EGM && egms.includes(CUR_EGM) ? CUR_EGM : egms[0];
@@ -227,7 +234,7 @@ function render(data){
 
   // connection card
   const kaAge=s.lastKeepAlive?Math.round(Date.now()/1000-s.lastKeepAlive):null;
-  document.getElementById("c-conn").innerHTML=`
+  setHTML(document.getElementById("c-conn"),`
     <div class="kv">
       <div class="k">State</div><div class="v">${esc(s.commsState)}</div>
       <div class="k">Joined</div><div class="v">${esc(timeShort(s.joinedAt)||"—")}</div>
@@ -239,12 +246,12 @@ function render(data){
       <div class="k">egmLocation</div><div class="v" style="font-size:12px">${esc(s.egmLocation||"—")}</div>
     </div>
     <p class="muted" style="margin:10px 0 0;font-size:12px">engine: keepalive ${eng.keepaliveMs/1000||0}s ·
-      harvest ${eng.harvest?"on":"off"} · subscribe ${eng.subscribe?"on":"off"}</p>`;
+      harvest ${eng.harvest?"on":"off"} · subscribe ${eng.subscribe?"on":"off"}</p>`);
 
   // cabinet card
   const cab=s.cabinet||{};
   const doors=Object.keys(cab).filter(k=>/door|tilt/i.test(k));
-  document.getElementById("c-cab").innerHTML=`
+  setHTML(document.getElementById("c-cab"),`
     <div class="big">${esc(cab.egmState||"—")}</div>
     <div class="kv" style="margin-top:8px">
       <div class="k">EGM clock</div><div class="v">${esc(cab.egmDateTime||"—")}</div>
@@ -255,15 +262,15 @@ function render(data){
       doors.length? doors.map(d=>{
         const on=String(cab[d]).toLowerCase()==="true";
         return `<span class="chip" style="${on?'color:var(--bad);border-color:#722':''}">${esc(d)}: ${esc(cab[d])}</span>`;
-      }).join(" ") : '<span class="none">no door/tilt data yet — hit “Cabinet status”</span>'}</div>`;
+      }).join(" ") : '<span class="none">no door/tilt data yet — hit “Cabinet status”</span>'}</div>`);
 
   // meters
   document.getElementById("mcount").textContent=s.meterCount?`(${s.meterCount})`:"";
   const meters=s.meters||{};
   const mkeys=Object.keys(meters).sort();
-  document.getElementById("c-meters").innerHTML= mkeys.length?
+  setHTML(document.getElementById("c-meters"), mkeys.length?
     mkeys.map(k=>`<div class="row"><span class="mn">${esc(k)}</span><span class="mv">${esc(meters[k])}</span></div>`).join("")
-    : '<p class="none">no meters yet — hit “Pull meters” (may be ownership-gated)</p>';
+    : '<p class="none">no meters yet — hit “Pull meters” (may be ownership-gated)</p>');
 
   // ownership + devices
   const hi=s.hostItems||{};
@@ -274,7 +281,7 @@ function render(data){
   }).join("");
   const cfg=(s.configDevices||[]);
   const claim=(s.ownedClaim||[]);
-  document.getElementById("c-own").innerHTML=`
+  setHTML(document.getElementById("c-own"),`
     <div class="kv"><div class="k">commConfig stage</div><div class="v">${esc(s.commConfigStage||"—")}</div>
       <div class="k">config-sync devices</div><div class="v">${s.configDeviceCount}</div>
       <div class="k">descriptors</div><div class="v">${s.descriptorCount}</div></div>
@@ -283,35 +290,51 @@ function render(data){
     ${claim.length?`<h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">LAST CLAIM</h3>
       <div class="devlist">${claim.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}
     ${cfg.length?`<h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">CONFIG-SYNC INVENTORY</h3>
-      <div class="devlist">${cfg.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}`;
+      <div class="devlist">${cfg.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}`);
 
   // events
   document.getElementById("ecount").textContent=s.eventCount?`(${s.eventCount} total)`:"";
   const evs=(s.recentEvents||[]).slice().reverse();
-  document.getElementById("c-events").innerHTML= evs.length?
+  setHTML(document.getElementById("c-events"), evs.length?
     evs.map(e=>`<div class="ev cat-${esc(e.category||'other')}">
       <span class="ic">${esc(e.icon||'•')}</span>
       <span class="lb">${esc(e.label||e.eventCode)}
         <small>${esc(e.eventCode)} · ${esc(e.deviceClass)}/${esc(e.deviceId)}${e.affectedMeters?` · ${e.affectedMeters} meters`:""}${e.eventText?` · ${esc(e.eventText)}`:""}</small></span>
       <span class="tm">${esc(timeShort(e.seenAt))}</span></div>`).join("")
-    : '<p class="none">no events yet. On this AVP the event stream is gated behind ownership — run the ownership cycle, or trigger a door/bill once subscribed.</p>';
+    : '<p class="none">no events yet. On this AVP the event stream is gated behind ownership — run the ownership cycle, or trigger a door/bill once subscribed.</p>');
 }
 
+let LAST_ETAG=null;
 async function tick(){
+  // chained setTimeout (not setInterval) so a slow reply can never stack polls
+  const ac=(typeof AbortController!=="undefined")?new AbortController():null;
+  const to=ac?setTimeout(()=>ac.abort(), POLL_MS*5):null;
   try{
-    const r=await fetch("/api/status",{cache:"no-store"});
-    const data=await r.json();
-    render(data);
+    /* cache:"no-cache" (revalidate, NOT no-store) so the browser echoes the
+       hub's ETag and gets a 304 on an unchanged floor; when the reply's ETag
+       matches the last seen, skip json()+render entirely. */
+    const r=await fetch("/api/status",{cache:"no-cache", signal:ac?ac.signal:undefined});
+    const etag=r.headers.get("ETag");
+    if(!(etag && etag===LAST_ETAG)){
+      LAST_ETAG=etag;
+      const data=await r.json();
+      render(data);
+    }
     document.getElementById("poll").textContent="updated "+timeShort(new Date().toISOString());
   }catch(e){
+    // the conn pill goes healthy only inside render(), so drop the ETag:
+    // a recovery on an unchanged floor must re-render, not skip
+    LAST_ETAG=null;
     document.getElementById("poll").textContent="poll error";
     document.getElementById("conn").className="pill bad";
     document.getElementById("conn").textContent="host unreachable";
+  }finally{
+    clearTimeout(to);
+    setTimeout(tick, POLL_MS);
   }
 }
 renderPanel();
 tick();
-setInterval(tick,POLL_MS);
 </script>
 </body>
 </html>

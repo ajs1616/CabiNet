@@ -34,7 +34,7 @@ TIMING — the two hazards the adversarial review caught (both real):
    read(n) blocks for the whole overall timeout. And the spec's 20 ms is the
    machine's deadline to START its response, NOT the host's read-completion
    budget. So we: wait up to first_byte_timeout (default 50 ms, lenient — a
-   forgiving host is safe point-to-point) for byte 1, then read byte-by-byte
+   forgiving host is safe point-to-point) for byte 1, then drain the reply
    stopping on a >gap_timeout silence (the spec's own 5 ms inter-byte limit
    means a real gap = end of frame).
 
@@ -86,6 +86,11 @@ class SASSerialPort:
             stopbits=serial.STOPBITS_ONE,
             timeout=self.first_byte_timeout,
         )
+        # Mirrors the timeout the constructor just applied — every
+        # ser.timeout assignment walks pyserial's full port-reconfigure
+        # path, so _set_timeout skips no-ops against this (never queries
+        # the property).
+        self._last_timeout = self.first_byte_timeout
         # Critical for USB adapters: drop the latency timer from 16 ms to 1 ms
         # so the mid-frame parity switch stays under the 5 ms inter-byte limit
         # and the read window isn't eaten. Harmless / no-op on the Pi PL011.
@@ -151,24 +156,35 @@ class SASSerialPort:
             self._tx_busy_until = time.perf_counter() + 0.001
         # leave the port at SPACE for the read (machines reply wake-up clear)
 
+    def _set_timeout(self, value: float) -> None:
+        """Apply a read timeout, skipping the no-op case (see _open)."""
+        if value != self._last_timeout:
+            self.ser.timeout = value
+            self._last_timeout = value
+
     def read_response(self, max_bytes: int = 256) -> bytes:
         """Read a machine response: wait up to first_byte_timeout for the
-        first byte (the machine has 20 ms to START), then read byte-by-byte,
+        first byte (the machine has 20 ms to START), then drain the reply,
         ending when no further byte arrives within gap_timeout (the spec's
         >5 ms inter-byte gap means the frame is complete). Length-agnostic, so
         it works for 1-byte exception codes, 2-byte busy, and full frames."""
-        self.ser.timeout = self.first_byte_timeout
+        self._set_timeout(self.first_byte_timeout)
         first = self.ser.read(1)
         if not first:
             return b""
         out = bytearray(first)
-        self.ser.timeout = self.gap_timeout
+        self._set_timeout(self.gap_timeout)
         while len(out) < max_bytes:
-            b = self.ser.read(1)
+            # Drain whatever already arrived in ONE read (not a syscall per
+            # byte); only with an empty buffer fall back to a single
+            # gap-timed 1-byte read, so a >gap_timeout silence still
+            # terminates the frame exactly as before.
+            n = self.ser.in_waiting
+            b = self.ser.read(min(n, max_bytes - len(out)) or 1)
             if not b:
                 break          # inter-byte gap exceeded -> end of frame
             out += b
-        self.ser.timeout = self.first_byte_timeout
+        self._set_timeout(self.first_byte_timeout)
         return bytes(out)
 
     def transact(self, frame: bytes, max_bytes: int = 256) -> bytes:
@@ -182,7 +198,7 @@ class SASSerialPort:
         to catch the 'chirp' (a lone address byte every ~200 ms after 5 s of
         host silence), which proves the RX path and wake-up framing are good
         independent of our TX."""
-        self.ser.timeout = duration
+        self._set_timeout(duration)
         return self.ser.read(64)
 
     def close(self) -> None:

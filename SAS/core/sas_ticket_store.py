@@ -111,6 +111,11 @@ class TicketStore:
     def __init__(self, path: str = DEFAULT_TICKET_STORE_PATH):
         self.path = path
         self.lock = threading.Lock()
+        # In-memory mutation counter: readers (the HubReporter ticket
+        # summary) cache derived views and rebuild only when this moved.
+        # Bumped by _save_locked — the one seam every mutating path
+        # already goes through. Never persisted.
+        self.revision = 0
         self.state = {"ticketSeq": 0, "tickets": {},
                       "validationSeq": 0, "pendingValidations": {}}
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -148,6 +153,10 @@ class TicketStore:
         OSError). The recorder paths (record_issued/close_redemption) may
         ignore the result and continue in memory, but the MINT must not — it
         rolls back and refuses to hand out a number it could not persist."""
+        # Bump BEFORE the write attempt: the in-memory state has already
+        # changed even when the disk write fails, so caches must invalidate
+        # either way (a spurious bump only costs one rebuild).
+        self.revision += 1
         try:
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:

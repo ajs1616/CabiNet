@@ -212,7 +212,20 @@ class SASPoller:
         nothing answers — but it both resets a desynced machine's poll-state
         counter AND serves as the implied ACK for a prior general-poll
         response (it is a poll to a 'different address')."""
-        self.transport.transact(self.protocol.build_general_poll(0))
+        frame = self.protocol.build_general_poll(0)
+        send = getattr(self.transport, "send_frame", None)
+        if send is None:
+            # transports exposing only transact() (bench/replay shims)
+            self.transport.transact(frame)
+            return
+        # Since nothing can answer address 0, transact()'s read window is
+        # pure dead time (the full 50 ms first-byte timeout, charged per
+        # _drain_fifo iteration and per resync). Send-only, with NO settle
+        # sleep: send_frame's own _tx_busy_until pacing already holds the
+        # NEXT frame until this one has cleared the shifter, and SAS frame
+        # starts are marked by the wake-up bit, not by wire silence — so
+        # back-to-back polls are the normal multidrop shape.
+        send(frame)
 
     def _general_poll(self) -> Optional[int]:
         frame = self.protocol.build_general_poll(self.address)

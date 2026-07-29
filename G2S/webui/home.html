@@ -1195,7 +1195,7 @@ function uiStampCheck(s){
     +'<button onclick="location.reload()">reload</button> for the new version';
   document.body.appendChild(b);
 }
-let statusInFlight=false, statusSeq=0;
+let statusInFlight=false, statusSeq=0, statusEtag=null;
 async function tickStatus(){
   // guard against a slow phone/Pi: never let polls stack up behind each other
   if(statusInFlight) return;
@@ -1203,6 +1203,7 @@ async function tickStatus(){
   const mySeq=++statusSeq;
   const ac=(typeof AbortController!=="undefined")?new AbortController():null;
   const to=ac?setTimeout(()=>ac.abort(), POLL_MS*5):null;
+  let repaint=true;
   try{
     /* D13: the 2s heartbeat polls the SLIM view (the hub drops the
        meterSubs/configOptions/configDevices whales, filters meters to the
@@ -1215,16 +1216,30 @@ async function tickStatus(){
        unchanged floor — the multi-MB body stays off the wire, while a
        real data change still returns a fresh 200. An old hub ignores
        ?slim=1 and serves full. */
-    const r=await fetch(GM.egm?"/api/status":"/api/status?slim=1",
-      {cache:"no-cache", signal:ac?ac.signal:undefined});
-    const j=await r.json();
-    if(mySeq!==statusSeq) return; // a newer poll superseded this one — drop the stale reply
-    S.status=j;
-    S.statusErr=false;
-    uiStampCheck(j.uiStamp);
-    sasResultCheck(j);
-    keyOffCheck(j);
-    const p=$("poll"); p.className="ok"; $("poll-t").textContent="live";
+    const url=GM.egm?"/api/status":"/api/status?slim=1";
+    const r=await fetch(url, {cache:"no-cache", signal:ac?ac.signal:undefined});
+    // a 304 revalidate hands back the SAME cached body — re-parsing the
+    // multi-MB JSON every 2s just to land on identical state is the CPU
+    // whale. ETag keyed by url (slim vs full bodies differ) unchanged =
+    // skip the parse/repaint; the successful poll alone feeds the pill.
+    const et=r.headers.get("ETag");
+    const etKey=et?url+"\n"+et:null;
+    if(etKey && etKey===statusEtag && S.status){
+      if(mySeq!==statusSeq) return; // a newer poll superseded this one — drop the stale reply
+      S.statusErr=false;
+      const p=$("poll"); p.className="ok"; $("poll-t").textContent="live";
+      repaint=false;
+    }else{
+      const j=await r.json();
+      if(mySeq!==statusSeq) return; // a newer poll superseded this one — drop the stale reply
+      statusEtag=etKey;
+      S.status=j;
+      S.statusErr=false;
+      uiStampCheck(j.uiStamp);
+      sasResultCheck(j);
+      keyOffCheck(j);
+      const p=$("poll"); p.className="ok"; $("poll-t").textContent="live";
+    }
   }catch(e){
     if(mySeq===statusSeq){
       S.statusErr=true;
@@ -1235,7 +1250,7 @@ async function tickStatus(){
     statusInFlight=false;
   }
   tabBadges();
-  renderActive();
+  if(repaint) renderActive();
 }
 function renderActive(){
   if(!S.status) return;

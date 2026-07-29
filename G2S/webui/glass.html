@@ -630,7 +630,19 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var hpCanClear = false;            // handpay CLEAR button gate (from the view)
 
   function $(id) { return document.getElementById(id); }
-  function setText(id, s) { $(id).textContent = s; }
+  function setText(id, s) {
+    // WebKit534 leaks on DOM churn (see hello.html) — the 1.5s poll repaints
+    // the SAME strings all night, so never touch the node when the text
+    // already matches. Idle polls must write zero DOM.
+    var el = $(id), f = el.firstChild;
+    if (f && f.nodeValue === s) { return; }
+    if (!f && (s === '' || s === null || s === undefined)) { return; }
+    el.textContent = s;
+  }
+  function setStyle(el, prop, v) {
+    // compare-before-write: same DOM-churn leak as setText, for inline styles
+    if (el.style[prop] !== v) { el.style[prop] = v; }
+  }
 
   // ---- view switching: pure display flips, no layout churn --------------
   var VIEWS = ['attract', 'home', 'stub', 'wallet', 'machine', 'logout',
@@ -845,36 +857,36 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     else if (bl > 14) { bFont = '18px'; bTrack = '2px'; }
     else if (bl > 11) { bFont = '22px'; bTrack = '3px'; }
     else if (bl > 9)  { bFont = '28px'; bTrack = '4px'; }
-    bEl.style.fontSize = bFont;
-    bEl.style.letterSpacing = bTrack;
+    setStyle(bEl, 'fontSize', bFont);
+    setStyle(bEl, 'letterSpacing', bTrack);
     setText('at-nick', place);
     setText('ph-hello', 'Hello ' + (who || 'Player'));
     setText('ph-nick', place);
     setText('ph-credits', credits ? ('CREDITS  ' + credits) : '');
-    $('ph-credits').style.display = credits ? 'block' : 'none';
-    $('ph-credits').style.fontSize =
-      (credits && credits.length > 14) ? '13px' : '17px';
+    setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
+    setStyle($('ph-credits'), 'fontSize',
+      (credits && credits.length > 14) ? '13px' : '17px');
     setText('wl-bal', credits || '\u2014');
     // the 232px column clips silently past ~$1M at 40px bold, so step
     // the font DOWN on long balances: every digit stays on the glass
     var wlLen = (credits || '\u2014').length;
-    $('wl-bal').style.fontSize =
+    setStyle($('wl-bal'), 'fontSize',
       wlLen <= 11 ? '40px' : wlLen <= 13 ? '32px'
-        : wlLen <= 16 ? '26px' : '20px';
+        : wlLen <= 16 ? '26px' : '20px');
     // footer = just the gameroom name (the raw UTC "in since HH:MM" was
     // confusing to players and served no purpose \u2014 dropped 2026-07-14)
     setText('ph-foot', brand);
     // ADMIN badge + the backend button stack: shown as one set off "admin"
-    $('hm-badge').style.display = admin ? 'block' : 'none';
+    setStyle($('hm-badge'), 'display', admin ? 'block' : 'none');
     for (var ai = 0; ai < ADMIN_BTNS.length; ai++) {
-      $(ADMIN_BTNS[ai]).style.display = admin ? 'block' : 'none';
+      setStyle($(ADMIN_BTNS[ai]), 'display', admin ? 'block' : 'none');
     }
     // ADMIN OVERLAY: hide the money buttons (MY WALLET / CASH OUT) so a
     // supervisor stacked over a friend can't reach the friend's wallet, and
     // relabel the badge + LOG OUT (its POST ends the overlay, not a card-out).
     // The hub also 403s wallet verbs on an overlay token (defense in depth).
-    $('hb-wallet').style.display = overlay ? 'none' : 'block';
-    $('hb-cashout').style.display = overlay ? 'none' : 'block';
+    setStyle($('hb-wallet'), 'display', overlay ? 'none' : 'block');
+    setStyle($('hb-cashout'), 'display', overlay ? 'none' : 'block');
     setText('hb-logout', overlay ? 'DONE' : 'LOG OUT');
     setText('hm-badge', overlay
       ? ('SUPERVISOR' + (supervising ? (' · ' + supervising +
