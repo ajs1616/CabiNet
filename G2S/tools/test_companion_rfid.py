@@ -17,6 +17,14 @@ Covers:
     class wrapper, deviceId/sessionType/timeToLive framing, label.
   * companion_report — registration, heartbeat, tap clamps (max 32, junk
     dropped), ack watermark dedupe, startedAt-reset replay, registry cap.
+  * piTail — the board-identity join key, end to end: the Companion daemon
+    omits it off a Pi, the hub clamps both daemons' reports to 6 lowercase
+    hex or stores nothing, and a hand-named SAS leg (smib-bb2) pairs with
+    its reader on the tail alone.
+  * the announce — sshUser / model / uartReady / i2cBus: the daemon says who
+    it runs as and what the board is, the hub keeps only what it was actually
+    told (junk and silence both read "unknown", never a capability), and the
+    reported login survives find_companions into deploy/update.py's ssh.
   * the tap -> carded-session state machine — card-in / re-tap card-out /
     card-switch (out then in, FIFO order), plus every honest-skip
     precondition (unknown fob, no binding, offline machine, no owned
@@ -32,17 +40,42 @@ Run from G2S/:  python3 tools/test_companion_rfid.py
 Must end "RESULT: N passed, 0 failed".
 """
 
+import getpass
 import itertools
+import json
 import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+G2S_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, G2S_DIR)
 import g2s_host as gh  # noqa: E402
+# The REAL v14 registry for the devices fold: that fold reads back what the
+# report path wrote, so a fake on both ends would only prove the fake. Built
+# on a tempfile — GR-04, G2S/data is never opened here.
+from hub_store import HubStore  # noqa: E402
+
+# The Companion DAEMON's half of the wire, asserted here alongside the hub's:
+# piTail only joins a board's two legs if the sender and the receiver agree on
+# it, and this is the one gate that sees both ends. Imported AFTER g2s_host so
+# the hub tree keeps first claim on every module name; safe to import at all
+# because the daemon is stdlib-only (reader.py included) — the
+# test_cabinetconfig cross-tree idiom.
+sys.path.insert(0, os.path.join(os.path.dirname(G2S_DIR), "Companion"))
+import companion_host as ch  # noqa: E402
+
+# The UPDATER's half: the reported login only matters if it survives all the
+# way to the ssh call, and find_companions is the one hop that used to drop it
+# (leaving every reader adopted under another username "NOT updated" forever).
+# Same cross-tree idiom, same reason it is safe: update.py is stdlib-only and
+# does nothing at import but define constants and functions.
+sys.path.insert(0, os.path.join(os.path.dirname(G2S_DIR), "deploy"))
+import update as upd  # noqa: E402
 
 logging.disable(logging.CRITICAL)   # the checks print, the engine doesn't
 
@@ -99,6 +132,8 @@ class FakeHubStore:
         self.nicks = {}          # machineKey -> nickname (registered-name signal)
         self.registry = []       # machines() rows (boot-seed source)
         self.settings = {}       # hub-wide host settings (gameroom_name, …)
+        self.devices = {}        # v14 device rows (deviceTail -> wire dict)
+        self.sats = {}           # v14 satellites rows the board attach writes
 
     def fob_get(self, uid):
         self.gets.append(uid)
@@ -127,6 +162,51 @@ class FakeHubStore:
 
     def set_host_setting(self, key, value):
         self.settings[key] = value
+
+    # --- the sas_report surface (piTail rides the SAS leg too) --------------
+    def machine_prefs(self, machine_key):
+        # operator prefs per SAS machine key; empty = every default
+        return {}
+
+    def touch_machine(self, *a, **kw):
+        # registered-fleet upsert — a no-op here, the ledger is hub_store's
+        pass
+
+    def ticket_header(self, *a, **kw):
+        # hub-wide printed-voucher branding; propName unset = never pushed
+        return {"propName": None, "rev": 0}
+
+    # --- the v14 device registry surface _touch_device writes through -------
+    # Every report now carries a board touch, so this stands in for the real
+    # table (which test_hub_store.py gates against real SQL). Same contract:
+    # None = keep, seen=False leaves lastSeen alone.
+    def device_set(self, device_tail, label=None, model=None, ssh_user=None,
+                   last_ip=None, meta=None, seen=True):
+        row = self.devices.setdefault(
+            device_tail, {"deviceTail": device_tail, "label": "",
+                          "model": None, "sshUser": None, "lastIp": None,
+                          "firstSeen": "2026-07-30T00:00:00",
+                          "lastSeen": "2026-07-30T00:00:00", "meta": {}})
+        for k, v in (("label", label), ("model", model),
+                     ("sshUser", ssh_user), ("lastIp", last_ip)):
+            if v is not None:
+                row[k] = v
+        if meta is not None:
+            row["meta"] = dict(meta)
+        if seen:
+            row["lastSeen"] = "2026-07-30T00:00:01"
+        return dict(row), None
+
+    def device_all(self):
+        return [dict(r) for r in self.devices.values()]
+
+    def sat_set(self, sat_id, device_tail=None, **kw):
+        row = self.sats.setdefault(sat_id, {"satId": sat_id, "label": "",
+                                            "deviceTail": None})
+        if device_tail is not None:
+            row["deviceTail"] = device_tail or None
+        row.update(kw)
+        return dict(row), None
 
 
 class FakeConfigStore:
@@ -177,6 +257,10 @@ def make_engine(fobs=None, accounts=None, assoc=None):
     # consults (empty = every companion resolves to its REPORTED binding, the
     # pre-v11 behavior this suite locks in). Assignment-override cases set it.
     eng.sat_bindings = {}
+    # v14 device registry surface: the per-board hub.db touch throttle every
+    # report now runs through, and the lock its satellites half writes under.
+    eng._device_touched = {}
+    eng._sat_write_lock = threading.Lock()
     # Glass-nav v1 surface the carded-session tap path now touches (added to
     # production after this harness was first written). Real GlassSessionStore
     # (mint/revoke are self-contained + cheap) + the cash-out-pin state
@@ -197,6 +281,11 @@ def make_engine(fobs=None, accounts=None, assoc=None):
     # config signal), the registry-touch throttle map the teardown clears.
     eng.config_store = FakeConfigStore()
     eng._registry_touched = {}
+    # sas_report surface (the piTail cases drive a SAS leg through the same
+    # engine): the two TTL caches it reads on the per-second report path. Both
+    # seeded EMPTY so the first read goes to FakeHubStore, like production.
+    eng._sysval_cache = (None, 0.0)
+    eng._ticket_cache = (None, 0.0)
     eng.sent = []
     eng._enqueue = lambda assoc, build, settle=0.0, epoch=None: \
         eng.sent.append(build(assoc))
@@ -205,13 +294,25 @@ def make_engine(fobs=None, accounts=None, assoc=None):
     return eng
 
 
+#: pi_tail=ABSENT means the key never appears in the payload at all — the
+#: shape a pre-1.1 daemon (and any daemon off a Pi) sends, and the DEFAULT
+#: here so every pre-existing case keeps asserting that shape.
+ABSENT = object()
+
+
 def report(eng, taps=(), comp="companion-bb2",
            started="2026-07-10T00:00:00Z", g2s=EGM, smib=None,
-           reader_ok=True, peer="192.168.60.87"):
-    return eng.companion_report(
-        {"companionId": comp, "startedAt": started, "uptimeSec": 12.5,
-         "readerOk": reader_ok, "g2sEgmId": g2s, "sasSmib": smib,
-         "sasAddress": "1", "taps": list(taps), "lastError": None}, peer)
+           reader_ok=True, peer="192.168.60.87", pi_tail=ABSENT, **fields):
+    """One daemon report. **fields go onto the payload VERBATIM under their
+    wire names (sshUser / model / uartReady / i2cBus …) and are absent by
+    default, so every pre-existing case keeps asserting the older shape."""
+    body = {"companionId": comp, "startedAt": started, "uptimeSec": 12.5,
+            "readerOk": reader_ok, "g2sEgmId": g2s, "sasSmib": smib,
+            "sasAddress": "1", "taps": list(taps), "lastError": None}
+    if pi_tail is not ABSENT:
+        body["piTail"] = pi_tail
+    body.update(fields)
+    return eng.companion_report(body, peer)
 
 
 def tap(n, uid=UID, at="2026-07-10T01:02:03.000Z"):
@@ -233,6 +334,164 @@ def xml_attrs(xml):
 def attr(xml, name):
     m = re.search(rf'g2s:{name}="([^"]*)"', xml)
     return m.group(1) if m else None
+
+
+def devices_fold():
+    """The /api/status 'devices' fold: ONE row per physical Pi.
+
+    A collector's box runs several role daemons, each reporting under its own
+    id (companion-a3f2b1 beside a hand-named smib-bb2), so the floor showed one
+    box as several strangers. These cases pin the join — on piTail, never on an
+    id string — and the two rules that make the page honest: a board that stops
+    reporting keeps its row, and a board nothing is set up on is still a row.
+    """
+    eng = make_engine()
+    eng.hub_store = HubStore(os.path.join(tempfile.mkdtemp(), "hub.db"))
+    eng.sat_bindings = eng.hub_store.sat_bindings()
+
+    def fold(e=None):
+        e = e or eng
+        return e.devices_snapshot(e.companion_snapshot(), e.sas_snapshot())
+
+    print("— one box, one row: the devices fold")
+    # AJ's BB2: a reader named from the silicon beside a HAND-NAMED SAS leg,
+    # both on one Pi. Nothing but the tail can pair them.
+    report(eng, comp="companion-a3f2b1", pi_tail="a3f2b1",
+           peer="192.168.50.102", sshUser="gameroom",
+           model="Raspberry Pi Zero 2 W Rev 1.0", uartReady=True,
+           i2cBus="/dev/i2c-11")
+    eng.sas_report({"smibId": "smib-bb2", "address": "1", "online": True,
+                    "piTail": "A3F2B1", "sshUser": "gameroom"},
+                   "192.168.50.102")
+    d = fold()
+    check("two daemons, two ids, ONE row — the box is the row",
+          list(d) == ["a3f2b1"], list(d))
+    row = d["a3f2b1"]
+    check("both roles hang off that one row",
+          sorted(row["roles"]) == ["reader", "sas"], sorted(row["roles"]))
+    check("the SAS role carries the hand-named leg and its machine",
+          row["roles"]["sas"]["id"] == "smib-bb2"
+          and row["roles"]["sas"]["machines"] == ["smib-bb2/1"]
+          and row["roles"]["sas"]["ok"] is True)
+    check("the reader role carries its own id and its own health",
+          row["roles"]["reader"]["id"] == "companion-a3f2b1"
+          and row["roles"]["reader"]["ok"] is True)
+    check("the board's own facts land ONCE, on the board",
+          row["model"] == "Raspberry Pi Zero 2 W Rev 1.0"
+          and row["ip"] == "192.168.50.102" and row["sshUser"] == "gameroom"
+          and row["uartReady"] is True and row["i2cBus"] == "/dev/i2c-11")
+    check("an unnamed board reads as a Pi, never as a bare serial",
+          row["label"] == "New Pi (a3f2b1)" and row["named"] is False)
+    check("a board that is reporting is not stale", row["stale"] is False)
+    eng.sas_report({"smibId": "smib-nopi", "address": "1", "online": True},
+                   "192.168.50.109")
+    check("a leg that reports no tail joins NOTHING — a guess would fuse "
+          "two boards forever",
+          list(fold()) == ["a3f2b1"] and "smib-nopi/1" in eng.sas_snapshot())
+
+    saved = eng.hub_store.device_get("a3f2b1")
+    check("the report persists what the board said about itself",
+          saved is not None
+          and saved["model"] == "Raspberry Pi Zero 2 W Rev 1.0"
+          and saved["sshUser"] == "gameroom"
+          and saved["lastIp"] == "192.168.50.102"
+          and saved["meta"] == {"uartReady": True, "i2cBus": "/dev/i2c-11"},
+          saved)
+    check("a report never NAMES a board — naming is the operator's",
+          saved["label"] == "")
+
+    print("— the row never vanishes: power pulled, then the hub restarted")
+    with eng.companion_lock:
+        eng.companions["companion-a3f2b1"]["lastSeen"] -= 3600
+    with eng.sas_lock:
+        eng.sas_machines["smib-bb2/1"]["receivedAt"] -= 3600
+    d = fold()
+    check("power pulled: the row STAYS, marked stale",
+          list(d) == ["a3f2b1"] and d["a3f2b1"]["stale"] is True
+          and sorted(d["a3f2b1"]["roles"]) == ["reader", "sas"]
+          and d["a3f2b1"]["roles"]["sas"]["stale"] is True)
+    check("...and a dark board still knows which board it is",
+          d["a3f2b1"]["model"] == "Raspberry Pi Zero 2 W Rev 1.0"
+          and d["a3f2b1"]["ip"] == "192.168.50.102")
+    # a hub restart with the Pi still unplugged: the role registries are
+    # memory, so the hub.db row is the ONLY reason the board is still there
+    eng2 = make_engine()
+    eng2.hub_store = HubStore(eng.hub_store.path)
+    eng2.sat_bindings = eng2.hub_store.sat_bindings()
+    d2 = eng2.devices_snapshot({}, {})
+    check("a dark board survives a hub restart with NO roles reporting",
+          list(d2) == ["a3f2b1"] and d2["a3f2b1"]["roles"] == {}
+          and d2["a3f2b1"]["stale"] is True
+          and d2["a3f2b1"]["reportAgeSec"] is None)
+    check("a board with no roles yet is a valid row, dated by hub.db",
+          d2["a3f2b1"]["ip"] == "192.168.50.102"
+          and isinstance(d2["a3f2b1"]["lastSeen"], str))
+
+    print("— the name: the board's own, then the legacy leg's, then neither")
+    eng.hub_store.sat_set("companion-a3f2b1", kind="companion",
+                          label="The Bluebird")
+    eng.sat_bindings = eng.hub_store.sat_bindings()
+    check("a leg named before v14 is attached to no board yet",
+          eng.hub_store.sat_get("companion-a3f2b1")["deviceTail"] is None)
+    eng._device_touched.clear()            # a minute passes
+    report(eng, comp="companion-a3f2b1", pi_tail="a3f2b1",
+           peer="192.168.50.102")
+    check("the next report attaches that leg to its board, id untouched",
+          eng.hub_store.sat_get("companion-a3f2b1")["deviceTail"] == "a3f2b1"
+          and eng.hub_store.sat_get("companion-a3f2b1")["satId"]
+          == "companion-a3f2b1")
+    check("a name given to the LEG becomes the board's name",
+          fold()["a3f2b1"]["label"] == "The Bluebird"
+          and fold()["a3f2b1"]["named"] is True)
+    eng.hub_store.device_set("a3f2b1", label="Bar Top Pi", seen=False)
+    check("the board's OWN name outranks the legacy leg name",
+          fold()["a3f2b1"]["label"] == "Bar Top Pi")
+
+    print("— the shapes a collector's floor actually makes")
+    engn = make_engine()
+    report(engn, comp="companion-a1b2c3", pi_tail="a1b2c3",
+           peer="192.168.50.147", reader_ok=False,
+           model="Raspberry Pi 3 Model A Plus Rev 1.0")
+    dn = fold(engn)["a1b2c3"]
+    check("a freshly flashed Pi is a row: powered on, nothing set up yet",
+          dn["label"] == "New Pi (a1b2c3)" and dn["stale"] is False
+          and dn["roles"]["reader"]["ok"] is False
+          and dn["model"] == "Raspberry Pi 3 Model A Plus Rev 1.0")
+    engm = make_engine()
+    for a in ("1", "2"):
+        engm.sas_report({"smibId": "smib-bar", "address": a, "online": True,
+                         "piTail": "d0d0d0"}, "192.168.50.55")
+    dm = fold(engm)
+    check("a multidrop Pi is ONE board with ONE role serving two machines",
+          list(dm) == ["d0d0d0"]
+          and sorted(dm["d0d0d0"]["roles"]) == ["sas"]
+          and dm["d0d0d0"]["roles"]["sas"]["machines"]
+          == ["smib-bar/1", "smib-bar/2"])
+
+    print("— bounded, ordered, and it never takes the poll down with it")
+    engc = make_engine()
+    engc.hub_store = HubStore(os.path.join(tempfile.mkdtemp(), "hub.db"))
+    for i in range(gh.G2SHost.COMPANION_MAX):
+        engc.hub_store.device_set("%06x" % i, label="dark %d" % i)
+    report(engc, comp="companion-ffffff", pi_tail="ffffff",
+           peer="192.168.50.9")
+    d3 = fold(engc)
+    check("bounded at COMPANION_MAX — the companion registry's own ceiling",
+          len(d3) == gh.G2SHost.COMPANION_MAX, len(d3))
+    check("...and the board that is REPORTING is the one that survives",
+          "ffffff" in d3 and d3["ffffff"]["stale"] is False)
+    check("rows come out in tail order (the ETag must not churn on order)",
+          list(d3) == sorted(d3))
+    body = json.dumps(d3, separators=(",", ":"))
+    check("a full section stays a rounding error beside one machine tile",
+          len(body) < 4096, len(body))
+    engf = make_engine()
+    engf.hub_store.device_all = lambda: (_ for _ in ()).throw(
+        RuntimeError("db down"))
+    report(engf, comp="companion-b0b0b0", pi_tail="b0b0b0")
+    d4 = fold(engf)
+    check("a registry read fault costs the persisted half, never the poll",
+          list(d4) == ["b0b0b0"] and d4["b0b0b0"]["named"] is False)
 
 
 def main():
@@ -383,6 +642,169 @@ def main():
           r == {"ok": True, "ackTapId": 32}, r)
     r = report(eng, taps="notalist")
     check("non-list taps -> heartbeat", r == {"ok": True, "ackTapId": 32})
+
+    print("— piTail on the wire: the Companion daemon's half")
+    d = ch.CompanionHost(reader=None, hub_url="http://hub:8081",
+                         companion_id="companion-a3f2b1")
+    d.pi_tail = "a3f2b1"
+    check("the daemon puts its board's tail on every report",
+          d.snapshot(0.0).get("piTail") == "a3f2b1")
+    d.pi_tail = None
+    check("off a Pi the key is ABSENT — never null, never the hostname",
+          "piTail" not in d.snapshot(0.0))
+    check("the tail is derived, never minted: no tail, no invented id",
+          d.snapshot(0.0)["companionId"] == "companion-a3f2b1")
+
+    print("— piTail on the wire: the hub clamps, or stores nothing")
+    engp = make_engine()
+    report(engp, pi_tail="A3F2B1")
+    check("a reported tail lands canonical (lowercase 6 hex)",
+          engp.companion_snapshot()["companion-bb2"]["piTail"] == "a3f2b1")
+    report(engp, pi_tail="  a3f2b1  ")
+    check("surrounding space stripped — still the same board",
+          engp.companion_snapshot()["companion-bb2"]["piTail"] == "a3f2b1")
+    # A GUESS here is worse than a blank: the tail is a device PRIMARY KEY, so
+    # a hostname or a truncated id admitted once would bind two boards into one
+    # row forever. Everything that is not exactly 6 hex stores nothing.
+    for junk, why in (("smib-bb2", "a hand-named id"),
+                      ("Office-PC", "a hostname"),
+                      ("a3f2b", "5 hex"),
+                      ("a3f2b1c", "7 hex"),
+                      ("g3f2b1", "not hex"),
+                      ("", "empty"),
+                      (None, "null"),
+                      (123456, "not a string"),
+                      (["a3f2b1"], "a list")):
+        report(engp, pi_tail=junk)
+        check("%s stores NOTHING rather than a guess" % why,
+              engp.companion_snapshot()["companion-bb2"]["piTail"] is None,
+              repr(junk))
+    engq = make_engine()
+    r = report(engq)                     # pre-1.1 daemon: no piTail key at all
+    check("a report with no piTail is still a normal report",
+          r == {"ok": True, "ackTapId": -1} and
+          engq.companion_snapshot()["companion-bb2"]["piTail"] is None)
+
+    print("— piTail on the wire: one board, two daemons, one key")
+    # AJ's BB2: a HAND-NAMED SAS leg (smib-bb2 — its id carries no tail
+    # anywhere) beside a reader named from the silicon. Nothing but piTail can
+    # pair them, which is the whole reason this field exists.
+    engj = make_engine()
+    report(engj, comp="companion-a3f2b1", pi_tail="a3f2b1",
+           peer="192.168.50.102")
+    engj.sas_report({"smibId": "smib-bb2", "address": "1", "online": True,
+                     "piTail": "A3F2B1", "sshUser": "gameroom"},
+                    "192.168.50.102")
+    csnap = engj.companion_snapshot()["companion-a3f2b1"]
+    ssnap = engj.sas_snapshot()["smib-bb2/1"]
+    check("the SAS leg's tail lands canonical on its snapshot too",
+          ssnap.get("piTail") == "a3f2b1", ssnap.get("piTail"))
+    check("the hand-named leg and the reader carry the SAME tail",
+          csnap["piTail"] == ssnap["piTail"] == "a3f2b1" and
+          "a3f2b1" not in ssnap["smibId"])
+    engj.sas_report({"smibId": "smib-bb2", "address": "1", "online": True,
+                     "piTail": "smib-bb2"}, "192.168.50.102")
+    check("a junk tail leaves the SAS entry with NO piTail at all",
+          "piTail" not in engj.sas_snapshot()["smib-bb2/1"])
+    engj.sas_report({"smibId": "smib-nopi", "address": "1", "online": True},
+                    "192.168.50.109")
+    check("a SAS leg that reports no piTail is still a normal machine",
+          "piTail" not in engj.sas_snapshot()["smib-nopi/1"] and
+          engj.sas_snapshot()["smib-nopi/1"]["stale"] is False)
+
+    print("— the announce: who this Pi is, and what a role would find")
+    d = ch.CompanionHost(reader=None, hub_url="http://hub:8081",
+                         companion_id="companion-a3f2b1")
+    check("the daemon reports the login it runs as — the hub stops guessing",
+          d.snapshot(0.0)["sshUser"] == getpass.getuser())
+    # These four are NOT piTail: they ride EVERY report, null when unknown,
+    # because "we looked and could not tell" is an answer a role prompt has to
+    # be able to show. Only the join key is absent-when-unknown.
+    d.ssh_user = d.model = d.i2c_bus = None
+    d.uart_ready = False
+    snap = d.snapshot(0.0)
+    check("found nothing -> the keys still ride, as null (never absent)",
+          all(k in snap for k in ("sshUser", "model", "uartReady", "i2cBus"))
+          and snap["sshUser"] is None and snap["model"] is None
+          and snap["i2cBus"] is None)
+    d.reader_ok = False
+    check("a board with NO PN532 attached still announces what it is",
+          d.snapshot(0.0)["readerOk"] is False and "model" in d.snapshot(0.0))
+    # The real probes, on whatever this gate runs on (the hub IS a Pi; a bench
+    # box is not): the contract is that they never raise and never invent.
+    m, u, b = ch._pi_model(), ch._uart_ready(), ch._i2c_bus()
+    check("the probes never raise off a Pi, and never invent a value",
+          (m is None or isinstance(m, str)) and isinstance(u, bool)
+          and (b is None or b.startswith("/dev/i2c-")), (m, u, b))
+
+    print("— the announce: the hub keeps the truth, or keeps nothing")
+    enga = make_engine()
+    report(enga, sshUser="gameroom", model="Raspberry Pi Zero 2 W Rev 1.0",
+           uartReady=True, i2cBus="/dev/i2c-11")
+    c = enga.companion_snapshot()["companion-bb2"]
+    check("the reported login lands on the snapshot update.py reads",
+          c["sshUser"] == "gameroom", c.get("sshUser"))
+    check("model / uartReady / i2cBus land as reported",
+          c["model"] == "Raspberry Pi Zero 2 W Rev 1.0"
+          and c["uartReady"] is True and c["i2cBus"] == "/dev/i2c-11")
+    report(enga, sshUser="  gameroom  ")
+    check("surrounding space stripped off the login",
+          enga.companion_snapshot()["companion-bb2"]["sshUser"] == "gameroom")
+    for junk, why in (("", "an empty login"),
+                      ("   ", "a whitespace-only login"),
+                      (None, "a null login"),
+                      (1000, "a uid instead of a name"),
+                      (["pi"], "a list where the name goes")):
+        report(enga, sshUser=junk)
+        check("%s stores NOTHING rather than a guess" % why,
+              enga.companion_snapshot()["companion-bb2"]["sshUser"] is None,
+              repr(junk))
+    # uartReady is the one field a collector would ACT on ("wire the machine
+    # to this one"), so only a real bool counts — everything else is unknown.
+    for junk in ("true", 1, "yes", [], {}):
+        report(enga, uartReady=junk)
+        check("uartReady=%r reads as unknown, never as ready" % (junk,),
+              enga.companion_snapshot()["companion-bb2"]["uartReady"] is None)
+    report(enga, uartReady=False)
+    check("uartReady=false SURVIVES — 'no' is not 'we never asked'",
+          enga.companion_snapshot()["companion-bb2"]["uartReady"] is False)
+    report(enga, sshUser="u" * 200, model="m" * 200,
+           i2cBus="/dev/i2c-" + "9" * 200)
+    c = enga.companion_snapshot()["companion-bb2"]
+    check("an oversized report is clamped, not refused",
+          len(c["sshUser"]) == 64 and len(c["model"]) == 64
+          and len(c["i2cBus"]) == 32)
+    engb = make_engine()
+    r = report(engb)                     # pre-0.2 daemon: none of the keys
+    c = engb.companion_snapshot()["companion-bb2"]
+    check("a pre-0.2 daemon is still a normal reader, all four null",
+          r == {"ok": True, "ackTapId": -1} and c["sshUser"] is None
+          and c["model"] is None and c["uartReady"] is None
+          and c["i2cBus"] is None)
+
+    print("— the announce: the login reaches deploy/update.py")
+    engu = make_engine()
+    report(engu, comp="companion-a3f2b1", sshUser="gameroom",
+           peer="192.168.50.101")
+    found = upd.find_companions({"companions": engu.companion_snapshot()})
+    check("find_companions carries the reported login through",
+          len(found) == 1 and found[0]["user"] == "gameroom", found)
+    check("...and sat_user hands THAT to ssh, not the hub's own login",
+          upd.sat_user(found[0]) == "gameroom"
+          and upd.sat_user({}) == upd.SAT_USER)
+    was = upd.SAT_USER_OVERRIDE
+    upd.SAT_USER_OVERRIDE = "operator"
+    try:
+        check("an explicit --ssh-user still outranks it (authority order)",
+              upd.sat_user(found[0]) == "operator")
+    finally:
+        upd.SAT_USER_OVERRIDE = was
+    engv = make_engine()
+    report(engv, comp="companion-old", peer="192.168.50.109")
+    older = upd.find_companions({"companions": engv.companion_snapshot()})
+    check("a reader too old to report one falls back, never crashes",
+          older[0]["user"] is None
+          and upd.sat_user(older[0]) == upd.SAT_USER)
 
     print("— carded session: in / re-tap out / switch / values")
     a = FakeAssoc()
@@ -846,6 +1268,8 @@ def main():
     gst3 = engG.glass_state(EGM)
     check("a host_setting fault degrades gameroom to '' (poll never 500s)",
           gst3.get("ok") is True and gst3.get("gameroom") == "")
+
+    devices_fold()
 
     print(f"\nRESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

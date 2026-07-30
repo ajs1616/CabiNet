@@ -14,9 +14,9 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hub_store import (FOB_TIERS, HubStore, MAX_DENOM_CENTS,  # noqa: E402
-                       MAX_FOB_LABEL_LEN, MAX_FOBS, MAX_GAME_KEY_LEN,
-                       MAX_GAME_NAMES, MAX_GAME_TITLE_LEN, MAX_MACHINES,
-                       MAX_SATELLITES, MAX_SETTING_VAL_LEN,
+                       MAX_DEVICES, MAX_FOB_LABEL_LEN, MAX_FOBS,
+                       MAX_GAME_KEY_LEN, MAX_GAME_NAMES, MAX_GAME_TITLE_LEN,
+                       MAX_MACHINES, MAX_SATELLITES, MAX_SETTING_VAL_LEN,
                        MAX_TICKET_FIELD_LEN, SCHEMA_VERSION, _norm_fob_uid)
 
 _p = _f = 0
@@ -115,7 +115,7 @@ def main():
     with hs.lock:
         ver = hs._conn.execute(
             "SELECT value FROM schema_meta WHERE key='version'").fetchone()
-    check("schema migrated to v13", int(ver["value"]) == SCHEMA_VERSION == 13,
+    check("schema migrated to v14", int(ver["value"]) == SCHEMA_VERSION == 14,
           ver["value"])
     # asset READ from the machine (1000 = e8 03 00 00 LE), registered
     hs.aft_upsert_observed("smib-bb2/1", "smib-bb2", 1, asset_number=1000,
@@ -1150,6 +1150,149 @@ def main():
           over is None and "full" in str(oerr), oerr)
     check("...but an UPDATE of an existing id still succeeds at the cap",
           hsat2.sat_set("companion-0000", label="renamed")[1] is None)
+
+    print("— v14 devices: one row per PHYSICAL board, named once")
+    ddev = tempfile.mkdtemp()
+    pdev = os.path.join(ddev, "dev.db")
+    hdev = HubStore(pdev)
+    TAIL = "a3f2b1"
+    # AJ's BB2: a reader leg and a SAS leg on ONE board. The SAS leg is
+    # hand-named ('smib-bb2' carries no tail in its id) — the tail its
+    # daemon reports is what joins them, never the id string.
+    hdev.sat_set("companion-a3f2b1", kind="companion", device_tail=TAIL)
+    hdev.sat_set("smib-bb2", kind="sas", device_tail=TAIL.upper())
+    row, err = hdev.device_set(TAIL, label="The Bluebird",
+                               model="Pi Zero 2 W", ssh_user="gameroom",
+                               last_ip="192.168.50.102")
+    legs = [s for s in hdev.sat_all() if s["deviceTail"] == TAIL]
+    check("two role rows sharing a tail fold into ONE device, named once",
+          err is None and len(hdev.device_all()) == 1 and len(legs) == 2
+          and {s["satId"] for s in legs} == {"companion-a3f2b1", "smib-bb2"}
+          and hdev.device_get(TAIL)["label"] == "The Bluebird", err)
+    check("a reported tail is normalized like the id (upper -> lower)",
+          hdev.sat_get("smib-bb2")["deviceTail"] == TAIL
+          and hdev.device_get("A3F2B1")["model"] == "Pi Zero 2 W")
+    check("sat_id is untouched — no rename, no minted id",
+          hdev.sat_get("smib-bb2")["satId"] == "smib-bb2"
+          and hdev.sat_get("companion-a3f2b1")["satId"] == "companion-a3f2b1")
+    check("deleting a role row leaves the device row AND its name",
+          hdev.sat_delete("companion-a3f2b1") is True
+          and hdev.sat_get("companion-a3f2b1") is None
+          and hdev.device_get(TAIL)["label"] == "The Bluebird"
+          and len([s for s in hdev.sat_all()
+                   if s["deviceTail"] == TAIL]) == 1)
+    for bad, why in ((123, "int"), (True, "bool"), (None, "None"),
+                     ("", "empty"), ("   ", "blank"), ("a3f2b", "5 hex"),
+                     ("a3f2b1c", "7 hex"), ("zzzzzz", "non-hex"),
+                     ("smib-bb2", "a hand-named id"),
+                     ("raspberrypi", "a hostname")):
+        got, gerr = hdev.device_set(bad, label="x")
+        check(f"only a 6-hex silicon tail is a device key ({why})",
+              got is None and gerr is not None
+              and hdev.device_get(bad) is None)
+    check("bad deviceTail on a role row -> error tuple, sat_id untouched",
+          hdev.sat_set("smib-bb2", device_tail="nope!")[1] is not None
+          and hdev.sat_get("smib-bb2")["deviceTail"] == TAIL)
+    # An operator rename must never fake presence: a board unplugged for a
+    # week still reads 'last seen 3 days ago' after you name it.
+    with hdev.lock:
+        hdev._conn.execute("UPDATE devices SET last_seen=? "
+                           "WHERE device_tail=?",
+                           ("2020-01-01T00:00:00", TAIL))
+        hdev._conn.commit()
+    hdev.device_set(TAIL, label="The Bluebird II", seen=False)
+    check("seen=False (operator edit) keeps lastSeen where it was",
+          hdev.device_get(TAIL)["lastSeen"] == "2020-01-01T00:00:00"
+          and hdev.device_get(TAIL)["label"] == "The Bluebird II")
+    hdev.device_set(TAIL, last_ip="192.168.50.7")
+    got = hdev.device_get(TAIL)
+    check("a presence report moves lastSeen, keeps name/model/login",
+          got["lastSeen"] != "2020-01-01T00:00:00"
+          and got["label"] == "The Bluebird II" and got["lastIp"]
+          == "192.168.50.7" and got["model"] == "Pi Zero 2 W"
+          and got["sshUser"] == "gameroom")
+    check("meta must be an object, is bounded, and round-trips",
+          hdev.device_set(TAIL, meta="nope")[1] is not None
+          and hdev.device_set(TAIL, meta={"k": "v" * 400})[1] is not None
+          and hdev.device_set(TAIL, meta={"uartReady": True})[0]["meta"]
+              == {"uartReady": True})
+    hdev2 = HubStore(pdev)              # reopen -> persistence
+    check("the board's name and its leg survive a reopen",
+          hdev2.device_get(TAIL)["label"] == "The Bluebird II"
+          and hdev2.sat_get("smib-bb2")["deviceTail"] == TAIL)
+    check("'' detaches a leg from its board, sat_id still its own key",
+          hdev2.sat_set("smib-bb2", device_tail="")[0]["deviceTail"] is None
+          and hdev2.sat_get("smib-bb2")["satId"] == "smib-bb2")
+    check("device_delete forgets the board, its legs keep their sat_ids",
+          hdev2.device_delete(TAIL) is True
+          and hdev2.device_get(TAIL) is None
+          and hdev2.sat_get("smib-bb2") is not None)
+    for i in range(MAX_DEVICES):
+        hdev2.device_set("%06x" % i, label="x")
+    over, oerr = hdev2.device_set("ffffff", label="y")
+    check("device cap refuses a NEW board when full (bounded, unauth edge)",
+          len(hdev2.device_all()) == MAX_DEVICES and over is None
+          and "full" in str(oerr), oerr)
+    check("...but renaming a board that already exists works at the cap",
+          hdev2.device_set("000000", label="renamed", seen=False)[1] is None)
+    hdev2.close()
+
+    print("— v14 migration v13 -> v14 (rerun-safe, the v4 landmine)")
+    d14 = tempfile.mkdtemp()
+    p14 = os.path.join(d14, "mig14.db")
+    old14 = HubStore(p14)
+    old14.set_nickname("legacy14/1", "Kept Cab", "SAS")
+    old14.sat_set("companion-legacy", kind="companion",
+                  egm_id="IGT_LEGACY", label="Legacy reader")
+    with old14.lock:                    # simulate an on-disk v13 db
+        old14._conn.execute("DROP TABLE devices")
+        old14._conn.execute("DROP INDEX satellites_device_idx")
+        old14._conn.execute("ALTER TABLE satellites DROP COLUMN device_tail")
+        old14._conn.execute(
+            "UPDATE schema_meta SET value='13' WHERE key='version'")
+        old14._conn.commit()
+    old14.close()
+    mig14 = HubStore(p14)               # reopen -> _migrate runs 13 -> 14
+    _leg = mig14.sat_get("companion-legacy")
+    check("v13 db migrates in place with every binding intact",
+          mig14.get_nickname("legacy14/1") == "Kept Cab"
+          and _leg["g2sEgmId"] == "IGT_LEGACY"
+          and _leg["label"] == "Legacy reader"
+          and _leg["deviceTail"] is None)   # backfills detached, never guessed
+    check("migrated tables are writable (the leg attaches on first report)",
+          mig14.device_set("bb2001", label="The Bluebird")[1] is None
+          and mig14.sat_set("companion-legacy",
+                            device_tail="bb2001")[0]["deviceTail"] == "bb2001")
+    with mig14.lock:
+        ver = mig14._conn.execute(
+            "SELECT value FROM schema_meta WHERE key='version'").fetchone()
+        idx = mig14._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND "
+            "name='satellites_device_idx'").fetchone()
+    check("schema stamped v14 and satellites.device_tail is indexed",
+          int(ver["value"]) == SCHEMA_VERSION and idx is not None)
+    # rerun-safety: a crash between the autocommitting DDL and the version
+    # stamp leaves version=13 with the table/column already present — the
+    # re-run must NOT raise/quarantine (the v4 landmine, v14 edition).
+    with mig14.lock:
+        mig14._conn.execute(
+            "UPDATE schema_meta SET value='13' WHERE key='version'")
+        mig14._conn.commit()
+    mig14.close()
+    mig14b = HubStore(p14)              # _migrate runs AGAIN over the v14 DDL
+    check("v14 step is rerun-safe (no quarantine on the second run)",
+          glob.glob(p14 + "*corrupt*") == [] and mig14b.ephemeral is False)
+    check("the re-run is a no-op: board, name and leg all unchanged",
+          mig14b.device_get("bb2001")["label"] == "The Bluebird"
+          and mig14b.sat_get("companion-legacy")["deviceTail"] == "bb2001"
+          and mig14b.sat_get("companion-legacy")["satId"]
+              == "companion-legacy")
+    with mig14b.lock:
+        ver = mig14b._conn.execute(
+            "SELECT value FROM schema_meta WHERE key='version'").fetchone()
+    check("version re-stamped v14 after the v14 rerun",
+          int(ver["value"]) == SCHEMA_VERSION)
+    mig14b.close()
 
     print("— read-only directory degrades to an ephemeral store")
     rod = os.path.join(d, "rodir")

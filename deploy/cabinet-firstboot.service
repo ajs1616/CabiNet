@@ -1,0 +1,28 @@
+[Unit]
+Description=CabiNet first boot (adopt this card's account, enroll the hub key)
+# The enroll half asks the DEFAULT GATEWAY for the hub key, so it wants a link;
+# the account half does not care and runs either way.
+After=network-online.target
+Wants=network-online.target
+# NO storm cap here, deliberately — contrast cabinet-companion.service:8-9 and
+# cabinet-sas.service:7-8, which cap a crash loop. Here FAILURE IS THE RETRY
+# (see Restart= below) and the thing being waited for is a hub that may not be
+# plugged in for days. A cap would end the retry before the hub ever appears.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Root: it rewrites units under /etc/systemd/system and writes into an account's
+# ~/.ssh. It runs from /usr/local/sbin and NOT from ~/CabiNet/deploy on purpose —
+# a script whose whole job is to resolve the home dir cannot be reached through
+# the home dir it is resolving (that path still says /home/<bake user> here).
+ExecStart=/usr/local/sbin/cabinet-firstboot.sh
+# Nonzero = the hub key is not in place yet. This IS the retry loop, at 60s,
+# for as long as it takes; cabinet-firstboot.timer only adds the hourly
+# re-assert once a run has succeeded (a hub key rotation, or an account that
+# only appeared later). on-failure is the one Restart= a oneshot may use.
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

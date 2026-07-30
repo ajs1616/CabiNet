@@ -609,6 +609,13 @@ class HubReporter:
         # 1-4 Hz report.
         self._http = KeepAliveHTTPClient(self.url, timeout=4)
         self.smib_id = smib_id
+        # This board's silicon serial tail, resolved ONCE (it cannot change
+        # while we run) and reported as piTail. It is the hub's ONLY join key
+        # between this leg and the RFID reader on the same Pi — smibId can't
+        # serve (see _pi_serial_tail). None off a Pi, and then the key is
+        # simply ABSENT from every report: an unidentified board, never a
+        # guessed one.
+        self.pi_tail = _pi_serial_tail()
         self.port_path = port_path
         self.address = address
         self.poller = poller
@@ -684,7 +691,7 @@ class HubReporter:
                 self._tickets_summary = {"total": len(tickets),
                                          **dict(by_state)}
                 self._tickets_rev = -1 if rev is None else rev
-        return {
+        snap = {
             "protocol": "SAS",
             "smibId": self.smib_id,
             "address": str(self.address),
@@ -732,6 +739,13 @@ class HubReporter:
             "sshUser": getpass.getuser(),
             "startedAt": self.started_at,
         }
+        # WHICH PHYSICAL BOARD THIS LEG RUNS ON. Off a Pi the key is omitted
+        # entirely rather than sent null: an absent tail is the honest "we
+        # cannot identify this board", and the hub then stores nothing instead
+        # of a guess. Old hubs ignore the extra key.
+        if self.pi_tail:
+            snap["piTail"] = self.pi_tail
+        return snap
 
     def _take_commands(self, reply_body: bytes) -> None:
         """Parse the hub's report reply and queue fresh commands for the
@@ -1103,6 +1117,28 @@ def _gateway_hub_url(port=8081, fallback="http://192.168.50.2:8081"):
     return f"http://{best_ip}:{port}" if best_ip else fallback
 
 
+def _pi_serial_tail():
+    """The last 6 hex of the Pi's hardware serial (/proc/cpuinfo 'Serial'), or
+    None off a Pi. Byte-for-byte Companion._pi_serial_tail: the SAS leg and the
+    RFID reader running on the SAME board MUST derive the same string, because
+    that string is the only thing the hub can join them on.
+
+    Split out of _default_smib_id (which keeps calling it) so the tail can ride
+    the report as `piTail`. The smibId cannot stand in for it: it bakes a
+    `smib-` prefix in AND falls back to the hostname, so a hand-named leg like
+    smib-bb2 carries no recoverable tail."""
+    try:
+        with open("/proc/cpuinfo", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("Serial"):
+                    val = line.split(":", 1)[1].strip().lower()
+                    val = val.lstrip("0") or "0"
+                    return val[-6:]
+    except OSError:
+        pass
+    return None
+
+
 def _default_smib_id():
     """smib-<pi-serial-tail> on a Pi, else the hostname — the SAS half of the
     ONE-identical-image story (mirrors Companion.default_companion_id). Two
@@ -1118,16 +1154,8 @@ def _default_smib_id():
     reader co-location. Such a board must be PINNED with an explicit
     `--smib-id <its-current-name>` in its unit BEFORE any redeploy (an explicit
     --smib-id always wins). New flagless golden-image cards are unaffected."""
-    try:
-        with open("/proc/cpuinfo", encoding="ascii", errors="replace") as f:
-            for line in f:
-                if line.startswith("Serial"):
-                    val = line.split(":", 1)[1].strip().lower()
-                    val = val.lstrip("0") or "0"
-                    return f"smib-{val[-6:]}"
-    except OSError:
-        pass
-    return socket.gethostname()
+    tail = _pi_serial_tail()
+    return f"smib-{tail}" if tail else socket.gethostname()
 
 
 def main():

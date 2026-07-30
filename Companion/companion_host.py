@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import collections
+import getpass
 import json
 import logging
 import socket
@@ -104,6 +105,79 @@ def default_companion_id():
     return f"companion-{tail}" if tail else socket.gethostname()
 
 
+def _login_name():
+    """The account this daemon runs as — the login deploy/update.py has to SSH
+    in with to update this tree. Reported, never guessed: the hub assuming its
+    OWN login is why a reader adopted under any other username read "NOT
+    updated" forever. Byte-for-byte the sshUser SAS/sas_host.py reports.
+    None if the account cannot be named — an unnameable account must not stop
+    a reader from reporting taps."""
+    try:
+        return getpass.getuser()
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def _pi_model():
+    """This board's own name from /proc/device-tree/model ("Raspberry Pi Zero
+    2 W Rev 1.0"), or None off a Pi. Device-tree strings are NUL-terminated,
+    so the NULs come out — the same `tr -d '\\0'` deploy/companion_setup.sh
+    runs. It is what tells a collector a Zero from a 4B in the hub's list with
+    nothing typed and no shell."""
+    try:
+        with open("/proc/device-tree/model", encoding="ascii",
+                  errors="replace") as f:
+            return f.read().replace("\0", "").strip() or None
+    except OSError:
+        return None
+
+
+def _uart_ready():
+    """True when this board could carry a SAS leg as it stands: the header
+    UART node exists AND dtoverlay=disable-bt is in the boot config. BOTH
+    halves, because either alone lies — without disable-bt the header gets the
+    mini-UART, which has no parity at all, and SAS wakeup IS mark/space parity
+    per byte (deploy/smib_setup.sh writes enable_uart=1 + disable-bt together
+    for exactly this reason). The boot config is /boot/firmware/config.txt
+    (bookworm) falling back to /boot/config.txt, smib_setup.sh's order, and
+    the FIRST one that reads wins — a stale leftover at the old path must not
+    answer for the live one. Unreadable = False: we cannot claim ready, and a
+    claim is what a collector would act on."""
+    try:
+        if not Path("/dev/ttyAMA0").exists():
+            return False
+    except OSError:
+        return False
+    for cfg in ("/boot/firmware/config.txt", "/boot/config.txt"):
+        try:
+            with open(cfg, encoding="ascii", errors="replace") as f:
+                return any(line.startswith("dtoverlay=disable-bt")
+                           for line in f)
+        except OSError:
+            continue
+    return False
+
+
+def _i2c_bus():
+    """The I2C node a PN532 would sit on, or None when no i2c overlay is live.
+    The order is the fleet's own wiring, not the kernel's numbering:
+    /dev/i2c-11 first (the software i2c-gpio bus on GPIO23/24 — ONE wiring for
+    the whole fleet, and the only option on a board whose SAS HAT owns the
+    hardware pins), then /dev/i2c-1 (hardware GPIO2/3, reader-only boards),
+    then whatever node does exist, so an unusual board reports the truth
+    instead of nothing."""
+    try:
+        nodes = {p.name for p in Path("/dev").glob("i2c-*")}
+    except OSError:
+        return None
+    for name in ("i2c-11", "i2c-1"):
+        if name in nodes:
+            return "/dev/" + name
+    if nodes:
+        return "/dev/" + sorted(nodes)[0]
+    return None
+
+
 def _default_gateway_ip():
     """The IPv4 default-route gateway from /proc/net/route, or None. On the
     CabiNet slot VLAN (and the Wi-Fi AP) the hub IS the DHCP server AND the
@@ -166,6 +240,22 @@ class CompanionHost:
         self.reader = reader
         self.url = hub_url.rstrip("/") + "/api/companion/report"
         self.companion_id = companion_id
+        # This board's silicon serial tail, resolved ONCE (it cannot change
+        # while we run) and reported as piTail. companionId usually embeds it,
+        # but not always — an operator --companion-id, or the hostname fallback
+        # off a Pi, erases it — and the SAS leg beside us can never embed it at
+        # all. So the tail rides as its own field: it is the hub's ONLY join
+        # key between the two daemons on one board. None off a Pi, and then the
+        # key is simply ABSENT from every report.
+        self.pi_tail = _pi_serial_tail()
+        # WHO WE RUN AS + WHAT THE BOARD IS, resolved ONCE beside the tail.
+        # These are boot-time facts (an overlay only lands at boot, and an
+        # account cannot be renamed under a running service), so re-probing
+        # three files on every heartbeat would buy nothing on a Zero.
+        self.ssh_user = _login_name()
+        self.model = _pi_model()
+        self.uart_ready = _uart_ready()
+        self.i2c_bus = _i2c_bus()
         self.g2s_egm = g2s_egm
         self.sas_smib = sas_smib
         # sasAddress rides as a string (hub contract: str|null) — the SAS
@@ -247,7 +337,7 @@ class CompanionHost:
     def snapshot(self, now):
         with self._taps_lock:
             queued = list(self.taps)
-        return {
+        snap = {
             "companionId": self.companion_id,
             "startedAt": self.started_at,
             "uptimeSec": round(now - self.started_mono, 1),
@@ -257,7 +347,28 @@ class CompanionHost:
             "sasAddress": self.sas_address,
             "taps": queued,
             "lastError": self.last_error,
+            # WHO WE RUN AS. deploy/update.py (on the hub) rsyncs this tree
+            # here during an update and needs an SSH login; the hub's own is
+            # only a guess, and a wrong one leaves this reader reading "NOT
+            # updated" forever. So report it and let the hub use the truth —
+            # the same key, from the same source, as the SAS leg's.
+            "sshUser": self.ssh_user,
+            # WHAT THIS BOARD IS AND WHAT IT COULD DO. model names it for a
+            # human; uartReady/i2cBus say whether a role would work here
+            # BEFORE anyone tries it. null = we could not tell — never a
+            # guess, and the hub stores the not-knowing as such. Old hubs
+            # ignore the extra keys.
+            "model": self.model,
+            "uartReady": self.uart_ready,
+            "i2cBus": self.i2c_bus,
         }
+        # WHICH PHYSICAL BOARD THIS READER RUNS ON. Off a Pi the key is omitted
+        # entirely rather than sent null: an absent tail is the honest "we
+        # cannot identify this board", and the hub then stores nothing instead
+        # of a guess. Old hubs ignore the extra key.
+        if self.pi_tail:
+            snap["piTail"] = self.pi_tail
+        return snap
 
     def _take_ack(self, reply_body):
         """Drop taps the hub has confirmed. Malformed replies are ignored

@@ -45,6 +45,7 @@ import queue
 import random
 import re
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -57,6 +58,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hub_store import HubStore, MAX_TICKET_FIELD_LEN   # noqa: E402  (sibling module, stdlib sqlite3)
+# The piTail canonicalizer lives with the table that owns the column (hub.db
+# v14 `devices.device_tail`), the same way _norm_fob_uid does below: the tail
+# on the wire and the tail in the table have to be ONE string, or a board
+# silently splits into two rows.
+from hub_store import _norm_device_tail   # noqa: E402  (sibling module)
 try:
     # RFID fobs registry (hub.db v8): the tier list, the row cap and the
     # UID canonicalizer live with the table's owner (hub_store).
@@ -327,6 +333,109 @@ HOST_LOG_BACKUPS = 3
 LOG_RETENTION_DAYS = 14                 # startup sweep prunes older run files
 WIRE_DIGEST_MIN_BYTES = 16384           # meter-heavy bodies >= this -> digest
 MAX_POST_BYTES = 2 * 1024 * 1024        # request-body ceiling (SAS-bridge F2)
+
+# ---------------------------------------------------------------------------
+# FLEET DOCTOR (The Back Office) — one brain, two faces
+# ---------------------------------------------------------------------------
+# deploy/cabinetconfig.py IS the fleet doctor. The hub never reimplements it
+# and never IMPORTS it: it shells out to the already-gated CLI
+# (`<noun> [<target>] <verb> --json`, machine-readable dict as the last stdout
+# line) and renders what the tool says. Two reasons, both hard:
+#   * a sweep ssh-probes every Pi on the floor and a wedged probe must not be
+#     able to take a hub request thread — let alone the 2 s /api/status poll —
+#     down with it. A subprocess can be killed by its process GROUP; an
+#     imported module cannot;
+#   * the CLI is the contract that already carries the refusals (read-only
+#     place, tournament, the one-writer lock, the empty hub-API write
+#     whitelist). Re-deriving those here would be a second, weaker copy.
+#
+# THE AUDIENCE decides every word that reaches the page. A CabiNet owner is a
+# slot collector on Windows or a Mac who bought a real machine — not a Linux
+# user. THE TOOL DOES THE WORK; IT NEVER PRINTS A COMMAND FOR THEM TO RUN. So
+# labels here are plain language about the machine ("Turn the SAS connection
+# on"), never a unit name, a shell line, or a path. The only human
+# instructions that legitimately survive are the ones no software can do:
+# physical wiring, and the machine's own operator menu — and those ride the
+# doctor's own `hint` text, verbatim, not our invention.
+FLEET_SCRIPT_REL = os.path.join("deploy", "cabinetconfig.py")
+
+# actions[] is DATA, computed hub-side from the doctor's verdict/codes. THIS
+# TABLE IS THE ONLY PLACE A REPAIR IS DESCRIBED: home.html renders whatever
+# the hub hands it, so a repair verb added to cabinetconfig later reaches the
+# collector by adding a row HERE — never by touching the web UI. Keys:
+#   id               stable action id; the POST /api/fleet/fix contract
+#   kind             which doctor's rows may offer it (smib | companion)
+#   noun/verb        the cabinetconfig one-liner it runs, verbatim
+#   when             offer ONLY when the doctor named one of these codes. The
+#                    classification IS the product: NEVER-PROVISIONED /
+#                    UNIT-OFF / HUB-PARKED look identical from the floor and
+#                    need three different fixes, so the code — never the
+#                    symptom — decides what is offered
+#   blockedBy        codes where the verb REFUSES, or where it would run and
+#                    provably not help. The action is withheld: a button that
+#                    cannot work is exactly the dead end this page exists to
+#                    kill
+#   blockedByFatal   same, but only at fatal severity — a warn-level SD gripe
+#                    must not hide the only repair a stopped machine has
+#   danger           true = it interrupts something the collector can see
+#   label / why      what the button says, and one sentence of why it is
+#                    offered right now
+#   reminder         the leave-state law, carried out of the CLI's finish pass
+#                    into the UI (SAS machines only)
+FLEET_ACTIONS = (
+    {
+        "id": "smib-up",
+        "kind": "smib",
+        "noun": "smib", "verb": "up",
+        # S2 exists for exactly one state, and says so in its own docstring.
+        "when": ("UNIT-OFF",),
+        "blockedBy": (
+            "UNREACHABLE",         # verb refuses: nothing answers to switch on
+            "NEVER-PROVISIONED",   # verb refuses: there is no SAS leg yet
+            "HUB-PARKED",          # a HUB-side switch — the web UI owns it
+            "RENAME-CONTENTION",   # two daemons would fight for the same port
+            # the leg would start and still never poll: the wire/port faults
+            # the doctor names separately. Offering "turn it on" here would be
+            # a promise the machine cannot keep.
+            "PORT-MISSING", "NO-DIALOUT", "GETTY-CONTENTION",
+            "CONSOLE-EATS-LINE", "MINI-UART-NO-PARITY", "DEBUG-CONNECTOR",
+        ),
+        # a card the kernel already remounted read-only gets a replacement,
+        # not a repair — the verb refuses on it too (write-verb law).
+        "blockedByFatal": ("SD-UNHEALTHY",),
+        "danger": False,
+        "label": "Turn the SAS connection on",
+        "why": "This machine's connection to the hub is switched off. "
+               "Turning it back on takes a few seconds, and the hub waits to "
+               "see the machine back on the floor before it says it worked.",
+        "reminder": "When you walk away from the machine: disable it, never "
+                    "leave it sitting enabled at 0 credits, and never "
+                    "re-enable a machine somebody locked.",
+    },
+    {
+        "id": "companion-restart",
+        "kind": "companion",
+        "noun": "companion", "verb": "restart",
+        # C2 is the proven reset for a reader that stopped answering, and it
+        # also starts one that is simply stopped. DAEMON-CRASH-LOOP is
+        # deliberately NOT here: systemd is already restarting it on a timer,
+        # so the button would provably change nothing — the journal is the
+        # answer there, and the doctor's own hint says so.
+        "when": ("UNIT-OFF", "READER-WEDGED", "READER-NOT-DETECTED"),
+        "blockedBy": (
+            "UNREACHABLE",         # verb refuses: nothing answers to restart
+            "NEVER-PROVISIONED",   # verb refuses: no reader software here yet
+            "RENAME-CONTENTION",   # a pre-rename daemon still fights for it
+        ),
+        "blockedByFatal": ("SD-UNHEALTHY",),
+        "danger": True,            # it stops something that is running now
+        "label": "Restart the card reader",
+        "why": "The card reader is not answering. Restarting it is the fix "
+               "that works — and if you just re-seated its wires or changed "
+               "its switches, this is what makes it look again.",
+        "reminder": None,
+    },
+)
 
 # Classes this host actively speaks (GR-21) — inbound commands handled by
 # G2SHost.dispatch and/or host-originated requests it builds. Drives the
@@ -3630,15 +3739,17 @@ class G2SHost:
         # companionId here (falling back to what the daemon reports when there's
         # no row — legacy flagged units + not-yet-assigned units keep working),
         # so a re-assign takes effect live with no restart. Same hot-reader idiom
-        # as sas_links: loaded once, the ONLY writer afterwards is /api/settings,
-        # readers do GIL-atomic dict lookups. Empty on a floor with no assigned
-        # satellites: the whole path stays dormant.
+        # as sas_links: loaded once, written by /api/settings and (v14) by
+        # _touch_device attaching an EXISTING row to the board that reported it
+        # — both under _sat_write_lock; readers do GIL-atomic dict lookups.
+        # Empty on a floor with no assigned satellites: the path stays dormant.
         self.sat_bindings = self.hub_store.sat_bindings()
-        # Serializes the /api/settings satellite read-modify-write (assign +
-        # one-reader-per-machine exclusivity, and the SAS-link-clears-explicit-
-        # reader step). The HTTP server is threaded, so two concurrent assigns
-        # to the same machine could otherwise mutually clear each other and
-        # leave it reader-less; this lock makes the whole displace cycle atomic.
+        # Serializes every satellite read-modify-write (the /api/settings assign
+        # + one-reader-per-machine exclusivity and the SAS-link-clears-explicit-
+        # reader step, plus _touch_device's board attach). The HTTP server is
+        # threaded, so two concurrent assigns to the same machine could otherwise
+        # mutually clear each other and leave it reader-less; this lock makes the
+        # whole displace cycle atomic.
         self._sat_write_lock = threading.Lock()
         # Companion floor registry (RFID phase 1): each Companion daemon —
         # a PN532 reader beside a satellite SMIB — POSTs tap reports to
@@ -3659,6 +3770,21 @@ class G2SHost:
         self._update = {"behind": 0, "commits": [], "checkedAt": None,
                         "error": None, "state": "idle"}
         self._update_auto_at = 0.0
+        # The Back Office ▸ Fleet Doctor. ONE job at a time (a sweep shells
+        # out to ssh per device; two at once would double the wedge surface
+        # for no gain), state in memory only — nothing here writes a file,
+        # and NOTHING goes under */data (sacred). The job thread never
+        # MUTATES `devices`/`log` in place, it replaces them, so a reader
+        # holding this lock for a shallow copy always sees a whole list.
+        self.fleet_lock = threading.Lock()
+        self._fleet = {"state": "idle", "kind": None, "target": None,
+                       "startedAt": None, "finishedAt": None,
+                       "startedTs": None, "finishedTs": None,
+                       "checkedAt": None, "error": None, "timedOut": False,
+                       "devices": [], "log": [], "lastFix": None}
+        # {noun: (verbs|None, readAt)} — what the INSTALLED cabinetconfig
+        # actually offers, asked once and cached (see _fleet_verbs).
+        self._fleet_verb_cache = {}
         self.card_sessions = {}
         # Admin overlay tap (#?): a transient SUPERVISOR layer stacked OVER a
         # carded player's session — an admin taps their fob on a machine a
@@ -3731,6 +3857,11 @@ class G2SHost:
         self._fob_seq = itertools.count(1)
         # throttle map for register_g2s_machines (egmId -> last hub.db touch)
         self._registry_touched = {}
+        # the same throttle for _touch_device (piTail -> last hub.db touch).
+        # Pruned rather than grown: the key comes off an unauthenticated wire,
+        # so a peer that reports a fresh tail every second must not make this
+        # a registry — see _touch_device.
+        self._device_touched = {}
         # hub-side auto AFT-register state (the sas_report canonical trigger):
         # machine_key -> (last_enqueue_ts, tries). Keeps a NOT_REGISTERED
         # machine — which reports every ~1 s — from storming the command queue,
@@ -4285,6 +4416,572 @@ class G2SHost:
         except OSError:
             return None
 
+    # ── Fleet Doctor (The Back Office) ────────────────────────────────────
+    #
+    # The Updates card's pattern, verb for verb: POST starts the job and
+    # returns AT ONCE, the job narrates into a transcript, the UI polls state
+    # + transcript, and THE TRANSCRIPT IS THE AUTHORITY on what happened. The
+    # one difference is where the transcript lives: an update restarts this
+    # service, so its transcript must survive on disk; a checkup does not, so
+    # ours stays in memory and no new file appears anywhere near */data.
+    #
+    # Every subprocess is bounded and killed BY PROCESS GROUP on timeout —
+    # cabinetconfig's own children are ssh, and ssh is the thing that wedges.
+    #: a whole-floor sweep: hub doctor + one ssh doctor per device
+    FLEET_SWEEP_TIMEOUT_SEC = 120.0
+    #: one device's doctor — ~20 probes over one ssh connection
+    FLEET_DEVICE_TIMEOUT_SEC = 90.0
+    #: one repair: probe → systemctl → the verb's own ~15 s wire verify
+    FLEET_FIX_TIMEOUT_SEC = 120.0
+    #: the verb-availability probe (see _fleet_verbs) — local, no ssh
+    FLEET_PROBE_TIMEOUT_SEC = 45.0
+    #: retry window for a verb probe that could NOT be read (a successful
+    #: read is kept for the life of the process — see _fleet_verbs)
+    FLEET_VERB_CACHE_SEC = 300.0
+    #: transcript tail kept in memory; a sweep of a real floor is ~200 lines
+    FLEET_LOG_LINES = 400
+
+    def fleet_script(self):
+        """deploy/cabinetconfig.py inside the clone we run from, or None.
+
+        None is a FEATURE, not an error: a hub that predates the fleet doctor
+        answers 404 on the endpoints, home.html drops S.caps.fleet, and The
+        Back Office renders exactly as it does today (the graceful-degradation
+        habit every other card here already follows)."""
+        p = os.path.join(self._repo_dir(), FLEET_SCRIPT_REL)
+        return p if os.path.isfile(p) else None
+
+    def _fleet_spawn(self, args, timeout):
+        """Run ONE cabinetconfig one-liner. Returns (rc, lines, timedOut).
+
+        stdin is /dev/null so an ssh that wants a password dies instead of
+        hanging forever, and the child gets its OWN session: on timeout we
+        kill the whole process GROUP, because the wedge is always a
+        grandchild ssh and killing only the parent leaves it holding the pipe
+        — communicate() would then never return and this thread would leak,
+        which is the one outcome a hub must never have."""
+        script = self.fleet_script()
+        if not script:
+            return 127, ["This hub does not have the fleet checkup "
+                         "installed."], False
+        try:
+            p = subprocess.Popen([sys.executable, script] + list(args),
+                                 cwd=self._repo_dir(),
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL,
+                                 text=True, errors="replace",
+                                 start_new_session=True)
+        except Exception as e:      # noqa: BLE001 — a failed spawn is an
+            #                        ANSWER here, never an exception upward
+            return 127, ["could not start the checkup: %s" % e], False
+        timed_out = False
+        try:
+            out, _ = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(p.pid, signal.SIGKILL)     # pgid == pid (own session)
+            except Exception:                        # already gone / no perm
+                p.kill()
+            try:
+                out, _ = p.communicate(timeout=10)
+            except Exception:                        # noqa: BLE001
+                out = ""
+        rc = p.returncode if p.returncode is not None else -9
+        lines = [ln.rstrip() for ln in (out or "").splitlines()]
+        if timed_out:
+            # Report honestly. A partial answer presented as a finished one is
+            # the confidently-wrong sentence this whole page exists to kill.
+            lines.append("⏱ gave up after %d seconds — something stopped "
+                         "answering part-way through, so this is not a "
+                         "complete answer." % int(timeout))
+        return rc, lines[-self.FLEET_LOG_LINES:], timed_out
+
+    @staticmethod
+    def _fleet_json_tail(lines):
+        """The machine-readable dict/list cabinetconfig promises as its LAST
+        stdout line — found by scanning BACKWARDS, not by taking [-1].
+
+        A read-only doctor really does end on it. A MUTATING verb does not:
+        it touched something, so the tool's finish pass re-polls the device
+        and prints its ✅/❌ lines AFTER the json. Taking the last line there
+        would parse a sentence.
+
+        Doctors emit an object (or, for a sweep, an array); a repair verb
+        emits its bare result — `true`, or `{"refused": true}` when it never
+        started. All four shapes are the contract, so all four are read."""
+        for ln in reversed(lines or []):
+            s = ln.strip()
+            if not s or s[0] not in "[{tfn":
+                continue
+            try:
+                return json.loads(s)
+            except ValueError:      # a human sentence starting with t/f/n
+                continue
+        return None
+
+    def _fleet_verbs(self, noun):
+        """Which verbs the INSTALLED cabinetconfig exposes for a noun, or
+        None for "cannot tell".
+
+        Asked the way the tool itself answers it — an unknown verb prints one
+        unwrapped line, `❌ unknown verb 'x' for 'smib' — verbs: doctor
+        journal park up` — so the hub never guesses, and an older
+        cabinetconfig can never be offered a button it does not have. Cached:
+        this costs a subprocess, and it only changes when the tree does.
+
+        "Cannot tell" trusts the table: the two files ship in the same tree
+        and update.py moves them together, so hiding a working repair would
+        be the worse failure. A stale offer still meets the tool's own
+        refusal, which names itself.
+
+        An ANSWER is cached for this process's whole life — the installed
+        tree only changes when deploy/update.py applies, and applying
+        restarts this service (update_state's git cache reasons the same
+        way). Only a failed read is retried, because every cabinetconfig run
+        rotates the operator's own CLI transcript and this one is ours, not
+        theirs."""
+        now = time.time()
+        got = self._fleet_verb_cache.get(noun)
+        if got and (got[0] is not None
+                    or now - got[1] < self.FLEET_VERB_CACHE_SEC):
+            return got[0]
+        _rc, lines, _to = self._fleet_spawn(
+            [noun, "__cabinet_verb_probe__"], self.FLEET_PROBE_TIMEOUT_SEC)
+        verbs = None
+        pat = re.compile(r"unknown verb .*for '%s'.*verbs:\s*(.+)$"
+                         % re.escape(noun))
+        for ln in lines:
+            m = pat.search(ln)
+            if m:
+                verbs = {v for v in m.group(1).split() if v}
+                break
+        self._fleet_verb_cache[noun] = (verbs, now)
+        return verbs
+
+    def fleet_tournament_phase(self):
+        """The phase name when a repair must refuse, else None.
+
+        cabinetconfig refuses on its own (a mid-tournament restart loses
+        seats/scores/countdown), and the hub asserts it too so a button can
+        never outrun the floor law. Copy the scalar out and release — nothing
+        is ever called while holding tournament_lock."""
+        with self.tournament_lock:
+            phase = str((self.tournament or {}).get("phase") or "")
+        return phase if phase in ("armed", "countdown", "running") else None
+
+    def fleet_actions_for(self, dev, probe=True):
+        """actions[] for ONE device row, from FLEET_ACTIONS × the doctor's
+        codes. This is the SAME computation POST /api/fleet/fix validates
+        against — the client is never the authority on what may run.
+
+        `probe=False` skips the verb-availability subprocess so the request
+        threads (GET state, POST fix) never spawn anything; the job thread
+        that built the row already warmed that cache moments earlier."""
+        codes = {str(c) for c in (dev.get("codes") or [])}
+        fatal = {str(f.get("code")) for f in (dev.get("findings") or [])
+                 if isinstance(f, dict) and f.get("severity") == "fatal"}
+        # "(not examined from here)" / "(doctor not built yet)" are answers
+        # about the RUN, not about the box. Never offer a repair on one.
+        if str(dev.get("verdict") or "").startswith("("):
+            return []
+        out = []
+        for a in FLEET_ACTIONS:
+            if a["kind"] != dev.get("kind"):
+                continue
+            if not codes & set(a["when"]):
+                continue
+            if codes & set(a["blockedBy"]):
+                continue
+            if fatal & set(a["blockedByFatal"]):
+                continue
+            if probe:
+                verbs = self._fleet_verbs(a["noun"])
+                if verbs is not None and a["verb"] not in verbs:
+                    continue
+            out.append({"id": a["id"], "label": a["label"], "why": a["why"],
+                        "danger": bool(a["danger"]),
+                        "reminder": a.get("reminder")})
+        return out
+
+    @staticmethod
+    def _fleet_flag(doc):
+        """The sweep summary's own flag rule, kept identical so the page and
+        the CLI never disagree: a verdict-OK box carrying a warn finding (a
+        wedged reader, a parked tile) must NEVER render as a clean ✅."""
+        verdict = str(doc.get("verdict") or "?")
+        warned = any(f.get("severity") == "warn"
+                     for f in (doc.get("findings") or [])
+                     if isinstance(f, dict))
+        if verdict == "OK":
+            return "⚠️" if warned else "✅"
+        if verdict.startswith("("):     # "not examined" is never a verdict
+            return "•"
+        return "❌" if doc.get("codes") else "⚠️"
+
+    def _fleet_row(self, doc, kind=None, peer=None, probe=True):
+        """One doctor dict → the row home.html renders.
+
+        The doctor's OWN words survive verbatim (code, severity, hint) — the
+        diagnosis layer is the product and we are its face, not its editor.
+        Only the key name is normalised: cabinetconfig calls the sentence
+        `evidence`, the wire calls it `detail`."""
+        name = str(doc.get("target") or "?")[:64]
+        kind = str(doc.get("kind") or kind or "?")[:16]
+        peer = str(doc.get("peer") or peer or "")[:64]
+        findings = []
+        for f in (doc.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            findings.append({
+                "code": str(f.get("code") or "?")[:48],
+                "severity": str(f.get("severity") or "info")[:8],
+                "detail": str(f.get("detail") or f.get("evidence") or "")[:400],
+                "hint": str(f.get("hint") or "")[:400] or None})
+        checks = []
+        for c in (doc.get("checks") or [])[:60]:
+            if isinstance(c, dict):
+                checks.append({"probe": str(c.get("probe") or "?")[:64],
+                               "ok": c.get("ok") if isinstance(c.get("ok"),
+                                                               bool) else None,
+                               "detail": str(c.get("detail") or "")[:300]})
+        row = {"id": "%s:%s" % (kind, name), "name": name, "kind": kind,
+               "peer": peer, "verdict": str(doc.get("verdict") or "?")[:64],
+               "flag": self._fleet_flag(doc),
+               "codes": [str(c)[:48] for c in (doc.get("codes") or [])],
+               "findings": findings, "checks": checks,
+               "checkedAt": now_iso()}
+        # One line the UI can print without deciding anything: the first
+        # fatal, else the first finding. With NO findings the verdict itself
+        # is the sentence — only a literal OK earns the all-clear, because a
+        # box that was never examined ("(not reachable from this computer)")
+        # reading as a clean bill of health is exactly the confidently-wrong
+        # answer the doctors exist to kill (GR-01).
+        first = next((f for f in findings if f["severity"] == "fatal"),
+                     findings[0] if findings else None)
+        row["headline"] = (
+            first["detail"] if first
+            else "Everything checks out here." if row["verdict"] == "OK"
+            else row["verdict"].strip("() ") or "not examined")
+        row["actions"] = self.fleet_actions_for(row, probe=probe)
+        return row
+
+    def _fleet_resolve(self, target, kind=None):
+        """A name the UI sent → (kind, name, peer), or None.
+
+        The last checkup's rows first (that is the floor as the doctor itself
+        named it), then the live floor — a collector must be able to check
+        ONE machine without sweeping everything first. Accepts a row id
+        ("smib:smib-bb2"), the device name, or its address."""
+        t = str(target or "").strip()[:64]
+        if not t:
+            return None
+        if t.lower() in ("hub", "hub:hub"):
+            return ("hub", "hub", "")
+        with self.fleet_lock:
+            rows = list(self._fleet.get("devices") or [])
+        for r in rows:
+            if t in (r.get("id"), r.get("name"), r.get("peer")) \
+                    and kind in (None, r.get("kind")) \
+                    and r.get("kind") in ("smib", "companion"):
+                return (r["kind"], r["name"], r.get("peer") or "")
+        if kind in (None, "smib"):
+            for key, e in (self.sas_snapshot() or {}).items():
+                e = e or {}
+                nm = str(e.get("smibId") or str(key).split("/")[0])
+                if t in (nm, str(e.get("peer") or "")):
+                    return ("smib", nm, str(e.get("peer") or ""))
+        if kind in (None, "companion"):
+            for cid, e in (self.companion_snapshot() or {}).items():
+                e = e or {}
+                if t in (str(cid), str(e.get("peer") or "")):
+                    return ("companion", str(cid), str(e.get("peer") or ""))
+        return None
+
+    def _fleet_merge(self, rows, incoming):
+        """Fold a single device's fresh row into the floor we already have —
+        replace by id, keep everyone else. Checking one machine must never
+        blank the rest of the page."""
+        out = [r for r in rows if r.get("id") != incoming.get("id")]
+        out.append(incoming)
+        out.sort(key=lambda r: ({"❌": 0, "⚠️": 1, "•": 2, "✅": 3}
+                                .get(r.get("flag"), 2), r.get("kind") or "",
+                                r.get("name") or ""))
+        return out
+
+    def start_fleet_check(self, scope="all", target=None, kind=None):
+        """POST /api/fleet/check — start a checkup and RETURN AT ONCE.
+
+        A sweep takes ~40 s and each device probe can time out; nothing here
+        may sit on the request thread. Never raises: the caller answers
+        ok:false at 200 (the never-500 rule)."""
+        if not self.fleet_script():
+            return {"ok": False,
+                    "error": "this hub does not have the fleet checkup "
+                             "installed"}
+        scope = "device" if str(scope) == "device" else "all"
+        peer = ""
+        if scope == "device":
+            found = self._fleet_resolve(target, kind)
+            if not found:
+                return {"ok": False,
+                        "error": "the hub has never heard of %r — run the "
+                                 "whole-floor checkup first"
+                                 % (str(target or "")[:40])}
+            kind, target, peer = found
+        with self.fleet_lock:
+            if self._fleet.get("state") == "running":
+                return {"ok": False,
+                        "error": "a checkup is already running — give it a "
+                                 "moment"}
+            self._fleet.update(
+                state="running", kind=("sweep" if scope == "all"
+                                       else "device"),
+                target=(None if scope == "all" else target),
+                startedAt=now_iso(), startedTs=time.time(),
+                finishedAt=None, finishedTs=None, error=None,
+                timedOut=False,
+                log=["Checking %s…" % ("every machine and reader on the floor"
+                                       if scope == "all" else target)])
+        log.warning("🩺 FLEET CHECKUP started by the operator — %s",
+                    "the whole floor" if scope == "all"
+                    else "%s %s" % (kind, target))
+        threading.Thread(target=self._fleet_check_job, daemon=True,
+                         args=(scope, kind, target, peer)).start()
+        return {"ok": True, "started": True,
+                "kind": "sweep" if scope == "all" else "device",
+                "target": None if scope == "all" else target}
+
+    def _fleet_check_job(self, scope, kind, target, peer):
+        """The checkup thread. Shells out, parses, stores. Never raises: a
+        crash here would strand the card on 'running' forever."""
+        try:
+            if scope == "all":
+                args, timeout = ["diag", "sweep", "--json"], \
+                    self.FLEET_SWEEP_TIMEOUT_SEC
+            elif kind == "hub":
+                args, timeout = ["hub", "doctor", "--json"], \
+                    self.FLEET_DEVICE_TIMEOUT_SEC
+            else:
+                args, timeout = [kind, target, "doctor", "--json"], \
+                    self.FLEET_DEVICE_TIMEOUT_SEC
+            rc, lines, timed_out = self._fleet_spawn(args, timeout)
+            data = self._fleet_json_tail(lines)
+            self._fleet_store(kind, target, peer, rc, lines, timed_out, data)
+        except Exception as e:      # noqa: BLE001 — the card must not strand
+            log.exception("fleet checkup thread failed")
+            with self.fleet_lock:
+                self._fleet.update(state="failed", error=str(e)[:200],
+                                   finishedAt=now_iso(),
+                                   finishedTs=time.time())
+
+    def _fleet_store(self, kind, target, peer, rc, lines, timed_out, data):
+        """Turn one finished run into stored rows + state. Shared by the
+        checkup job and the repair job's re-check."""
+        with self.fleet_lock:
+            rows = list(self._fleet.get("devices") or [])
+        error = None
+        if isinstance(data, list):
+            rows = [self._fleet_row(d) for d in data if isinstance(d, dict)]
+            rows.sort(key=lambda r: ({"❌": 0, "⚠️": 1, "•": 2, "✅": 3}
+                                     .get(r.get("flag"), 2),
+                                     r.get("kind") or "", r.get("name") or ""))
+        elif isinstance(data, dict) and not data.get("refused"):
+            rows = self._fleet_merge(rows, self._fleet_row(
+                data, kind=kind, peer=peer))
+        elif isinstance(data, dict) and data.get("refused"):
+            error = ("the checkup refused to run — see the transcript "
+                     "below")
+        else:
+            # No machine-readable tail at all: the tool died, was killed, or
+            # is not the version we think. Say so; do not invent a verdict.
+            error = ("the checkup did not finish%s"
+                     % (" in time" if timed_out else
+                        " (it stopped with code %s)" % rc))
+        flagged = sum(1 for r in rows if r.get("flag") in ("❌", "⚠️"))
+        with self.fleet_lock:
+            self._fleet.update(
+                state="failed" if error else "done", error=error,
+                devices=rows, log=lines[-self.FLEET_LOG_LINES:],
+                timedOut=bool(timed_out), finishedAt=now_iso(),
+                finishedTs=time.time(), checkedAt=now_iso())
+            started = self._fleet.get("startedTs") or time.time()
+        log.info("🩺 fleet checkup finished in %.1fs — %d device(s), %d "
+                 "flagged%s", time.time() - started, len(rows), flagged,
+                 " · %s" % error if error else "")
+
+    def start_fleet_fix(self, device, action):
+        """POST /api/fleet/fix — run ONE offered repair and return AT ONCE.
+
+        The allow-list is recomputed here from the stored doctor row by the
+        SAME function that produced actions[]; the client's opinion of what
+        is offered is never consulted. Refuses during a tournament with the
+        phase named (the floor law: a mid-tournament restart loses seats,
+        scores and the countdown)."""
+        if not self.fleet_script():
+            return {"ok": False,
+                    "error": "this hub does not have the fleet checkup "
+                             "installed"}
+        spec = next((a for a in FLEET_ACTIONS
+                     if a["id"] == str(action or "")), None)
+        if spec is None:
+            return {"ok": False,
+                    "error": "%r is not something this hub can do"
+                             % str(action or "")[:40]}
+        want = str(device or "").strip()[:64]
+        with self.fleet_lock:
+            if self._fleet.get("state") == "running":
+                return {"ok": False,
+                        "error": "a checkup is already running — give it a "
+                                 "moment"}
+            rows = list(self._fleet.get("devices") or [])
+        # Match on the row id first (kind:name — the UI always has it) and
+        # fall back to the bare name. A combined SMIB+reader Pi appears as
+        # TWO rows under one name, so the kind is what disambiguates; a name
+        # that exists under a different kind is named as such rather than
+        # answered with "never heard of it", which would be a lie.
+        named = [r for r in rows if want in (r.get("id"), r.get("name"))]
+        row = next((r for r in named if r.get("kind") == spec["kind"]), None)
+        if row is None:
+            return {"ok": False,
+                    "error": ("%s is a %s — %s applies to a %s"
+                              % (want, named[0].get("kind"), spec["label"],
+                                 spec["kind"])) if named else
+                             ("run the checkup first — the hub has no "
+                              "findings for %r right now" % want)}
+        # The tournament gate goes BEFORE the allow-list: for a real device
+        # and a real repair, "wait for the tournament" is the answer the
+        # operator needs to hear, and it must never be masked by a stale
+        # actions[] list. cabinetconfig refuses too — this is belt and
+        # braces, the way the floor law is written.
+        phase = self.fleet_tournament_phase()
+        if phase:
+            return {"ok": False,
+                    "error": "a tournament is %s — repairs that restart "
+                             "anything wait until it finishes" % phase}
+        offered = {a["id"] for a in self.fleet_actions_for(row, probe=False)}
+        if spec["id"] not in offered:
+            return {"ok": False,
+                    "error": "%s is not offered for %s right now — re-run "
+                             "the checkup" % (spec["label"], row["name"])}
+        with self.fleet_lock:
+            if self._fleet.get("state") == "running":     # re-check under lock
+                return {"ok": False,
+                        "error": "a checkup is already running — give it a "
+                                 "moment"}
+            self._fleet.update(
+                state="running", kind="fix", target=row["name"],
+                startedAt=now_iso(), startedTs=time.time(),
+                finishedAt=None, finishedTs=None, error=None, timedOut=False,
+                lastFix={"device": row["id"], "name": row["name"],
+                         "action": spec["id"], "label": spec["label"],
+                         "state": "running", "startedAt": now_iso(),
+                         "finishedAt": None, "ok": None, "outcome": None},
+                log=["%s on %s…" % (spec["label"], row["name"])])
+        log.warning("🛠️ FLEET REPAIR started by the operator — %s on %s %s "
+                    "(%s %s %s --yes)", spec["label"], row["kind"],
+                    row["name"], spec["noun"], row["name"], spec["verb"])
+        threading.Thread(target=self._fleet_fix_job, daemon=True,
+                         args=(row, spec)).start()
+        return {"ok": True, "started": True, "device": row["id"],
+                "action": spec["id"], "label": spec["label"],
+                "reminder": spec.get("reminder")}
+
+    def _fleet_fix_job(self, row, spec):
+        """The repair thread: run the verb, keep its ONE outcome line, then
+        re-check that device so the page shows the state it is in NOW —
+        never the state it was in before the repair."""
+        try:
+            rc, lines, timed_out = self._fleet_spawn(
+                [spec["noun"], row["name"], spec["verb"], "--yes", "--json"],
+                self.FLEET_FIX_TIMEOUT_SEC)
+            # the verb's own single outcome line ("✅ …" / "❌ …" at column 0
+            # — the finish pass's re-poll lines are indented). The TRANSCRIPT
+            # is the authority; this is only its headline.
+            outcome = next((ln for ln in reversed(lines)
+                            if ln[:1] in ("✅", "❌")), None)
+            # The tool's own machine-readable result, cross-checked against
+            # the exit code: `true` = verified on the wire, {"refused": true}
+            # = it never started (a read-only place, or the update lock is
+            # held). Both already answer nonzero — reading it lets the card
+            # say WHICH rather than "code 1".
+            tail = self._fleet_json_tail(lines)
+            ok = (rc == 0) and not timed_out and tail is not False
+            if isinstance(tail, dict) and tail.get("refused") and not outcome:
+                outcome = ("the repair did not start — the hub was busy with "
+                           "an update, or this install cannot make changes")
+            log.warning("🛠️ fleet repair %s — %s", "SUCCEEDED" if ok
+                        else "did not complete",
+                        outcome or "no outcome line (exit code %s)" % rc)
+            with self.fleet_lock:
+                fix = dict(self._fleet.get("lastFix") or {})
+                fix.update(state="done" if ok else "failed", ok=bool(ok),
+                           outcome=(outcome
+                                    or ("the repair did not finish in time"
+                                        if timed_out
+                                        else "the repair stopped with code "
+                                             "%s" % rc)),
+                           finishedAt=now_iso())
+                self._fleet.update(lastFix=fix,
+                                   log=lines[-self.FLEET_LOG_LINES:])
+            # Re-check THIS device in the same job: the verb already verified
+            # on the wire, but the page must not keep showing the old
+            # verdict. Bounded like any other device probe; a failed re-check
+            # leaves the previous row and says so.
+            rc2, lines2, to2 = self._fleet_spawn(
+                [row["kind"], row["name"], "doctor", "--json"],
+                self.FLEET_DEVICE_TIMEOUT_SEC)
+            data2 = self._fleet_json_tail(lines2)
+            self._fleet_store(row["kind"], row["name"], row.get("peer") or "",
+                              rc2, lines + [""] + lines2, to2, data2)
+            with self.fleet_lock:
+                # _fleet_store judged the RE-CHECK; the card is reporting the
+                # REPAIR. Restore the kind it ran under, and never let a
+                # follow-up check that could not finish paint a repair that
+                # worked as a failure — say exactly which of the two it was.
+                self._fleet["kind"] = "fix"
+                if ok and self._fleet.get("state") == "failed":
+                    self._fleet.update(
+                        state="done",
+                        error="the repair worked — the follow-up check did "
+                              "not finish, so what you see below may be one "
+                              "step behind")
+        except Exception as e:      # noqa: BLE001 — the card must not strand
+            log.exception("fleet repair thread failed")
+            with self.fleet_lock:
+                self._fleet.update(state="failed", error=str(e)[:200],
+                                   finishedAt=now_iso(),
+                                   finishedTs=time.time())
+
+    def fleet_state(self):
+        """GET /api/fleet/check — the job state + every device row + the
+        transcript tail. Read-only and cheap: no subprocess, no ssh, no
+        file. Safe to poll beside /api/status."""
+        phase = self.fleet_tournament_phase()
+        blocked = ("a tournament is %s — repairs that restart anything wait "
+                   "until it finishes" % phase) if phase else None
+        with self.fleet_lock:
+            st = dict(self._fleet)
+            devices = list(st.get("devices") or [])
+            st["log"] = list(st.get("log") or [])
+            st["lastFix"] = dict(st["lastFix"]) if st.get("lastFix") else None
+        # The tournament gate is LIVE state, so it is stamped at read time
+        # rather than frozen into the row when the checkup ran.
+        st["devices"] = [
+            dict(d, actions=[dict(a, blocked=blocked)
+                             for a in (d.get("actions") or [])])
+            for d in devices]
+        st["tournament"] = phase
+        st["busy"] = st.get("state") == "running"
+        started, finished = st.get("startedTs"), st.get("finishedTs")
+        st["elapsedSec"] = (round((finished or time.time()) - started, 1)
+                            if started else None)
+        st["flagged"] = sum(1 for d in devices
+                            if d.get("flag") in ("❌", "⚠️"))
+        st["ok"] = True
+        return st
+
     def ticket_header(self):
         """The hub-wide ticket header (C1/C2/C4) — hub_store.ticket_header()
         behind the sysval-style TTL cache: zero extra hub.db reads on the
@@ -4537,6 +5234,15 @@ class G2SHost:
         _su = payload.get("sshUser")
         if isinstance(_su, str) and _su.strip():
             entry["sshUser"] = _su.strip()[:64]
+        # piTail: which physical board this leg runs on — the ONLY join key
+        # between a SAS leg and the RFID reader on the same Pi (the smibId
+        # cannot carry it: smib-bb2 was named by hand). Clamped through the
+        # store's canonicalizer, so anything that is not exactly 6 lowercase
+        # hex leaves the key ABSENT: an unidentified board is stored as
+        # nothing, never as a guess.
+        _pt = _norm_device_tail(payload.get("piTail"))
+        if _pt:
+            entry["piTail"] = _pt
         entry["receivedAt"] = time.time()
         # Echo the operator prefs back so /api/status carries them (the UI
         # prefers them over its local cache — kiosk and phone agree). ONE
@@ -4682,6 +5388,11 @@ class G2SHost:
                 "smibId": entry.get("smibId"),
                 "address": entry.get("address"),
                 "port": entry.get("port")})
+        # The BOARD this leg runs on (v14): its own registry, its own throttle,
+        # same after-admission rule. A multidrop Pi touches one board row per
+        # address — the throttle collapses them to one write a minute.
+        self._touch_device(entry.get("piTail"), ip=peer,
+                           ssh_user=entry.get("sshUser"), sat_id=smib)
         if not known:
             log.info("🔌 [sas:%s] SMIB registered from %s (port=%s)",
                      key, peer, entry.get("port"))
@@ -5470,6 +6181,34 @@ class G2SHost:
         last_error = payload.get("lastError")
         last_error = last_error[:96] if isinstance(last_error, str) \
             and last_error else None
+        # piTail: which physical board this reader runs on — the ONLY join key
+        # between it and the SAS leg on the same Pi. companionId usually embeds
+        # the tail but cannot be trusted to (an operator --companion-id, or the
+        # hostname fallback off a Pi, erases it), so the tail rides separately.
+        # Clamped through the store's canonicalizer: anything that is not
+        # exactly 6 lowercase hex lands as None, so an unidentified board is
+        # stored as nothing rather than a guess.
+        pi_tail = _norm_device_tail(payload.get("piTail"))
+        # The login the reader runs as, so deploy/update.py SSHes in as the
+        # RIGHT user instead of assuming the hub's own — a wrong guess there
+        # is a reader that reads "NOT updated" forever. Absent from older
+        # daemons; the updater falls back exactly as it did before.
+        ssh_user = payload.get("sshUser")
+        ssh_user = ssh_user.strip()[:64] if isinstance(ssh_user, str) \
+            and ssh_user.strip() else None
+        # What the board IS and what it COULD do. None of this is authority —
+        # it is what the board said about itself, so junk and silence both
+        # land as None ("unknown"), never as a capability it does not have.
+        # uartReady stays a strict bool-or-None for that reason: a truthy
+        # string must never read as "ready".
+        model = payload.get("model")
+        model = model.strip()[:64] if isinstance(model, str) \
+            and model.strip() else None
+        uart_ready = payload.get("uartReady")
+        uart_ready = uart_ready if isinstance(uart_ready, bool) else None
+        i2c_bus = payload.get("i2cBus")
+        i2c_bus = i2c_bus.strip()[:32] if isinstance(i2c_bus, str) \
+            and i2c_bus.strip() else None
         # taps: bounded list of {tapId:int, uid:str, at:iso}; junk entries
         # drop silently (a skipped tap is unacked — the daemon re-sends it,
         # and if it is junk again it drops again: no wedge, no crash).
@@ -5584,11 +6323,13 @@ class G2SHost:
                     # co-location is AMBIGUOUS — we can't tell which cabinet the
                     # reader sits at, so we DON'T auto-bind (fall through to the
                     # operator's explicit pick) rather than guess a cabinet.
-                    peer = comp.get("peer")
-                    if peer:
+                    # its OWN name: `peer` is this report's source IP and is
+                    # still needed after this block (the device touch below)
+                    co_peer = comp.get("peer")
+                    if co_peer:
                         matches = [lk for lk, entry
                                    in list(self.sas_machines.items())
-                                   if (entry or {}).get("peer") == peer]
+                                   if (entry or {}).get("peer") == co_peer]
                         if len(matches) == 1:
                             leg = matches[0]
                             auto = True
@@ -5624,6 +6365,11 @@ class G2SHost:
                 comp["reported"] = {"g2sEgmId": g2s_egm, "sasSmib": sas_smib,
                                     "sasAddress": sas_addr}
                 comp["lastError"] = last_error
+                comp["piTail"] = pi_tail
+                comp["sshUser"] = ssh_user
+                comp["model"] = model
+                comp["uartReady"] = uart_ready
+                comp["i2cBus"] = i2c_bus
                 fresh = [t for t in taps if t["tapId"] > comp["ackTapId"]]
                 if fresh:
                     # advance BEFORE processing: a tap whose handling
@@ -5642,6 +6388,12 @@ class G2SHost:
                     #                     not wedge the report/ack cycle
                     log.error("💳 [companion:%s] tap %s failed: %s",
                               comp_id, t.get("tapId"), e)
+        # The BOARD this reader runs on (v14) — throttled, best-effort, and
+        # OUTSIDE every lock of ours (hub_store has its own and is never
+        # nested under companion_lock/procLock). See _touch_device.
+        self._touch_device(pi_tail, ip=peer, model=model, ssh_user=ssh_user,
+                           uart_ready=uart_ready, i2c_bus=i2c_bus,
+                           sat_id=comp_id)
         return {"ok": True, "ackTapId": ack}
 
     def _process_companion_tap(self, comp, tap):
@@ -6319,11 +7071,259 @@ class G2SHost:
                             "label": c.get("label") or "",
                             "reported": dict(c.get("reported") or {}),
                             "peer": c.get("peer"),
+                            # the board this reader runs on (6 hex, or null
+                            # when it never reported one) — what a device row
+                            # joins this reader to its SAS leg by
+                            "piTail": c.get("piTail"),
+                            # the login the reader itself reports — what
+                            # deploy/update.py SSHes in with (null on a daemon
+                            # too old to say, and it falls back as before)
+                            "sshUser": c.get("sshUser"),
+                            # what the board is + what a role would find here:
+                            # null everywhere means "it never said", which is
+                            # not the same as "no" and must not read as one
+                            "model": c.get("model"),
+                            "uartReady": c.get("uartReady"),
+                            "i2cBus": c.get("i2cBus"),
                             "lastError": c.get("lastError"),
                             "ackTapId": c.get("ackTapId"),
                             "lastTap": dict(c["lastTap"])
                             if c.get("lastTap") else None}
         return out
+
+    # -------------------------------- the device registry (hub.db v14)
+    # ONE row per physical Pi. A collector's box runs one, two or three role
+    # daemons (reader / SAS leg / player screen) and each reports under its
+    # OWN id — companion-a3f2b1 beside a hand-named smib-bb2 — so the floor
+    # showed one box as several strangers. The daemons now report the last 6
+    # hex of the board's cpuinfo serial as piTail; that, and NEVER an id
+    # string, is what pairs them. The tail comes off the silicon: it is
+    # derived, never minted, and no id is renamed to match it.
+
+    def _touch_device(self, tail, ip=None, model=None, ssh_user=None,
+                      uart_ready=None, i2c_bus=None, sat_id=None):
+        """Persist what a reporting daemon just said about the BOARD it runs
+        on. Throttled at REGISTRY_TOUCH_SEC exactly like register_g2s_machines
+        — satellites report every 1 s and readers every ~5 s, so one upsert a
+        minute is plenty and the SD card is never hammered. The persisted copy
+        is therefore up to a minute coarse; the live snapshots carry the
+        present tense.
+
+        This is the ONLY reason a board survives a hub restart with its power
+        pulled: the role registries are memory, so without a row a dark Pi
+        would vanish from the floor rather than read "last seen 3 days ago".
+        The NAME is never written here — naming is the operator's
+        (/api/settings) — and last_seen moves only on presence, so a board
+        recorded here today still reads as long-gone if that is the truth.
+
+        sat_id attaches an EXISTING role row to this board
+        (satellites.device_tail), which is what lets a name given to a leg
+        before v14 reach the board's row while the board is dark. A row is
+        never CREATED here: a leg the operator never touched has no name to
+        carry, and inventing one would mint identity.
+
+        Best-effort throughout — a full registry or a dying card costs the
+        persisted copy of a row, never the report that carried it."""
+        if not tail:
+            return                     # no tail, no guess (the whole law)
+        now = time.time()
+        if now - self._device_touched.get(tail, 0) < self.REGISTRY_TOUCH_SEC:
+            return
+        if len(self._device_touched) > self.COMPANION_MAX:
+            # the tail rides an unauthenticated wire, so this map is pruned
+            # to the window it exists to enforce rather than allowed to grow
+            # into a second, unbounded registry.
+            self._device_touched = {
+                k: v for k, v in self._device_touched.items()
+                if now - v < self.REGISTRY_TOUCH_SEC}
+        self._device_touched[tail] = now
+        meta = None
+        if isinstance(uart_ready, bool) or i2c_bus:
+            # what a role would FIND on this board. uartReady stays strict
+            # bool-or-None: a truthy string must never read as "ready" to
+            # someone deciding where to wire a machine.
+            meta = {}
+            if isinstance(uart_ready, bool):
+                meta["uartReady"] = uart_ready
+            if i2c_bus:
+                meta["i2cBus"] = i2c_bus
+        _, err = self.hub_store.device_set(
+            tail, model=model, ssh_user=ssh_user, last_ip=ip, meta=meta)
+        if err:
+            # a full registry (more boards than the cap) leaves this board
+            # LIVE on the floor and merely unpersisted — say so, don't hide it
+            log.warning("🔻 [device:%s] not recorded: %s", tail, err)
+        row = self.sat_bindings.get(sat_id) if sat_id else None
+        if row is not None and (row.get("deviceTail") or "") != tail:
+            with self._sat_write_lock:
+                new, serr = self.hub_store.sat_set(sat_id, device_tail=tail)
+                if new:
+                    self.sat_bindings[sat_id] = new
+                    log.info("🧩 [device:%s] %s runs on this board",
+                             tail, sat_id)
+                elif serr:
+                    log.warning("🔻 [device:%s] could not attach %s: %s",
+                                tail, sat_id, serr)
+
+    def devices_snapshot(self, companions, sas):
+        """The /api/status 'devices' section: one row per physical board,
+        folded from the two live role sections it is handed (so the fold and
+        the sections it folds can never disagree inside one payload) plus the
+        hub.db registry, joined on piTail and NEVER on an id string. A role
+        that reports no tail is simply not joinable — it stays in its own
+        section and contributes nothing here, because a guess would fuse two
+        boards forever.
+
+        A board that stops reporting KEEPS its row, marked stale — the
+        sas_snapshot posture: a powered-off Pi has not stopped existing. A
+        board with no roles yet is a row too (that is the whole point: a
+        freshly flashed card shows up as itself, waiting to be named).
+
+        Bounded like the companion registry it folds: at most COMPANION_MAX
+        rows, and when the union overflows, the STALEST goes first — the
+        companion_report eviction rule applied to the wire instead of the
+        registry. Rows come out in tail order so the bytes (and therefore the
+        poll's ETag) don't churn on dict ordering alone.
+
+        Best-effort: this rides the 2 s poll, so a db fault costs the
+        persisted half of the fold, never the poll."""
+        rows, legacy, live_reader, live_sas = {}, {}, {}, {}
+
+        def _blank(tail):
+            return {"deviceTail": tail, "label": "", "named": False,
+                    "model": None, "ip": None, "sshUser": None,
+                    "uartReady": None, "i2cBus": None,
+                    # lastSeen = the hub.db stamp (durable, up to
+                    # REGISTRY_TOUCH_SEC coarse — it is what a dark board is
+                    # dated by); reportAgeSec = the live present tense, null
+                    # when nothing on this board is reporting at all.
+                    "lastSeen": None, "reportAgeSec": None,
+                    "stale": True, "roles": {}}
+
+        def _fill(row, key, val):
+            # "" and None are "it never said", which must not overwrite
+            # something a daemon actually reported
+            if val:
+                row[key] = val
+
+        def _age(v):
+            # an unreported age sorts as infinitely old — never as fresh
+            return v if isinstance(v, (int, float)) else float("inf")
+
+        try:
+            persisted = self.hub_store.device_all()
+        except Exception:      # noqa: BLE001 — the poll survives a dying SD
+            log.exception("device registry read failed — rows degrade to "
+                          "the live half")
+            persisted = []
+        for d in persisted:
+            tail = d.get("deviceTail")
+            if not tail:
+                continue
+            r = rows[tail] = _blank(tail)
+            _fill(r, "model", d.get("model"))
+            _fill(r, "ip", d.get("lastIp"))
+            _fill(r, "sshUser", d.get("sshUser"))
+            r["lastSeen"] = d.get("lastSeen")
+            meta = d.get("meta") or {}
+            if isinstance(meta.get("uartReady"), bool):
+                r["uartReady"] = meta["uartReady"]
+            _fill(r, "i2cBus", meta.get("i2cBus"))
+            name = (d.get("label") or "").strip()
+            if name:
+                r["label"], r["named"] = name, True
+        # a name the operator gave a LEG before v14 (satellites.label) is the
+        # fallback below the board's own name — collected here so it reaches a
+        # dark board too, not only one whose reader happens to be reporting
+        for srow in list(self.sat_bindings.values()):
+            t, name = srow.get("deviceTail"), (srow.get("label") or "").strip()
+            if t and name:
+                legacy.setdefault(t, name)
+
+        for cid, c in (companions or {}).items():
+            tail = c.get("piTail")
+            if not tail:
+                continue
+            r = rows.get(tail) or rows.setdefault(tail, _blank(tail))
+            age = c.get("reportAgeSec")
+            prev = r["roles"].get("reader")
+            if prev is not None \
+                    and _age(prev.get("reportAgeSec")) <= _age(age):
+                continue           # two daemons, one tail: the freshest wins
+            # "reader" IS the companion daemon. Its PRESENCE is not a claim
+            # that a card reader is attached — ok says that (the golden image
+            # runs this daemon on every board, PN532 or not).
+            r["roles"]["reader"] = {
+                "id": cid, "ok": bool(c.get("readerOk")),
+                "reportAgeSec": age, "stale": bool(c.get("stale")),
+                "lastTapAt": (c.get("lastTap") or {}).get("at"),
+                "error": c.get("lastError")}
+            live_reader[tail] = c
+            name = (c.get("label") or "").strip()
+            if name:
+                legacy.setdefault(tail, name)
+
+        for key, s in sorted((sas or {}).items()):
+            tail = s.get("piTail")
+            if not tail:
+                continue
+            r = rows.get(tail) or rows.setdefault(tail, _blank(tail))
+            age = s.get("reportAgeSec")
+            role = r["roles"].get("sas")
+            if role is None:
+                role = r["roles"]["sas"] = {
+                    "id": s.get("smibId"), "ok": False,
+                    "reportAgeSec": age, "stale": True, "machines": []}
+            # one Pi can poll several addresses on a multidrop bus — that is
+            # ONE role serving several machines, not several roles. Total keys
+            # across all rows can't exceed the SAS registry's own bound.
+            role["machines"].append(key)
+            role["ok"] = role["ok"] or bool(s.get("online"))
+            role["stale"] = role["stale"] and bool(s.get("stale"))
+            if tail not in live_sas or _age(age) < _age(role["reportAgeSec"]):
+                role["reportAgeSec"] = age
+                role["id"] = s.get("smibId")
+                live_sas[tail] = s
+
+        for tail, r in rows.items():
+            # what the board says about ITSELF now beats the hub.db copy,
+            # which lags by up to REGISTRY_TOUCH_SEC. The reader is applied
+            # last: it is the only daemon that reports the board's model and
+            # what a role would find on it.
+            s = live_sas.get(tail)
+            if s is not None:
+                _fill(r, "sshUser", s.get("sshUser"))
+                _fill(r, "ip", s.get("peer"))
+            c = live_reader.get(tail)
+            if c is not None:
+                _fill(r, "sshUser", c.get("sshUser"))
+                _fill(r, "ip", c.get("peer"))
+                _fill(r, "model", c.get("model"))
+                _fill(r, "i2cBus", c.get("i2cBus"))
+                if isinstance(c.get("uartReady"), bool):
+                    r["uartReady"] = c["uartReady"]
+            ages = [v["reportAgeSec"] for v in r["roles"].values()
+                    if v.get("reportAgeSec") is not None]
+            r["reportAgeSec"] = round(min(ages), 1) if ages else None
+            # the board is stale unless SOME role on it is currently fresh —
+            # no roles at all (a persisted row whose Pi is unplugged) is stale
+            r["stale"] = not any(not v.get("stale")
+                                 for v in r["roles"].values())
+            if not r["named"]:
+                name = legacy.get(tail)
+                if name:
+                    r["label"], r["named"] = name, True
+                else:
+                    # never a bare tail on its own: the page has to be
+                    # readable by someone who has never seen a serial number
+                    r["label"] = f"New Pi ({tail})"
+        if len(rows) > self.COMPANION_MAX:
+            keep = sorted(rows.items(),
+                          key=lambda kv: (kv[1]["reportAgeSec"] is None,
+                                          kv[1]["reportAgeSec"] or 0.0)
+                          )[:self.COMPANION_MAX]
+            rows = dict(keep)
+        return {t: rows[t] for t in sorted(rows)}
 
     def card_sessions_snapshot(self):
         """The /api/status 'cardSessions' section — {egmId: {uid, name,
@@ -19449,6 +20449,21 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # until a companion reports (dormant on a fob-less floor).
                     snap["companions"] = engine.companion_snapshot()
                     snap["cardSessions"] = engine.card_sessions_snapshot()
+                    # One row per PHYSICAL Pi (hub.db v14): the reader and SAS
+                    # sections above folded by the piTail each daemon reports,
+                    # so the Pis page shows one box once instead of one row per
+                    # daemon. Handed the two sections it folds (never re-taken
+                    # snapshots) so a payload can't disagree with itself. ≤16
+                    # short rows — a rounding error beside one machine tile.
+                    # Reserved key the UI's EGM loop skips structurally; guarded
+                    # like tournament, because the poll the whole UI hangs off
+                    # must never 500 over a registry fold.
+                    try:
+                        snap["devices"] = engine.devices_snapshot(
+                            snap["companions"], snap["sas"])
+                    except Exception:  # noqa: BLE001 — status must never 500
+                        log.exception("devices fold failed — section empty")
+                        snap["devices"] = {}
                     # Glass nav v1: live glass-session summary (count + tier/name
                     # per EGM — NO token values; the token travels only in the
                     # carded EGM's own /api/glass/state poll). Reserved key the
@@ -19722,6 +20737,27 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 "logFile": engine.host_log_file,
                 "engine": engine.engine_meta()}, indent=2),
                 "application/json", soap=False)
+        elif path.startswith("/api/fleet/check"):
+            # The Back Office ▸ Fleet Doctor: the job state, every device row
+            # the last checkup produced, and the transcript tail. 404 when
+            # deploy/cabinetconfig.py is not in this install — that is the
+            # S.caps.<x> handshake every other card here uses, and it is how
+            # an older hub keeps The Back Office exactly as it is today.
+            # NEVER-500: the card polls this while a job runs.
+            engine = self.host_engine
+            if not engine.fleet_script():
+                return self._send(404, json.dumps(
+                    {"ok": False,
+                     "error": "this hub does not have the fleet checkup "
+                              "installed"}), "application/json", soap=False)
+            try:
+                body = json.dumps(engine.fleet_state(), indent=2,
+                                  allow_nan=False)
+            except Exception as e:  # noqa: BLE001 — never-500 endpoint
+                body = json.dumps({"ok": False,
+                                   "error": str(e)[:200]
+                                   or "fleet state failed"})
+            self._send(200, body, "application/json", soap=False)
         elif path.startswith("/api/vouchers"):
             # G2S-40 ticket browser: the DURABLE VoucherStore (not the
             # last-25 presentation rings). ?vid= is an exact-match lookup;
@@ -21214,6 +22250,51 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         return self._send(200 if reply.get("ok") else 400,
                           json.dumps(reply), "application/json", soap=False)
 
+    def _fleet_body(self, raw):
+        """The shared body parse for the two fleet endpoints. Returns the
+        dict, or None after answering — both endpoints follow the never-500
+        rule and hand a refusal back at 200, because the card polls them and
+        an HTTP error would only read as "the hub broke"."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+            return req
+        except (ValueError, TypeError) as e:
+            self._send(200, json.dumps(
+                {"ok": False, "error": "invalid JSON: %s" % e}),
+                "application/json", soap=False)
+            return None
+
+    def _handle_fleet_check(self, raw):
+        """POST /api/fleet/check {scope: "all"|"device", target?, kind?} —
+        start the fleet doctor and return AT ONCE. The job runs in its own
+        thread and every subprocess it starts is bounded, so neither this
+        request nor the 2 s /api/status poll can be held by a wedged ssh.
+        The UI polls GET /api/fleet/check for the result."""
+        req = self._fleet_body(raw)
+        if req is None:
+            return
+        res = self.host_engine.start_fleet_check(
+            scope=str(req.get("scope") or "all"),
+            target=req.get("target"),
+            kind=(str(req.get("kind")) if req.get("kind") else None))
+        self._send(200, json.dumps(res), "application/json", soap=False)
+
+    def _handle_fleet_fix(self, raw):
+        """POST /api/fleet/fix {device, action} — run ONE repair the hub is
+        currently offering for that device. The allow-list is recomputed
+        server-side from the stored doctor row (the client is never the
+        authority on what may run), a live tournament refuses with the phase
+        named, and the run itself is a bounded background subprocess. The UI
+        polls GET /api/fleet/check for the outcome."""
+        req = self._fleet_body(raw)
+        if req is None:
+            return
+        res = self.host_engine.start_fleet_fix(req.get("device"),
+                                               req.get("action"))
+        self._send(200, json.dumps(res), "application/json", soap=False)
+
     def _handle_fobs(self, raw):
         """POST /api/fobs {action: "set"|"delete", uid, tier?, label?,
         accountId?} — the fob registry write path (Settings ▸ Fobs &
@@ -22448,6 +23529,10 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             return self._handle_g2s_forget(raw, peer)
         if self.path.startswith("/api/sas/command"):
             return self._handle_sas_command(raw, peer)
+        if self.path.startswith("/api/fleet/check"):
+            return self._handle_fleet_check(raw)
+        if self.path.startswith("/api/fleet/fix"):
+            return self._handle_fleet_fix(raw)
         if self.path.startswith("/api/accounts"):
             return self._handle_accounts(raw)
         if self.path.startswith("/api/players"):

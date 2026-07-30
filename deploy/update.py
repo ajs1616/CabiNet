@@ -471,6 +471,12 @@ def find_companions(status):
             continue
         seen.add(peer)
         out.append({"companionId": cid, "peer": peer,
+                    # the reader REPORTS the account it runs as, same as a
+                    # satellite — never guess it. Assuming the hub's own login
+                    # is what left every reader adopted under a different
+                    # username permanently "NOT updated". None on older
+                    # daemons; sat_user() falls back.
+                    "user": (ent or {}).get("sshUser") or None,
                     "fresh": not (ent or {}).get("stale")})
     return out
 
@@ -1135,7 +1141,7 @@ def push_companions(root, comps, key, dry, touched=None):
     src = os.path.join(root, "Companion") + "/"
     done = []
     for c in comps:
-        u = sat_user(c)   # companions don't self-report a login (yet) —
+        u = sat_user(c)   # the login the reader reported about itself;
         #                   sat_user falls back to --ssh-user / the hub's own
         cdir, why = sat_companion_dir(c["peer"], key, user=u)
         if not cdir:
@@ -1197,7 +1203,7 @@ def restart_fleet(sats, comps, key, dry, touched=None):
         try:
             rc, _ = sat_ssh(c["peer"], key,
                             "sudo systemctl restart cabinet-companion",
-                            check=False, user=c.get("user") or sat_user(c))
+                            check=False, user=sat_user(c))
         except Exception:       # TimeoutExpired — a hung reader stays soft
             rc = 1
         if rc != 0:

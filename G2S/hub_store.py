@@ -51,6 +51,13 @@ rerun-safety story remain honest; the tables sit dormant. Historical ledger
 refs "hold:<machine>:<rowid>" in account_state.json are money history and
 once=True dedupe keys — never clean them. Do not rebuild.
 
+Schema v14 (2026-07-29) adds the DEVICE registry: one row per PHYSICAL board,
+keyed by the last 6 hex of its silicon serial (the wire's `piTail`). Role legs
+keep their own `satellites` rows — `sat_id` is untouched and there is no rename
+path anywhere — and hang off a device row via satellites.device_tail, so a Pi
+running both a Companion reader and a SAS SMIB is ONE thing the collector names
+once instead of two ids they have to know are the same box.
+
 Still future: accounts + ledger (migrate the WAT AccountStore/WatStore),
 events (leaderboard history).
 """
@@ -65,7 +72,7 @@ import time
 
 log = logging.getLogger("g2s.hub_store")
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Hard bounds — /api/names is unauthenticated (anyone on the floor VLAN/AP),
 # so the registry must stay bounded: without these, one hostile poster loops
@@ -216,6 +223,24 @@ MAX_SAT_LABEL_LEN = 64
 SAT_KINDS = ("companion", "sas")
 _SAT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
+# v14: the DEVICE registry — ONE ROW PER PHYSICAL BOARD. A Pi can run several
+# role legs (a Companion reader, a SAS SMIB), each self-IDing under its own
+# sat_id; device_tail is the last 6 hex of that board's silicon serial, which
+# every leg on it reports identically, so the legs FOLD into one row the
+# collector names once. THE TAIL IS READ FROM THE SILICON: never minted, never
+# renamed, and never a hostname — sat_id stays the satellites primary key and a
+# device row is what role rows hang off, not a replacement for them. A legacy
+# hand-named leg ('smib-bb2') carries device_tail='' until that daemon reports
+# its piTail, and attaches then.
+# The cap is the g2s host's COMPANION_MAX ceiling (16 boards — a hobby floor is
+# a couple of Zeros, never hundreds), restated here because hub_store must
+# never import the host; it is that same bound, not a second policy. Labels and
+# the reported strings reuse the satellite clamps — one board is one satellite-
+# sized row.
+MAX_DEVICES = 16
+_DEVICE_TAIL_RE = re.compile(r"^[0-9a-f]{6}$")
+MAX_DEVICE_META_LEN = 256
+
 
 def _now_iso():
     # Naive LOCAL time (no offset), matching SAS/core/sas_ticket_store's
@@ -253,6 +278,20 @@ def _norm_sat_id(sat_id):
         return None
     clean = sat_id.strip()
     return clean if _SAT_ID_RE.match(clean) else None
+
+
+def _norm_device_tail(tail):
+    """Canonicalize a device tail (the wire's piTail): strip, lowercase,
+    require EXACTLY 6 hex characters. Returns the canonical string or None.
+    Same normalize-or-None discipline as _norm_sat_id — the tail on the wire
+    and the tail in the table are one string — narrowed to what the silicon
+    actually yields, so a hostname, a hand-typed name or a padded id can never
+    become a device key. A daemon off a Pi reports no tail; the hub stores
+    nothing rather than guessing."""
+    if not isinstance(tail, str):
+        return None
+    clean = tail.strip().lower()
+    return clean if _DEVICE_TAIL_RE.match(clean) else None
 
 
 def _int_or_none(v):
@@ -618,6 +657,36 @@ class HubStore:
             c.execute("CREATE INDEX IF NOT EXISTS tito_activity_idx "
                       "ON tito_tickets("
                       "COALESCE(redeemed_at, issued_at, minted_at) DESC)")
+        if current < 14:
+            # v14: the device registry — one row per PHYSICAL board, keyed by
+            # the silicon serial's 6-hex tail (the wire's piTail). Role legs
+            # stay in `satellites` under their own sat_id and attach here via
+            # satellites.device_tail; the DEFAULT '' is the whole backfill, so
+            # a v13 db upgrades with every binding intact and legacy legs
+            # (hand-named ids that carry no tail) simply sit detached until
+            # their daemon reports one. NO row is rewritten, no id renamed.
+            # CREATE IF NOT EXISTS + the PRAGMA-guarded ALTER keep the step
+            # rerun-safe (the v4 DDL-autocommit landmine: DDL autocommits
+            # BEFORE the version stamp, so a crash between them must not
+            # raise OperationalError and quarantine a healthy db on re-run).
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS devices (
+                    device_tail TEXT PRIMARY KEY,   -- 6-hex silicon tail
+                    label       TEXT NOT NULL DEFAULT '',  -- operator name
+                    model       TEXT NOT NULL DEFAULT '',  -- as REPORTED
+                    ssh_user    TEXT NOT NULL DEFAULT '',  -- login that works
+                    last_ip     TEXT NOT NULL DEFAULT '',
+                    first_seen  TEXT NOT NULL,
+                    last_seen   TEXT NOT NULL,
+                    meta        TEXT NOT NULL DEFAULT '{}'
+                )""")
+            cols = {r["name"] for r in
+                    c.execute("PRAGMA table_info(satellites)").fetchall()}
+            if "device_tail" not in cols:
+                c.execute("ALTER TABLE satellites ADD COLUMN "
+                          "device_tail TEXT NOT NULL DEFAULT ''")
+            c.execute("CREATE INDEX IF NOT EXISTS satellites_device_idx "
+                      "ON satellites(device_tail)")
         if current < SCHEMA_VERSION:
             c.execute("INSERT INTO schema_meta(key,value) VALUES('version',?) "
                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1309,10 +1378,11 @@ class HubStore:
                 "sasSmib": r["sas_smib"] or None,
                 "sasAddress": r["sas_address"] or None,
                 "label": r["label"], "updatedAt": r["updated_at"],
+                "deviceTail": r["device_tail"] or None,
                 "meta": meta}
 
     def sat_set(self, sat_id, kind=None, egm_id=None, sas_smib=None,
-                sas_address=None, label=None):
+                sas_address=None, label=None, device_tail=None):
         """Assign or PARTIALLY update one satellite: None = keep the
         existing value (or the column default on first insert), so the UI
         can set the machine binding and the friendly label independently.
@@ -1322,7 +1392,12 @@ class HubStore:
         at MAX_SATELLITES — an UPDATE of a known sat_id always succeeds at
         the cap; only NEW rows refuse (a full table must never lock the
         operator out of re-binding a device that already exists). Pass ''
-        (empty) for a binding field to CLEAR it (unassign)."""
+        (empty) for a binding field to CLEAR it (unassign).
+
+        device_tail (v14) attaches this role leg to the PHYSICAL board that
+        reported it — the daemon's piTail, never anything typed. '' detaches.
+        It is a binding like the others: sat_id is not derived from it and is
+        never rewritten because of it."""
         norm = _norm_sat_id(sat_id)
         if norm is None:
             return None, f"satId must be 1..{MAX_SAT_ID_LEN} id characters"
@@ -1340,6 +1415,15 @@ class HubStore:
             sas_address = sas_address.strip()[:MAX_KEY_LEN]
         if label is not None:
             label = label.strip()[:MAX_SAT_LABEL_LEN]
+        if device_tail is not None:
+            if not isinstance(device_tail, str):
+                return None, "deviceTail must be a string"
+            if device_tail.strip():
+                device_tail = _norm_device_tail(device_tail)
+                if device_tail is None:
+                    return None, "deviceTail must be 6 hex characters"
+            else:
+                device_tail = ""            # '' detaches the leg
         now = _now_iso()
         try:
             with self.lock:
@@ -1355,18 +1439,23 @@ class HubStore:
                                       f"({MAX_SATELLITES})")
                 self._conn.execute("""
                     INSERT INTO satellites(sat_id, kind, egm_id, sas_smib,
-                                           sas_address, label, updated_at)
+                                           sas_address, label, updated_at,
+                                           device_tail)
                     VALUES (?, COALESCE(?,'companion'), COALESCE(?,''),
-                            COALESCE(?,''), COALESCE(?,''), COALESCE(?,''), ?)
+                            COALESCE(?,''), COALESCE(?,''), COALESCE(?,''), ?,
+                            COALESCE(?,''))
                     ON CONFLICT(sat_id) DO UPDATE SET
                         kind=COALESCE(?, satellites.kind),
                         egm_id=COALESCE(?, satellites.egm_id),
                         sas_smib=COALESCE(?, satellites.sas_smib),
                         sas_address=COALESCE(?, satellites.sas_address),
                         label=COALESCE(?, satellites.label),
+                        device_tail=COALESCE(?, satellites.device_tail),
                         updated_at=?
                 """, (norm, kind, egm_id, sas_smib, sas_address, label, now,
-                      kind, egm_id, sas_smib, sas_address, label, now))
+                      device_tail,
+                      kind, egm_id, sas_smib, sas_address, label,
+                      device_tail, now))
                 self._conn.commit()
                 row = self._conn.execute(
                     "SELECT * FROM satellites WHERE sat_id=?",
@@ -1439,6 +1528,152 @@ class HubStore:
         except sqlite3.Error as e:
             self._warn_limited("sat_bindings", e)
             return {}
+
+    # ---- v14 device registry (one row per physical board) ----------------
+    @staticmethod
+    def _device_row_out(r):
+        """sqlite row -> camelCase wire dict. Unreported strings surface as
+        None; the LABEL stays raw ('' = never named) because the caller
+        resolves the display name devices.label -> satellites.label (legacy)
+        -> 'New Pi (<tail>)' and must be able to tell an empty name from a
+        set one. meta JSON-decoded defensively (a hand-edited bad blob
+        degrades to {})."""
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+            if not isinstance(meta, dict):
+                meta = {}
+        except (ValueError, TypeError):
+            meta = {}
+        return {"deviceTail": r["device_tail"], "label": r["label"],
+                "model": r["model"] or None,
+                "sshUser": r["ssh_user"] or None,
+                "lastIp": r["last_ip"] or None,
+                "firstSeen": r["first_seen"], "lastSeen": r["last_seen"],
+                "meta": meta}
+
+    def device_set(self, device_tail, label=None, model=None, ssh_user=None,
+                   last_ip=None, meta=None, seen=True):
+        """Record or PARTIALLY update one physical board: None = keep the
+        existing value (or the column default on first insert), so the report
+        ingest refreshes model/ip/login while the operator's name is set
+        independently. Returns (row_dict, None) on success, (None,
+        error_string) on refusal. The tail is validated and every string
+        clamped — both the report edge and /api/settings are unauthenticated
+        on the floor AP — and the table capped at MAX_DEVICES: an UPDATE of a
+        known tail always succeeds at the cap, only NEW rows refuse (a full
+        table must never lock the operator out of renaming a board that
+        already exists).
+
+        seen=False for an OPERATOR edit: naming a board that has been
+        unplugged for a week must not make its row read 'just now'. Only a
+        presence report moves last_seen."""
+        norm = _norm_device_tail(device_tail)
+        if norm is None:
+            return None, "deviceTail must be 6 hex characters"
+        for name, val in (("label", label), ("model", model),
+                          ("sshUser", ssh_user), ("lastIp", last_ip)):
+            if val is not None and not isinstance(val, str):
+                return None, f"{name} must be a string"
+        if label is not None:
+            label = label.strip()[:MAX_SAT_LABEL_LEN]
+        if model is not None:
+            model = model.strip()[:MAX_SAT_LABEL_LEN]
+        if ssh_user is not None:
+            ssh_user = ssh_user.strip()[:MAX_SAT_LABEL_LEN]
+        if last_ip is not None:
+            last_ip = last_ip.strip()[:MAX_SAT_LABEL_LEN]
+        meta_json = None
+        if meta is not None:
+            if not isinstance(meta, dict):
+                return None, "meta must be an object"
+            meta_json = json.dumps(meta, separators=(",", ":"))
+            if len(meta_json) > MAX_DEVICE_META_LEN:
+                return None, f"meta over {MAX_DEVICE_META_LEN} bytes"
+        now = _now_iso()
+        try:
+            with self.lock:
+                known = self._conn.execute(
+                    "SELECT 1 FROM devices WHERE device_tail=?",
+                    (norm,)).fetchone()
+                if known is None:
+                    n = self._conn.execute(
+                        "SELECT COUNT(*) AS n FROM devices").fetchone()["n"]
+                    if n >= MAX_DEVICES:
+                        return None, f"device registry full ({MAX_DEVICES})"
+                self._conn.execute("""
+                    INSERT INTO devices(device_tail, label, model, ssh_user,
+                                        last_ip, first_seen, last_seen, meta)
+                    VALUES (?, COALESCE(?,''), COALESCE(?,''), COALESCE(?,''),
+                            COALESCE(?,''), ?, ?, COALESCE(?,'{}'))
+                    ON CONFLICT(device_tail) DO UPDATE SET
+                        label=COALESCE(?, devices.label),
+                        model=COALESCE(?, devices.model),
+                        ssh_user=COALESCE(?, devices.ssh_user),
+                        last_ip=COALESCE(?, devices.last_ip),
+                        meta=COALESCE(?, devices.meta),
+                        last_seen=CASE WHEN ? THEN ? ELSE devices.last_seen
+                                  END
+                """, (norm, label, model, ssh_user, last_ip, now, now,
+                      meta_json,
+                      label, model, ssh_user, last_ip, meta_json,
+                      1 if seen else 0, now))
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT * FROM devices WHERE device_tail=?",
+                    (norm,)).fetchone()
+            return (self._device_row_out(row) if row else None), None
+        except sqlite3.Error as e:
+            self._warn_limited("device_set", e)
+            return None, "db write failed"
+
+    def device_get(self, device_tail):
+        """One board as the camelCase wire dict, or None (unknown/malformed
+        tail, db error). Best-effort."""
+        norm = _norm_device_tail(device_tail)
+        if norm is None:
+            return None
+        try:
+            with self.lock:
+                row = self._conn.execute(
+                    "SELECT * FROM devices WHERE device_tail=?",
+                    (norm,)).fetchone()
+            return self._device_row_out(row) if row else None
+        except sqlite3.Error as e:
+            self._warn_limited("device_get", e)
+            return None
+
+    def device_all(self):
+        """Every board (camelCase dicts) in tail order, bounded by
+        MAX_DEVICES. Best-effort: degrades to [] on a db error (this rides
+        the /api/status path, which must never raise)."""
+        try:
+            with self.lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM devices ORDER BY device_tail "
+                    "LIMIT ?", (MAX_DEVICES,)).fetchall()
+            return [self._device_row_out(r) for r in rows]
+        except sqlite3.Error as e:
+            self._warn_limited("device_all", e)
+            return []
+
+    def device_delete(self, device_tail):
+        """Forget a board. True if a row went away; False for an unknown/
+        malformed tail or a db error (best-effort — re-doable from the UI).
+        Role rows are NOT touched: their sat_id is their own key and a leg
+        outliving the board row simply reads as detached until that daemon
+        reports its piTail again."""
+        norm = _norm_device_tail(device_tail)
+        if norm is None:
+            return False
+        try:
+            with self.lock:
+                cur = self._conn.execute(
+                    "DELETE FROM devices WHERE device_tail=?", (norm,))
+                self._conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.Error as e:
+            self._warn_limited("device_delete", e)
+            return False
 
     def machine_prefs(self, machine_key):
         """Operator prefs in ONE best-effort read (nickname + denomCents +

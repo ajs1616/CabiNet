@@ -1,0 +1,15 @@
+[Unit]
+Description=CabiNet first boot re-check (hourly, after the first success)
+
+[Timer]
+# Imager's firstrun may still be renaming the account when this fires; a run
+# that finds none exits nonzero and the service's 60s retry covers the gap.
+OnBootSec=30s
+# The steady-state cadence, and the ONLY thing this timer contributes:
+# everything before the first success is the service's Restart=on-failure at
+# 60s, not a shorter period here (a timer cannot change its own).
+OnUnitActiveSec=1h
+Unit=cabinet-firstboot.service
+
+[Install]
+WantedBy=timers.target
