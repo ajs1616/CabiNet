@@ -33,6 +33,7 @@ transcript never rotates. GR-04-clean: run it from a scratch checkout.
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -607,32 +608,50 @@ def t_verbs():
 # 4. CLI surface — menu pipe, pick prompt, dispatch rc, bare-checkout import
 # ---------------------------------------------------------------------------
 
-EMPTY_FLEET = {"degraded": True, "sats": [], "companions": [],
-               "machines": [], "leases": [], "neigh": [], "probes": {}}
-
-
 def t_pick():
-    """pick> is a prompt, not a dialer: q quits, a stray number or single
-    keystroke gets the correction line — none of them become an ssh peer."""
+    """The prompt is a prompt, not a dialer: q quits, a stray number or
+    single keystroke gets the correction line — none of them become an ssh
+    peer. _read_choice IS the whole vocabulary now (numbers pick, b q r ? are
+    the only letters), so these three guards are asserted at the source
+    instead of through a screen that has to build a fleet first."""
     import builtins
-    ctx = {"root": "/nowhere/fixture", "local": None}
-    old_df, old_in = cc.discover_fleet, builtins.input
-    cc.discover_fleet = lambda *a, **k: dict(EMPTY_FLEET)
+    old_in = builtins.input
     try:
-        with patched_status({"__error__": "down"}):
-            builtins.input = lambda prompt="": "q"
-            res, _out = run_quiet(cc._pick_device, ctx, "smib")
-            check("pick> 'q' quits — never dialed as a host", res == "quit")
-            builtins.input = lambda prompt="": "9"
-            res, out = run_quiet(cc._pick_device, ctx, "smib")
-            check("pick> out-of-range number → corrected, not dialed",
-                  res is None and "pick a number" in out)
-            builtins.input = lambda prompt="": "x"
-            res, out = run_quiet(cc._pick_device, ctx, "companion")
-            check("pick> single keystroke → corrected, not dialed",
-                  res is None and "pick a number" in out)
+        builtins.input = lambda prompt="": "q"
+        res, _out = run_quiet(cc._read_choice, 3, 0)
+        check("pick> 'q' quits — never dialed as a host", res == "quit")
+        builtins.input = lambda prompt="": "9"
+        res, out = run_quiet(cc._read_choice, 3, 0, True)
+        check("pick> out-of-range number → corrected, not dialed",
+              res is None and "pick a number" in out)
+        builtins.input = lambda prompt="": "x"
+        res, out = run_quiet(cc._read_choice, 3, 1, True)
+        check("pick> single keystroke → corrected, not dialed",
+              res is None and "pick a number" in out)
+        # b is the only back key, it is NEVER rendered at the root, and it
+        # never exits — the old Enter/0 could dump you past the finish pass.
+        builtins.input = lambda prompt="": "b"
+        res, out = run_quiet(cc._read_choice, 3, 0)
+        check("b at the root corrects instead of exiting",
+              res is None and "You are at the top" in out)
+        res, _out = run_quiet(cc._read_choice, 3, 1)
+        check("b one screen in goes back", res == "back")
+        builtins.input = lambda prompt="": ""
+        res, _out = run_quiet(cc._read_choice, 3, 1)
+        check("Enter redraws — never navigation", res == "redraw")
+        builtins.input = lambda prompt="": "192.168.50.66"
+        res, _out = run_quiet(cc._read_choice, 3, 0, True)
+        check("a typed address is taken only where the footer offers it",
+              res == ("host", "192.168.50.66"))
+        res, out = run_quiet(cc._read_choice, 3, 1, False)
+        check("…and corrected where it is not", res is None
+              and "pick a number" in out)
+        builtins.input = lambda prompt="": "2"
+        res, _out = run_quiet(cc._read_choice, 3, 0)
+        check("an in-range number picks the n-th thing on THIS screen",
+              res == ("pick", 2))
     finally:
-        cc.discover_fleet, builtins.input = old_df, old_in
+        builtins.input = old_in
 
 
 def t_dispatch():
@@ -651,24 +670,56 @@ def t_dispatch():
           rc == 2 and "takes no target" in out)
 
 def t_cli(tmp):
+    """Every menu walk runs with `--hub none` so the PLACE is deterministic:
+    without it a gate run on a box that can route to a real floor would find
+    it, hit the network, and render a different screen."""
     home = os.path.join(tmp, "home")
     os.makedirs(home)
     env = dict(os.environ, HOME=home)
     script = os.path.join(DEPLOY, "cabinetconfig.py")
+    argv = [sys.executable, script, "--hub", "none"]
 
-    p = subprocess.run([sys.executable, script], input="q\n", text=True,
+    p = subprocess.run(argv, input="q\n", text=True,
                        capture_output=True, env=env, cwd=REPO, timeout=120)
     check("menu: piped 'q' exits rc 0", p.returncode == 0)
     check("…finish pass closes the session",
           "nothing was touched" in p.stdout)
 
-    walk = "3\n3\n0\nq\n"    # SMIB menu → S3 signpost → back → quit
-    p = subprocess.run([sys.executable, script], input=walk, text=True,
+    # THE FRONT DOOR — the most-seen screen in a public repo. It teaches,
+    # names where the tool runs, and never leads with what it failed to find.
+    front = p.stdout
+    check("front door: says what the tool is and that it runs ON THE HUB",
+          "fleet repair" in front and "It runs ON THE HUB" in front)
+    check("…and shows exactly how to get there",
+          "ssh <you>@<your-hub>" in front and "./cabinetconfig" in front)
+    check("…no scolding banner, no read-only tag, no dead entries",
+          not any(bad in front for bad in
+                  ("READ-ONLY", "no hub evidence", "planned", "[ro]",
+                   "[signpost]", "0) back")))
+    # Split defensively: if the footer's lead ever moves, this must FAIL the
+    # check, never raise IndexError out of the gate.
+    foot = ([l for l in front.splitlines() if l.startswith(" Pick a number.")]
+            or [""])[0]
+    check("…and no back affordance at the root",
+          bool(foot) and ") back" not in foot)
+    check("…and no dead 'look for a hub' entry when discovery is switched "
+          "off", "Look for a hub" not in front and "answered at ." not in front
+          and "r) check again" not in foot)
+
+    walk = "1\nb\nq\n"       # scope page → back → quit
+    p = subprocess.run(argv, input=walk, text=True,
                        capture_output=True, env=env, cwd=REPO, timeout=120)
     check("menu: 2-level walk exits rc 0", p.returncode == 0)
-    check("…S3 signpost rendered on the walk", "Switchboard" in p.stdout)
+    check("…the scope page names the frozen two-repair surface",
+          "It changes exactly two things" in p.stdout)
 
-    p = subprocess.run([sys.executable, script], input="", text=True,
+    # b at the root is a correction, never an exit past the finish pass
+    p = subprocess.run(argv, input="b\nq\n", text=True,
+                       capture_output=True, env=env, cwd=REPO, timeout=120)
+    check("menu: 'b' at the root does not exit",
+          p.returncode == 0 and "You are at the top" in p.stdout)
+
+    p = subprocess.run(argv, input="", text=True,
                        capture_output=True, env=env, cwd=REPO, timeout=120)
     check("menu: EOF (empty stdin) exits rc 0", p.returncode == 0)
 
@@ -682,6 +733,370 @@ def t_cli(tmp):
                        capture_output=True, env=env, cwd=tmp, timeout=60)
     check("import-from-bare-checkout + say-tee patch",
           p.returncode == 0 and "import-ok" in p.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 4b. the screens — renderers return line lists, so every screen can be
+#     asserted with no subprocess and no fake stdin
+# ---------------------------------------------------------------------------
+
+EGM = "IGT_00AA00BB00CC"
+# a plan code (S1.4, C2, H14) in anything a person is asked to CHOOSE is the
+# leak the rework exists to close; design-doc tags likewise
+PLAN_CODE = re.compile(r"\b[SCH]\d{1,2}(\.\d+)?\b")
+DOC_TAGS = ("[ro]", "[signpost]")
+
+
+def screen_ctx(place, status, mode="full", local=None, verdict="hub",
+               wd="", root="/nowhere/fixture"):
+    import argparse as _ap
+    ctx = {"root": root, "mode": mode, "place": place, "status": status,
+           "session": {"touched": []}, "local": local, "tried": [],
+           "identity": {"verdict": verdict, "wd": wd, "units": True},
+           "args": _ap.Namespace(yes=False, dry_run=False, json=False,
+                                 hub="none")}
+    ctx["ui"] = cc._fresh_ui(ctx)
+    return ctx
+
+
+def floor_status(sas_over=None, comp_over=None, phase="idle"):
+    st = status_fix(sas={SMIB + "/1": tile(**(sas_over or {}))},
+                    companions={COMP: comp_row(**(comp_over or {}))},
+                    phase=phase)
+    st["companions"][COMP]["bindings"] = {"g2sEgmId": EGM, "sasSmib": SMIB,
+                                          "sasAddress": 1}
+    st["names"] = {EGM: "Bluebird 2"}
+    st["hostOptions"] = {"gameroomName": "THE GAME ROOM",
+                         "updates": {"current": "abc1234 a commit"}}
+    return st
+
+
+def fleet_of(st):
+    return cc.discover_fleet(st, "/nowhere/fixture", local=mock(
+        {"ip -4 -o addr 2>/dev/null || true": (0, ""),
+         "ip neigh 2>/dev/null || true": (0, "")}))
+
+
+HUB_LOCAL = dict(HUB_OK)
+HUB_LOCAL['for u in cabinet-g2s cabinet-dhcp cabinet-dns cabinet-ntp '
+          'cabinet-tftp; do echo "$u $(systemctl show -p '
+          'ExecMainStartTimestamp --value $u 2>/dev/null)"; done'] = (0, "")
+
+
+def t_screens():
+    screens = []                       # (label, lines, action-labels)
+
+    def render(label, lines, acts=()):
+        screens.append((label, list(lines), [a["label"] for a in acts]))
+        return lines, acts
+
+    st = floor_status()
+    ctx = screen_ctx("hub", st, local=mock(HUB_LOCAL))
+    lines, acts = render("root healthy",
+                         *cc.render_root(ctx, {"status": st,
+                                               "fleet": fleet_of(st)}))
+    body = "\n".join(lines)
+    check("root: leads with the ANSWER, not a menu",
+          body.index("Nothing needs you") < body.index("Floor tools"))
+    check("root: the top list IS the fleet, device-first",
+          [a["label"] for a in acts][:4]
+          == ["Bluebird 2", SMIB, COMP, "hub"])
+
+    # the same floor on fire must NOT render like the healthy one
+    st_bad = floor_status(
+        sas_over={"online": False, "stale": True, "reportAgeSec": 740},
+        comp_over={"readerOk": False, "lastError": "PN532 wedged"})
+    ctx_bad = screen_ctx("hub", st_bad, local=mock(HUB_LOCAL))
+    lines, acts = render("root broken",
+                         *cc.render_root(ctx_bad, {"status": st_bad,
+                                                   "fleet": fleet_of(st_bad)}))
+    body_bad = "\n".join(lines)
+    check("root: a burning floor cannot render like a healthy one",
+          body_bad != body and "need you, worst first" in body_bad)
+    check("…and the machine's row says MONEY, not 'offline' (dual-stack law)",
+          "credits and meters" in body_bad)
+    check("…worst first: the ❌ rows come before 'The rest are fine'",
+          body_bad.index("credits and meters")
+          < body_bad.index("The rest are fine"))
+
+    # device screen: the fix is a CHILD of the finding, in plain language
+    doc, _o = run_quiet(cc.doctor_smib, mock(SM_OFF), SMIB, ST_EMPTY)
+    dev = next(e for e in ctx_bad["ui"]["ents"] if e["kind"] == "smib")
+    lines, acts = render("device UNIT-OFF",
+                         *cc.render_device(ctx_bad, dev, doc))
+    body = "\n".join(lines)
+    check("device: UNIT-OFF renders as a sentence with the fix under it",
+          "The SAS service on this Pi is switched off" in body
+          and acts[0]["label"] == "Turn the SAS leg back on")
+    check("…the classification code still prints, next to its evidence",
+          "UNIT-OFF" in body)
+    check("…and the probe table collapses to a count",
+          "Looked at" in body and "config.txt" not in body)
+    render("checks", cc.render_checks(dev, doc))
+    render("one-liners", cc.render_oneliners(ctx_bad, dev))
+
+    # HUB-PARKED: the switch, never the verb
+    pdoc, _o = run_quiet(cc.doctor_smib, mock(SM_UP), SMIB, ST_PARKED)
+    lines, acts = render("device HUB-PARKED",
+                         *cc.render_device(ctx_bad, dev, pdoc))
+    check("HUB-PARKED offers the signpost and NEVER 'turn the leg on'",
+          acts[0]["label"].startswith("Show me where")
+          and not any("Turn the SAS leg" in a["label"] for a in acts))
+
+    # UNREACHABLE: zero actions that could not run
+    udoc, _o = run_quiet(cc.doctor_smib, mock({}, reachable=False), SMIB,
+                         ST_EMPTY)
+    lines, acts = render("device UNREACHABLE",
+                         *cc.render_device(ctx_bad, dev, udoc))
+    check("UNREACHABLE offers no repair and no page that cannot answer",
+          [a["label"] for a in acts] == ["The one-line commands for this "
+                                         "screen"])
+
+    # a rail replaces the action with ONE sentence — never a dead item
+    ctx_t = screen_ctx("hub", floor_status(phase="running"),
+                       local=mock(HUB_LOCAL))
+    cc.render_root(ctx_t, {"status": ctx_t["status"],
+                           "fleet": fleet_of(ctx_t["status"])})
+    lines, acts = render("device UNIT-OFF, tournament up",
+                         *cc.render_device(ctx_t, dev, doc))
+    check("a tournament removes the repair ITEM and says why",
+          "tournament is running" in "\n".join(lines)
+          and not any("Turn the SAS leg" in a["label"] for a in acts))
+
+    # a card reader is never told its SAS service is off
+    cdoc, _o = run_quiet(cc.doctor_companion,
+                         mock(dict(CO_BROKEN, **{NRES: (0, "0"),
+                                                 EN_COMP: (0, "disabled"),
+                                                 AC_COMP: (0, "inactive")})),
+                         COMP, ST_EMPTY)
+    cdev = next(e for e in ctx_bad["ui"]["ents"] if e["kind"] == "companion")
+    lines, acts = render("device companion UNIT-OFF",
+                         *cc.render_device(ctx_bad, cdev, cdoc))
+    check("UNIT-OFF on a READER never says 'SAS service' or offers smib up",
+          "card reader's service is switched off" in "\n".join(lines)
+          and not any("SAS leg" in a["label"] for a in acts))
+
+    # THE HUB'S OWN device screen — it runs cabinet-g2s, it is its own noun,
+    # and it takes no target. It used to be offered a cabinet-sas journal and
+    # a copy-pasteable `smib hub up --yes`.
+    hdoc, _o = run_quiet(cc.doctor_hub, FIXROOT, mock(HUB_OK), floor_status())
+    hdev = cc._dev("hub", "hub", "192.168.50.2", role="the floor host",
+                   key="hub")
+    lines, acts = render("device hub", *cc.render_device(ctx_bad, hdev, hdoc))
+    hlabels = [a["label"] for a in acts]
+    check("the hub's screen offers its OWN unit's journal, not a satellite's",
+          any("cabinet-g2s" in l for l in hlabels)
+          and not any("cabinet-sas" in l for l in hlabels))
+    ol = "\n".join(render("one-liners hub",
+                          cc.render_oneliners(ctx_bad, hdev))[0])
+    check("…and its one-liners are hub verbs with no target, never `smib "
+          "hub up`", "./cabinetconfig hub doctor" in ol
+          and "smib hub" not in ol and "hub up" not in ol)
+
+    # the plan-code stripper the sweep now runs its doctors through
+    _d, dout = run_quiet(cc.doctor_smib, mock(SM_OFF), SMIB, ST_EMPTY)
+    stripped = cc._plain_report(dout.rstrip("\n").split("\n"))
+    check("sweep: a doctor's printed table loses its plan codes and keeps "
+          "its columns",
+          not any(PLAN_CODE.search(l) for l in stripped)
+          and any(l.startswith("   ✅ ") and "  " in l[6:] for l in stripped)
+          and any("unit census" in l for l in stripped))
+
+    # the machine screen — "what is wrong with my BB2"
+    ment = next(e for e in ctx_bad["ui"]["ents"] if e["kind"] == "machine")
+    lines, acts = render("machine", *cc.render_machine(ctx_bad, ment))
+    check("machine screen routes to what serves it, and owns no settings",
+          [a["label"] for a in acts] == [SMIB, COMP]
+          and "never changed from here" in "\n".join(lines))
+
+    # off the hub, hub reachable: full visibility, mutation RELOCATED
+    ctx_r = screen_ctx("remote", st_bad, mode="read-only", verdict="not-hub")
+    lines, acts = render("root remote",
+                         *cc.render_root(ctx_r, {"status": st_bad,
+                                                 "fleet": fleet_of(st_bad)}))
+    body_r = "\n".join(lines)
+    check("state 2: the header names the hub and how it was reached",
+          "reachable from here" in body_r)
+    check("…the read-only reason is the lock and the key, not 'permission'",
+          "update lock" in body_r and "key that reaches the Pis" in body_r)
+    check("…lease/ARP is hidden off the hub (it would be fiction)",
+          not any("who is on the wire" in a["label"] for a in acts))
+    rdev = next(e for e in ctx_r["ui"]["ents"] if e["kind"] == "smib")
+    lines, acts = render("device remote", *cc.render_device(ctx_r, rdev, doc))
+    check("state 2: the repair is relocated, not refused",
+          acts[0]["label"].endswith("runs on the hub"))
+    render("relay", cc.render_relay(ctx_r, rdev, "verb-smib-up"))
+    render("hub over the API", *cc.render_hub_api_view(ctx_r))
+
+    # THE HUB'S VIEW of a Pi this computer cannot ssh to — the screen that
+    # used to print `tile smib-x/1 — online=False stale=True` at a person.
+    rcomp = next(e for e in ctx_r["ui"]["ents"] if e["kind"] == "companion")
+    hv_s = render("hub view of a SAS leg", *cc.render_hub_view(ctx_r, rdev))
+    hv_c = render("hub view of a reader", *cc.render_hub_view(ctx_r, rcomp))
+    hv = "\n".join(list(hv_s[0]) + list(hv_c[0]))
+    check("the hub's view speaks sentences, never dict fields",
+          not any(t in hv for t in ("online=", "stale=", "readerOk=",
+                                    "True", "False", " tile "))
+          and "the hub has not heard from this leg" in hv)
+    check("…and it never guesses the hub login for a copy-paste ssh line",
+          "<you>@" in hv and ("ssh %s@" % cc._u.SAT_USER) not in hv)
+
+    # EVERY 'show how to fix it' page — the leaf screens of the whole flow,
+    # and the ones the 80-column law never used to see.
+    wire_row = {"kind": "wire", "name": "192.168.50.104",
+                "peer": "192.168.50.104", "role": "a box on the wire"}
+    for _tbl_name, tbl in (("code", cc.CODE_UI),
+                           ("companion", cc.CODE_UI_BY_KIND["companion"])):
+        for code, ui in sorted(tbl.items()):
+            d = dict(rdev, kind=("companion" if _tbl_name == "companion"
+                                 else "smib"))
+            act = ui.get("act") or {}
+            if act.get("kind") == "block":
+                render("fix page %s" % code,
+                       ["", cc._b("   " + act["label"])]
+                       + cc._pad(act["build"](d)))
+            if ui.get("after"):
+                render("fix page %s" % code, ui["after"](d))
+                # a lease row carries no reported login: this used to be a
+                # KeyError, i.e. the menu dying on the normal case
+                render("fix page %s (lease row)" % code,
+                       ui["after"](wire_row))
+
+    # the other places
+    ctx_d = screen_ctx("degraded", {"__error__": "down"}, mode="degraded",
+                       local=mock(HUB_LOCAL))
+    render("root degraded",
+           *cc.render_root(ctx_d, {"status": {"__error__": "down"},
+                                   "fleet": cc.discover_fleet(
+                                       {"__error__": "down"},
+                                       "/nowhere/fixture",
+                                       local=mock({}))}))
+    ctx_w = screen_ctx("wrong-clone", st, mode="read-only",
+                       verdict="wrong-clone", wd="/other/tree/G2S",
+                       local=mock(HUB_LOCAL))
+    lines, acts = render("root wrong clone",
+                         *cc.render_root(ctx_w, {"status": st,
+                                                 "fleet": fleet_of(st)}))
+    check("wrong clone: the menu SHRINKS to what still works, fix printed",
+          "cd /other/tree" in "\n".join(lines)
+          and not any(a["label"] == SMIB for a in acts))
+    ctx_f = screen_ctx("away", {"__error__": "no hub"}, mode="read-only",
+                       verdict="not-hub")
+    render("front door (--hub none: no look-again item)",
+           *cc.render_front_door(ctx_f))
+    # …and the shape where discovery DID run and found nothing: item 4 is
+    # live, and the note that explains why that is normal is at the bottom.
+    ctx_f2 = screen_ctx("away", {"__error__": "no hub"}, mode="read-only",
+                        verdict="not-hub")
+    ctx_f2["args"].hub = None
+    ctx_f2["ui"]["tried"] = [("http://192.168.50.2:8081", "the documented "
+                              "default"), ("http://192.168.4.1:8081",
+                                           "this computer's gateway")]
+    fd2, fd2a = render("front door (looked, found none)",
+                       *cc.render_front_door(ctx_f2))
+    check("front door: the look-again item exists only when looking can work",
+          any(a["label"].startswith("Look for a hub") for a in fd2a)
+          and not any(a["label"].startswith("Look for a hub")
+                      for a in cc.render_front_door(ctx_f)[1]))
+    render("scope", cc.render_scope())
+    render("cli map", cc.render_cli_map())
+
+    # THE 14-MACHINE TESTER FLOOR — the fold the code cites as its reason to
+    # exist, with collector-given names, which is exactly where it broke 80.
+    big = []
+    names = ["Bally Blazing 7s Upright", "IGT Game King Corner Slot",
+             "Konami Podium Center Row", "Wheel of Fortune 25c",
+             "Red White and Blue", "Triple Cash Wheel", "Jackpot Party",
+             "Money Storm", "Piggy Bankin", "Reel Em In", "Cash Express",
+             "Top Dollar", "Double Diamond", "Blazing Sevens"]
+    for i, nm in enumerate(names):
+        big.append({"kind": "machine", "name": nm,
+                    "peer": "192.168.50.%d" % (30 + i), "flag": "✅",
+                    "detail": "online · G2S", "sub": [],
+                    "key": "machine:%d" % i})
+    big.append({"kind": "hub", "name": "hub", "peer": "192.168.50.2",
+                "flag": "✅", "detail": "5 services up, API answering",
+                "sub": [], "key": "hub"})
+    fold_acts = []
+    fold = cc._board_lines(screen_ctx("hub", st), big, fold_acts)
+    render("root folded 14-machine floor", fold,
+           [{"label": a} for a in [x["label"] for x in fold_acts]])
+    check("the folded tail stays pickable — one number per device",
+          len(fold_acts) == len(big))
+    check("…and the hub keeps its full row instead of folding to a bare name",
+          any("✅ hub" in l and "192.168.50.2" in l for l in fold))
+
+    # --- the laws, over every screen rendered above --------------------
+    leaks, tags, dead = [], [], []
+    for label, lines, act_labels in screens:
+        for a in act_labels:
+            if PLAN_CODE.search(a):
+                leaks.append("%s: %r" % (label, a))
+            if any(t in a for t in DOC_TAGS) or "[y/N]" in a:
+                tags.append("%s: %r" % (label, a))
+            if not a.strip():
+                dead.append(label)
+        for l in lines:
+            if PLAN_CODE.search(cc._ANSI.sub("", l)):
+                leaks.append("%s: %r" % (label, l))
+            if any(t in l for t in DOC_TAGS):
+                tags.append("%s: %r" % (label, l))
+            if "planned" in l or "0) back" in l:
+                dead.append("%s: %r" % (label, l))
+    for b in (leaks + tags + dead)[:6]:
+        print("     ↳ %s" % b)
+    check("LAW: no plan code (S1.4/C2/H14) in ANY rendered screen or label, "
+          "across %d screens" % len(screens), not leaks)
+    check("LAW: no design-doc tag ([ro]/[signpost]/[y/N]) in any label",
+          not tags)
+    check("LAW: no dead entry — nothing rendered that does nothing",
+          not dead)
+    # DISPLAY cells, not code points: ✅/❌ are one character and two cells,
+    # so len() under-measures every flagged row by one.
+    wide = ["%s: %d cols: %r" % (lb, cc._dispw(cc._ANSI.sub("", l)), l)
+            for lb, ls, _a in screens for l in ls
+            if cc._dispw(cc._ANSI.sub("", l)) > 80]
+    for w in wide[:6]:
+        print("     ↳ %s" % w)
+    check("LAW: every rendered screen fits 80 columns, measured in display "
+          "cells, across %d screens" % len(screens), not wide)
+
+
+def t_menu_safety(tmp):
+    """THE SAFETY LAW: a number never changes anything. A number opens a
+    screen or shows a plan; only an explicit y at a confirm() prompt mutates.
+    That is what makes the worst-first renumbering safe — the board can
+    reorder between two glances and a stale keystroke still cannot fire a
+    repair."""
+    import builtins
+    root = os.path.join(tmp, "safety-root")
+    os.makedirs(root)
+    st = floor_status()
+    ctx = screen_ctx("hub", st, local=mock(HUB_LOCAL), root=root)
+    cc.render_root(ctx, {"status": st, "fleet": fleet_of(st)})
+    dev = next(e for e in ctx["ui"]["ents"] if e["kind"] == "smib")
+    doc, _o = run_quiet(cc.doctor_smib, mock(SM_OFF), SMIB, ST_EMPTY)
+    ctx["ui"]["docs"][dev["key"]] = doc
+    t = mock(SM_OFF)                       # the box every action would touch
+    old_tp, old_in = cc._transport_for, builtins.input
+    # press every number on the screen, in order, backing out of each
+    keys = iter(list("1234") + ["b"] * 6 + ["q"])
+    cc._transport_for = lambda c, d: t
+    # echo the prompt the way a terminal does, so confirm()'s own [y/N] is
+    # part of the captured session and not swallowed by the patch
+    builtins.input = lambda prompt="": (sys.stdout.write(prompt),
+                                        next(keys))[1]
+    try:
+        with patched_status(st):
+            _res, out = run_quiet(cc.device_screen, ctx, dev)
+    finally:
+        cc._transport_for, builtins.input = old_tp, old_in
+    fired = [c for c in t.journal
+             if any(tok in c for tok in MUT_TOKENS)]
+    check("LAW: pressing only NUMBERS issues zero mutating commands",
+          not fired)
+    check("…the repair still showed its literal plan and asked",
+          CMD_S2 in out and "[y/N]" in out)
 
 
 # ---------------------------------------------------------------------------
@@ -735,7 +1150,11 @@ def main():
         t_verbs()
         print("== CLI (menu pipe + bare-checkout import)")
         t_cli(tmp)
-        print("== pick prompt")
+        print("== screens")
+        t_screens()
+        print("== menu safety law")
+        t_menu_safety(tmp)
+        print("== the prompt")
         t_pick()
         print("== dispatch exit codes")
         t_dispatch()
