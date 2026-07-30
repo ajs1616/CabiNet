@@ -58,6 +58,7 @@ G2S_GATES = (
     "test_tournament.py",
     "test_hub_store.py",
     "test_hub_tito.py",
+    "test_cabinetconfig.py",
     "test_companion_rfid.py",
     "test_aft_push.py",
     "test_machine_linking.py",

@@ -1,0 +1,3 @@
+#!/bin/sh
+# CabiNet fleet repair menu — a real script, not a symlink (Windows checkouts). Everything lives in deploy/cabinetconfig.py.
+exec python3 "$(dirname "$0")/deploy/cabinetconfig.py" "$@"
