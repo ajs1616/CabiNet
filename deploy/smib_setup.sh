@@ -99,28 +99,59 @@ RUSER=$("${SSH[@]}" "$HOST" 'id -un')
 RHOME=$("${SSH[@]}" "$HOST" 'echo "$HOME"')
 
 say "UART: PL011 to the header, console off"
-"${SSH[@]}" "$HOST" '
+# Prints "uart-changed" if it actually edited boot config (=> reboot needed),
+# else "uart-nochange". WITHOUT this the script rebooted on EVERY run: re-running
+# it on an already-correct Pi took a live SAS cabinet off the floor for 2-4
+# minutes and changed nothing. companion_setup.sh has had this discipline since
+# the duplicate-overlay incident; this is its twin.
+UART_OUT=$("${SSH[@]}" "$HOST" '
 set -e
 MODEL=$(tr -d "\0" < /proc/device-tree/model 2>/dev/null || echo unknown)
-echo "board: $MODEL"
+echo "board: $MODEL" >&2
+CHANGED=0
 case "$MODEL" in
   *"Zero 2"*|*"Zero W"*|*"Pi 3"*|*"Pi 4"*) : ;;   # the proven PL011 recipe
-  *"Pi 5"*) echo "NOTE: Pi 5 — UARTs live on the RP1; disable-bt still frees ttyAMA0 on current firmware, but verify the port after reboot" ;;
-  *) echo "WARNING: unrecognized board ($MODEL) — PL011 assumptions unverified; check /dev/ttyAMA0 exists after reboot" ;;
+  *"Pi 5"*) echo "NOTE: Pi 5 — UARTs live on the RP1; disable-bt still frees ttyAMA0 on current firmware, but verify the port after reboot" >&2 ;;
+  *) echo "WARNING: unrecognized board ($MODEL) — PL011 assumptions unverified; check /dev/ttyAMA0 exists after reboot" >&2 ;;
 esac
 CFG=/boot/firmware/config.txt; [ -f "$CFG" ] || CFG=/boot/config.txt
 CMD=/boot/firmware/cmdline.txt; [ -f "$CMD" ] || CMD=/boot/cmdline.txt
-sudo cp "$CFG" "$CFG.bak-sas" 2>/dev/null || true
-grep -q "^dtoverlay=disable-bt" "$CFG" || printf "\n# SAS SMIB: PL011 -> GPIO14/15 (mini-UART has no parity, cannot do SAS)\nenable_uart=1\ndtoverlay=disable-bt\n" | sudo tee -a "$CFG" >/dev/null
-sudo cp "$CMD" "$CMD.bak-sas" 2>/dev/null || true
-sudo sed -i "s/console=serial0,[0-9]* //; s/console=ttyAMA0,[0-9]* //" "$CMD"
+if ! grep -q "^dtoverlay=disable-bt" "$CFG"; then
+  sudo cp "$CFG" "$CFG.bak-sas" 2>/dev/null || true
+  printf "\n# SAS SMIB: PL011 -> GPIO14/15 (mini-UART has no parity, cannot do SAS)\nenable_uart=1\ndtoverlay=disable-bt\n" | sudo tee -a "$CFG" >/dev/null
+  CHANGED=1
+fi
+# Only rewrite cmdline.txt if a console= is actually on the serial port —
+# an unconditional sed rewrites the file (new mtime, same bytes) and told us
+# nothing about whether a reboot was owed.
+if grep -qE "console=(serial0|ttyAMA0)," "$CMD"; then
+  sudo cp "$CMD" "$CMD.bak-sas" 2>/dev/null || true
+  sudo sed -i "s/console=serial0,[0-9]* //; s/console=ttyAMA0,[0-9]* //" "$CMD"
+  CHANGED=1
+fi
+# These three take effect immediately — they never justify a reboot.
 sudo systemctl disable --now hciuart 2>/dev/null || true
 sudo systemctl mask serial-getty@ttyAMA0.service 2>/dev/null || true
 sudo usermod -aG dialout "$USER"
-echo "uart config done"'
+[ "$CHANGED" = 1 ] && echo uart-changed || echo uart-nochange')
+echo "$UART_OUT"
 
 say "python venv + deps"
+# ALREADY-SATISFIED FIRST. The slot segment is deliberately isolated (DEPLOY.md:
+# "never bridge it into your home LAN"), so on a correct install apt and pip have
+# no route out — and this ran AFTER the UART block, so a hard failure here left a
+# Pi with a rewritten boot config and no software. A board that already has its
+# deps (a re-run, or an image that ships them) must never need the network at
+# all; only a genuinely bare board does, and it says so plainly.
 "${SSH[@]}" "$HOST" '
+if [ -x ~/venvs/cabinet/bin/python ] && \
+   ~/venvs/cabinet/bin/python -c "import serial, crcmod, loguru" 2>/dev/null; then
+  echo "deps OK (already installed — no network needed)"
+  exit 0
+fi
+echo "fetching deps (this board needs the internet ONCE; an isolated slot"
+echo "segment has no route out — give it one for this step, or flash an image"
+echo "that already carries them)"
 set -e
 sudo apt-get -qq update && sudo apt-get -qq install -y python3-venv rsync >/dev/null
 python3 -m venv ~/venvs/cabinet 2>/dev/null || true
@@ -201,13 +232,21 @@ sed -e "s|/dev/ttyAMA0|$PORT|" -e "s|--address 1|--address $ADDRESS|" \
 sudo systemctl daemon-reload && sudo systemctl enable cabinet-sas >/dev/null 2>&1
 echo "service installed + enabled"'
 
-say "rebooting the Zero (config.txt changes)"
-"${SSH[@]}" "$HOST" 'sudo reboot' || true
-sleep 40
-for i in $(seq 1 20); do
-    "${SSH[@]}" "$HOST" 'echo up' 2>/dev/null && break
-    sleep 10
-done
+if echo "$UART_OUT" | grep -q uart-changed; then
+    say "rebooting the Zero (boot config changed)"
+    "${SSH[@]}" "$HOST" 'sudo reboot' || true
+    sleep 40
+    for i in $(seq 1 20); do
+        "${SSH[@]}" "$HOST" 'echo up' 2>/dev/null && break
+        sleep 10
+    done
+else
+    # Nothing about the boot config moved, so the port is already what it will
+    # be after a reboot. Starting the service is the whole remaining job — and
+    # a re-run must never take a live cabinet off the floor for nothing.
+    say "no boot-config change — starting the service (no reboot)"
+    "${SSH[@]}" "$HOST" 'sudo systemctl restart cabinet-sas || true'
+fi
 
 say "verify"
 "${SSH[@]}" "$HOST" "ls -la $PORT; systemctl is-active cabinet-sas; journalctl -u cabinet-sas --no-pager | tail -3"
