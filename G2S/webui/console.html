@@ -242,8 +242,17 @@ function renderGlass(s){
     const cs=m.contentStatus||{};
     let name=nameOf(dev);
     if(dupes[name]>1){const sd=sideOf(p); if(sd) name+=` · ${sd}`;}
+    // The page itself reports in on its own poll, and that survives a hub
+    // restart when the content map does not. It OUTRANKS an empty content
+    // map: a live SPA means the glass is genuinely up on this window.
+    const spaHere=(s.glassSpa&&String(s.glassSpa.dev)===String(dev));
     const size=p&&p.mediaDisplayWidth?`${p.mediaDisplayWidth}×${p.mediaDisplayHeight}`:"";
-    const st=WIN_STATE[cs.contentState]||[p?"nothing loaded":"","" ];
+    // Never claim a window is empty on missing data. A known contentState is
+    // the answer; a live page beats an empty map; anything else is "unknown"
+    // and says so, because "nothing loaded" is a CLAIM and we would be wrong.
+    const st = spaHere ? ["the glass is up here","up"]
+             : WIN_STATE[cs.contentState] ? WIN_STATE[cs.contentState]
+             : ["","" ];
     const caps=p?(String(p.capabilities||"").replace(/^[,\s]+/,"")||"doesn’t say"):null;
     return `<div class="win ${st[1]}" data-dev="${esc(dev)}">
       <div class="top">

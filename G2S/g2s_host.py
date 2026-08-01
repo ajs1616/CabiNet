@@ -20818,6 +20818,23 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     with engine.assoc_lock:        # avoid 'dict changed size' vs new EGM
                         assocs = list(engine.associations.values())
                     snap = {a.egm_id: a.snapshot() for a in assocs}
+                    # ⚖️ THE RESIDENT PAGE IS THE TRUTH ABOUT ITSELF. The
+                    # in-memory content map dies with the hub; the SPA's own
+                    # 1.5s poll does not. Without this the console renders a
+                    # window that is live and SHOWING as "nothing loaded" the
+                    # moment the hub bounces — the UI lying about the floor
+                    # (live-hit 2026-08-01: the AVP was displaying the login
+                    # prompt while every window read empty). Absence of this
+                    # field means "we don't know", never "nothing there".
+                    _now = time.time()
+                    for _eid, _e in snap.items():
+                        if not isinstance(_e, dict):
+                            continue
+                        _spa = engine._glass_spa_seen.get(_eid) or {}
+                        _age = _now - (_spa.get("ts") or 0)
+                        if _spa.get("dev") and _age <= GLASS_SPA_LIVE_SEC:
+                            _e["glassSpa"] = {"dev": str(_spa.get("dev")),
+                                              "ageSec": round(_age, 1)}
                     if slim:
                         snap["slim"] = True
                         for a in assocs:
