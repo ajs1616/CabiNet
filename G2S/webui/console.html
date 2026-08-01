@@ -84,7 +84,24 @@
   .t.ok{border-left-color:var(--good)} .t.err{border-left-color:var(--bad)}
   @keyframes sl{from{transform:translateX(20px);opacity:0}}
   .muted{color:var(--dim)} .none{color:var(--dim);font-style:italic}
-  @media (max-width:600px){main{padding:10px;gap:10px}}
+  /* Glass windows panel — one row per media-display window, so a collector can
+     try each one and SEE the cabinet's answer without a shell. */
+  .panel-glass{grid-column:1/-1}
+  .win{border:1px solid var(--line);border-radius:10px;background:var(--panel2);
+    padding:10px 12px;margin-bottom:8px}
+  .win:last-child{margin-bottom:0}
+  .win .top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .win .name{font-weight:600}
+  .win .size{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
+  .win .acts{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
+  .win button.cmd{min-height:34px;padding:6px 11px;font-size:12px}
+  .win .fact{margin-top:6px;font-size:13px;color:var(--dim);display:flex;
+    gap:8px;flex-wrap:wrap;align-items:baseline}
+  .win .fact b{color:var(--txt);font-weight:600}
+  .win.up{border-color:#295}
+  .win.stuck{border-color:#733}
+  @media (max-width:600px){main{padding:10px;gap:10px}
+    .win .acts{margin-left:0;width:100%}}
 </style>
 </head>
 <body>
@@ -105,6 +122,8 @@
   <div class="card"><h2>🔧 Ownership &amp; Devices</h2><div class="body" id="c-own"></div></div>
   <div class="card events"><h2>🔔 Event feed <span id="ecount" class="muted"></span></h2>
     <div class="body"><div class="feed" id="c-events"></div></div></div>
+  <div class="card panel-glass"><h2>🪟 Glass windows <span id="wcount" class="muted"></span></h2>
+    <div class="body" id="c-glass"></div></div>
   <div class="card panel-cmds"><h2>🎛️ Test Panel</h2><div class="body" id="c-panel"></div></div>
 </main>
 <div id="toast"></div>
@@ -148,18 +167,119 @@ function toast(msg,ok){
   setTimeout(()=>t.remove(),4200);
 }
 
-async function cmd(action,danger){
+// `extra` merges extra body fields (deviceId, rung, page…) so a caller can aim a
+// command at ONE device; `say` replaces the action name in the toast with plain
+// words, because a collector should never have to read "mediaDisplayProbe".
+async function cmd(action,danger,extra,say){
   if(danger && !confirm(
       action+"\n\nThis DISABLES game play on the machine until the change "+
       "applies or is cancelled. Only run with the machine idle at 0 credits.\n\nProceed?"))
-    return;
+    return null;
+  const label=say||action;
   try{
+    const body=Object.assign(CUR_EGM?{action,egmId:CUR_EGM}:{action}, extra||{});
     const r=await fetch("/api/command",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(CUR_EGM?{action,egmId:CUR_EGM}:{action})});
+      body:JSON.stringify(body)});
     const j=await r.json();
-    toast((j.ok?"✓ ":"✗ ")+action+(j.ok?` (state=${j.commsState})`:`: ${j.error||r.status}`),j.ok);
-  }catch(e){toast("✗ "+action+": "+e,false);}
+    toast((j.ok?"✓ ":"✗ ")+label+(j.ok?"":`: ${j.error||r.status}`),j.ok);
+    return j;
+  }catch(e){toast("✗ "+label+": "+e,false);return null;}
+}
+
+// ── Glass windows ───────────────────────────────────────────────────────────
+// A cabinet has SEVERAL windows and only some of them will take our page. The
+// numbering differs per cabinet (one machine's Digital Glass is dev 3, another's
+// is dev 5), so this lists them BY NAME with the machine's own answers, and lets
+// the owner try each one. Everything here rides endpoints that already exist:
+// mediaDisplayProbe(rung=profile) is a pure read; glassShow aims the proven
+// load->activate->show ladder at ONE window.
+const WIN_STATE = {
+  "IGT_contentExecuting":["the glass is up here","up"],
+  "IGT_contentLoaded"   :["page loaded, not shown yet",""],
+  "IGT_contentPending"  :["waiting for this window to open the page","stuck"],
+  "IGT_contentReleased" :["empty",""],
+  "IGT_contentError"    :["this window refused the page","stuck"],
+};
+
+function glassDevices(s){
+  const ids={};
+  for(const d of (s.configDevices||[])){
+    const m=/^IGT_mediaDisplay\/(\d+)$/.exec(d); if(m) ids[m[1]]=1;
+  }
+  for(const d of Object.keys(s.mediaDisplay||{})) ids[d]=1;
+  return Object.keys(ids).sort((a,b)=>(+a)-(+b));
+}
+
+function renderGlass(s){
+  const el=document.getElementById("c-glass");
+  const devs=glassDevices(s);
+  document.getElementById("wcount").textContent=devs.length?`(${devs.length})`:"";
+  if(!devs.length){
+    setHTML(el,'<p class="none">This machine has not told us about any display '+
+                'windows yet. They appear once it finishes joining.</p>');
+    return;
+  }
+  // Some cabinets name BOTH service windows "Service Window" with no side, so an
+  // unqualified list shows two identical rows. Only when a name repeats do we add
+  // where it physically sits — derived from the window's own x offset, since the
+  // position attribute is optional and the leftmost one often omits it entirely.
+  const nameOf=dev=>{
+    const p=((s.mediaDisplay||{})[dev]||{}).mediaDisplayProfile;
+    return (p&&p.mediaDisplayDescription)||`Window ${dev}`;
+  };
+  const dupes={};
+  for(const d of devs){const n=nameOf(d); dupes[n]=(dupes[n]||0)+1;}
+  const sideOf=p=>{
+    if(!p) return "";
+    const pos=String(p.mediaDisplayPosition||"").replace(/^IGT_/,"").toLowerCase();
+    if(pos) return pos;
+    return (+(p.xPosition||0))>0 ? "right" : "left";
+  };
+  const rows=devs.map(dev=>{
+    const m=(s.mediaDisplay||{})[dev]||{};
+    const p=m.mediaDisplayProfile||null;
+    const cs=m.contentStatus||{};
+    let name=nameOf(dev);
+    if(dupes[name]>1){const sd=sideOf(p); if(sd) name+=` · ${sd}`;}
+    const size=p&&p.mediaDisplayWidth?`${p.mediaDisplayWidth}×${p.mediaDisplayHeight}`:"";
+    const st=WIN_STATE[cs.contentState]||[p?"nothing loaded":"","" ];
+    const caps=p?(String(p.capabilities||"").replace(/^[,\s]+/,"")||"doesn’t say"):null;
+    return `<div class="win ${st[1]}" data-dev="${esc(dev)}">
+      <div class="top">
+        <span class="name">${esc(name)}</span>
+        <span class="size">${esc(size)}</span>
+        <span class="acts">
+          <button class="cmd" data-act="ask">Ask this window</button>
+          <button class="cmd" data-act="show">Show glass here</button>
+        </span>
+      </div>
+      <div class="fact">
+        ${p?`<span>renders: <b>${esc(caps)}</b></span>`
+           :'<span class="none">not asked yet — press “Ask this window”</span>'}
+        ${st[0]?`<span>· ${esc(st[0])}</span>`:""}
+      </div></div>`;
+  }).join("");
+  setHTML(el,
+    `<p class="muted" style="margin:0 0 10px;font-size:13px">Each window is a
+      separate screen area the cabinet can put a page on. Ask a window to hear
+      what it can display, then try the glass on it. Nothing here changes how the
+      machine plays.</p>
+     <div class="btns" style="margin-bottom:10px">
+       <button class="cmd" id="ask-all">Ask every window</button></div>
+     ${rows}`);
+  el.querySelectorAll(".win").forEach(w=>{
+    const dev=w.dataset.dev;
+    w.querySelector('[data-act="ask"]').onclick=()=>
+      cmd("mediaDisplayProbe",false,{rung:"profile",deviceId:dev},`asked window ${dev}`);
+    w.querySelector('[data-act="show"]').onclick=()=>
+      cmd("glassShow",false,{deviceId:dev},`glass sent to window ${dev}`);
+  });
+  const all=document.getElementById("ask-all");
+  if(all) all.onclick=async()=>{
+    for(const d of devs)
+      await cmd("mediaDisplayProbe",false,{rung:"profile",deviceId:d},`asked window ${d}`);
+  };
 }
 
 function renderPanel(){
@@ -291,6 +411,8 @@ function render(data){
       <div class="devlist">${claim.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}
     ${cfg.length?`<h3 style="margin:12px 0 5px;font-size:12px;color:var(--dim)">CONFIG-SYNC INVENTORY</h3>
       <div class="devlist">${cfg.map(d=>`<span class="chip">${esc(d)}</span>`).join("")}</div>`:""}`);
+
+  renderGlass(s);
 
   // events
   document.getElementById("ecount").textContent=s.eventCount?`(${s.eventCount} total)`:"";
