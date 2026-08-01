@@ -81,7 +81,17 @@
        attract column: brand y=264(+40), nick y=330, tap y=520(+64),
          note y=930(+60 wrap room)                           -> all < 1024  OK -->
 <head>
+<!-- X-UA-Compatible MUST be the first meta after charset, and is ignored by
+     every non-Microsoft engine (the AVP's QtEmbedded/QNX WebKit 534 never sees
+     it). It is here for the OTHER platform: a tester's G23 identifies to DHCP
+     as 'MSFT 5.0' and requests NetBIOS + option 249, i.e. its brainbox runs a
+     Windows stack, so its service window may well be an embedded IE control.
+     Those default to Quirks Mode, where a fixed-px kiosk layout collapses. One
+     tag, zero cost on QNX, and it removes the whole quirks-mode class of doubt
+     before the wire tells us which engine it actually is. -->
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>GAME ROOM</title>
 <style type="text/css">
 html, body {
