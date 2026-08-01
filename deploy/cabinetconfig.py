@@ -362,6 +362,16 @@ def hub_identity(root, t):
         verdict = "wrong-clone"
     else:
         verdict = "not-hub"
+    # GATE SEAM (test-only, never set on a real box; same posture as
+    # firstboot.sh's CABINET_FIRSTBOOT_ROOT). A gate must answer the same
+    # everywhere: without this, the front-door screens pass on a dev box and
+    # FAIL on the hub, because deploy/update.py gates in a git WORKTREE —
+    # hub units present, WorkingDirectory pointing at the service's tree
+    # instead, i.e. verdict 'wrong-clone' and a different screen entirely.
+    # Live-caught 2026-07-31 when the updater refused to deploy over it.
+    forced = os.environ.get("CABINET_PLACE", "").strip()
+    if forced in ("hub", "wrong-clone", "not-hub"):
+        verdict = forced
     return {"units": units, "wd": wd, "wd_matches": wd_matches,
             "slot_nic": slot_nic, "verdict": verdict}
 

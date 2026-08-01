@@ -675,7 +675,12 @@ def t_cli(tmp):
     it, hit the network, and render a different screen."""
     home = os.path.join(tmp, "home")
     os.makedirs(home)
-    env = dict(os.environ, HOME=home)
+    # CABINET_PLACE pins the PLACE as well as the hub: --hub none stops the
+    # network probe, but hub_identity reads the local box, and update.py gates
+    # in a git worktree ON THE HUB — units present, WorkingDirectory pointing
+    # elsewhere — which renders the wrong-clone screen, not the front door.
+    # Without this the front-door checks pass here and fail there.
+    env = dict(os.environ, HOME=home, CABINET_PLACE="not-hub")
     script = os.path.join(DEPLOY, "cabinetconfig.py")
     argv = [sys.executable, script, "--hub", "none"]
 
