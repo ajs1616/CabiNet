@@ -55,6 +55,21 @@ API_SNAPSHOTS = [
     "/api/debug/log",
 ]
 TAIL_BYTES = 5 * 1024 * 1024       # cap per log/journal/API artifact
+# What must survive truncation, because a fault is diagnosed from ONE
+# exchange and it is never conveniently at the end of the file: the media
+# (glass) ladder, the ticket path, and anything the cabinet REFUSED.
+# Match the COMMANDS, never the class name: every SOAP envelope declares
+# xmlns:igtMediaDisplay in its header, so a bare "mediaDisplay" rescues the
+# whole log and therefore nothing (measured: 408 ordinary frames saved, not
+# one exchange). These strings appear only in traffic that matters.
+RESCUE_PATTERNS = (b"loadContent", b"contentStatus", b"setActiveContent",
+                   b"releaseContent", b"showMediaDisplay",
+                   b"mediaDisplayProfile", b"IGT_MDE", b"IGT_MDX",
+                   b"contentException", b"contentState", b"errorCode=",
+                   b"issueVoucher", b"redeemVoucher", b"validationId",
+                   b"hostException", b"validationData")
+RESCUE_BYTES = 512 * 1024          # ceiling on rescued lines, per file
+RESCUE_LINE_MAX = 64 * 1024        # one wire frame can be enormous
 LOG_GROUP_LIMIT = 6                # newest N log files PER prefix group
 DB_MAX_BYTES = 100 * 1024 * 1024   # skip a database bigger than this
 
@@ -83,11 +98,48 @@ def run(cmd, timeout=20):
     return run_rc(cmd, timeout)[1]
 
 
-def truncate_bytes(data, cap=TAIL_BYTES):
-    """Keep the LAST cap bytes (byte-accurate; logs matter most at the end)."""
-    if len(data) <= cap:
+def truncate_bytes(data, cap=TAIL_BYTES, rescued=b""):
+    """Keep the LAST cap bytes (byte-accurate; logs matter most at the end),
+    with any `rescued` lines from the dropped head carried in front."""
+    if len(data) <= cap and not rescued:
         return data
-    return (b"[... truncated to last %d bytes ...]\n" % cap) + data[-cap:]
+    return (rescued
+            + (b"[... truncated to last %d bytes ...]\n" % cap)
+            + data[-cap:])
+
+
+def _rescue(head, keep):
+    """Pull the diagnostically load-bearing lines out of the part of a log
+    we are about to throw away.
+
+    WHY THIS EXISTS (2026-07-31): a tester's stuck glass was diagnosed from
+    our own log lines for nine days because his hub's RAW WIRE — which held
+    the actual loadContent/contentStatus exchange — reached us truncated to
+    its last 5 MiB, and the failure had happened earlier in the file. The
+    evidence existed, was collected, and was discarded in transit. A wire
+    log is not a tail-is-what-matters artifact: the ONE exchange that
+    explains a fault sits wherever it happened.
+
+    Bounded on purpose — a rescue that doubles the bundle helps nobody.
+    """
+    if not head or not keep:
+        return b""
+    out, used = [], 0
+    for line in head.split(b"\n"):
+        if len(line) > RESCUE_LINE_MAX:
+            line = line[:RESCUE_LINE_MAX] + b" [... line truncated ...]"
+        if any(p in line for p in keep):
+            out.append(line)
+            used += len(line) + 1
+            if used >= RESCUE_BYTES:
+                out.append(b"[... rescue budget reached; more matches above "
+                           b"the cut were dropped ...]")
+                break
+    if not out:
+        return b""
+    return (b"[... %d line(s) RESCUED from the truncated head: the "
+            b"exchange that explains a fault is rarely at the end ...]\n"
+            % len(out)) + b"\n".join(out) + b"\n"
 
 
 class Bundle:
@@ -117,16 +169,23 @@ class Bundle:
         self.add_bytes(name, truncate_bytes(
             text.encode("utf-8", "replace")))
 
-    def add_file(self, name, src, cap=None):
+    def add_file(self, name, src, cap=None, keep=None):
         try:
-            with open(src, "rb") as f:
-                data = f.read((cap or 0) + 1 if cap else -1)
-            if cap and len(data) > cap:
-                # re-read the tail — the END of a log is the useful end
-                size = os.path.getsize(src)
+            size = os.path.getsize(src)
+            if not cap or size <= cap:
                 with open(src, "rb") as f:
-                    f.seek(max(0, size - cap))
-                    data = truncate_bytes(f.read(), cap)
+                    data = f.read()
+            else:
+                # The tail is the useful end for a log that was still being
+                # written — but NOT for a wire log, where the one exchange
+                # that explains a fault is wherever it happened to occur.
+                # `keep` rescues those lines from the part we are dropping.
+                with open(src, "rb") as f:
+                    head = f.read(size - cap) if keep else None
+                    if not keep:
+                        f.seek(size - cap)
+                    data = truncate_bytes(f.read(), cap,
+                                          rescued=_rescue(head, keep))
             self.add_bytes(name, data, mtime=os.path.getmtime(src))
         except Exception as e:  # noqa: BLE001
             self.skip(name, str(e))
@@ -202,7 +261,23 @@ def api_snapshot(bundle, base, path):
         with _OPENER.open(base + path, timeout=5) as r:
             data = r.read(TAIL_BYTES + 1)
         if len(data) > TAIL_BYTES:
-            data = data[:TAIL_BYTES] + b"\n[... truncated ...]"
+            # Cutting JSON in half yields a file that LOOKS like a snapshot
+            # and cannot be parsed by anything (a tester's /api/status
+            # arrived at exactly 5 MiB and no tool could read it). Say so in
+            # the name, and take the slim variant — which is small by
+            # design — as the readable one beside it.
+            bundle.add_bytes(name + ".TRUNCATED-not-valid-json",
+                             data[:TAIL_BYTES]
+                             + b"\n[... truncated: too large to capture "
+                               b"whole; see the .slim.json beside this ...]")
+            try:
+                with _OPENER.open(base + path + ("&" if "?" in path else "?")
+                                  + "slim=1", timeout=5) as r2:
+                    bundle.add_bytes(name.replace(".json", ".slim.json"),
+                                     r2.read(TAIL_BYTES))
+            except Exception as e2:  # noqa: BLE001
+                bundle.skip(name.replace(".json", ".slim.json"), str(e2))
+            return
         bundle.add_bytes(name, data)
     except Exception as e:  # noqa: BLE001 — a down host is a finding, not a crash
         bundle.add_text(name, json.dumps(
@@ -231,7 +306,11 @@ def copy_dir_files(bundle, srcdir, arcprefix, cap=None, group_limit=None):
             bundle.skip(f"{arcprefix}/{f}",
                         f"older than the newest {group_limit} '{g}' files")
             continue
-        bundle.add_file(f"{arcprefix}/{f}", os.path.join(srcdir, f), cap=cap)
+        # A WIRE log is the one artifact whose value is not at its end: it
+        # holds the raw machine<->host XML, and the exchange that explains a
+        # fault sits wherever it happened. Rescue those lines before the cut.
+        bundle.add_file(f"{arcprefix}/{f}", os.path.join(srcdir, f), cap=cap,
+                        keep=RESCUE_PATTERNS if "wire" in f else None)
 
 
 def snapshot_sqlite(bundle, src, arcname):

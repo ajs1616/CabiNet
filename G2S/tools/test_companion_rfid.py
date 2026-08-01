@@ -494,6 +494,258 @@ def devices_fold():
           list(d4) == ["b0b0b0"] and d4["b0b0b0"]["named"] is False)
 
 
+# The OWNER'S live AVP (IGT_00012E492815), probed 2026-07-31 with
+# /api/command mediaDisplayProbe rung=profile, device by device. This is the
+# machine the glass works on TODAY, so it is the regression fixture: the
+# picker must land on "1" — the LEFT Service Window — and dev 1 is exactly
+# the window that carries NO mediaDisplayPosition attribute at all.
+OWNER_WINDOWS = {
+    "1": {"screenDescription": "Primary Screen",
+          "mediaDisplayDescription": "Service Window",
+          "xPosition": "0", "yPosition": "0",
+          "mediaDisplayHeight": "1024", "mediaDisplayWidth": "256",
+          "localConnectionPort": "30001"},
+    "2": {"mediaDisplayPosition": "IGT_right",
+          "mediaDisplayDescription": "Service Window",
+          "xPosition": "1024", "yPosition": "0",
+          "mediaDisplayHeight": "1024", "mediaDisplayWidth": "256"},
+    "3": {"screenType": "IGT_secondary",
+          "mediaDisplayPosition": "IGT_fullScreen",
+          "mediaDisplayType": "IGT_overlay",
+          "mediaDisplayDescription": "Digital Glass",
+          "touchscreenCapable": "false",
+          "mediaDisplayWidth": "1280", "mediaDisplayHeight": "1024"},
+    "4": {"mediaDisplayPriority": "3",
+          "mediaDisplayPosition": "IGT_fullScreen",
+          "mediaDisplayType": "IGT_overlay",
+          "mediaDisplayDescription": "Play Area",
+          "mediaDisplayWidth": "1280", "mediaDisplayHeight": "1024"},
+    "5": {"mediaDisplayPriority": "2", "mediaDisplayPosition": "IGT_bottom",
+          "mediaDisplayDescription": "Player Banner",
+          "mediaDisplayWidth": "1280", "mediaDisplayHeight": "32"},
+    "6": {"mediaDisplayPriority": "4", "mediaDisplayPosition": "IGT_bottom",
+          "mediaDisplayDescription": "Notification Window",
+          "mediaDisplayWidth": "1280", "mediaDisplayHeight": "200"},
+}
+
+
+def glass_window(egm=EGM, windows=None, owned=("1", "2", "3", "4", "5", "6"),
+                 profiled=None, state="onLine"):
+    """A joined association carrying a mediaDisplay ownership map and, in
+    assoc.media, the profile census exactly where the fold puts it."""
+    a = gh.EgmAssociation(egm)
+    a.comms_state = state
+    a.host_items = {"1": {"owned": [f"IGT_mediaDisplay/{d}" for d in owned]}}
+    windows = OWNER_WINDOWS if windows is None else windows
+    for dev in (windows if profiled is None else profiled):
+        a.media[dev] = {"lastCommand": "mediaDisplayProfile",
+                        "mediaDisplayProfile": dict(windows[dev])}
+    return a
+
+
+def glass_window_picker():
+    """The glass window is PICKED from the cabinet's own profile census,
+    never assumed to be device 1.
+
+    "Device 1 = the left Service Window" was one AVP's truth read as a law.
+    A tester's cabinet exposes SEVEN mediaDisplay devices and answered every
+    push at its device 1 with contentException=3 — his glass never came up.
+    These cases pin the three things that make the fix safe: the owner's
+    live map still resolves to "1", an explicit deviceId always wins, and
+    anything the hub doesn't (yet) know falls back to GLASS_DEFAULT_DEVICE
+    rather than guessing."""
+    print("— glass window picker: the cabinet names its own windows")
+    check("the owner's live 6-window map resolves to dev 1 (LEFT service "
+          "window — the window the floor works on today)",
+          gh.pick_glass_device(OWNER_WINDOWS) == "1",
+          gh.pick_glass_device(OWNER_WINDOWS))
+    check("dict order never decides it (same map, reversed)",
+          gh.pick_glass_device(
+              dict(reversed(list(OWNER_WINDOWS.items())))) == "1")
+    # dev 1 carries NO mediaDisplayPosition; dev 2 says IGT_right. Absence
+    # must beat a stated right — the exact case that must still win.
+    check("no mediaDisplayPosition beats IGT_right (leftmost wins)",
+          gh.pick_glass_device({k: OWNER_WINDOWS[k]
+                                for k in ("2", "1")}) == "1")
+    check("the right service window alone is still a usable page target",
+          gh.pick_glass_device({"2": OWNER_WINDOWS["2"]}) == "2")
+    # The tester's shape: the service window is NOT device 1.
+    tester = {
+        "1": {"mediaDisplayDescription": "Play Area",
+              "mediaDisplayType": "IGT_overlay",
+              "mediaDisplayWidth": "1920", "mediaDisplayHeight": "1080"},
+        "2": {"mediaDisplayDescription": "Player Banner",
+              "mediaDisplayWidth": "1920", "mediaDisplayHeight": "32"},
+        "3": {"mediaDisplayDescription": "Digital Glass",
+              "mediaDisplayType": "IGT_overlay",
+              "mediaDisplayWidth": "1920", "mediaDisplayHeight": "1080"},
+        "4": {"mediaDisplayDescription": "Service Window", "xPosition": "0",
+              "mediaDisplayWidth": "256", "mediaDisplayHeight": "1080"},
+        "5": {"mediaDisplayDescription": "Service Window",
+              "mediaDisplayPosition": "IGT_right", "xPosition": "1664",
+              "mediaDisplayWidth": "256", "mediaDisplayHeight": "1080"},
+        "6": {"mediaDisplayDescription": "Notification Window",
+              "mediaDisplayWidth": "1920", "mediaDisplayHeight": "200"},
+        "7": {"mediaDisplayDescription": "Ticker",
+              "mediaDisplayWidth": "1920", "mediaDisplayHeight": "48"},
+    }
+    check("a cabinet whose service window is device 4 resolves to 4 "
+          "(seven windows, overlays and strips rejected)",
+          gh.pick_glass_device(tester) == "4", gh.pick_glass_device(tester))
+    check("a banner-only map falls back — a 1280x32 strip cannot host a UI",
+          gh.pick_glass_device({"5": OWNER_WINDOWS["5"]})
+          == gh.GLASS_DEFAULT_DEVICE)
+    check("overlays + strips only (dev 3/4/5/6) fall back",
+          gh.pick_glass_device({k: OWNER_WINDOWS[k]
+                                for k in ("3", "4", "5", "6")})
+          == gh.GLASS_DEFAULT_DEVICE)
+    check("an empty map falls back", gh.pick_glass_device({})
+          == gh.GLASS_DEFAULT_DEVICE)
+    check("no map at all falls back (never None — a push always has a "
+          "window to aim at)",
+          gh.pick_glass_device(None) == gh.GLASS_DEFAULT_DEVICE)
+    # EVERY attribute is optional: a census with nothing but a description
+    # must still resolve, and junk must never raise on a push path.
+    check("description alone is enough",
+          gh.pick_glass_device(
+              {"9": {"mediaDisplayDescription": "Service Window"}}) == "9")
+    check("bare service windows tie-break on the lowest deviceId",
+          gh.pick_glass_device(
+              {"9": {"mediaDisplayDescription": "Service Window"},
+               "2": {"mediaDisplayDescription": "Service Window"}}) == "2")
+    check("the cabinet's casing is its own business",
+          gh.pick_glass_device(
+              {"5": {"mediaDisplayDescription": "service window"}}) == "5")
+    # Junk must never raise on a push path — and a window the cabinet never
+    # NAMED is not a service window, so the answer is the fallback, not the
+    # last dict standing. Picking an unnamed window is how the glass ends up
+    # on a game area we have never seen.
+    check("junk in the census never raises, and an unnamed window is not a "
+          "target",
+          gh.pick_glass_device({"1": None, "2": "not-a-dict",
+                                "3": {"mediaDisplayWidth": "wide"}})
+          == gh.GLASS_DEFAULT_DEVICE)
+
+    print("— glass target: explicit wins, a half-arrived census never moves it")
+    eng = make_engine()
+    a = glass_window()
+    eng.associations[EGM] = a
+    check("a settled census picks the LEFT service window",
+          eng.glass_target_device(a) == "1")
+    check("a complete census asks for nothing more (no wire at all)",
+          eng.sent == [], eng.sent)
+    check("the answer is journaled ONCE — (device, picked?) latched",
+          a.glass_target_said == ("1", True), a.glass_target_said)
+    check("an explicit deviceId ALWAYS wins over the picker",
+          eng.glass_target_device(a, "5") == "5"
+          and eng.glass_target_device(a, 6) == "6")
+    # A tester's cabinet: same call, his own windows, his own answer.
+    engT = make_engine()
+    aT = glass_window(windows=tester, owned=tuple(tester))
+    check("the same call lands on dev 4 for the tester's cabinet",
+          engT.glass_target_device(aT) == "4")
+
+    # THE regression guard: dev 2 (the RIGHT window) answering first must
+    # not aim a working floor at the wrong side of the screen.
+    engH = make_engine()
+    aH = glass_window(profiled=("2",))
+    got = engH.glass_target_device(aH)
+    check("a HALF-arrived census stays on GLASS_DEFAULT_DEVICE (dev 2 alone "
+          "would otherwise aim at the RIGHT window)",
+          got == gh.GLASS_DEFAULT_DEVICE, got)
+    check("...and it harvests exactly the windows it is still missing",
+          [lbl.split(",")[0] for _, lbl in engH.sent]
+          == [f"getMediaDisplayProfile(dev={d}"
+              for d in ("1", "3", "4", "5", "6")],
+          [lbl for _, lbl in engH.sent])
+    engH.sent = []
+    check("a second resolution asks nothing again — one ask per window per "
+          "join, so this can never become a poll",
+          engH.glass_target_device(aH) == gh.GLASS_DEFAULT_DEVICE
+          and engH.sent == [], engH.sent)
+    # ⚖️ A PARTIAL CENSUS NEVER DECIDES — no matter how old it is. This
+    # assert used to pin the opposite (age it past a settle timer and let
+    # whatever answered win), which on the owner's own cabinet means the ONE
+    # window that replied is dev 2, the RIGHT service window: the glass moves
+    # to the wrong side of a floor that works today. Waiting costs nothing —
+    # the fallback IS the shipped behavior — while deciding early costs a
+    # working cabinet. Time can never substitute for an answer.
+    aH.media_profile_ts = time.time() - gh.GLASS_PROFILE_SETTLE_SEC - 1
+    check("an aged PARTIAL census still refuses to decide (dev 2 alone must "
+          "never move the glass to the right-hand window)",
+          engH.glass_target_device(aH) == gh.GLASS_DEFAULT_DEVICE)
+
+    print("— the census harvest: guest-safe, one ask per join, never blocking")
+    engC = make_engine()
+    aC = glass_window(profiled=())
+    asked = engC.harvest_media_display_profiles(aC, why="a gate")
+    check("every owned window is asked what it is, lowest deviceId first",
+          asked == ["1", "2", "3", "4", "5", "6"], asked)
+    check("the harvest sends getMediaDisplayProfile and nothing else",
+          all(lbl.startswith("getMediaDisplayProfile(") for _, lbl in engC.sent)
+          and len(engC.sent) == 6, [lbl for _, lbl in engC.sent])
+    engC.sent = []
+    check("one ask per window per join: a second harvest is a no-op",
+          engC.harvest_media_display_profiles(aC) == [] and engC.sent == [])
+    # A rejoin IS the retry — new_epoch clears the asked-set, so windows
+    # that stayed silent get one more chance and nothing else does.
+    with aC.lock:
+        aC.new_epoch()
+    aC.comms_state = "onLine"
+    aC.media["2"] = {"mediaDisplayProfile": dict(OWNER_WINDOWS["2"])}
+    engC.sent = []
+    check("a rejoin re-asks the SILENT windows only (the one that answered "
+          "is never asked again)",
+          engC.harvest_media_display_profiles(aC)
+          == ["1", "3", "4", "5", "6"])
+    # ...and the map it is waiting for never delays a push.
+    check("while the census is in flight the target is the fallback",
+          engC.glass_target_device(aC) == gh.GLASS_DEFAULT_DEVICE)
+    engOff = make_engine()
+    aOff = glass_window(profiled=(), state="offline")
+    check("an offline cabinet is never harvested",
+          engOff.harvest_media_display_profiles(aOff) == []
+          and engOff.sent == [])
+    engU = make_engine()
+    aU = glass_window(profiled=(), owned=())
+    check("no ownership revealed yet -> nothing asked, nothing assumed",
+          engU.harvest_media_display_profiles(aU) == [] and engU.sent == []
+          and engU.glass_target_device(aU) == gh.GLASS_DEFAULT_DEVICE)
+
+    print("— glassShow/glassHide aim at the picked window")
+    engS = make_engine()
+    engS._md_content_seq = itertools.count(1)
+    aS = glass_window(windows=tester, owned=tuple(tester))
+    engS.associations[EGM] = aS
+    r = engS.start_glass_show(aS)
+    check("glassShow with no deviceId lands on the picked service window",
+          r.get("deviceId") == "4" and f"&dev=4" in r.get("uri", ""), r)
+    check("the load rode the wire for that window",
+          any(lbl.startswith("loadContent(") and ",dev=4," in lbl
+              for _, lbl in engS.sent),
+          [lbl for _, lbl in engS.sent])
+    engS.sent = []
+    r2 = engS.start_glass_hide(aS, device_id="5")
+    check("an explicit deviceId still overrides on glassHide",
+          r2.get("deviceId") == "5"
+          and any("hideMediaDisplay(dev=5" in lbl for _, lbl in engS.sent),
+          [lbl for _, lbl in engS.sent])
+
+    print("— contentException reads as words, never as a bare digit")
+    check("the two seen in the wild say what happened, raw value kept",
+          gh.content_exception_words("3")
+          == "the cabinet refused the content (exception 3)"
+          and gh.content_exception_words("1")
+          == "the cabinet refused the content (exception 1)")
+    check("no exception is silence (absent, empty, or the 0 no-error value)",
+          gh.content_exception_words(None) == ""
+          and gh.content_exception_words("") == ""
+          and gh.content_exception_words("0") == "")
+    check("an unknown code is still reported, never swallowed",
+          gh.content_exception_words(7)
+          == "the cabinet refused the content (exception 7)")
+
+
 def main():
     print("— set_id_validation_xml: the 21-attribute census (MSX005 law)")
     x_in = gh.G2SHost.set_id_validation_xml(
@@ -1270,6 +1522,7 @@ def main():
           gst3.get("ok") is True and gst3.get("gameroom") == "")
 
     devices_fold()
+    glass_window_picker()
 
     print(f"\nRESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0

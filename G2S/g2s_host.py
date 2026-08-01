@@ -161,8 +161,42 @@ MD_DEFAULT_CONTENT_URI = "http://192.168.50.2:8081/webui/hello.html"
 GLASS_PAGE = "glass.html"
 GLASS_CONTENT_URI_BASE = "http://192.168.50.2:8081/webui/"
 # Device 1 = the AVP's left Service Window (256x1024) — the wire-proven HTML
-# renderer (dev 5 does not render; 3/4 are RAM-gated overlays).
+# renderer (dev 5 does not render; 3/4 are RAM-gated overlays). This is the
+# FALLBACK, no longer the assumption: it is true of ONE collector's AVP and
+# was never true in general (a tester's cabinet exposes SEVEN mediaDisplay
+# devices and every push at its device 1 answered contentState
+# IGT_contentError contentException=3 — his glass never came up). The hub
+# now asks the cabinet what its windows ARE (pick_glass_device below) and
+# only falls back here when it has no answer yet.
 GLASS_DEFAULT_DEVICE = "1"
+# ---- window picker inputs (2026-07-31) --------------------------------
+# The cabinet NAMES ITS OWN WINDOWS in the mediaDisplayProfile census, so
+# the picker matches on the machine's words, not on a device number. The
+# owner's AVP calls both its 256x1024 side windows "Service Window"
+# (mediaDisplayDescription) — that is the page target we want, and the
+# comparison is lowercased because casing is the machine's business.
+GLASS_WINDOW_DESCRIPTION = "service window"  # matched as a SUBSTRING (see pick_glass_device)
+# A window smaller than this in EITHER axis cannot host a UI — the AVP's own
+# 1280x32 "Player Banner" is the case that proves it. Only a STATED size
+# disqualifies: an absent dimension means the cabinet didn't say, and silence
+# is never a disqualifier here (see pick_glass_device's optional-attribute
+# law).
+GLASS_MIN_WINDOW_PX = 100
+# Descriptions that name a strip or a chrome layer rather than a page
+# surface — substring match on the cabinet's own lowercased words. Kept
+# beside the IGT_overlay type check, which catches the same idea when the
+# window is described by its content instead of its shape.
+GLASS_NON_PAGE_WORDS = ("banner", "notification", "ticker", "marquee")
+# The census fires at ownership time and lazily behind a push, asks each
+# window at most ONCE PER JOIN, and NOTHING ever waits on it: an unharvested
+# cabinet pushes to GLASS_DEFAULT_DEVICE now and the map improves the NEXT
+# push. There is deliberately no interval knob — this class does not poll.
+# A profile map may only MOVE the target off GLASS_DEFAULT_DEVICE once it is
+# SETTLED: every owned window answered, or the harvest is this old and at
+# least one did. A half-arrived map is the regression hazard — on the
+# owner's working AVP a map holding only dev 2 (the RIGHT Service Window)
+# would aim the glass at the wrong side of a floor that works today.
+GLASS_PROFILE_SETTLE_SEC = 30
 # Content-push sequencer stage timeout: a push stalled mid-lifecycle
 # (loading/activating/showing) longer than this is ⚠️-logged and cleared —
 # the manual mediaDisplayProbe rungs stay usable as the fallback.
@@ -592,10 +626,19 @@ def localname(tag):
 
 
 def attr(el, name):
-    """Read an attribute that may be g2s:-prefixed (IGT style) or bare."""
+    """Read an attribute that may be g2s:-prefixed (IGT style) or bare.
+
+    Falls back to ANY namespace as a last resort: vendor extension elements
+    carry their own (igtMediaDisplay:softwareType=…, :eventCode=…), and
+    reading those as absent is how the mediaDisplay census came back with
+    empty capabilities while the cabinet was plainly stating them."""
     v = el.get(f"{{{SCHEMA_NS}}}{name}")
     if v is None:
         v = el.get(name)
+    if v is None:
+        for k, val in el.attrib.items():
+            if k.rsplit("}", 1)[-1] == name:
+                return val
     return v
 
 
@@ -1215,6 +1258,105 @@ def pick_remote_key_off_type(rec):
     return "G2S_remoteCredit" if _t("localCredit") else "G2S_remoteHandpay"
 
 
+def pick_glass_device(profiles, default=GLASS_DEFAULT_DEVICE):
+    """Pick the window the glass page gets pushed to, from the profile
+    census the CABINET gave us: {deviceId: {attrName: value}} exactly as
+    the mediaDisplay fold captured each getMediaDisplayProfile answer.
+
+    EVERY ATTRIBUTE IS OPTIONAL. The owner's live AVP (probed 2026-07-31)
+    describes its dev 1 — the working left Service Window, 256x1024 at
+    x=0 — with NO mediaDisplayPosition attribute at all, while its dev 2
+    (the right one) carries IGT_right. So absence must not disqualify:
+    the LEFTMOST rule reads "not stated right" as leftmost, then breaks
+    ties on xPosition. Anything the census doesn't say is simply not held
+    against the window.
+
+    ⚖️ LEFT WINS, BUT RIGHT BEATS NOTHING (owner's call, 2026-07-31): with
+    both service windows present the LEFT one is the target, always — the
+    "not stated right" test outranks geometry, so a cabinet reporting an odd
+    xPosition can never flip the choice. But a cabinet that offers only a
+    RIGHT service window gets the page there rather than being refused. Do
+    not "fix" that into a left-or-nothing rule.
+
+    Two filters run first, because some windows can never host a page:
+    an IGT_overlay type (chrome ON the game, RAM-gated on this cabinet), a
+    banner/notification strip by name, or a stated size too small to draw
+    a UI in (1280x32). What survives is a page target; among page targets
+    the cabinet's own "Service Window" description wins outright.
+
+    Returns `default` — GLASS_DEFAULT_DEVICE, today's shipped behavior —
+    whenever nothing qualifies or the census is empty. NEVER returns None:
+    a push always has a window to aim at."""
+    def _txt(prof, key):
+        return str(prof.get(key) or "").strip()
+
+    def _num(prof, key, absent):
+        # A stated-but-unparseable number reads as SILENCE — same as the
+        # attribute never appearing. Each caller picks what silence means
+        # for it: a size we were not told passes the too-small filter, an
+        # xPosition we were not told sorts as leftmost (which is what dev 1
+        # on the owner's AVP relies on).
+        raw = _txt(prof, key)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return absent
+
+    ranked = []
+    for dev, prof in (profiles or {}).items():
+        if not isinstance(prof, dict):
+            continue
+        desc = _txt(prof, "mediaDisplayDescription").lower()
+        if "overlay" in _txt(prof, "mediaDisplayType").lower():
+            continue
+        if any(w in desc for w in GLASS_NON_PAGE_WORDS):
+            continue
+        # Absent geometry passes (silence is not a disqualifier); a stated
+        # too-small one is out.
+        if min(_num(prof, "mediaDisplayWidth", GLASS_MIN_WINDOW_PX),
+               _num(prof, "mediaDisplayHeight", GLASS_MIN_WINDOW_PX)) \
+                < GLASS_MIN_WINDOW_PX:
+            continue
+        dev = str(dev)
+        # SUBSTRING, not equality. "Left Service Window" and "Service
+        # Display" are the same window by any human reading, and an exact
+        # match would drop them to the deviceId tie-break — i.e. straight
+        # back to the hardcode this function exists to delete.
+        # TWO TIERS, both substring. Exact-equality on "service window" sent
+        # "Left Service Window" and "Service Display" to the deviceId
+        # tie-break — i.e. straight back to the hardcode this function exists
+        # to delete. A cabinet that says both words wins outright; one that
+        # only says "service" still beats a device number.
+        ranked.append((
+            not (GLASS_WINDOW_DESCRIPTION in desc or
+                 ("service" in desc and "window" in desc)),
+            "service" not in desc,
+            _txt(prof, "mediaDisplayPosition").lower().endswith("right"),
+            _num(prof, "xPosition", 0),              # leftmost
+            not dev.isdigit(), int(dev) if dev.isdigit() else 0, dev,
+        ))
+    # ⚖️ NO SERVICE WINDOW => NO OPINION. Promoting "the best remaining page
+    # target" would hand the glass to a full-screen game area on a cabinet we
+    # have never seen. The fallback is today's shipped behavior; a wrong
+    # window on someone's game screen is not.
+    if not ranked or all(r[1] for r in ranked):
+        return default
+    return min(ranked)[-1]
+
+
+def content_exception_words(code):
+    """Plain words for a mediaDisplay contentException. The DIGIT's meaning
+    is not wire-proven (1 and 3 are the two seen in the wild — a tester's
+    every push answered 3), so we translate the FACT the cabinet stated —
+    it refused — and carry the raw value rather than invent a table.
+    Empty string when there is nothing to say (absent, or the 0 no-error
+    value), so callers can append it unconditionally."""
+    raw = str(code or "").strip()
+    if raw in ("", "0"):
+        return ""
+    return f"the cabinet refused the content (exception {raw})"
+
+
 # ----------------------------------------------------------------------------
 # Per-EGM association state
 # ----------------------------------------------------------------------------
@@ -1465,6 +1607,10 @@ class EgmAssociation:
         self.voucher_list_id = 0
         self.voucher_ids_sent = 0
         self.voucher_list_at = None
+        # True while our own disable/enable cycle is in flight — setVoucherState
+        # answers with a voucherStatus, which lands back in the reconcile that
+        # sent it. Cleared when the replacement list actually goes out.
+        self.voucher_reconciling = False
         self.vouchers = []
         self.voucher_count = 0
         # voucher redemption tier-2 (G2S-26): redemptions is a bounded ring
@@ -1568,6 +1714,26 @@ class EgmAssociation:
         # new_epoch (a re-handshake does not unload the EGM's content).
         self.media = {}
         self.media_content = {}
+        # Window census (the picker's input, 2026-07-31): the per-window
+        # mediaDisplayProfile answers land in assoc.media[dev]
+        # ["mediaDisplayProfile"] like any other fold, so the MAP needs no
+        # second copy. media_profile_asked is the one-shot guard — the
+        # deviceIds asked THIS epoch, so a chatty commHostList or a tap
+        # storm can never turn a dormant class into a poll (cleared in
+        # new_epoch: a rejoin IS the retry). media_profile_ts is when the
+        # census last went out, which is the SETTLE clock — a half-arrived
+        # census must not move the target off GLASS_DEFAULT_DEVICE, but a
+        # window that never answers must not freeze it there either.
+        # glass_target_said is the "say it once" latch for the resolved
+        # window: (deviceId, picked?) of the last line we journaled, so a
+        # stuck-glass diagnosis can read which window we aimed at without
+        # the log repeating it on every push/poll. The census itself is
+        # accumulated with assoc.media — NOT cleared in new_epoch (a
+        # re-handshake does not re-shape the cabinet's windows) — and is
+        # cleared with media on a RAM clear, the one event that can.
+        self.media_profile_asked = set()
+        self.media_profile_ts = 0.0
+        self.glass_target_said = None
         # deviceId -> the transactionId the EGM assigned to that device's
         # loaded content (captured from the contentStatus / mediaDisplayAck
         # fold). setActiveContent/releaseContent/getContentStatus echo it —
@@ -1691,6 +1857,12 @@ class EgmAssociation:
         # self-corrects in one press if the window survived visible
         self.glass_visible = False
         self.glass_button_ts = 0.0
+        # The window census asks each window ONCE per join (not on a timer —
+        # nothing about this class polls). Clearing the asked-set here is
+        # what makes a rejoin the retry: a window that stayed silent last
+        # time gets one more chance, and one that answered is never asked
+        # again (its profile lives on in assoc.media, which survives).
+        self.media_profile_asked = set()
 
     def snapshot(self):
         # Copies of the mutable containers are taken under self.lock:
@@ -2266,6 +2438,20 @@ class VoucherStore:
                 self.state["vouchers"] = \
                     self.state["vouchers"][-self.KEEP_VOUCHERS:]
             info = self.state["issuedIds"].get(rec.get("validationId"))
+            if info is None and rec.get("kind") == "issue":
+                # The machine just printed real paper carrying a number we
+                # never minted, and until 2026-07-31 we said nothing — the
+                # operator only found out when the ticket was refused at
+                # redemption, by which point the cause was hours behind them.
+                # Reconciling at reconnect should make this unreachable, so if
+                # it ever fires again it is a bug worth hearing about at the
+                # moment the paper comes out.
+                log.error("🎟️ [%s] UNREDEEMABLE TICKET JUST PRINTED — "
+                          "validationId=%s is not one this host issued. It "
+                          "will be refused if presented. The cabinet is "
+                          "holding ids from a validation list we no longer "
+                          "have (a replaced/rewound voucher store).",
+                          egm_id, rec.get("validationId"))
             if info is not None and rec.get("kind") == "issue":
                 # Stash the ticket's value on the id record — this is what
                 # authorize_redemption pays out when the ticket comes back
@@ -6583,7 +6769,10 @@ class G2SHost:
             assoc = self.associations.get(egm_id)
         if assoc is None or assoc.comms_state != "onLine":
             return
-        dev = GLASS_DEFAULT_DEVICE
+        # Same window resolution every glass path uses, so the button
+        # toggles the window the push actually landed on (resolved BEFORE
+        # the lock — it takes assoc.lock itself).
+        dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
             if now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC:
@@ -6625,7 +6814,7 @@ class G2SHost:
             return
         if assoc is None or assoc.comms_state != "onLine":
             return
-        dev = GLASS_DEFAULT_DEVICE
+        dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
             push = assoc.glass_push.get(dev)
@@ -7819,9 +8008,15 @@ class G2SHost:
         # _glass_poll_advance. Guarded so an advance fault can never
         # break token delivery to the page.
         if src == "spa":
+            # A page that didn't say which window it is on is credited to
+            # the window we AIM at, not to a hardcoded 1 — otherwise the
+            # residency stamp and the push disagree on a cabinet whose
+            # service window isn't device 1. probe=False: this is the 1.5s
+            # poll, it wants the answer and no side effects.
             self._glass_spa_seen[egm_id] = {
                 "ts": time.time(),
-                "dev": str(dev or GLASS_DEFAULT_DEVICE)}
+                "dev": str(dev or self.glass_target_device(assoc,
+                                                           probe=False))}
             try:
                 self._glass_poll_advance(assoc)
             except Exception as e:  # noqa: BLE001 — poll keeps answering
@@ -13278,6 +13473,67 @@ class G2SHost:
             return inner, f"getVoucherProfile(dev={dev},cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
+    def _reconcile_validation_list(self, assoc, egm_list_id):
+        """A cabinet must never hold validation ids this host cannot honor.
+
+        THE BUG THIS EXISTS FOR (tester floor, 2026-07-29/30): a hub whose
+        voucher store was replaced came up with validationListSeq rewound
+        (7 -> 2, 140 issued ids -> 20) while its cabinets still held ids from
+        the old store. Those machines printed perfectly good $17 and $20
+        tickets that the host then refused at redemption —
+        `hostException=4 (unknown validation number (never issued here))`,
+        because has_id() cannot know an id it never minted.
+
+        The purge itself was never broken: getValidationData already sends
+        deleteCurrent=true whenever the EGM's list is not the one we last
+        issued it. It was only ever REACTIVE — it rides a request the CABINET
+        makes when its own buffer runs low, so between a store reset and that
+        request every ticket printed is scrap. The tester's own log caught it
+        by one second: the ticket printed at 17:01:49, the corrective list
+        landed at 17:01:50.
+
+        voucherStatus is the moment both facts are in our hands — what the
+        machine holds, and what we last gave it — and it rides the join
+        probes, so this fires on every reconnect. A mismatch does not need an
+        unsolicited push (the class has none): a host disable expires the
+        EGM's valIdListLife (§21.9), so re-enabling makes the machine ask,
+        and the PROVEN getValidationData path replaces the buffer.
+
+        Silent on a healthy floor: a store that has been running continuously
+        always matches, and a first-ever join (lastListId 0, EGM 0) is not a
+        mismatch. Never re-entrant — setVoucherState's own response is a
+        voucherStatus, which lands right back here."""
+        try:
+            egm_list = str(egm_list_id or "0").strip() or "0"
+            known = str(self.voucher_store.last_list_id(assoc.egm_id) or 0)
+            if egm_list == known:
+                return
+            # A cabinet with NO list yet is not stale — it simply has not been
+            # given one, and getValidationData will do that unprompted.
+            if egm_list == "0":
+                return
+            with assoc.lock:
+                if assoc.voucher_reconciling:
+                    return          # our own disable/enable is in flight
+                assoc.voucher_reconciling = True
+            log.warning("=" * 64)
+            log.warning("🎟️ [%s] STALE TICKET IDS — this cabinet is holding "
+                        "validation list %s; the last list we issued it was "
+                        "%s. Anything it prints from that list we could NOT "
+                        "redeem (it would come back 'never issued here').",
+                        assoc.egm_id, egm_list, known)
+            log.warning("   Cycling ticket printing to expire its buffer — "
+                        "the refill lands with deleteCurrent=true and the "
+                        "machine drops the stale ids.")
+            log.warning("=" * 64)
+            self.enqueue_set_voucher_state(
+                assoc, enable=False,
+                disable_text="Refreshing ticket validation")
+            self.enqueue_set_voucher_state(assoc, enable=True)
+        except Exception as e:      # noqa: BLE001 — a reconcile fault must
+            log.error("[%s] validation-list reconcile failed: %s",   # never
+                      assoc.egm_id, e)                      # break the join
+
     def enqueue_set_voucher_state(self, assoc, enable=True, disable_text="",
                                   device_id=None):
         """voucher.setVoucherState (spec §21.9, Table 21.9) — enable/disable
@@ -13989,6 +14245,128 @@ class G2SHost:
             return inner, f"getMediaDisplayProfile(dev={dev},cid={cid})"
         self._enqueue(assoc, build)
 
+    # ------------------------------- the window census + the glass target
+    # "Device 1 is the left Service Window" was one cabinet's truth read as
+    # a law. A tester's AVP exposes SEVEN mediaDisplay devices and answered
+    # every push at its device 1 with contentException=3, so his glass never
+    # came up — the hub was aiming at a window that could not host a page.
+    # The cabinet already TELLS us what each window is (getMediaDisplayProfile
+    # returns description/position/size/type), so we ask, and we pick. Two
+    # rules keep the owner's working floor safe: a push NEVER waits on the
+    # census (no answer yet => GLASS_DEFAULT_DEVICE, exactly today's
+    # behavior), and a HALF-arrived census never moves the target.
+
+    def harvest_media_display_profiles(self, assoc, why="a push"):
+        """Ask every owned mediaDisplay window we have no profile for what
+        it IS. Fire-and-forget: the answers land in the ordinary fold
+        (assoc.media[dev]["mediaDisplayProfile"]) and the NEXT target
+        resolution reads them — no caller ever blocks on this.
+
+        getMediaDisplayProfile is the ladder's guest-safe EMPTY read: it
+        changes no glass state, so running it at ownership time cannot
+        disturb a machine. Each window is asked at most ONCE PER JOIN
+        (media_profile_asked, cleared in new_epoch) and never asked again
+        once it has answered — so this can never become a timer, and a
+        chatty commHostList or a tap storm costs nothing. A window that
+        stays silent gets its next chance at the next rejoin. Returns the
+        deviceIds asked (the gate's handle); [] when it declined."""
+        if assoc is None or assoc.comms_state != "onLine":
+            return []
+        owned = self.owned_media_display_devices(assoc)   # takes assoc.lock
+        if not owned:
+            # Ownership not revealed yet (no commHostList) — asking a window
+            # we may not own is noise; the reveal itself re-triggers this.
+            return []
+        now = time.time()
+        with assoc.lock:
+            want = sorted(
+                (d for d in owned
+                 if d not in assoc.media_profile_asked
+                 and not (assoc.media.get(d) or {}).get("mediaDisplayProfile")),
+                key=lambda d: (not d.isdigit(),
+                               int(d) if d.isdigit() else d))
+            if not want:
+                return []
+            assoc.media_profile_asked.update(want)
+            assoc.media_profile_ts = now
+        # enqueue OUTSIDE assoc.lock (_enqueue takes it — the no-nesting rule)
+        for dev in want:
+            self.enqueue_get_media_display_profile(assoc, dev)
+        log.info("🪟 [%s] window census — getMediaDisplayProfile x%d for the "
+                 "unprofiled window(s) %s (%s). Guest-safe reads; nothing "
+                 "waits on them — until they answer the glass keeps going to "
+                 "the dev=%s fallback.", assoc.egm_id, len(want), want, why,
+                 GLASS_DEFAULT_DEVICE)
+        return want
+
+    def glass_target_device(self, assoc, device_id=None, probe=True):
+        """THE glass window for this cabinet — the one answer every glass
+        path (glassShow/glassHide, the card-IN recovery push, the service
+        button, glass-follows-card, the SPA residency stamp) resolves
+        through, so they can never aim at different windows.
+
+        An explicit deviceId from /api/command ALWAYS wins — the bench
+        keeps its override, and the probe ladder's own rungs are untouched.
+        Otherwise the picker reads the cabinet's census, but only once it is
+        SETTLED: every owned window answered, or the harvest is
+        GLASS_PROFILE_SETTLE_SEC old and at least one did (a window that
+        never answers must not freeze the target forever). Anything less —
+        no census, a half-arrived one, an all-unusable one — returns
+        GLASS_DEFAULT_DEVICE, which is today's shipped behavior and the
+        owner's correct window.
+
+        probe=False for the resident SPA's 1.5s state poll: that path wants
+        the answer, not a side effect."""
+        if device_id is not None:
+            return str(device_id)
+        owned = self.owned_media_display_devices(assoc)   # takes assoc.lock
+        now = time.time()
+        with assoc.lock:
+            profiles = {
+                d: dict((m or {}).get("mediaDisplayProfile") or {})
+                for d, m in assoc.media.items()
+                if (m or {}).get("mediaDisplayProfile")}
+            harvest_ts = assoc.media_profile_ts
+        # ⚖️ ONLY WINDOWS WE OWN ARE CANDIDATES. assoc.media is shared with
+        # the bench: `mediaDisplayProbe {rung: profile, deviceId: N}` accepts
+        # ANY id (that is how this cabinet's map was first read), and host 0
+        # may own windows we do not. An unowned winner is worse than a wrong
+        # one — start_glass_show/_hide hard-reject it, so every push and every
+        # card-IN self-heal would fail for the life of the association.
+        profiles = {d: p for d, p in profiles.items() if str(d) in owned}
+        missing = sorted(owned - set(profiles))
+        # ⚖️ COMPLETE OR NOT AT ALL. There is deliberately no time-based
+        # escape hatch: a census holding only dev 2 would rank the RIGHT
+        # Service Window and aim the glass at the wrong side of a floor that
+        # works today. Waiting costs nothing (the fallback IS today's
+        # behavior); deciding early costs a working cabinet. `owned` empty
+        # (pre-commHostList) is NOT settled — otherwise a single stray fold
+        # would decide with nothing to be complete against.
+        settled = bool(owned) and bool(profiles) and not missing
+        dev = pick_glass_device(profiles) if settled else GLASS_DEFAULT_DEVICE
+        if probe and missing:
+            self.harvest_media_display_profiles(assoc, why="a glass target")
+        # Say it ONCE per distinct answer: a stuck-glass diagnosis should
+        # never have to guess which window we aimed at, and a per-push line
+        # would bury the one that matters.
+        with assoc.lock:
+            said = assoc.glass_target_said
+            assoc.glass_target_said = (dev, settled)
+        if said != (dev, settled):
+            prof = profiles.get(dev) or {}
+            what = (f"\"{prof.get('mediaDisplayDescription') or 'no description'}\""
+                    f" {prof.get('mediaDisplayWidth') or '?'}x"
+                    f"{prof.get('mediaDisplayHeight') or '?'}"
+                    if prof else "(not profiled yet)")
+            log.info("🪟 [%s] glass target = dev %s %s — %s. An explicit "
+                     "deviceId still overrides.", assoc.egm_id, dev, what,
+                     f"picked from the cabinet's own census of "
+                     f"{len(profiles)} window(s)" if settled
+                     else (f"no settled census yet ({len(profiles)} of "
+                           f"{len(owned) or '?'} owned window(s) have "
+                           f"answered) — GLASS_DEFAULT_DEVICE fallback"))
+        return dev
+
     def enqueue_set_media_display_state(self, assoc, device_id, enable):
         """mediaDisplay.setMediaDisplayState — the hostEnabled flip (the
         recon's answer to egmEnabled=false at last recon: the ladder
@@ -14280,18 +14658,22 @@ class G2SHost:
     # glassShow runs from /api/command or the throttled card-IN recovery.
 
     def start_glass_show(self, assoc, device_id=None, page=None):
-        """/api/command glassShow {egmId, deviceId?=1, page?=glass.html} —
-        arm the sequencer and fire the load. The wire verbs are the
+        """/api/command glassShow {egmId, deviceId?=picked, page?=glass.html}
+        — arm the sequencer and fire the load. The wire verbs are the
         probe ladder's own builders VERBATIM (enqueue_load_content /
         _enqueue_md_txn_verb / _enqueue_md_bare_verb — live-proven, never
         re-derived). Release-before-load honors maxContentLoaded=1 (a load
         over active content NO-OPs, live-hit 2026-07-10); the old content's
         ids come from media_content/media_txn, best-effort — absent ids
         skip the release and the stage timeout is the honest failure
-        surface. Errors as dicts at HTTP 200 (the probe posture)."""
+        surface. Errors as dicts at HTTP 200 (the probe posture).
+
+        The window comes from glass_target_device — the cabinet's own
+        census when it has settled, GLASS_DEFAULT_DEVICE until then. An
+        explicit deviceId still wins, and the push NEVER waits on a
+        census (the harvest it may kick improves the NEXT push)."""
         owned = self.owned_media_display_devices(assoc)
-        dev = str(device_id) if device_id is not None \
-            else GLASS_DEFAULT_DEVICE
+        dev = self.glass_target_device(assoc, device_id)
         if owned and dev not in owned:
             return {"ok": False,
                     "error": f"device {dev} is not an owned "
@@ -14406,13 +14788,14 @@ class G2SHost:
                 "ownedMediaDisplays": sorted(owned)}
 
     def start_glass_hide(self, assoc, device_id=None):
-        """/api/command glassHide {egmId, deviceId?=1} — hideMediaDisplay:
-        the window goes away, the content stays RESIDENT (glass_push keeps
-        its 'shown' stage — the page still polls underneath, so a bare
-        show probe rung brings it straight back without a 5-8s reload)."""
+        """/api/command glassHide {egmId, deviceId?=picked} —
+        hideMediaDisplay: the window goes away, the content stays RESIDENT
+        (glass_push keeps its 'shown' stage — the page still polls
+        underneath, so a bare show probe rung brings it straight back
+        without a 5-8s reload). Same window resolution as glassShow, so
+        hide always aims at the window show used."""
         owned = self.owned_media_display_devices(assoc)
-        dev = str(device_id) if device_id is not None \
-            else GLASS_DEFAULT_DEVICE
+        dev = self.glass_target_device(assoc, device_id)
         if owned and dev not in owned:
             return {"ok": False,
                     "error": f"device {dev} is not an owned "
@@ -14424,7 +14807,7 @@ class G2SHost:
         return {"deviceId": dev}
 
     def _glass_recovery_push(self, assoc):
-        """Card-IN recovery: if the default glass window is not KNOWN to be
+        """Card-IN recovery: if the target glass window is not KNOWN to be
         showing the resident SPA (hub-side truth = a completed 'shown'
         push THIS epoch — new_epoch clears glass_push, so a rebooted
         cabinet honestly reads not-shown), auto-run glassShow. Throttled
@@ -14432,7 +14815,10 @@ class G2SHost:
         flight is left alone. This is how a tap after a machine/hub
         reboot self-heals the page — and the ONLY glassShow trigger
         besides /api/command (nothing fires at join)."""
-        dev = GLASS_DEFAULT_DEVICE
+        # Resolved ONCE and handed to the show below: the residency it
+        # judges and the window it then pushes to must be the same one,
+        # even if a census answer lands in between.
+        dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
             push = assoc.glass_push.get(dev)
@@ -14456,7 +14842,7 @@ class G2SHost:
             if now - assoc.glass_recovery_ts < GLASS_RECOVERY_THROTTLE_SEC:
                 return
             assoc.glass_recovery_ts = now
-        r = self.start_glass_show(assoc)
+        r = self.start_glass_show(assoc, device_id=dev)
         log.info("🪟 [%s] card-IN recovery push -> %s", assoc.egm_id,
                  f"glassShow content={r.get('contentId')}"
                  if r.get("contentId") else r.get("error"))
@@ -16972,6 +17358,17 @@ class G2SHost:
             log.info("=" * 64)
             if stype == "G2S_request":
                 self.enqueue_comm_host_list_ack(assoc, req)
+            # Ownership is what makes a mediaDisplay window OURS to push to,
+            # so this reveal is the moment to ask each one WHAT IT IS —
+            # behind the ack, and once (throttled, skipped when every owned
+            # window already answered). Guest-safe EMPTY reads that change
+            # no glass state; they exist so the first glass push of the
+            # night already knows which window is the service window
+            # instead of assuming device 1. ⚠️ This is the ONE mediaDisplay
+            # send that is not operator-triggered — the probe ladder's
+            # dormancy rule otherwise stands (nothing else fires unasked).
+            self.harvest_media_display_profiles(assoc,
+                                                why="ownership revealed")
 
         elif cmd == "eventReport":
             # THE payoff: the AVP is streaming us an event it fired (spec §4.16).
@@ -17414,10 +17811,20 @@ class G2SHost:
                     assoc.media = {}
                     assoc.media_content = {}
                     assoc.media_txn = {}
+                    # The window census went with it (it LIVED in
+                    # assoc.media) — clear the asked-set, the settle clock
+                    # and the said-once latch too, or the target would sit
+                    # on the fallback behind a one-shot guard that thinks it
+                    # already asked. Cleared, the next glass path
+                    # re-harvests into the fresh machine.
+                    assoc.media_profile_asked = set()
+                    assoc.media_profile_ts = 0.0
+                    assoc.glass_target_said = None
                 self._glass_spa_seen.pop(assoc.egm_id, None)
                 log.info("🧹 [%s] mediaDisplay tracking cleared after RAM "
                          "clear — next glassShow loads clean into the empty "
-                         "window", assoc.egm_id)
+                         "window (the window census re-harvests too)",
+                         assoc.egm_id)
             if entries:
                 log.info("🔔 [%s] LOG BACKFILL — %d log entr%s: %d merged, "
                          "%d duplicate/known skipped; lastSequence=%d "
@@ -18594,6 +19001,10 @@ class G2SHost:
                     assoc.voucher_list_id = list_id
                     assoc.voucher_ids_sent = len(items)
                     assoc.voucher_list_at = now_iso()
+                    # The replacement is out; a reconcile (if one was driving
+                    # this) is finished. Cleared HERE and nowhere else — this
+                    # is the only event that actually ends the stale state.
+                    assoc.voucher_reconciling = False
                 log.info("=" * 64)
                 log.info("🎫 [%s] issued validation list %d (%d ids, "
                          "deleteCurrent=%s) — EGM had listId=%s expired=%s",
@@ -19619,6 +20030,7 @@ class G2SHost:
                      "egmEnabled=%s validationListId=%s", assoc.egm_id,
                      req["deviceId"], data["hostEnabled"],
                      data["egmEnabled"], data["validationListId"])
+            self._reconcile_validation_list(assoc, data["validationListId"])
 
         elif cmd == "voucherProfile" and stype == "G2S_response":
             # voucher device profile (§21.14) — captured verbatim (valId
@@ -19934,6 +20346,35 @@ class G2SHost:
                             attr(ch, "contentId"),
                             attr(ch, "transactionId"),
                             attr(ch, "logSequence")))
+            # Same shape, and the reason a stuck-glass hunt stayed blind for
+            # nine days: mediaDisplayProfile's most useful content is in its
+            # CHILDREN, and we kept only the parent's attribs.
+            #   capabilitiesList/capabilityItem — what this window can
+            #     actually render (softwareType IGT_flash | IGT_HTML, its
+            #     version, the file extension). minOccurs=1 in the schema, so
+            #     every cabinet sends it. A window that cannot do HTML
+            #     explains a load that fails before any fetch.
+            #   localEventList/localEventItem — THE CABINET'S OWN WORDS for
+            #     its event codes. IGT_MDE105 fired on 11 of 11 failed loads
+            #     on a tester's floor and we had no idea what it meant; the
+            #     machine has been able to tell us the whole time.
+            if cmd == "mediaDisplayProfile":
+                caps, events = [], []
+                for ch in el.iter():
+                    tag = localname(ch.tag)
+                    if tag == "capabilityItem":
+                        caps.append("/".join(
+                            x for x in (attr(ch, "softwareType"),
+                                        attr(ch, "softwareVersion"),
+                                        attr(ch, "fileExtension")) if x))
+                    elif tag == "localEventItem":
+                        code = attr(ch, "eventCode")
+                        if code:
+                            events.append((code, attr(ch, "eventText") or ""))
+                if caps:
+                    data["capabilities"] = ", ".join(caps[:12])[:200]
+                if events:
+                    data["localEvents"] = dict(events[:40])
             with assoc.lock:
                 assoc.media[dev] = dict(assoc.media.get(dev) or {},
                                         lastCommand=cmd,
@@ -20038,10 +20479,18 @@ class G2SHost:
                         tries=0, lastTryTs=0)
                     assoc.media_content[dev] = rpush["contentId"]
                     glass_recover = (occ, rpush["contentId"], rpush["uri"])
+            # contentException reads as a bare digit in the census above —
+            # the ONE attribute in this fold that is a verdict rather than a
+            # description, and the one a stuck-glass hunt needs in words
+            # (a tester's every push answered 3 and nobody could tell from
+            # the log that the CABINET had refused it). The raw value stays
+            # verbatim in attrs=; this only says what it means.
+            exc_words = content_exception_words(data.get("contentException"))
             log.info("🖥️ [%s] mediaDisplay %s dev=%s attrs=%s — WIRE "
                      "EVIDENCE (schema-adjudicated igtMediaDisplay v1.8; "
-                     "captured to /api/status mediaDisplay)", assoc.egm_id,
-                     cmd, dev, data)
+                     "captured to /api/status mediaDisplay)%s", assoc.egm_id,
+                     cmd, dev, data,
+                     f" — {exc_words}" if exc_words else "")
             if glass_step is not None:
                 if glass_step[0] == "setActiveContent":
                     self.enqueue_set_active_content(
@@ -20245,17 +20694,34 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         /webui/../g2s_host.py and %2e%2e variants all 404. Files are read per
         request so the page can be edited live without restarting the host."""
         name = rel_path.lstrip("/")
-        if name in ("hello.html", "glass_ping.html"):
-            # mediaDisplay P9 proof (#18): the AVP's built-in browser
-            # fetching a probe page IS the on-glass evidence — one loud
-            # line with its User-Agent, greppable from the journal. These
-            # two pages ONLY (the kiosk polling home.html must not spam).
+        if name in ("hello.html", "glass_ping.html", GLASS_PAGE, "smib.html"):
+            # mediaDisplay P9 proof (#18): the cabinet's built-in browser
+            # fetching the page IS the on-glass evidence — one loud line
+            # with its User-Agent, greppable from the journal. (The kiosk
+            # polling home.html must not spam, so this stays a fixed list.)
+            #
+            # glass.html/smib.html were NOT on this list until 2026-07-31,
+            # which made the fetch invisible for the ONE page that matters:
+            # a cabinet whose load never arrives and a cabinet whose load
+            # arrives fine looked identical from the journal. That is the
+            # difference between "the GET never reached us" (wire/route) and
+            # "it reached us and we answered" (renderer) — the first split a
+            # stuck-glass diagnosis has to make.
             log.info("🖥️ GLASS FETCH /webui/%s UA=%r", name,
                      self.headers.get("User-Agent") or "")
         root = os.path.realpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "webui"))
         full = os.path.realpath(os.path.join(root, rel_path.lstrip("/")))
         if not full.startswith(root + os.sep) or not os.path.isfile(full):
+            if name in ("hello.html", "glass_ping.html", GLASS_PAGE,
+                        "smib.html"):
+                # A cabinet asked for its glass and we had nothing to give it.
+                # Silent, this is indistinguishable from "the request never
+                # arrived" — one is a wire/route problem, the other is a tree
+                # missing its webui files, and they have nothing in common.
+                log.warning("🖥️ GLASS FETCH /webui/%s -> 404 — the cabinet "
+                            "asked for its page and this tree does not have "
+                            "it; the content can never load", name)
             return self._send(404, '{"error": "not found"}',
                               "application/json", soap=False)
         ctype = WEBUI_CONTENT_TYPES.get(

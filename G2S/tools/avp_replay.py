@@ -8400,6 +8400,14 @@ def main():
     # and every id is pure-numeric (MSX005). DORMANCY IS A GATE: the whole
     # standard suite above ran with zero probes fired, so not one byte of
     # mediaDisplay may exist on the wire before this line.
+    # AMENDED 2026-07-31 (the window picker): dormancy still holds at JOIN
+    # and through every standard exchange, but an OWNERSHIP REVEAL now also
+    # harvests the window census — one getMediaDisplayProfile per owned
+    # window, once per join. That is the only unasked mediaDisplay traffic
+    # the host emits, and it exists because "device 1 is the left Service
+    # Window" was one cabinet's truth: a tester's AVP exposes seven windows
+    # and answered every push at its device 1 with contentException=3. The
+    # commHostList reveal below is therefore expected to draw the census.
 
     print("— Step 6.998: mediaDisplay probe scaffold (#18 P3) — dormancy "
           "gate, wire-shape law, folds, glass ping")
@@ -8439,7 +8447,20 @@ def main():
           and cbody.get("rung") == "status" and cbody.get("deviceId") == "1"
           and cbody.get("ownedMediaDisplays", [])[:3] == ["1", "2", "3"],
           f"got {cs}/{cbody}")
+    # The reveal's own census rides ahead of the probe rung on the FIFO:
+    # one EMPTY getMediaDisplayProfile per owned window, lowest deviceId
+    # first, once per join (this replay never answers them, and the host
+    # must not ask twice — the asserts after this step would catch it).
+    # Drain it, then take the status rung's own POST.
+    census = []
     m = expect_host_post("getMediaDisplayStatus")
+    while m and m.get("command") == "getMediaDisplayProfile":
+        census.append(m["deviceId"])
+        m = expect_host_post("getMediaDisplayStatus")
+    check("ownership reveal harvests the WINDOW CENSUS — one "
+          "getMediaDisplayProfile per owned window (the picker's input; a "
+          "glass push never waits on it)",
+          census == ["1", "2", "3", "4", "5", "6"], census)
     md_sid = m["sessionId"] if m else "1001"
     if m:
         wire_inner = html.unescape(m["raw"])
