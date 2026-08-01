@@ -20826,11 +20826,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     # (live-hit 2026-08-01: the AVP was displaying the login
                     # prompt while every window read empty). Absence of this
                     # field means "we don't know", never "nothing there".
+                    # getattr, not attribute access: a bench host built without
+                    # the engine's __init__ (every gate does this) has no such
+                    # map, and a diagnostic field must never be able to 500 the
+                    # status endpoint the whole UI polls. No map => no field =>
+                    # "unknown", which is the honest answer anyway.
+                    _seen = getattr(engine, "_glass_spa_seen", None) or {}
                     _now = time.time()
                     for _eid, _e in snap.items():
                         if not isinstance(_e, dict):
                             continue
-                        _spa = engine._glass_spa_seen.get(_eid) or {}
+                        _spa = _seen.get(_eid) or {}
                         _age = _now - (_spa.get("ts") or 0)
                         if _spa.get("dev") and _age <= GLASS_SPA_LIVE_SEC:
                             _e["glassSpa"] = {"dev": str(_spa.get("dev")),
