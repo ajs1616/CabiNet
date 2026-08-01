@@ -16476,6 +16476,22 @@ class G2SHost:
                                 "rung; live-proven 2026-07-25).",
                                 assoc.egm_id, d, p.get("contentId"), rerr)
                 for d, p in cleared:
+                    # ⚖️ THE REFUSAL BELONGS WHERE THE BUTTON IS. The machine
+                    # answers in ~50ms and its answer is the whole diagnosis
+                    # ("Device Disabled" = that window is off in the operator
+                    # menu) — but it only ever reached the journal, so the
+                    # console's window row sat there looking inert and the
+                    # operator concluded the button was broken (live-hit
+                    # 2026-08-01, owner clicked all five spare windows).
+                    # ONE record per device, REPLACED not appended, so this
+                    # can never grow.
+                    with assoc.lock:
+                        assoc.media[d] = dict(
+                            assoc.media.get(d) or {},
+                            lastResult={"ok": False, "what": "load",
+                                        "code": rerr or "",
+                                        "text": rtext or "",
+                                        "at": now_iso()})
                     log.warning("⚠️ 🪟 [%s] glass push dev=%s (content=%s) "
                                 "REJECTED at load (%s%s) — cleared now "
                                 "(fail-fast). If the window holds foreign "
@@ -20376,7 +20392,14 @@ class G2SHost:
                 if events:
                     data["localEvents"] = dict(events[:40])
             with assoc.lock:
-                assoc.media[dev] = dict(assoc.media.get(dev) or {},
+                # A GOOD answer supersedes a stale refusal: this window just
+                # spoke, so whatever it last refused is history. Without the
+                # pop, a row that failed once would wear "switched off" for
+                # the life of the association even after the operator turned
+                # it on and it answered cleanly.
+                _prev = dict(assoc.media.get(dev) or {})
+                _prev.pop("lastResult", None)
+                assoc.media[dev] = dict(_prev,
                                         lastCommand=cmd,
                                         lastSeen=now_iso(),
                                         **{cmd: data})

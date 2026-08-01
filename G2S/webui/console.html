@@ -100,6 +100,12 @@
   .win .fact b{color:var(--txt);font-weight:600}
   .win.up{border-color:#295}
   .win.stuck{border-color:#733}
+  /* One status line per window. Fixed to a single row: an operator mashing a
+     button must never grow the card off the screen. */
+  .win .status{font-size:12px;min-height:16px;margin-top:2px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+  .win .status.bad{color:var(--warn)}
+  @media (max-width:600px){.win .status{white-space:normal}}
   @media (max-width:600px){main{padding:10px;gap:10px}
     .win .acts{margin-left:0;width:100%}}
 </style>
@@ -194,6 +200,23 @@ async function cmd(action,danger,extra,say){
 // the owner try each one. Everything here rides endpoints that already exist:
 // mediaDisplayProbe(rung=profile) is a pure read; glassShow aims the proven
 // load->activate->show ladder at ONE window.
+// The machine's own refusals, in words a collector can act on. The code is the
+// key, the sentence is what shows — an operator should never have to look up
+// "APX016". Unknown codes fall through to the cabinet's own errorText, and if
+// even that is empty, to the bare code: always SOMETHING, never a blank row.
+const WIN_ERR = {
+  "G2S_APX016":"switched off on the machine — enable it in the operator menu",
+  "IGT_MDX003":"this window is already holding other content",
+  "IGT_MDX005":"the page hadn't finished loading yet",
+  "IGT_MDX006":"the machine didn't understand the request",
+  "G2S_APX003":"the machine is busy and refused the command",
+};
+function winErrWords(r){
+  if(!r) return "";
+  const c=String(r.code||""), t=String(r.text||"");
+  return WIN_ERR[c] || t || c || "the machine refused it";
+}
+
 const WIN_STATE = {
   "IGT_contentExecuting":["the glass is up here","up"],
   "IGT_contentLoaded"   :["page loaded, not shown yet",""],
@@ -246,6 +269,8 @@ function renderGlass(s){
     // restart when the content map does not. It OUTRANKS an empty content
     // map: a live SPA means the glass is genuinely up on this window.
     const spaHere=(s.glassSpa&&String(s.glassSpa.dev)===String(dev));
+    // The machine's verdict on the last thing we asked THIS window to do.
+    const res=m.lastResult||null;
     const size=p&&p.mediaDisplayWidth?`${p.mediaDisplayWidth}×${p.mediaDisplayHeight}`:"";
     // Never claim a window is empty on missing data. A known contentState is
     // the answer; a live page beats an empty map; anything else is "unknown"
@@ -267,7 +292,10 @@ function renderGlass(s){
         ${p?`<span>renders: <b>${esc(caps)}</b></span>`
            :'<span class="none">not asked yet — press “Ask this window”</span>'}
         ${st[0]?`<span>· ${esc(st[0])}</span>`:""}
-      </div></div>`;
+      </div>
+      <div class="fact status ${res&&!res.ok?"bad":""}" data-status="${esc(dev)}"
+        >${res&&!res.ok?`⚠️ ${esc(winErrWords(res))}`:""}</div>
+      </div>`;
   }).join("");
   setHTML(el,
     `<p class="muted" style="margin:0 0 10px;font-size:13px">Each window is a
@@ -279,10 +307,25 @@ function renderGlass(s){
      ${rows}`);
   el.querySelectorAll(".win").forEach(w=>{
     const dev=w.dataset.dev;
+    const line=w.querySelector(".status");
+    // Say something the instant it is pressed. The hub answers in a few ms and
+    // the machine's own verdict lands on the next poll and REPLACES this — the
+    // line never appends, so the row cannot grow.
+    const fire=async(action,extra,say)=>{
+      if(line){line.classList.remove("bad");line.textContent="sending…";}
+      const j=await cmd(action,false,extra,say);
+      if(!line) return;
+      if(!j||!j.ok){
+        line.classList.add("bad");
+        line.textContent="⚠️ "+((j&&j.error)||"the hub could not send it");
+      }else{
+        line.textContent="sent — waiting for the machine";
+      }
+    };
     w.querySelector('[data-act="ask"]').onclick=()=>
-      cmd("mediaDisplayProbe",false,{rung:"profile",deviceId:dev},`asked window ${dev}`);
+      fire("mediaDisplayProbe",{rung:"profile",deviceId:dev},`asked window ${dev}`);
     w.querySelector('[data-act="show"]').onclick=()=>
-      cmd("glassShow",false,{deviceId:dev},`glass sent to window ${dev}`);
+      fire("glassShow",{deviceId:dev},`glass sent to window ${dev}`);
   });
   const all=document.getElementById("ask-all");
   if(all) all.onclick=async()=>{
