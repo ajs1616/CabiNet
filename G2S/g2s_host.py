@@ -14595,6 +14595,30 @@ class G2SHost:
                 f"{GLASS_CONTENT_URI_BASE}{page}"
                 f"{'?probe=1' if with_query else ''}"
                 if page else MD_DEFAULT_CONTENT_URI)
+            # Occupied-window refusal (live-hit 2026-08-17): AJ pressed every
+            # Try button at the one window ALREADY SHOWING the glass — the
+            # machine holds ONE page per window (maxContentLoaded=1), so each
+            # load drew MDX003 in ~100ms and nothing on the row ever moved.
+            # A test aimed at an occupied window can never work; say so IN
+            # the button's own reply instead of letting the machine refuse
+            # off-screen. The release/hide rungs stay available for bench
+            # work that really means it.
+            with assoc.lock:
+                _cs = (assoc.media.get(dev) or {}).get("contentStatus") or {}
+                _push = assoc.glass_push.get(dev) or {}
+                _spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+                occupied = (
+                    _cs.get("contentState") == "IGT_contentExecuting"
+                    or _push.get("stage") in ("showing", "shown")
+                    or (_spa.get("dev") == dev and
+                        time.time() - (_spa.get("ts") or 0)
+                        <= GLASS_SPA_LIVE_SEC))
+            if occupied and not uri:
+                return {"ok": False,
+                        "error": "this window is already showing the glass "
+                                 "— a machine window holds one page at a "
+                                 "time, so run the test on a different "
+                                 "window (or hide the glass here first)"}
             if content_id is not None:
                 cnt = str(content_id)
             else:
@@ -16449,41 +16473,48 @@ class G2SHost:
             # this phantom-release MDX002 aborted the push, so a loaded glass
             # never showed). Skip the fail-fast here and let the load's own
             # outcome — the contentStatus advance, or its own MDX003 — decide.
-            if req["class"] == "mediaDisplay" and rerr != "IGT_MDX002":
+            if req["class"] == "mediaDisplay":
                 mdev = str(req.get("deviceId") or "")
                 cleared = []
                 recover = []
-                with assoc.lock:
-                    for d, p in list(assoc.glass_push.items()):
-                        if p.get("stage") == "loading" and \
-                                (not mdev or mdev == d):
-                            # IGT_MDX003 "Must release loaded content." is NOT a
-                            # dead end for the AUTO first-spawn: the window
-                            # holds content from a prior session, but host
-                            # memory is empty (a fresh host restart, or Fix A
-                            # wiped media_content/media_txn on a RAM clear), so
-                            # start_glass_show had no occupant id to release
-                            # before loading and the bare load smashed into
-                            # maxContentLoaded=1. The MANUAL operator wins
-                            # because their FIRST rung is a discovery read
-                            # (logstatus/log/getContentStatus) that seeds
-                            # exactly that release — the auto path must
-                            # self-discover. Hold the push (stage='recovering'),
-                            # pull getContentLog to learn the occupant, then
-                            # release + reload (live A/B 2026-07-25: adding one
-                            # discovery read flipped the identical auto glassShow
-                            # from MDX003 straight to full SHOWN — the only
-                            # variable changed). One-shot (recovered flag): a
-                            # second MDX003 after we already released is the
-                            # honest failure the manual rungs still backstop.
-                            if rerr == "IGT_MDX003" and not p.get("recovered"):
-                                assoc.glass_push[d] = dict(
-                                    p, stage="recovering", recovered=True,
-                                    startedTs=time.time())
-                                recover.append((d, p))
-                            else:
-                                del assoc.glass_push[d]
-                                cleared.append((d, p))
+                # The push fail-fast excludes IGT_MDX002 (the phantom-release
+                # verdict that rides ahead of a load in the same FIFO batch —
+                # see the comment above); the MANUAL-probe stamp further down
+                # deliberately does NOT exclude it, because a probe-fired
+                # setactive/release answered MDX002 is that button's whole
+                # verdict (live-hit 2026-08-17: "Make it live" died silently).
+                if rerr != "IGT_MDX002":
+                    with assoc.lock:
+                        for d, p in list(assoc.glass_push.items()):
+                            if p.get("stage") == "loading" and \
+                                    (not mdev or mdev == d):
+                                # IGT_MDX003 "Must release loaded content." is NOT a
+                                # dead end for the AUTO first-spawn: the window
+                                # holds content from a prior session, but host
+                                # memory is empty (a fresh host restart, or Fix A
+                                # wiped media_content/media_txn on a RAM clear), so
+                                # start_glass_show had no occupant id to release
+                                # before loading and the bare load smashed into
+                                # maxContentLoaded=1. The MANUAL operator wins
+                                # because their FIRST rung is a discovery read
+                                # (logstatus/log/getContentStatus) that seeds
+                                # exactly that release — the auto path must
+                                # self-discover. Hold the push (stage='recovering'),
+                                # pull getContentLog to learn the occupant, then
+                                # release + reload (live A/B 2026-07-25: adding one
+                                # discovery read flipped the identical auto glassShow
+                                # from MDX003 straight to full SHOWN — the only
+                                # variable changed). One-shot (recovered flag): a
+                                # second MDX003 after we already released is the
+                                # honest failure the manual rungs still backstop.
+                                if rerr == "IGT_MDX003" and not p.get("recovered"):
+                                    assoc.glass_push[d] = dict(
+                                        p, stage="recovering", recovered=True,
+                                        startedTs=time.time())
+                                    recover.append((d, p))
+                                else:
+                                    del assoc.glass_push[d]
+                                    cleared.append((d, p))
                 for d, p in recover:
                     self.enqueue_get_content_log(assoc, d, 0)
                     log.warning("🔎 🪟 [%s] glass push dev=%s (content=%s) hit "
@@ -16517,6 +16548,32 @@ class G2SHost:
                                 "probe rungs recover it.",
                                 assoc.egm_id, d, p.get("contentId"), rerr,
                                 f' "{rtext}"' if rtext else "")
+                if mdev and not cleared and not recover:
+                    # The MANUAL-probe twin of the law above (live-hit
+                    # 2026-08-17: AJ pressed "Try the test page" on a
+                    # disabled window — APX016 answered in 100ms, but with
+                    # no glass_push in flight NOTHING stamped the row, and
+                    # it wore "sent — waiting for the machine" forever; his
+                    # verdict: "the glass debugger is bugged"). A class-level
+                    # mediaDisplay refusal is that window's verdict whether
+                    # or not a sequencer push rode the request — stamp the
+                    # row. recover-in-progress is excluded: MDX003 is being
+                    # self-healed and a scary refusal mid-heal would lie —
+                    # and so is any push at a still-MOVING stage (an MDX005
+                    # at 'activating' is the expected too-early verdict the
+                    # poll heartbeat retries straight through; stamping it
+                    # would flash a refusal that un-happens). A push parked
+                    # at 'shown' is NOT in motion: a probe misfire on a
+                    # window with resident glass deserves its verdict.
+                    with assoc.lock:
+                        _p = assoc.glass_push.get(mdev)
+                        if not _p or _p.get("stage") == "shown":
+                            assoc.media[mdev] = dict(
+                                assoc.media.get(mdev) or {},
+                                lastResult={"ok": False, "what": "load",
+                                            "code": rerr or "",
+                                            "text": rtext or "",
+                                            "at": now_iso()})
             # denom write (§6.15): a gamePlay-class error response IS the
             # verdict on a pending setActiveDenoms — error responses carry
             # NO child command, so the gameDenomList fold can never fire.
@@ -17627,6 +17684,7 @@ class G2SHost:
                     mdev = str(ev["deviceId"] or "")
                     etxn = str(ev["transactionId"] or "")
                     md_fire = None
+                    md_read = None
                     md_epoch = None
                     with assoc.lock:
                         md_epoch = assoc.epoch
@@ -17645,6 +17703,25 @@ class G2SHost:
                                     gpush, txn=str(txn), stage="activating",
                                     lastTryTs=time.time(), tries=1)
                                 md_fire = (mdev, gpush["contentId"], str(txn))
+                        elif not gpush:
+                            # MANUAL probe load (no sequencer push): the AVP
+                            # says "loaded" ONLY through this event, which
+                            # never folds into contentStatus — so the console
+                            # row sat on "waiting for this window to open the
+                            # page" after a load that had in fact landed
+                            # (2026-08-17, the same session that found the
+                            # refusal twin). Pull the status so the row flips
+                            # to "page loaded, not shown yet" and Make-it-live
+                            # stops being guesswork.
+                            r_cnt = assoc.media_content.get(mdev)
+                            r_txn = etxn if (etxn.isdigit() and
+                                             int(etxn) >= 1) \
+                                else assoc.media_txn.get(mdev)
+                            if r_cnt and r_txn:
+                                md_read = (mdev, r_cnt, str(r_txn))
+                    if md_read:
+                        self.enqueue_get_content_status(
+                            assoc, md_read[0], md_read[1], md_read[2])
                     if md_fire:
                         self.enqueue_set_active_content(
                             assoc, md_fire[0], md_fire[1], md_fire[2],
