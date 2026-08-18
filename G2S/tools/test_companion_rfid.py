@@ -718,8 +718,14 @@ def glass_window_picker():
     aS = glass_window(windows=tester, owned=tuple(tester))
     engS.associations[EGM] = aS
     r = engS.start_glass_show(aS)
+    # URI shape (2026-08-17): path-embedded /glass/<egm>/<dev>/<page>, query-
+    # LESS and .html-final — the Windows-era content manager admits content by
+    # file extension, and "?egm=&dev=" left the trailing token as "html?egm=…"
+    # (nine wire-documented exception-3 deaths). The window still rides the
+    # path's <dev> segment, so the pick assertion reads it there.
     check("glassShow with no deviceId lands on the picked service window",
-          r.get("deviceId") == "4" and f"&dev=4" in r.get("uri", ""), r)
+          r.get("deviceId") == "4" and "/4/glass.html" in r.get("uri", "")
+          and "?" not in r.get("uri", ""), r)
     check("the load rode the wire for that window",
           any(lbl.startswith("loadContent(") and ",dev=4," in lbl
               for _, lbl in engS.sent),
@@ -730,6 +736,23 @@ def glass_window_picker():
           r2.get("deviceId") == "5"
           and any("hideMediaDisplay(dev=5" in lbl for _, lbl in engS.sent),
           [lbl for _, lbl in engS.sent])
+
+    print("— differential-load probe params (the console's A/B buttons)")
+    # page= builds on the slot-VLAN base the CABINET can reach (never the
+    # console's own address); withQuery appends the ?probe=1 twin that
+    # adjudicates the Windows-era extension-admission theory.
+    r3 = engS.start_media_display_probe(aS, rung="load", device_id="4",
+                                        page="hello.html")
+    check("probe load page= is hub-built and query-less",
+          r3.get("uri") == gh.GLASS_CONTENT_URI_BASE + "hello.html", r3)
+    r4 = engS.start_media_display_probe(aS, rung="load", device_id="4",
+                                        page="hello.html", with_query=True)
+    check("probe load withQuery appends exactly ?probe=1",
+          r4.get("uri") == gh.GLASS_CONTENT_URI_BASE + "hello.html?probe=1",
+          r4)
+    r5 = engS.start_media_display_probe(aS, rung="load", device_id="4")
+    check("probe load with nothing still defaults to the hello page",
+          r5.get("uri") == gh.MD_DEFAULT_CONTENT_URI, r5)
 
     print("— contentException reads as words, never as a bare digit")
     check("the two seen in the wild say what happened, raw value kept",

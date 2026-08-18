@@ -14534,7 +14534,8 @@ class G2SHost:
 
     def start_media_display_probe(self, assoc, rung=None, device_id=None,
                                   uri=None, content_id=None,
-                                  transaction_id=None, last_sequence=None):
+                                  transaction_id=None, last_sequence=None,
+                                  page=None, with_query=False):
         """/api/command mediaDisplayProbe — ONE action, rung-parameterized;
         the climbing happens from the bench with observability between
         rungs (the start_bonus_award posture: errors as dicts at HTTP 200,
@@ -14587,7 +14588,13 @@ class G2SHost:
             (self.enqueue_show_media_display if rung == "show"
              else self.enqueue_hide_media_display)(assoc, dev)
         elif rung == "load":
-            target_uri = str(uri) if uri else MD_DEFAULT_CONTENT_URI
+            # page/with_query (2026-08-17): the console's differential-load
+            # buttons. Hub-built on the slot-VLAN base (never the caller's
+            # own address); an explicit uri still wins for raw bench work.
+            target_uri = str(uri) if uri else (
+                f"{GLASS_CONTENT_URI_BASE}{page}"
+                f"{'?probe=1' if with_query else ''}"
+                if page else MD_DEFAULT_CONTENT_URI)
             if content_id is not None:
                 cnt = str(content_id)
             else:
@@ -14680,10 +14687,21 @@ class G2SHost:
                              f"IGT_mediaDisplay device ({sorted(owned)})"}
         page = str(page or GLASS_PAGE)
         now = time.time()
-        # The SPA reads ?egm=&dev= off location.search — its state poll and
-        # any future EMDI-side logic key off them.
-        uri = (f"{GLASS_CONTENT_URI_BASE}{page}"
-               f"?egm={urllib.parse.quote(assoc.egm_id or '')}&dev={dev}")
+        # PATH-EMBEDDED params (2026-08-17): /webui/glass/<egm>/<dev>/<page>.
+        # The SPA reads egm/dev off location.pathname (with the old
+        # location.search form kept as a fallback reader). This replaced
+        # ?egm=&dev= because the Windows-era content manager admits content
+        # BY FILE EXTENSION (capabilityItem fileExtension="html" on every
+        # window of a tester's G23, wire-read 2026-08-02) and a query string
+        # leaves the URI's trailing token as "html?egm=…" — nine loads on
+        # two Windows-era cabinets fetched fine (UA='') then died
+        # contentException=3 within ~300ms, while the QNX AVP (no admission
+        # step, degenerate capability profile) never cared. One URI shape
+        # for BOTH eras — never branch on model/platform; a legal .html-
+        # final URI costs the QNX path nothing.
+        uri = (f"{GLASS_CONTENT_URI_BASE}glass/"
+               f"{urllib.parse.quote(assoc.egm_id or '', safe='')}/{dev}/"
+               f"{page}")
         # <epoch><2-digit seq> — the probe ladder's pure-numeric contentId
         # shape (the MSX005 id law).
         cnt = f"{int(now)}{next(self._md_content_seq) % 100:02d}"
@@ -17636,6 +17654,36 @@ class G2SHost:
                                  "the real load cue, mirrors the manual "
                                  "operator; beats the MDX005 poll-race)",
                                  assoc.egm_id, md_fire[0])
+                # IGT_MDE105 = "content log changed" — on the Windows-era
+                # cabinets it is the ONLY unsolicited breadcrumb a failed
+                # load leaves (they narrate MDE101 then MDE105 ~300ms apart
+                # and never a contentStatus). The verdict itself sits in the
+                # content status; pull it NOW with the live-proven
+                # getContentStatus read so the exception fail-fast in the
+                # fold fires in ~1s instead of riding the next patient poll
+                # (~13s observed on a tester's floor, 2026-08-02). Same
+                # shape as the MDE102 hook: decision under the lock, enqueue
+                # after (a pure read — no epoch tag to carry). Needs the
+                # EGM-assigned txn — absent (pending never narrated) the
+                # patient poll remains the backstop.
+                if code == "IGT_MDE105":
+                    mdev = str(ev["deviceId"] or "")
+                    md_pull = None
+                    with assoc.lock:
+                        gpush = assoc.glass_push.get(mdev)
+                        ptxn = str((gpush or {}).get("txn") or "")
+                        if gpush and gpush.get("stage") in (
+                                "loading", "activating", "showing") and \
+                                ptxn.isdigit() and int(ptxn) >= 1:
+                            md_pull = (mdev, gpush["contentId"], ptxn)
+                    if md_pull:
+                        self.enqueue_get_content_status(
+                            assoc, md_pull[0], md_pull[1], md_pull[2])
+                        log.info("🪟 [%s] glass sequencer dev=%s -> "
+                                 "getContentStatus (IGT_MDE105 content-log "
+                                 "change mid-push — reading the verdict now "
+                                 "rather than waiting out the patient poll)",
+                                 assoc.egm_id, md_pull[0])
                 if bill is not None:
                     log.info("=" * 64)
                     log.info("💵 [%s] BILL IN — %s (#%d this session, "
@@ -20502,6 +20550,46 @@ class G2SHost:
                         tries=0, lastTryTs=0)
                     assoc.media_content[dev] = rpush["contentId"]
                     glass_recover = (occ, rpush["contentId"], rpush["uri"])
+                # Exception fail-fast (2026-08-17): a contentException / an
+                # IGT_contentError state IS the machine's final verdict on
+                # the load — on a tester's Windows-era floor every push died
+                # this way and the sequencer sat on 'loading' until the 25s
+                # watchdog swept it as a nameless stall, while the verdict
+                # had been in the journal within a second. Fail the push the
+                # moment the verdict folds, and stamp lastResult so the
+                # console row that fired the load wears the refusal (the
+                # 2026-08-01 lastResult law — previously only CLASS-level
+                # errors stamped it; a contentStatus-borne error stamped
+                # nothing). contentId gate: a narration about OTHER content
+                # (the old occupant's teardown, a stale log record) must
+                # never kill a live push, so a stated contentId must match;
+                # 'recovering' is excluded outright (its window legitimately
+                # narrates the occupant's records mid-recovery).
+                glass_fail = None
+                exc_raw = str(data.get("contentException") or "").strip()
+                if exc_raw not in ("", "0") or \
+                        (data.get("contentState") or "") == "IGT_contentError":
+                    fpush = assoc.glass_push.get(dev)
+                    d_cnt = str(data.get("contentId") or "")
+                    if fpush and fpush.get("stage") in (
+                            "loading", "activating", "showing") and \
+                            (not d_cnt or
+                             d_cnt == str(fpush.get("contentId") or "")):
+                        del assoc.glass_push[dev]
+                        glass_fail = fpush
+                    if glass_fail or not assoc.glass_push.get(dev):
+                        # Manual probe loads have no push record — the row
+                        # still deserves the verdict. Never overwrite while
+                        # a DIFFERENT push is live on this window.
+                        assoc.media[dev] = dict(
+                            assoc.media.get(dev) or {},
+                            lastResult={
+                                "ok": False, "what": "load",
+                                "code": f"contentException {exc_raw or '?'}",
+                                "text": "this window took the page, then "
+                                        f"refused it (exception "
+                                        f"{exc_raw or '?'})",
+                                "at": now_iso()})
             # contentException reads as a bare digit in the census above —
             # the ONE attribute in this fold that is a verdict rather than a
             # description, and the one a stuck-glass hunt needs in words
@@ -20514,6 +20602,17 @@ class G2SHost:
                      "captured to /api/status mediaDisplay)%s", assoc.egm_id,
                      cmd, dev, data,
                      f" — {exc_words}" if exc_words else "")
+            if glass_fail is not None:
+                log.warning("⚠️ 🪟 [%s] glass push dev=%s (content=%s) — the "
+                            "machine REFUSED the loaded page (contentException"
+                            "=%s). Push failed NOW (was stage=%r; no 25s "
+                            "stall). Check the GLASS FETCH line above it: "
+                            "fetch-then-refuse = the content was rejected "
+                            "AFTER download (the Windows-era admission "
+                            "signature); no fetch at all = it never even "
+                            "pulled the URL.", assoc.egm_id, dev,
+                            glass_fail.get("contentId"), exc_raw or "?",
+                            glass_fail.get("stage"))
             if glass_step is not None:
                 if glass_step[0] == "setActiveContent":
                     self.enqueue_set_active_content(
@@ -20709,14 +20808,35 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                      getattr(self, "client_address", ("?",))[0],
                      e.__class__.__name__, len(data))
 
-    def _serve_webui(self, rel_path):
+    def _serve_webui(self, rel_path, head_only=False):
         """G2S-36: static serving for the Test Panel — files under G2S/webui/
         only. Content-type by extension (WEBUI_CONTENT_TYPES); traversal-proof:
         the request path is unquoted by do_GET, then the resolved real path
         must stay strictly under webui/ (normalize + prefix check), so
         /webui/../g2s_host.py and %2e%2e variants all 404. Files are read per
-        request so the page can be edited live without restarting the host."""
+        request so the page can be edited live without restarting the host.
+
+        head_only (2026-08-17): do_HEAD serves the same headers with no body —
+        a strict content-manager downloader (the Windows-era cabinets fetch
+        glass content with a bare non-browser client) may HEAD before GET,
+        and the stdlib's answer to an unimplemented method is a 501 that
+        reads as "this server is broken", not "use GET"."""
         name = rel_path.lstrip("/")
+        # Path-embedded glass params (2026-08-17): /webui/glass/<egm>/<dev>/
+        # <page> serves <page> verbatim — the page reads egm/dev back off its
+        # own location.pathname. Exists because the Windows-era content
+        # manager admits content BY FILE EXTENSION (capabilityItem
+        # fileExtension="html", read off a tester's G23 2026-08-02) and a
+        # ?egm=&dev= query leaves the URI's trailing token as "html?egm=…" —
+        # nine wire-documented loads on two Windows-era cabinets died
+        # exception-3 within ~300ms of a successful UA='' fetch. The page
+        # gate is glassShow's own (bare name, .html, no dots-walking); the
+        # egm/dev segments are display-only here and deliberately unparsed.
+        seg = name.split("/")
+        if seg[0] == "glass" and len(seg) == 4 and seg[3] and \
+                re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", seg[3]) and \
+                ".." not in seg[3] and seg[3].endswith(".html"):
+            name = rel_path = seg[3]
         if name in ("hello.html", "glass_ping.html", GLASS_PAGE, "smib.html"):
             # mediaDisplay P9 proof (#18): the cabinet's built-in browser
             # fetching the page IS the on-glass evidence — one loud line
@@ -20730,8 +20850,19 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # difference between "the GET never reached us" (wire/route) and
             # "it reached us and we answered" (renderer) — the first split a
             # stuck-glass diagnosis has to make.
-            log.info("🖥️ GLASS FETCH /webui/%s UA=%r", name,
-                     self.headers.get("User-Agent") or "")
+            #
+            # from= and the RAW request line joined 2026-08-17: a tester's
+            # Windows-era cabinets fetch with UA='' (a downloader, not a
+            # browser), and without the client IP nobody could prove WHICH
+            # box the empty-UA fetch came from; without the raw path (do_GET
+            # strips the query before routing) nobody could prove whether
+            # the downloader kept or dropped our ?egm=&dev= params. Both
+            # questions burned a week; neither is ever open again.
+            log.info("🖥️ GLASS FETCH %s from=%s UA=%r%s",
+                     self.path,
+                     getattr(self, "client_address", ("?",))[0],
+                     self.headers.get("User-Agent") or "",
+                     " (HEAD)" if self.command == "HEAD" else "")
         root = os.path.realpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "webui"))
         full = os.path.realpath(os.path.join(root, rel_path.lstrip("/")))
@@ -20742,9 +20873,12 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 # Silent, this is indistinguishable from "the request never
                 # arrived" — one is a wire/route problem, the other is a tree
                 # missing its webui files, and they have nothing in common.
-                log.warning("🖥️ GLASS FETCH /webui/%s -> 404 — the cabinet "
+                log.warning("🖥️ GLASS FETCH %s from=%s -> 404 — the cabinet "
                             "asked for its page and this tree does not have "
-                            "it; the content can never load", name)
+                            "it; the content can never load", self.path,
+                            getattr(self, "client_address", ("?",))[0])
+            if head_only:
+                return self._head_status(404)
             return self._send(404, '{"error": "not found"}',
                               "application/json", soap=False)
         ctype = WEBUI_CONTENT_TYPES.get(
@@ -20753,6 +20887,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
+            if head_only:
+                return self._head_status(404)
             return self._send(404, '{"error": "not found"}',
                               "application/json", soap=False)
         if name in ("hello.html", "banner.html", "glass_ping.html"):
@@ -20778,12 +20914,34 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         try:
             self.end_headers()
-            self.wfile.write(data)
+            if not head_only:
+                self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError) as e:
             # the _send treatment: a mid-download hangup is one line.
             log.info("http: client %s dropped mid-page (%s, %s)",
                      getattr(self, "client_address", ("?",))[0],
                      e.__class__.__name__, name)
+
+    def _head_status(self, status):
+        """Headers-only status line for do_HEAD (an HTTP HEAD response must
+        carry no body — _send always writes one)."""
+        try:
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_HEAD(self):
+        """HEAD, for the webui tree only (2026-08-17): the Windows-era
+        cabinets' content downloader is a bare HTTP client, and a validator
+        that probes with HEAD would previously draw the stdlib's 501 — an
+        answer indistinguishable from a broken server. Everything outside
+        /webui/ answers 404 headers-only; the API surface stays GET/POST."""
+        path = urllib.parse.unquote(self.path.split("?", 1)[0])
+        if path.startswith("/webui/"):
+            return self._serve_webui(path[len("/webui/"):], head_only=True)
+        return self._head_status(404)
 
     def do_GET(self):
         # Strip the query string, then unquote BEFORE routing/serving so
@@ -21961,6 +22119,27 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             # the orchestrator. deviceId/contentId digits-only: both land
             # inside wire XML attributes (the MSX005 id law).
             kwargs["rung"] = str(req.get("rung") or "")
+            # Differential-load params (2026-08-17, load rung only): "page"
+            # names a webui page (glassShow's own gate) and the hub builds
+            # the URI on the slot-VLAN base itself — the console must NEVER
+            # build it from its own location (an operator browsing over the
+            # management interface would aim the cabinet at an address it
+            # can't reach). withQuery=true appends "?probe=1": the A/B that
+            # adjudicates the Windows-era extension-admission theory (a
+            # query-less page loading while the query twin dies exception-3
+            # is the whole proof).
+            if req.get("page") is not None:
+                pg = str(req["page"])
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", pg) \
+                        or ".." in pg or not pg.endswith(".html"):
+                    return self._send(400, json.dumps({
+                        "ok": False,
+                        "error": "page must be a bare webui/*.html "
+                                 "filename"}),
+                        "application/json", soap=False)
+                kwargs["page"] = pg
+            if req.get("withQuery"):
+                kwargs["with_query"] = True
             if req.get("deviceId") is not None:
                 dev = str(req["deviceId"])
                 if not dev.isdigit() or not 1 <= int(dev) <= 999:

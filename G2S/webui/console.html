@@ -214,6 +214,13 @@ const WIN_ERR = {
 function winErrWords(r){
   if(!r) return "";
   const c=String(r.code||""), t=String(r.text||"");
+  // contentException = the machine took the load and refused the CONTENT
+  // afterwards (the Windows-era signature: download ok, admission failed).
+  // The hub words the refusal; the advice on what to press next lives here,
+  // beside the buttons that do it.
+  if(c.indexOf("contentException")===0)
+    return (t||"this window took the page, then refused it")+
+           " — try the plain test page below, or another window";
   return WIN_ERR[c] || t || c || "the machine refused it";
 }
 
@@ -293,6 +300,12 @@ function renderGlass(s){
            :'<span class="none">not asked yet — press “Ask this window”</span>'}
         ${st[0]?`<span>· ${esc(st[0])}</span>`:""}
       </div>
+      <div class="fact btns" style="margin-top:4px">
+        <button class="cmd" data-act="t-plain" title="Load the small built-in test page into this window — nothing else changes">Try the test page</button>
+        <button class="cmd" data-act="t-query" title="Same test page with ?probe=1 on the URL — if the plain one works and this fails, the machine dislikes URLs with a query on the end">Test page + ?query</button>
+        <button class="cmd" data-act="t-glass" title="Load the real glass page here without making it visible yet">Try the glass page</button>
+        <button class="cmd" data-act="t-live" title="After a page says loaded: make it the window's active content and show it">Make it live</button>
+      </div>
       <div class="fact status ${res&&!res.ok?"bad":""}" data-status="${esc(dev)}"
         >${res&&!res.ok?`⚠️ ${esc(winErrWords(res))}`:""}</div>
       </div>`;
@@ -301,7 +314,11 @@ function renderGlass(s){
     `<p class="muted" style="margin:0 0 10px;font-size:13px">Each window is a
       separate screen area the cabinet can put a page on. Ask a window to hear
       what it can display, then try the glass on it. Nothing here changes how the
-      machine plays.</p>
+      machine plays. If the glass won&rsquo;t come up, the Try buttons narrow it
+      down: the test page loading while the glass page fails points at the page;
+      the plain test loading while &ldquo;+ ?query&rdquo; fails means the machine
+      refuses URLs with a query on the end; nothing loading at all points at the
+      window itself (is it enabled in the machine&rsquo;s operator menu?).</p>
      <div class="btns" style="margin-bottom:10px">
        <button class="cmd" id="ask-all">Ask every window</button></div>
      ${rows}`);
@@ -326,6 +343,30 @@ function renderGlass(s){
       fire("mediaDisplayProbe",{rung:"profile",deviceId:dev},`asked window ${dev}`);
     w.querySelector('[data-act="show"]').onclick=()=>
       fire("glassShow",{deviceId:dev},`glass sent to window ${dev}`);
+    // Differential loads (2026-08-17): the three test loads that tell a
+    // URL problem from a page problem from a window problem — the machine's
+    // own verdict lands on this row via lastResult/contentState. The hub
+    // builds every URL itself on the address the CABINET can reach; this
+    // page only names the test.
+    w.querySelector('[data-act="t-plain"]').onclick=()=>
+      fire("mediaDisplayProbe",{rung:"load",deviceId:dev,page:"hello.html"},
+           `test page sent to window ${dev}`);
+    w.querySelector('[data-act="t-query"]').onclick=()=>
+      fire("mediaDisplayProbe",{rung:"load",deviceId:dev,page:"hello.html",
+           withQuery:true},`test page (with query) sent to window ${dev}`);
+    w.querySelector('[data-act="t-glass"]').onclick=()=>
+      fire("mediaDisplayProbe",{rung:"load",deviceId:dev,page:"glass.html"},
+           `glass page sent to window ${dev}`);
+    // "Make it live" = the manual operator's own two rungs, in order. The
+    // engine remembers the contentId + the machine-assigned transactionId
+    // per window, so no ids to type; pressed too early it earns an honest
+    // "the page hadn't finished loading yet" on this row.
+    w.querySelector('[data-act="t-live"]').onclick=async()=>{
+      await fire("mediaDisplayProbe",{rung:"setactive",deviceId:dev},
+                 `activating content on window ${dev}`);
+      await fire("mediaDisplayProbe",{rung:"show",deviceId:dev},
+                 `showing window ${dev}`);
+    };
   });
   const all=document.getElementById("ask-all");
   if(all) all.onclick=async()=>{

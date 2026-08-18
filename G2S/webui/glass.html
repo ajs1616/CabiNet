@@ -1,5 +1,17 @@
 <!DOCTYPE html>
 <html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>GAME ROOM</title>
+<!-- HEAD FIRST (2026-08-17): DOCTYPE, <head> and the three metas sit at the
+     very top so the charset declaration lands inside HTML5's 1024-byte
+     encoding prescan. The architecture comment below used to sit between
+     <html> and <head> and pushed the charset meta to byte ~6339 — harmless
+     to a browser reading the HTTP header, but a Windows-era content manager
+     re-parses the SAVED file where no header exists. Keep any new prose
+     BELOW the metas. -->
 <!-- CabiNet glass navigation v1 — the RESIDENT player-panel SPA (#glass-nav).
      ================================================================
      ONE page per glass window (IGT_mediaDisplay dev 1, Service Window,
@@ -80,8 +92,7 @@
        footers: y=976 + ~16                                  -> ends y=992  OK
        attract column: brand y=264(+40), nick y=330, tap y=520(+64),
          note y=930(+60 wrap room)                           -> all < 1024  OK -->
-<head>
-<!-- X-UA-Compatible MUST be the first meta after charset, and is ignored by
+<!-- X-UA-Compatible (now up top, first meta after charset) is ignored by
      every non-Microsoft engine (the AVP's QtEmbedded/QNX WebKit 534 never sees
      it). It is here for the OTHER platform: a tester's G23 identifies to DHCP
      as 'MSFT 5.0' and requests NetBIOS + option 249, i.e. its brainbox runs a
@@ -89,10 +100,6 @@
      Those default to Quirks Mode, where a fixed-px kiosk layout collapses. One
      tag, zero cost on QNX, and it removes the whole quirks-mode class of doubt
      before the wire tells us which engine it actually is. -->
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>GAME ROOM</title>
 <style type="text/css">
 html, body {
   margin: 0; padding: 0;
@@ -580,13 +587,29 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var OFFLINE_AFTER = 4;     // contract: 4 failed polls -> offline note
   var XHR_MS = 6000;         // watchdog abort; x.timeout is XHR2, too new here
 
-  // ---- page identity from our own URL (?egm=...&dev=...) ---------------
+  // ---- page identity from our own URL --------------------------------------
+  // TWO shapes, path first (2026-08-17): the hub now pushes
+  // /webui/glass/<egm>/<dev>/glass.html because the Windows-era content
+  // manager admits content by FILE EXTENSION and a ?egm=&dev= query left the
+  // URI ending in "html?egm=..." (every such load died exception-3 after a
+  // clean fetch). The ?egm=&dev= reader stays as the fallback so a mid-deploy
+  // cabinet still resident on the old URL keeps working. ES5 string ops only
+  // (indexOf/split) — the QNX WebKit534 floor of this page never rises.
   function qp(k) {
     var m = new RegExp('[?&]' + k + '=([^&]*)').exec(location.search || '');
     return m ? decodeURIComponent(m[1]) : '';
   }
-  var egmId = qp('egm');
-  var devId = qp('dev') || '1';
+  function pathParam(idx) {
+    var p = (location.pathname || '').split('/');
+    for (var i = 0; i < p.length; i++) {
+      if (p[i] === 'glass' && i + 2 < p.length) {
+        return decodeURIComponent(p[i + idx] || '');
+      }
+    }
+    return '';
+  }
+  var egmId = qp('egm') || pathParam(1);
+  var devId = qp('dev') || pathParam(2) || '1';
 
   // ---- state: sess lives ONLY here (a closure var, never the URL) ------
   var sess = null, tier = '', who = '', nick = '', sinceIso = '';
@@ -1439,7 +1462,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 
   // ---- boot ---------------------------------------------------------------
   show('attract');
-  if (!egmId) { note('missing egm= in page URL'); }
+  if (!egmId) { note('no machine id in page URL (want /glass/<egm>/<dev>/ or ?egm=)'); }
   poll();
 })();
 </script>

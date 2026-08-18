@@ -38,8 +38,13 @@ required for fetch or display, only for a page that wants to talk back to the ca
 
 ## Two enables, and a RAM ceiling
 
-> **Setting up a machine?** CabiNet uses only the **left Service Window
-> (dev 1)** — enable that one, leave the rest off. The step-by-step is in
+> **Setting up a machine?** Enable the **Service Window (Left)** first — on every
+> cabinet censused so far it is dev 1 and it is the proven page surface. But the
+> numbering and the working window are the **cabinet's** business, not a law: the
+> hub asks the machine to name its own windows (the profile census) and the
+> console's **Glass windows** card lists them by the machine's words and lets you
+> try each one. If the left Service Window refuses the page, try the others from
+> that card before concluding anything. Step-by-step:
 > [`deploy/AVP_SETUP.md`](../../deploy/AVP_SETUP.md).
 
 - **Play-enable ≠ media-enable.** A cabinet can be fully playable (credits, ready-to-play,
@@ -193,6 +198,46 @@ resident glass picks it up on its next poll, no content re-push, no operator tou
 no flexbox/grid (absolute or table layout), sized to the target window's geometry
 (dev 1 = 256×1024 portrait). There is no worse-of-fleet browser to wait for: **the BB2
 has no browser at all** (next section).
+
+## The Windows-era IGT platform — wire-adjudicated 2026-08-17
+
+QNX-era AVPs (AJ's, `MSFT`-less DHCP, browser UA `QtEmbedded QNX WebKit/534.34`) and
+Windows-era cabinets (a tester's G23 + siblings, DHCP vendor class `MSFT 5.0`) run the
+**same igtMediaDisplay control dialect** but a **different content pipeline**:
+
+- **QNX era: the browser fetches.** loadContent → the window's own browser GETs the
+  URL (real UA) → renders. No admission step; the AVP's profile declares a degenerate
+  capabilitiesList (an empty item + `flashli`) — a window that never says what it
+  renders has nothing to enforce.
+- **Windows era: a downloader fetches, then an admission step judges.** The same
+  loadContent is acked, `IGT_contentPending` narrated, then a **bare non-browser HTTP
+  client (empty User-Agent)** downloads the page — and ~300 ms later the load dies
+  `contentState=IGT_contentError contentException=3`, no browser ever spawns, no
+  sub-resource is fetched. Nine loads on two cabinets, one signature (Jul 25–Aug 7
+  bundles). Its windows declare `capabilityItem softwareType="IGT_html"
+  softwareVersion="5" fileExtension="html"` — the platform **matches content by file
+  extension**.
+- **The leading mechanism (bench-pending):** our glass URI carried `?egm=…&dev=…`, so
+  the trailing token wasn't `html` — and the cabinet's own contentLog echoes the URI
+  **with the query stripped**, proving its content manager parses/normalizes URLs.
+  The hub now pushes **path-embedded params**: `/webui/glass/<egm>/<dev>/glass.html`
+  (query-less, `.html`-final, one shape for both eras). The decisive A/B lives in the
+  console's Glass windows card: **Try the test page** (query-less) vs **Test page +
+  ?query** — plain loading while the query twin dies exception-3 is the proof; both
+  dying kills the theory (next suspects, in order: the `no-store` cache header, page
+  bytes/size, a platform ceremony we've never sent).
+- **Failure narration differs:** these cabinets tell you about a dead load only via
+  `IGT_MDE101` (load) then `IGT_MDE105` (content-log change) events — never an
+  unsolicited contentStatus. The hub hooks MDE105 mid-push to pull getContentStatus
+  immediately, and any folded `contentException` now **fails the push at once**
+  (stamped on the console row) instead of stalling out the 25 s watchdog.
+- **contentException values seen in the wild:** `1` (BB2E, loader never fetched — CGC
+  unconfigured) and `3` (Windows-era, post-download refusal). IGT never published the
+  enum (`t_contentExceptions` is a bare int in the schema); treat the digit as
+  evidence, not vocabulary.
+- **A sibling failure mode is per-window disable:** one Windows-era cabinet refused
+  loadContent synchronously with `G2S_APX016 Device Disabled` while fully playable —
+  that's the operator-menu media enable, not content admission (see "Two enables").
 
 ## The BB2E (WMS) fleet tell — live-adjudicated 2026-07-10
 
