@@ -5529,8 +5529,22 @@ function renderUpdates(){
          whose last line is "✅ Updated to <sha>". */
       const age=u.logAgeSec!=null
         ?(u.logAgeSec<60?"just now":fmtDur(u.logAgeSec)+" ago"):"";
-      body+=`<div class="kd" style="color:${doneLine.startsWith("✅")
-        ?"var(--felt)":"var(--ruby)"}">${esc(doneLine.trim())}${
+      /* Ruby means BROKEN RIGHT NOW (the color law) — a failed run that a
+         FRESHER successful check has since contradicted (up to date, no
+         error) is history, not an alarm, so it demotes to dim. It stays
+         ruby while it may still bite: updates pending, a check error, or
+         no check newer than the run (live-hit 2026-08-18: AJ fixed the
+         refusal's cause, checked, read "up to date" — and the old ❌ still
+         screamed red above it). The transcript keeps the whole story
+         either way. */
+      let doneColor=doneLine.startsWith("✅")?"var(--felt)":"var(--ruby)";
+      if(doneLine.startsWith("❌")&&!behind&&!u.error&&u.checkedAt){
+        const ckAge=(Date.now()-Date.parse(u.checkedAt))/1000;
+        if(isFinite(ckAge)&&u.logAgeSec!=null&&ckAge<u.logAgeSec)
+          doneColor="var(--faint)";
+      }
+      body+=`<div class="kd" style="color:${doneColor}">${
+        esc(doneLine.trim())}${
         age?` <span style="color:var(--faint)">(${esc(age)})</span>`:""}</div>`;
     } else {
       // ending-less AND stale (inflight already went to the progress bar):
