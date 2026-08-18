@@ -4565,10 +4565,13 @@ class G2SHost:
                 # Reporting behind=0 here would tell the operator they are
                 # CURRENT when we simply cannot tell — the same silent-zero
                 # trap deploy/update.py hit. Say so instead.
+                # No shell homework on a collector surface (2026-08-17):
+                # deploy/update.py's repair_upstream now fixes this inside
+                # its guarded run, so the honest advice IS the Update button.
                 st.update(behind=0, commits=[], checkedAt=now_iso(),
-                          error="cannot tell — this clone has no upstream "
-                                "branch (detached HEAD?). Fix with: "
-                                "git checkout main")
+                          error="can't tell — this install isn't tracking "
+                                "the update server. Press Update now and "
+                                "CabiNet repairs that first.")
             else:
                 commits = [l for l in log.splitlines() if l.strip()]
                 st.update(behind=len(commits), commits=commits[:20],
@@ -4577,6 +4580,25 @@ class G2SHost:
             self._update.update({k: st.get(k) for k in
                                  ("behind", "commits", "checkedAt", "error")})
         return st
+
+    def lock_sayer(self):
+        """Who a machine's own screen says did the locking (setCabinetState
+        / setGamePlayState / setVoucherState disableText). The product name
+        is BANNED on player-facing surfaces — the gameroom's name is the
+        brand there — and AJ's Settings toggle (2026-08-17: "were not
+        exactly trying to advertise lol") picks between the neutral default
+        "the host" and the collector's own gameroom name in lights. Falls
+        back to "the host" when the toggle is on but no name is set yet."""
+        try:
+            if self.hub_store.host_setting("lock_brand_gameroom",
+                                           "0") == "1":
+                gn = (self.hub_store.host_setting("gameroom_name", "")
+                      or "").strip()
+                if gn:
+                    return gn
+        except Exception:   # noqa: BLE001 — a db hiccup must not block a lock
+            pass
+        return "the host"
 
     def start_update(self):
         """Spawn the updater DETACHED and return immediately.
@@ -4603,6 +4625,14 @@ class G2SHost:
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "data", self.UPDATE_LOG)
         try:
+            # unlink-first: a sudo TERMINAL run (pre-tee builds) could leave
+            # this file root-owned, and open('w') then dies EACCES with
+            # state already set 'running' — replacing the directory entry
+            # needs only directory write (2026-08-17).
+            try:
+                os.remove(log_path)
+            except OSError:
+                pass
             fh = open(log_path, "w", encoding="utf-8")
             subprocess.Popen([sys.executable, script, "--yes"],
                              cwd=self._repo_dir(), stdout=fh,
@@ -9785,7 +9815,8 @@ class G2SHost:
                 continue
             self.enqueue_set_cabinet_state(
                 a, enable=not lock,
-                disable_text="Floor locked from CabiNet" if lock else "")
+                disable_text=("Floor locked by %s" % self.lock_sayer())
+                if lock else "")
             results.append({"machine": nick, "ok": True, "via": "g2s",
                             "detail": "queued"})
         for key, entry in sas_entries.items():
@@ -11861,7 +11892,7 @@ class G2SHost:
             return inner, f"resetProcessor(cid={cid},sid={sid})"
         self._enqueue(assoc, build)
 
-    def enqueue_reboot_script(self, assoc, script_id=None):
+    def enqueue_reboot_script(self, assoc, script_id=None, auto_retry=False):
         """download.setScript w/ systemCmd G2S_resetEgm (spec §10.30
         setScript p.422-423, §10.37 systemCmd p.424, Table 10.70 operSystem
         p.441) — plan-B remote warm reboot, for the machines (this AVP014
@@ -11912,7 +11943,12 @@ class G2SHost:
             a.last_reset_probe = {
                 "kind": "script", "sessionId": str(sid),
                 "scriptId": sid_script, "sentAt": now_iso(),
-                "sentTs": time.time(), "outcome": "sent"}
+                "sentTs": time.time(), "outcome": "sent",
+                # the honored-countdown re-fire marks ITS probe so a second
+                # idle refusal can never chain another retry (the flag lives
+                # in the probe the retry itself mints — a fresh operator
+                # press mints a clean one and earns one retry again)
+                "autoRetried": bool(auto_retry)}
             return inner, f"setScript(resetEgm,id={sid_script},cid={cid})"
         with assoc.lock:
             epoch = assoc.epoch
@@ -16519,6 +16555,24 @@ class G2SHost:
             return inline_response
         return self.build_inner_g2s_ack(egm_id)
 
+    def _reboot_retry_now(self, assoc, epoch):
+        """The honored-countdown reboot re-fire (timer thread, never the
+        FIFO worker — the ce2602f deadlock rule). Epoch-gated HARD: a
+        re-commsOnLine during the wait means the machine already power-
+        cycled (or the world changed) and re-firing a REBOOT at a fresh
+        join would bounce it twice; offline likewise drops."""
+        with assoc.lock:
+            stale = assoc.epoch != epoch or assoc.comms_state != "onLine"
+        if stale:
+            log.warning("⬇️ [%s] honored-countdown reboot re-fire DROPPED — "
+                        "the machine rejoined or went offline during the "
+                        "wait (a reboot never lands on a fresh epoch)",
+                        assoc.egm_id)
+            return
+        log.info("⬇️ [%s] idle countdown elapsed — re-firing the reboot "
+                 "script (once)", assoc.egm_id)
+        self.enqueue_reboot_script(assoc, auto_retry=True)
+
     def dispatch(self, assoc, req):
         """Handle one class-level command. Outbound sends run on a worker
         thread, serialized per association so commandIds hit the wire in
@@ -16996,20 +17050,55 @@ class G2SHost:
                                   "fresh default id is minted per attempt) "
                                   "or override with {\"scriptId\": N}",
                 }.get(rerr, "")
+                # Honor the machine's own countdown (2026-08-18, AJ pressed
+                # reboot 10s early): the APX999 errorText literally names
+                # the wait ("There are N second(s) remaining until the EGM
+                # is idle") — so parse it and re-fire ONCE after N+2s
+                # instead of making the operator play the timing game. The
+                # once-guard is the autoRetried flag stamped in the RETRY'S
+                # own probe (enqueue_reboot_script auto_retry=True): a
+                # machine that is genuinely busy (someone playing, a tilt)
+                # refuses the retry too and THAT refusal surfaces honestly.
+                # Counts over 120s mean "actually in use" — no silent lurk.
+                retry_in = None
+                if rerr == "G2S_APX999":
+                    m = re.search(r"(\d+)\s*second", rtext or "")
+                    if m and 0 < int(m.group(1)) <= 120:
+                        retry_in = int(m.group(1)) + 2
                 # Stamp the probe verdict (the only download traffic we
                 # originate is the reboot pair) so the refusal surfaces in
                 # /api/status.lastResetProbe alongside the log shout.
                 with assoc.lock:
                     pr = assoc.last_reset_probe
-                    if pr.get("kind") == "script" and \
-                            pr.get("outcome") in ("sent", "inProgress"):
-                        pr["outcome"] = f"error:{rerr}"
+                    live = pr.get("kind") == "script" and \
+                        pr.get("outcome") in ("sent", "inProgress")
+                    can_retry = bool(live and retry_in is not None
+                                     and not pr.get("autoRetried"))
+                    if live:
+                        pr["outcome"] = ("retrying" if can_retry
+                                         else f"error:{rerr}")
                         pr["outcomeAt"] = now_iso()
-                log.warning("⬇️ [%s] REBOOT SCRIPT PATH REJECTED — %s%s",
-                            assoc.egm_id, rerr,
-                            f" ({hint})" if hint else "")
-                self._reset_activity(assoc, f"⬇️ Reset script refused "
-                                     f"({rerr})", f"error:{rerr}")
+                    r_epoch = assoc.epoch
+                if can_retry:
+                    log.warning("⬇️ [%s] reboot refused — machine not idle; "
+                                "its own countdown says %ds. Honoring it: "
+                                "re-firing once in %ds.", assoc.egm_id,
+                                retry_in - 2, retry_in)
+                    self._reset_activity(
+                        assoc, f"⬇️ Machine not idle — rebooting in "
+                               f"{retry_in}s (its own countdown)",
+                        "retrying")
+                    t = threading.Timer(retry_in, self._reboot_retry_now,
+                                        kwargs={"assoc": assoc,
+                                                "epoch": r_epoch})
+                    t.daemon = True
+                    t.start()
+                else:
+                    log.warning("⬇️ [%s] REBOOT SCRIPT PATH REJECTED — %s%s",
+                                assoc.egm_id, rerr,
+                                f" ({hint})" if hint else "")
+                    self._reset_activity(assoc, f"⬇️ Reset script refused "
+                                         f"({rerr})", f"error:{rerr}")
 
         if cmd == "commsOnLine":
             el = req["commandEl"]
@@ -21327,6 +21416,12 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # blanks the page render, the route always serves.
                         "boardEnabled": engine.hub_store.host_setting(
                             "board_enabled", "1") == "1",
+                        # Lock-message brand (2026-08-17): ON = a locked
+                        # machine's own screen names the GAMEROOM ("Locked
+                        # by THE GOLDEN PALACE"), OFF = the neutral "the
+                        # host". The product name never appears either way.
+                        "lockBrandGameroom": engine.hub_store.host_setting(
+                            "lock_brand_gameroom", "0") == "1",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
                         # current balance (so Options ▸ House Bankroll prefills) and
                         # whether it may run negative. The Bank is just bankroll
@@ -23950,7 +24045,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 gn = req.get("gameroomName")
                 if not isinstance(gn, str):
                     raise ValueError("gameroomName must be a string")
-                gn = gn.strip()
+                # C0 controls are illegal in XML 1.0 even escaped, and the
+                # name now rides G2S disableText frames (lock_sayer) — strip
+                # them at the door so every downstream player surface
+                # inherits clean input (verify pass, 2026-08-18).
+                gn = re.sub(r"[\x00-\x1f\x7f]", "", gn).strip()
                 if len(gn) > MAX_GAMEROOM_NAME_LEN:
                     raise ValueError(f"gameroomName must be <= "
                                      f"{MAX_GAMEROOM_NAME_LEN} characters")
@@ -23966,6 +24065,18 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 engine.hub_store.set_host_setting(
                     "board_enabled", "1" if be else "0")
                 out["boardEnabled"] = be
+            if "lockBrandGameroom" in req:
+                # Settings ▸ Gameroom: what a locked machine's screen says.
+                # Strict boolean, stored "1"/"0"; lock_sayer() reads it live
+                # at each lock — no restart, and no retroactive push (a
+                # machine already locked keeps the text it was locked with
+                # until the next lock).
+                lb = req.get("lockBrandGameroom")
+                if not isinstance(lb, bool):
+                    raise ValueError("lockBrandGameroom must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "lock_brand_gameroom", "1" if lb else "0")
+                out["lockBrandGameroom"] = lb
             if "updateAutoCheck" in req:
                 # Settings ▸ Updates ▸ "check automatically". OFF unless the
                 # operator turns it on — a hub often sits on an isolated slot

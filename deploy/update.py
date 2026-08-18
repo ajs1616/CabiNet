@@ -108,15 +108,66 @@ DATA_DIRS = ("G2S/data", "SAS/data", "Companion/data")
 # NOT copied — the API folds them in.
 SQLITE_FILES = ("hub.db",)
 SKIP_SUFFIXES = ("-wal", "-shm")
+# The updater's OWN transcript lives in G2S/data/ (the hub reads it there),
+# but it is not floor data and must NEVER ride a snapshot: a rollback that
+# restores it puts an OLD transcript over the LIVE one via os.replace — the
+# detached run keeps writing to the orphaned inode and every line after the
+# restore (including "your data was restored" and the ⚠️ DATA RESTORE
+# INCOMPLETE block, the lines that matter most) never reaches the file the
+# card reads. Found by the 2026-08-17 UI review's critics; likely broken in
+# the field before this. Excluded from backup, restore, AND the
+# before/after data fingerprint (a transcript "appearing" is not data loss).
+UPDATER_OWN_FILES = ("update_last.log",)
 
 
 class Fail(Exception):
     """A step failed in a way that should trigger rollback."""
 
 
+def brief_reason(e):
+    """The first CLAUSE of a Fail, for the one-line outcome sentence: the
+    full multi-line text already printed above it in the transcript; the
+    headline needs the what, not the whole remedy (and never a mid-word
+    truncation). Splits at the EARLIEST clause boundary (not by separator
+    priority — 'quick_check failed (x). Fix or…' must not keep the remedy
+    half), and an empty message degrades to a pointer, never a traceback
+    inside an except handler."""
+    t = (str(e).splitlines() or [""])[0]
+    cuts = [t.find(sep) for sep in (" — ", ". ") if sep in t]
+    if cuts:
+        t = t[:min(cuts)]
+    t = t.rstrip(".:— ").strip()
+    if len(t) > 100:
+        t = t[:100].rsplit(" ", 1)[0] + "…"
+    return t or "see the lines above"
+
+
+
+VERBOSE = False   # --verbose restores the per-command "$ …" echo
+_TEE = None       # terminal runs mirror their transcript into the hub's log
+                  # (see main() — card runs arrive with stdout ALREADY the log)
+TREE_TOUCHED = False   # adopt()/repair_upstream moved code before the work
+                       # section — "nothing was changed" would then be a lie
+# The RUNNING script's own text, captured at import — self_update() must
+# compare the upstream blob against what is EXECUTING, not against the disk
+# file: repair_upstream/adoption may rewrite deploy/update.py on disk first,
+# and re-reading __file__ would then say "already current" while the OLD
+# in-memory updater drives the new release (verify pass, 2026-08-18 — the
+# docstring's own 'hit the same three defects again' scenario).
+try:
+    _SELF_TEXT = open(os.path.abspath(__file__), encoding="utf-8").read()
+except OSError:
+    _SELF_TEXT = None
+
 
 def say(msg=""):
     print(msg, flush=True)
+    if _TEE is not None:
+        try:
+            _TEE.write(msg + "\n")
+            _TEE.flush()
+        except OSError:
+            pass    # a full disk must not kill the update over its own diary
 
 
 def step(msg):
@@ -124,8 +175,14 @@ def step(msg):
 
 
 def run(cmd, cwd=None, check=True, quiet=False, timeout=900, env=None):
-    """Run a command, returning (rc, stdout+stderr)."""
-    if not quiet:
+    """Run a command, returning (rc, stdout+stderr).
+
+    The per-command echo sits behind --verbose since 2026-08-17: a collector
+    reading the Updates card was buried under 230-char rsync/ssh command
+    lines while the actual narration ("snapshot: 18 file(s)", "machines 2/2
+    back") scrolled past. Failures still carry the full command — Fail's
+    message includes it."""
+    if not quiet and VERBOSE:
         say("   $ %s" % (" ".join(cmd) if isinstance(cmd, list) else cmd))
     p = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str),
                        capture_output=True, text=True, timeout=timeout,
@@ -391,6 +448,8 @@ def _adopt_inner(root, remote, assume_yes, snap, before):
                       "\n   STILL MISSING (not covered by the snapshot): %s"
                       % ", ".join(still[:5])))
 
+    global TREE_TOUCHED
+    TREE_TOUCHED = True
     try:
         with open(os.path.join(root, ADOPT_MARKER), "w") as f:
             f.write("adopted — first full gate+push+restart still pending\n")
@@ -477,6 +536,10 @@ def find_companions(status):
                     # username permanently "NOT updated". None on older
                     # daemons; sat_user() falls back.
                     "user": (ent or {}).get("sshUser") or None,
+                    # the collector's Settings label, for NOT-updated
+                    # headlines — the verify pass caught c.get("name") dead
+                    # because nothing ever copied it (2026-08-18)
+                    "name": (ent or {}).get("label") or None,
                     "fresh": not (ent or {}).get("stale")})
     return out
 
@@ -583,7 +646,8 @@ def data_inventory(root):
                 # backup API folds them in) — so counting them guarantees a
                 # false "adoption removed data files" someday
                 if name.endswith((".tmp", ".corrupt", ".restore-tmp")) \
-                        or name.endswith(SKIP_SUFFIXES):
+                        or name.endswith(SKIP_SUFFIXES) \
+                        or name in UPDATER_OWN_FILES:
                     continue
                 full = os.path.join(dirpath, name)
                 found.append(os.path.relpath(full, root).replace(os.sep, "/"))
@@ -650,7 +714,7 @@ def backup_data(root, tag, dest_base=None):
         path = os.path.join(src, name)
         if name == BACKUP_DIRNAME or not os.path.isfile(path):
             continue
-        if name.endswith(SKIP_SUFFIXES):
+        if name.endswith(SKIP_SUFFIXES) or name in UPDATER_OWN_FILES:
             continue
         try:
             if name in SQLITE_FILES:
@@ -710,7 +774,9 @@ def restore_data(root, snapshot):
     failed = []
     for name in sorted(os.listdir(snapshot)):
         s = os.path.join(snapshot, name)
-        if not os.path.isfile(s):
+        if not os.path.isfile(s) or name in UPDATER_OWN_FILES:
+            # UPDATER_OWN_FILES: an old snapshot may still carry a transcript
+            # (pre-exclusion) — restoring it would clobber the live one.
             continue
         # drop a stale -wal/-shm beside a restored db or sqlite will replay it
         # ON TOP of the restore and undo it
@@ -789,9 +855,13 @@ def preflight(root, hub_url, allow_dirty, dry=False, no_satellites=False):
         for l in dirty.strip().splitlines()[:12]:
             say("     " + l)
         if not allow_dirty:
-            raise Fail("refusing to pull over local edits — commit, stash, or "
-                       "re-run with --allow-dirty if you are sure they are "
-                       "disposable")
+            # This headline rides the Updates card (a tester WILL hit it with
+            # a hand-patched file) — lead with what happened and what to do,
+            # keep the CLI flag as the trailing operator detail.
+            raise Fail("this install has hand-edited CabiNet files — the "
+                       "list above says which. Put them back, then Update "
+                       "again (a helper can pass --allow-dirty if the edits "
+                       "are disposable)")
         say("   --allow-dirty given; continuing")
 
     # Are we even updating the tree the hub RUNS from? A second clone is a very
@@ -1145,7 +1215,14 @@ def push_companions(root, comps, key, dry, touched=None):
         #                   sat_user falls back to --ssh-user / the hub's own
         cdir, why = sat_companion_dir(c["peer"], key, user=u)
         if not cdir:
-            say("   ⚠️  %s (%s) NOT updated — %s"
+            # The headline speaks collector (the card UNFOLDS lines carrying
+            # the literal "NOT updated" token — keep it); the technical why
+            # and the address demote to an indented detail line the card
+            # folds into the transcript (2026-08-17).
+            say('   ⚠️  Card reader "%s" NOT updated — its box couldn\'t '
+                "take the update. Check it's powered, then Update again."
+                % (c.get("name") or c["companionId"]))
+            say("      detail: %s at %s — %s"
                 % (c["companionId"], c["peer"], why))
             continue
         say("   %s -> %s:%s" % (c["companionId"], c["peer"], cdir))
@@ -1172,7 +1249,10 @@ def push_companions(root, comps, key, dry, touched=None):
         except Exception as e:  # TimeoutExpired etc. — best-effort means it
             rc, out = 1, str(e)  # never escalates a reader into a rollback
         if rc != 0:
-            say("   ⚠️  %s (%s) NOT updated — rsync failed: %s"
+            say('   ⚠️  Card reader "%s" NOT updated — the copy didn\'t '
+                "finish. Check it's powered, then Update again."
+                % (c.get("name") or c["companionId"]))
+            say("      detail: %s at %s — rsync: %s"
                 % (c["companionId"], c["peer"],
                    ((out or "").strip().splitlines() or ["?"])[-1][:120]))
             continue
@@ -1249,8 +1329,87 @@ def verify(hub_url, sats, machines, comps, dry):
     return False
 
 
+def repair_upstream(root):
+    """Give the clone a working @{u}, or the whole run lies (2026-08-17).
+
+    Every read downstream — incoming()'s behind count, the dry-run diff, the
+    self-update handoff, the ff-only merge — keys off @{u}. An install with
+    no upstream (detached HEAD after a hand checkout, or a branch tracking
+    nothing) used to sail through as "✅ Already current — nothing to do",
+    and the Settings card could only offer the operator a bare git command —
+    banned on a collector surface. The card's fix-it path now just presses
+    Update; the repair happens HERE, inside the updater's guarded run.
+
+    Returns True when the WORKING TREE moved (detached → main): the caller
+    forces the full gate+push+restart ride — a tree that just jumped
+    versions must never exit "already current" and strand the satellites,
+    exactly the adoption rule. And because a LATER pre-work Fail would leave
+    exactly that jumped-tree state behind with nothing in memory to remember
+    it, a tree move also writes ADOPT_MARKER (the verify pass's blocker,
+    2026-08-18): the marker forces the full ride on every re-run until one
+    completes and removes it — same machinery, same reason, as adoption."""
+    def _moved_marker():
+        global TREE_TOUCHED
+        TREE_TOUCHED = True
+        try:
+            with open(os.path.join(root, ADOPT_MARKER), "w") as f:
+                f.write("upstream repaired (tree moved) — first full "
+                        "gate+push+restart still pending\n")
+        except OSError as e:
+            say("   ⚠️  could not write %s (%s) — if this run fails before "
+                "finishing, make sure\n      a re-run actually pushes the "
+                "satellites (it may claim to be current)"
+                % (ADOPT_MARKER, e))
+
+    def _move_to_main():
+        # collector-first failure wording: a refused checkout must never
+        # headline as "command failed (rc=128): ['git', 'checkout'…]"
+        rc, _ = git(["checkout", "main"], root, check=False, quiet=True)
+        if rc == 0:
+            return
+        rc2, out2 = git(["checkout", "-b", "main", "origin/main"], root,
+                        check=False, quiet=True)
+        if rc2 != 0:
+            raise Fail("couldn't move this install onto the release branch "
+                       "— git wouldn't switch to main. The detail:\n%s"
+                       % "\n".join("     " + l for l in
+                                   (out2 or "?").strip().splitlines()[-4:]))
+
+    rc, _ = git(["rev-parse", "--abbrev-ref", "@{u}"], root, check=False,
+                quiet=True)
+    if rc == 0:
+        return False
+    rc_b, br = git(["symbolic-ref", "--short", "-q", "HEAD"], root,
+                   check=False, quiet=True)
+    br = (br or "").strip()
+    if br:
+        say("   this install's branch %r wasn't tracking the update server "
+            "— repairing that first" % br)
+        rc2, _ = git(["branch", "--set-upstream-to", "origin/%s" % br, br],
+                     root, check=False, quiet=True)
+        if rc2 == 0:
+            return False
+        if br == "main":
+            raise Fail("couldn't point main at the update server — does this "
+                       "install have a remote at all? (git remote -v)")
+        say("   origin/%s doesn't exist — releases live on main; moving "
+            "there" % br)
+        _moved_marker()
+        _move_to_main()
+        git(["branch", "--set-upstream-to", "origin/main", "main"], root,
+            check=False, quiet=True)
+        return True
+    say("   this install is on no branch (a detached checkout) — moving to "
+        "main")
+    _moved_marker()
+    _move_to_main()
+    git(["branch", "--set-upstream-to", "origin/main", "main"], root,
+        check=False, quiet=True)
+    return True
+
+
 def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
-             touched=None):
+             touched=None, reason=""):
     """Undo exactly as much as was actually done — no more, no less.
 
     `touched` carries three facts the return codes cannot express:
@@ -1312,6 +1471,13 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
                 "exactly as it is.")
             if snapshot:
                 say("   (snapshot kept anyway: %s)" % snapshot)
+            # THE outcome line for the single most common rollback (a gate
+            # failure) — this early return used to skip the outcome block
+            # below entirely, so the card headlined the raw gate error
+            # instead (verify pass, 2026-08-18).
+            say("\n❌ Update stopped — %s. Nothing was changed and your "
+                "floor never restarted."
+                % (reason or "see the lines above"))
             return
 
         # Data BEFORE services, and ONLY if the new code actually ran — with
@@ -1345,10 +1511,12 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
         if pushed:
             push_satellites(root, sats, key, dry=False)
             push_companions(root, comps, key, dry=False)
+        back = True
         if restarted:
             restart_fleet(sats, comps, key, dry=False)
             hub_stopped = False
             ok = verify(hub_url, sats, machines, comps, dry=False)
+            back = ok
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted, but the floor did not "
                    "fully return — check `journalctl -u cabinet-g2s -n 50`",
@@ -1371,6 +1539,7 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
                 except Exception:   # hung reader must not abort a rollback
                     pass
             ok = verify(hub_url, sats, machines, comps, dry=False)
+            back = ok
             say("\n   rollback %s. You are back on %s."
                 % ("succeeded" if ok else "restarted the satellites, but the "
                    "floor did not fully return — check the satellite journals",
@@ -1379,18 +1548,43 @@ def rollback(root, old, sats, comps, key, hub_url, machines, snapshot=None,
             say("\n   rollback succeeded — old code is back on the hub and on "
                 "every satellite, and nothing needed restarting because the "
                 "new code never started.")
+        # ═══ THE OUTCOME LINE (2026-08-17) ═══ Every run must END in one
+        # column-0 ✅/❌ sentence a collector can act on — the card's
+        # doneLine picker headlines the LAST such line, and until now the
+        # reassuring "rollback succeeded" above was INDENTED and could never
+        # headline: the card led with the first failure and buried the part
+        # that mattered ("your floor is back, your data is safe"). The
+        # restore-incomplete variant prints BEFORE its ⚠️ block — that block
+        # stays the transcript's last lines by law.
         if restored is False:
-            # LAST line on purpose: the Updates card shows only the log tail,
-            # and an incomplete restore must be the thing the operator reads.
+            say("\n❌ Update failed and your data didn't fully restore — "
+                "read the details below.")
+            # LAST lines on purpose: the Updates card shows only the log
+            # tail, and an incomplete restore must be the thing the operator
+            # reads.
             say("\n   ⚠️  BUT THE DATA RESTORE WAS INCOMPLETE — data may exist "
                 "only in the snapshot\n   at %s (anything that failed is named "
                 "above). Copy it back before\n   trusting the floor's money "
                 "state." % snapshot)
+        elif back:
+            say("\n❌ The update didn't take — CabiNet rolled back. Your "
+                "floor is back on the previous version and your data was "
+                "%s." % ("restored" if restored else "never touched"))
+        else:
+            say("\n❌ The update didn't take — CabiNet rolled back, but the "
+                "floor hasn't fully come back. The lines above say which "
+                "machines are still out.")
     except BaseException as e:
         interrupted = isinstance(e, KeyboardInterrupt)
         say("\n   ⚠️  ROLLBACK %s: %s"
             % ("INTERRUPTED" if interrupted else "ITSELF FAILED",
                "Ctrl-C" if interrupted else e))
+        # The outcome line for the worst path, printed BEFORE the recovery
+        # narration so the ⚠️ details keep their place as the last lines
+        # (it stays the last COLUMN-0 line — everything below is indented,
+        # which is all the card's headline picker reads).
+        say("\n❌ Update failed and the rollback needs you — the recovery "
+            "steps below say exactly what to do.")
         if hub_stopped:
             # never leave the floor dark because the rollback tripped partway
             run(["sudo", "systemctl", "start", "cabinet-g2s"], check=False,
@@ -1433,7 +1627,8 @@ def self_update(root, argv):
         if p.returncode != 0 or not p.stdout.strip():
             return                      # no upstream copy — carry on as-is
         incoming_src = p.stdout
-        mine = open(os.path.abspath(__file__), encoding="utf-8").read()
+        mine = _SELF_TEXT if _SELF_TEXT is not None else \
+            open(os.path.abspath(__file__), encoding="utf-8").read()
         if incoming_src == mine:
             return
     except Exception:
@@ -1478,6 +1673,9 @@ def main():
                     help="run the gates against your working tree (uncommitted "
                          "edits included) in an isolated copy, then exit — no "
                          "fetch, no pull, no adopt, no restart")
+    ap.add_argument("--verbose", action="store_true",
+                    help="echo every command as it runs (the old default; "
+                         "failures always show their command regardless)")
     ap.add_argument("--remote", default=DEFAULT_REMOTE,
                     help="repo to adopt/track (default %s)" % DEFAULT_REMOTE)
     a = ap.parse_args()
@@ -1491,6 +1689,8 @@ def main():
                    "first:\n     sudo apt-get install -y git")
 
     SAT_USER_OVERRIDE = a.ssh_user
+    global VERBOSE
+    VERBOSE = a.verbose
 
     # If self_update() re-exec'd us, we ARE the temp copy. Clean it up on the
     # way out so /tmp does not slowly fill with cabinet-update-*.py, one per
@@ -1521,6 +1721,40 @@ def main():
                        "wait for it to finish (its transcript: "
                        "G2S/data/update_last.log)")
 
+    # Every run's transcript must land where the hub reads it. Card-triggered
+    # runs arrive with stdout ALREADY redirected to the log by the hub — the
+    # fstat dev/ino dedupe keeps exactly ONE writer. A terminal run used to
+    # narrate only to the terminal, so the card kept showing an ancient run
+    # as current (live-hit: a hub whose card narrated a 20-day-old update).
+    # unlink+recreate instead of open('w'): a sudo terminal run leaves a
+    # root-owned file the service user could never truncate on the NEXT card
+    # run — replacing the directory entry needs only directory write. Skipped
+    # for --dry-run/--gates-only: a read-only request must never overwrite
+    # the last real run's transcript under the card. (2026-08-17)
+    if not (a.dry_run or a.gates_only):
+        global _TEE
+        tee_path = os.path.join(data_dir(root), "update_last.log")
+        try:
+            same = False
+            try:
+                s1, s2 = os.fstat(1), os.stat(tee_path)
+                same = (s1.st_dev, s1.st_ino) == (s2.st_dev, s2.st_ino)
+            except OSError:
+                pass
+            if not same:
+                try:
+                    os.unlink(tee_path)
+                except OSError:
+                    pass
+                os.makedirs(data_dir(root), exist_ok=True)
+                _TEE = open(tee_path, "w", encoding="utf-8")
+                if os.geteuid() == 0:
+                    st = os.stat(data_dir(root))
+                    os.chown(tee_path, st.st_uid, st.st_gid)
+        except OSError as e:
+            say("   (couldn't mirror this transcript for the Updates card: %s)"
+                % e)
+
     # --gates-only is a READ-ONLY request and must stay one. This used to sit
     # below the adopt block, so `--gates-only --yes` on a copied install would
     # git-init it, fetch, overwrite edited files and only then run the gates —
@@ -1547,8 +1781,17 @@ def main():
 
     # Fetch first so @{u} is current, then hand off to the incoming updater if
     # this release changes it. Both are cheap and read-only.
+    repaired = False
     if not a.dry_run:
         git(["fetch", "--prune"], root, check=False, quiet=True)
+        repaired = repair_upstream(root)
+        if repaired:
+            # the tree just moved (detached → main) — same rule as adoption:
+            # force the full gate+push+restart path, never "already current".
+            # UNLIKE adoption it does NOT inherit the prompt skip below — the
+            # operator hasn't said yes to anything yet (verify pass caught
+            # the silent full-restart; card runs carry --yes regardless).
+            adopted = True
         self_update(root, sys.argv)
 
     status, sats, machines, comps = preflight(root, a.hub_url, a.allow_dirty,
@@ -1570,8 +1813,9 @@ def main():
             raise Fail("could not create %s — make one by hand, or re-run with "
                        "--no-satellites if this hub has none" % a.ssh_key)
         raise Fail(
-            "created %s. Your satellite(s) have not authorized it yet, so run "
-            "this ONCE per satellite and then re-run the update:\n"
+            "your satellites haven't authorized the hub's new key yet "
+            "(it was just created at %s) — run this ONCE per satellite and "
+            "then re-run the update:\n"
             "     %s"
             % (a.ssh_key,
                "\n     ".join("ssh-copy-id -i %s.pub %s@%s   # %s"
@@ -1594,7 +1838,7 @@ def main():
         # tool exists to prevent, after swapping 60 files.
         step("Adopted the released code — gating it and syncing the fleet")
 
-    if not a.yes and not a.dry_run and not adopted:
+    if not a.yes and not a.dry_run and (not adopted or repaired):
         say("\nThis will update the hub%s, run the gates, and restart the "
             "floor." % ("" if not sats else " and %d satellite(s)" % len(sats)))
         try:
@@ -1605,7 +1849,14 @@ def main():
             say("No terminal to confirm on — rerun with --yes.")
             return 1
         if ans not in ("y", "yes"):
-            say("Aborted — nothing changed.")
+            if repaired:
+                # the repair already moved the tree; "nothing changed" would
+                # be a lie, and the marker makes the next run finish the job
+                say("Aborted — but this install was just moved onto the "
+                    "release branch, so the next update completes the job "
+                    "(a reminder is left).")
+            else:
+                say("Aborted — nothing changed.")
             return 1
     elif adopted:
         # Do NOT ask again here. You already said yes to adoption, and adoption
@@ -1685,7 +1936,7 @@ def main():
     except Fail as e:
         say("\n❌ %s" % e)
         rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
-                 touched=touched)
+                 touched=touched, reason=brief_reason(e))
         return 2
     except KeyboardInterrupt:
         # Ctrl-C after the push began is the WORST moment to take the outer
@@ -1694,12 +1945,12 @@ def main():
         say("\n\n❌ interrupted mid-update — rolling back rather than leaving "
             "the fleet split")
         rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
-                 touched=touched)
+                 touched=touched, reason="the run was interrupted")
         return 130
     except Exception as e:
         say("\n❌ unexpected error: %r" % (e,))
         rollback(root, old, sats, comps, a.ssh_key, a.hub_url, machines, snapshot,
-                 touched=touched)
+                 touched=touched, reason="something unexpected went wrong")
         return 2
 
     try:
@@ -1707,7 +1958,16 @@ def main():
     except OSError:
         pass
     rc, out = git(["rev-parse", "HEAD"], root, quiet=True)
-    say("\n✅ Updated to %s. Floor is back." % out.strip()[:12])
+    rc2, cnt = git(["rev-list", "--count", "%s..HEAD" % old], root,
+                   check=False, quiet=True)
+    n = cnt.strip() if (rc2 == 0 and cnt.strip().isdigit()) else ""
+    # The outcome line leads with what a collector cares about (how much
+    # changed, the floor is back); the sha demotes to a detail line — a
+    # headline hash told nobody anything (2026-08-17).
+    say("\n✅ Updated — %s. The floor is back."
+        % (("%s change%s installed" % (n, "" if n == "1" else "s"))
+           if n else "the new version is installed"))
+    say("   now on version %s" % out.strip()[:12])
     if snapshot:
         say("   Your data snapshot is kept at %s" % snapshot)
     say("   If a kiosk/tablet is showing the UI, hard-reload it — the browser "
@@ -1719,7 +1979,17 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Fail as e:
+        # A Fail this high up happened BEFORE the work section (preflight,
+        # lock, adoption prompt) — nothing was touched. The full text prints
+        # first for the transcript; the canonical outcome line goes LAST so
+        # the card headlines it (2026-08-17).
         say("\n❌ %s" % e)
+        say("\n❌ Update stopped — %s. %s" % (
+            brief_reason(e),
+            "The floor never restarted, but this install's code WAS already "
+            "staged — the next update finishes the job."
+            if TREE_TOUCHED else
+            "Nothing was changed and your floor never restarted."))
         sys.exit(1)
     except KeyboardInterrupt:
         say("\nInterrupted — nothing further was changed.")

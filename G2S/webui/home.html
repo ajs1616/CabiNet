@@ -1058,8 +1058,15 @@ function toast(msg, ok){
 }
 
 /* ---- command channel ------------------------------------------------------ */
-async function cmd(body, label){
+async function cmd(body, label, opts){
   label=label||body.action;
+  /* opts.silent (2026-08-17, updater six-faces pass): the caller owns ALL
+     outcome messaging — cmd suppresses its generic "label ✓" / "label
+     failed" toasts so a command with its own specific message (updCheck,
+     updApply) shows ONE toast, not two. Mechanism-level toasts (stale-UI
+     reload, awaiting-host-update, host-unreachable) still fire here and
+     stamp .toasted on the result so the caller knows not to double up. */
+  const silent=!!(opts&&opts.silent);
   try{
     /* stale-client fence (D7): every command echoes the uiStamp of the JS
        actually RUNNING — uiStamp0, first-seen by uiStampCheck — never the
@@ -1072,22 +1079,22 @@ async function cmd(body, label){
       headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const text=await r.text();
     let j={}; try{j=JSON.parse(text);}catch(e){}
-    if(j.ok===true){toast(label+" ✓", true); return {ok:true,data:j};}
+    if(j.ok===true){if(!silent)toast(label+" ✓", true); return {ok:true,data:j};}
     const err=String(j.error||text||("HTTP "+r.status));
     if(r.status===409&&/stale UI/i.test(err)){
       toast("This page is outdated — reloading for the new version", false);
       setTimeout(function(){location.reload();},600);
-      return {ok:false,error:err};
+      return {ok:false,error:err,toasted:true};
     }
     if(/unknown action/i.test(err)){
       toast(label+" — awaiting host update", false);
-      return {ok:false,pending:true};
+      return {ok:false,pending:true,toasted:true};
     }
-    toast(label+" failed · "+err.slice(0,120), false);
-    return {ok:false,error:err};
+    if(!silent) toast(label+" failed · "+err.slice(0,120), false);
+    return {ok:false,error:err,toasted:!silent};
   }catch(e){
     toast("Host unreachable — "+label+" not sent", false);
-    return {ok:false,error:String(e)};
+    return {ok:false,error:String(e),toasted:true};
   }
 }
 function flash(btn, ok){
@@ -1173,6 +1180,13 @@ function tabBadges(){
   const tn=(ti&&typeof ti==="object")?(Number(ti.total)||0):0;
   for(const el of document.querySelectorAll('[data-tab="tickets"] .bd'))
     el.outerHTML=`<span class="bd">${tn?`<span class="badge gold">${tn}</span>`:""}</span>`;
+  // Settings tab: updates waiting = a GOLD count pill (2026-08-17). Gold,
+  // not ruby — a count is news, not an alarm (same rule as Tickets).
+  // Without this, "Check automatically" was near-pointless: the only
+  // announcement of new updates lived inside the Settings card itself.
+  const ub=Number(((((S.status||{}).hostOptions||{}).updates)||{}).behind||0);
+  for(const el of document.querySelectorAll('[data-tab="settings"] .bd'))
+    el.outerHTML=`<span class="bd">${ub?`<span class="badge gold">${ub}</span>`:""}</span>`;
 }
 
 /* ---- main poll ---------------------------------------------------------------- */
@@ -2309,7 +2323,7 @@ async function mcState(btn){
   const on=btn.dataset.en==="1";
   if(!on && !armCheck(btn,"disable this machine")) return;
   const body={action:"setCabinetState", egmId:btn.dataset.egm, enable:on};
-  if(!on) body.disableText="Machine disabled from CabiNet";
+  if(!on) body.disableText="Machine disabled by "+lockSayer();
   const r=await cmd(body, on?"Enable machine":"Disable machine");
   flash(btn, r.ok);
 }
@@ -3136,7 +3150,7 @@ async function gpState(btn){
   if(!on && !armCheck(btn,"disable this game")) return;
   const body={action:"setGamePlayState", egmId:btn.dataset.egm,
               deviceId:btn.dataset.dev, enable:on};
-  if(!on) body.disableText="Game disabled from CabiNet";
+  if(!on) body.disableText="Game disabled by "+lockSayer();
   const r=await cmd(body,(on?"Enable":"Disable")+" game "+btn.dataset.dev);
   flash(btn,r.ok);
 }
@@ -4280,7 +4294,7 @@ async function tkToggle(btn){
   const on=btn.dataset.en==="1";
   if(!on && !armCheck(btn,"turn ticketing off")) return;
   const body={action:"setVoucherState", egmId:btn.dataset.egm, enable:on};
-  if(!on) body.disableText="Ticketing paused from CabiNet";
+  if(!on) body.disableText="Ticketing paused by "+lockSayer();
   const r=await cmd(body, on?"Ticketing on":"Ticketing off");
   flash(btn,r.ok);
 }
@@ -4613,6 +4627,31 @@ async function boardToggle(btn){
     !cur?"Gameroom board enabled":"Gameroom board disabled");
   flash(btn,ok);
 }
+function lockSayer(){
+  /* Who a locked machine's own screen blames (Settings ▸ Gameroom toggle,
+     2026-08-18 — AJ: "were not exactly trying to advertise"): the
+     collector's gameroom name in lights, or the neutral "the host". The
+     product name never appears — the machine glass is the most
+     player-facing surface there is. Mirrors the hub's lock_sayer(); the
+     empty-name fallback matches too. */
+  const ho=((S.status||{}).hostOptions)||{};
+  if(ho.lockBrandGameroom){
+    const gn=String(ho.gameroomName||"").trim();
+    if(gn) return gn;
+  }
+  return "the host";
+}
+async function lockBrandToggle(btn){
+  /* What a locked machine's screen blames — reversible, no arm. Read live
+     at each lock; a machine already locked keeps the text it was locked
+     with until the next lock (no retroactive push). */
+  const cur=!!(((S.status||{}).hostOptions||{}).lockBrandGameroom);
+  const ok=await settingsPost({lockBrandGameroom:!cur},
+    !cur?"Lock messages now show your gameroom name"
+        :"Lock messages now say “the host”");
+  flash(btn,ok);
+  if(ok) tickStatus();
+}
 async function gameroomSave(){
   /* Gameroom name save — reversible personalization, no arm. Posts only when
      it differs from the hub face ("" clears it back to the neutral default).
@@ -4683,6 +4722,16 @@ function renderSettings(){
           <button class="btn slim gold" onclick="gameroomSave()">
             <span class="bl">Save name</span></button>
         </div>
+        ${ho.lockBrandGameroom===undefined?"":`
+        <div class="tkf" style="margin-top:12px"><label>When you lock a
+          machine, its screen says</label></div>
+        <div class="btnrow">
+          <button class="btn slim" onclick="lockBrandToggle(this)">
+            <span class="bl">${esc(!!ho.lockBrandGameroom
+              ?("Locked by "+(grName||"your gameroom name"))
+              :"Locked by the host")}</span>
+            <span class="ba">tap to switch</span></button>
+        </div>`}
       </div>`;
     /* Gameroom Board — the wall-TV spectator page at /board (live Action
        feed, standings, fireworks on a handpay). Feature-detected like the
@@ -5203,51 +5252,122 @@ function fobAcctSel(id, cur){
    share one card here, which is why this is now two functions over two tabs
    sharing the same companions/fobs poll data. */
 /* ---- Settings ▸ Updates ------------------------------------------------
-   The hub never phones home by itself: "Check now" is a button, and the
-   automatic option ships OFF (a game room may run an isolated slot VLAN —
+   The hub never phones home by itself: "Check for updates" is a button, and
+   the automatic option ships OFF (a game room may run an isolated slot VLAN —
    reaching out is the operator's call). "Update now" hands off to
    deploy/update.py, which snapshots data, gates in a throwaway worktree,
    updates satellites too, and rolls BOTH code and data back on any failure.
    That script restarts this very service, so the button intentionally shows
-   "the page will go quiet" rather than pretending to stream progress. */
-let UPDBUSY = false;
+   "the page will go quiet" rather than pretending to stream progress — the
+   card POLLS the transcript; it never streams (KillMode=process law).
+
+   2026-08-17 six-faces pass: the card wears exactly ONE face at a time —
+   IDLE / CHECKING / UPDATING / VERIFYING / DONE / NEEDS-YOU — derived from
+   (isClone, CHECKBUSY, u.state, doneLine, logAgeSec, behind, checkedAt).
+   The transcript stays the completion authority throughout (law): this pass
+   changes what the card SAYS, never how a run's ending is judged. */
+let UPDBUSY = false;   // an Update/Adopt fired from THIS tab; doneLine clears it
+/* ② CHECKING gets its own flag, deliberately NOT tied to doneLine
+   (2026-08-17): the old busy=(UPDBUSY&&!doneLine) was defeated by any past
+   run's ✅ line, and the 2s repaint reset UPDBUSY mid-check — so a 2-minute
+   git fetch on a dead network showed an enabled, unlabelled button inviting
+   double-presses into 300s server threads. Set in updCheck's try, cleared
+   in its finally, and nothing else touches it. */
+let CHECKBUSY = false;
 /* update.py's transcript is for debugging; the CARD narrates. Phase headers
    ("== Name") become a live progress bar mid-run and a ✓-checklist after;
-   the raw transcript (ANSI stripped) lives behind a details fold. */
-const UPD_PHASES=[["Pre-flight","preflight"],["Protecting","snapshot"],
-  ["Updating the working tree","pull"],["Gates","gates"],
-  ["Pushing the SAS","satellites"],["Pushing the Companion","readers"],
-  ["Restarting","restart"],["Verifying","verify"]];
+   the raw transcript (ANSI stripped) lives behind a details fold.
+   Columns: [transcript-header prefix, collector-voice name, bar weight].
+   The LEFT column is matched (startsWith) against update.py's real "== "
+   lines — NEVER reword it; only the right column is display copy. Weights
+   (2026-08-17) replace the old 8-equal-slices math: self-testing gets the
+   width it actually takes, so the bar no longer parks at 50% for minutes
+   and reads as hung. The cumulative sum reaches 100 but the bar CAPS at 90
+   until a doneLine exists — "full but still going" can never render. */
+const UPD_PHASES=[["Pre-flight","checking",4],
+  ["Protecting","backing up your data",8],
+  ["Updating the working tree","downloading",10],
+  ["Gates","self-testing",40],
+  ["Pushing the SAS","updating the machines' boxes",10],
+  ["Pushing the Companion","updating the card readers",10],
+  ["Restarting","restarting",6],
+  ["Verifying","waiting for the floor",12]];
 function updStripAnsi(l){ return String(l).replace(/\x1b\[[0-9;]*m/g,""); }
 function updPhaseIx(h){
+  /* rollback's own "Restarting satellites (the hub never ran new code)"
+     header must NOT read as the forward run's "Restarting" phase — it used
+     to tick the checklist past the point the run actually died
+     (2026-08-17). */
+  if(h.startsWith("Restarting satellites")) return -1;
   for(let i=0;i<UPD_PHASES.length;i++)
     if(h.startsWith(UPD_PHASES[i][0])) return i;
   return -1;
 }
+/* split a `git log --oneline` line into [sha, subject]: the collector reads
+   the sentence; the hash rides a title= hover (2026-08-17) */
+function updSplitSha(line){
+  const m=String(line||"").match(/^([0-9a-f]{6,40})\s+(.*)$/i);
+  return m?[m[1],m[2]]:["",String(line||"")];
+}
 async function updCheck(btn){
-  UPDBUSY = true; renderUpdates();
-  const r = await cmd({action:"checkUpdates"}, "Check for updates");
-  UPDBUSY = false;
-  // cmd() nests the server's payload under .data — reading r.behind made
-  // every toast say "Already up to date" while the card showed the truth
-  const d = (r&&r.data)||{};
-  if(r && r.error) toast(r.error, false);
-  else if(Number(d.behind)) toast(d.behind+" update(s) available", true);
-  else if(r && r.ok) toast("Already up to date", true);
-  flash(btn, !!(r && r.ok));
-  tickStatus();
+  CHECKBUSY = true; renderUpdates();
+  try{
+    /* silent:true — ONE toast per outcome, owned here (cmd's generic
+       "Check for updates ✓" used to double every message) */
+    const r = await cmd({action:"checkUpdates"}, "Check for updates",
+                        {silent:true});
+    // cmd() nests the server's payload under .data — reading r.behind made
+    // every toast say "Already up to date" while the card showed the truth
+    const d = (r&&r.data)||{};
+    if(r && r.error && !r.toasted) toast(r.error, false);
+    else if(Number(d.behind)) toast(d.behind+" update"
+      +(Number(d.behind)===1?"":"s")+" ready", true);
+    else if(r && r.ok) toast("You're up to date", true);
+    flash(btn, !!(r && r.ok));
+  } finally {
+    /* the flag never outlives the request — a thrown fetch or a slow hub
+       must not wedge the card on the CHECKING face */
+    CHECKBUSY = false;
+    renderUpdates();
+    tickStatus();
+  }
 }
 async function updApply(btn){
   const u = (((S.status||{}).hostOptions||{}).updates)||{};
   const n = Number(u.behind||0);
-  if(!armCheck(btn, "Update now — "+n+" commit"+(n===1?"":"s")
+  /* n===0 = the error/no-upstream repair path (the count is unknown until
+     the run refetches) — the arm must not promise "0 changes" (verify
+     pass, 2026-08-18). */
+  if(!armCheck(btn, (n?("Update now — "+n+" change"+(n===1?"":"s"))
+      :"Update now — repairs the update connection, installs whatever is new")
       +". The floor restarts and briefly drops out.")) return;
-  const r = await cmd({action:"applyUpdate"}, "Apply update");
+  const r = await cmd({action:"applyUpdate"}, "Apply update", {silent:true});
   if(r && r.ok){
     UPDBUSY = true; renderUpdates();
     toast("Updating — the hub restarts, so this page will go quiet for a "
           +"minute. Reload after that.", true);
-  } else toast((r&&r.error)||"Could not start the update", false);
+  } else if(!(r&&r.toasted))
+    toast((r&&r.error)||"Could not start the update", false);
+}
+/* ⑥ Adopt this install (2026-08-17) — an untracked copy becomes updatable
+   with one gold button instead of shell homework (the old face printed
+   "run python3 deploy/update.py" — never a command on a collector surface).
+   It fires the EXISTING applyUpdate verb: update.py --yes on a non-clone
+   ADOPTS — there is no adopt-only flag, so the armed wording carries the
+   full consequence: data is snapshotted first, but any locally-edited
+   CabiNet files are replaced with the release, then the floor restarts. */
+async function updAdopt(btn){
+  if(!armCheck(btn, "Adopt & update — snapshots your data, replaces any "
+      +"changed CabiNet files with the release, then the floor restarts "
+      +"briefly.")) return;
+  const r = await cmd({action:"applyUpdate"}, "Adopt this install",
+                      {silent:true});
+  if(r && r.ok){
+    UPDBUSY = true; renderUpdates();
+    toast("Adopting — the hub restarts, so this page will go quiet for a "
+          +"minute. Reload after that.", true);
+  } else if(!(r&&r.toasted))
+    toast((r&&r.error)||"Could not start the adoption", false);
 }
 async function updAutoToggle(btn){
   const cur = !!((((S.status||{}).hostOptions||{}).updates)||{}).autoCheck;
@@ -5262,32 +5382,25 @@ function renderUpdates(){
   if(!u){ setHTML(box, pendChip("Updates")); setHTML($("st-upd-n"),""); return; }
   const behind=Number(u.behind||0);
   setHTML($("st-upd-n"), behind?(behind+" available"):"");
-  const cur=esc(String(u.current||"unknown"));
-  let body=`<div class="kd" style="color:var(--faint)">running</div>
-    <div class="nm" style="font:600 13px var(--mono);margin:2px 0 10px">${cur}</div>`;
-  if(u.isClone===false){
-    body+=`<p class="none">This install isn't tracked yet, so it can't check
-      for updates. Running <span style="font-family:var(--mono)">python3
-      deploy/update.py</span> on the hub once will adopt it — your data is
-      snapshotted and untouched.</p>`;
-  } else if(u.error){
-    body+=`<p class="none" style="color:var(--ruby)">${esc(u.error)}</p>`;
-  } else if(behind){
-    body+=`<div class="kd" style="margin-bottom:4px">${behind} new commit${behind===1?"":"s"}:</div>`;
-    body+=(u.commits||[]).slice(0,8).map(c=>
-      `<div class="kd" style="font-family:var(--mono);color:var(--faint)">${esc(c)}</div>`).join("");
-  } else if(u.checkedAt){
-    body+=`<p class="none">Up to date as of ${esc(clock(u.checkedAt))} — when new
-      commits are available, an <b>Update now</b> button appears here.</p>`;
-  } else {
-    body+=`<p class="none">Not checked yet — the hub doesn't contact the
-      update server unless you ask it to.</p>`;
-  }
+  /* header: a version line a collector can read aloud — "CabiNet · version
+     af90582" with the commit SUBJECT in the title= hover (2026-08-17; the
+     old "running · af90582 <dev commit msg>" face led with jargon) */
+  const [curSha,curMsg]=updSplitSha(u.current);
+  let body=`<div class="kd" style="margin:0 0 10px"${
+      curMsg?` title="${esc(curMsg)}"`:""}><span style="color:var(--faint)">CabiNet · version</span>
+      <span style="font:600 13px var(--mono)">${
+      esc(curSha||String(u.current||"unknown"))}</span></div>`;
   const tail=(u.lastLog||[]).filter(Boolean).map(updStripAnsi);
   const heads=tail.map(l=>l.trim()).filter(l=>l.startsWith("== "))
     .map(l=>l.slice(3));
-  const rolling=heads.some(h=>h.startsWith("ROLLING BACK"));
-  const lastIx=heads.reduce((a,h)=>Math.max(a,updPhaseIx(h)),-1);
+  const rbIx=heads.findIndex(h=>h.startsWith("ROLLING BACK"));
+  const rolling=rbIx>=0;
+  /* Phase progress reads only the headers BEFORE the rollback marker:
+     rollback re-runs push/restart/verify and their headers would otherwise
+     re-light phases the FORWARD run never reached — the ✗ would then land
+     on the wrong phase with a lying ✓ above it (verify pass, 2026-08-18). */
+  const fwdHeads=rolling?heads.slice(0,rbIx):heads;
+  const lastIx=fwdHeads.reduce((a,h)=>Math.max(a,updPhaseIx(h)),-1);
   /* The hub's own state is LOST when the updater restarts it (in-memory,
      reset to idle by the fresh process), so the TRANSCRIPT is the authority
      on whether a run finished: update.py's terminal lines are the only ones
@@ -5298,9 +5411,14 @@ function renderUpdates(){
   /* a FRESH transcript with no ending = the detached updater is still at
      work. This is the NORMAL post-restart state (the page reloads on
      uiStamp, the new hub says idle, and verify polls silently for up to
-     ~3.5 min) — only a STALE ending-less log means an interrupted run. */
+     ~3.5 min) — only a STALE ending-less log means an interrupted run.
+     Threshold raised 300s→1000s (2026-08-17): update.py's run() buffers a
+     child's entire output and prints it only on completion, and the gates
+     ride run()'s default 900s timeout — so a LIVE run can legally sit
+     silent for up to ~900s. The old 300s bar made a mid-update card flash
+     "this run never wrote its ending" during a long self-test. */
   const inflight=!doneLine&&tail.length>0
-    &&u.logAgeSec!=null&&u.logAgeSec<300;
+    &&u.logAgeSec!=null&&u.logAgeSec<1000;
   /* BELT (2026-08-17): a wedged server-side "running" must not freeze the
      card in an old tab forever. The transcript is the completion authority
      (the rule above) — so when it carries its ending line AND the log has
@@ -5310,9 +5428,62 @@ function renderUpdates(){
   const wedged=!!doneLine&&u.logAgeSec!=null&&u.logAgeSec>1000;
   const busy=(u.state==="running"&&!wedged)||inflight||(UPDBUSY&&!doneLine);
   if(doneLine) UPDBUSY=false;
+  const lock=busy||CHECKBUSY;   // ② both action buttons sleep while checking
+  if(!busy){
+    if(u.isClone===false){
+      /* ⑥ NEEDS-YOU: untracked install. The fix is the gold Adopt button
+         in the row below — never shell homework on a collector surface
+         (the old face printed a python3 command). */
+      body+=`<p class="none">This install isn't tracked yet, so it can't check
+        for updates.</p>`;
+    } else if(u.error){
+      /* ⑥ the hub words this refusal itself (unreachable update server, no
+         upstream…). Render u.error verbatim and NOTHING else — the card
+         never appends a shell command (collector-surface law). */
+      body+=`<p class="none" style="color:var(--ruby)">${esc(u.error)}</p>`;
+    } else if(behind){
+      /* ① updates-ready: commit subjects as plain sentences, shas demoted
+         to title= hovers, capped at 8 with an honest remainder (the old
+         face sliced silently while its header claimed the true count) */
+      body+=`<div class="kd" style="margin-bottom:4px">${behind} update${
+        behind===1?"":"s"} ready</div>`;
+      body+=(u.commits||[]).slice(0,8).map(c=>{
+        const [sha,subj]=updSplitSha(c);
+        return `<div class="kd" style="color:var(--faint)"${
+          sha?` title="${esc(sha)}"`:""}>${esc(subj)}</div>`;
+      }).join("");
+      if(behind>8) body+=`<div class="kd" style="color:var(--faint)">…and ${
+        behind-8} more</div>`;
+    } else if(u.checkedAt){
+      /* ① current: ago(), never a bare clock — "as of 14:32:07" made a
+         three-day-old check read as today */
+      body+=`<p class="none" style="color:var(--felt)">✓ You're up to date —
+        checked ${esc(ago(u.checkedAt))}.</p>`;
+    } else if(doneLine.startsWith("✅")&&u.logAgeSec!=null&&u.logAgeSec<21600){
+      /* ① post-update contradiction fix: checkedAt died with the restart
+         (in-memory hub state) but the transcript's ✅ is fresh-ish — never
+         say "not checked" above a green ✅ */
+      body+=`<p class="none" style="color:var(--felt)">✓ Updated ${
+        esc(fmtDur(u.logAgeSec))} ago — you're current as of that update.</p>`;
+    } else {
+      /* ① never-checked — the exact privacy copy (law: no phone-home) */
+      body+=`<p class="none">Updates are checked only when you ask — nothing
+        leaves your gameroom on its own.</p>`;
+    }
+  }
   if(busy&&tail.length){
-    const pct=rolling?100:Math.round(((lastIx+1)/UPD_PHASES.length)*100);
-    const label=rolling?"rolling back":(lastIx>=0?UPD_PHASES[lastIx][1]:"starting");
+    /* ③ UPDATING — the weighted bar (cumulative phase weights, capped at
+       90 until a doneLine exists so "full but still going" never renders;
+       the rollback bar is ruby and capped the same way).
+       ④ VERIFYING — the last phase holds the bar at 90 while the machines
+       rejoin; a fresh ending-less transcript is the NORMAL detached state,
+       not an error. */
+    let cum=0; for(let i=0;i<=lastIx;i++) cum+=UPD_PHASES[i][2];
+    const pct=rolling?90:Math.min(90,Math.max(cum,2));
+    const label=rolling?"rolling back"
+      :(lastIx===UPD_PHASES.length-1
+        ?"waiting for the machines to rejoin — up to 3½ minutes"
+        :(lastIx>=0?UPD_PHASES[lastIx][1]:"starting"));
     body+=`<div class="kd" style="margin-top:12px">update in progress — <b>${esc(label)}</b></div>
       <div style="height:6px;border-radius:3px;background:var(--line2);margin:6px 0 4px;overflow:hidden">
         <div style="height:100%;width:${pct}%;border-radius:3px;background:${
@@ -5321,12 +5492,16 @@ function renderUpdates(){
         while the hub bounces — it comes back on its own</div>`;
   }
   body+=`<div class="btnrow" style="margin-top:12px">
-      <button class="btn slim" onclick="updCheck(this)" ${busy?"disabled":""}>
-        <span class="bl">${busy?"Working…":"Check now"}</span>
-        <span class="ba">asks the update server</span></button>
-      ${behind?`<button class="btn slim gold" onclick="updApply(this)" ${busy?"disabled":""}>
+      <button class="btn slim" onclick="updCheck(this)" ${lock?"disabled":""}>
+        <span class="bl">${CHECKBUSY?"Checking…":(busy?"Working…":"Check for updates")}</span>
+        <span class="ba">${CHECKBUSY?"asking the update server":"asks the update server"}</span></button>
+      ${u.isClone===false?`<button class="btn slim gold" onclick="updAdopt(this)" ${lock?"disabled":""}>
+        <span class="bl">${busy?"Adopting…":"Adopt this install"}</span>
+        <span class="ba">snapshots your data first</span></button>`
+      :((behind||u.error)?`<button class="btn slim gold" onclick="updApply(this)" ${lock?"disabled":""}>
         <span class="bl">${busy?"Updating…":"Update now"}</span>
-        <span class="ba">floor restarts briefly</span></button>`:""}
+        <span class="ba">${behind?"the floor restarts briefly"
+          :"repairs the connection, then updates"}</span></button>`:"")}
     </div>
     <div class="btnrow" style="margin-top:8px">
       <button class="btn slim" onclick="updAutoToggle(this)">
@@ -5335,34 +5510,55 @@ function renderUpdates(){
           :"off — nothing leaves your network"}</span></button>
     </div>`;
   if(!busy&&tail.length){
-    // the narrated version: outcome + phase checklist; raw transcript folded.
+    // ⑤ DONE / ⑥ NEEDS-YOU — the narrated last run: outcome + collector
+    // checklist; raw transcript folded.
     // ⚠️ lines stay OUT of the card (they read as "something broke" right
     // after a successful update — operator feedback) with ONE exception: a
-    // fleet member that was NOT updated must never be buried in the fold.
+    // fleet member that was NOT updated must never be buried in the fold —
+    // matched on the literal "NOT updated" token (law; mechanism unchanged).
     const warns=tail.map(l=>l.trim())
       .filter(l=>l.startsWith("⚠️")&&l.includes("NOT updated")).slice(-3);
     const done=[...new Set(heads.map(h=>updPhaseIx(h)).filter(i=>i>=0))]
-      .sort((a,b)=>a-b).map(i=>UPD_PHASES[i][1]);
+      .sort((a,b)=>a-b);
     body+=`<div style="margin-top:12px;border-top:1px solid var(--line2);padding-top:8px">
       <div class="kd" style="color:var(--faint)">last update run</div>`;
     if(doneLine){
+      /* ⑤ the outcome ALWAYS wears its age (2026-08-17) — an undated
+         readout is a lie of omission: a 20-day-old run used to render as
+         if it had just happened. Degrades cleanly against old transcripts
+         whose last line is "✅ Updated to <sha>". */
+      const age=u.logAgeSec!=null
+        ?(u.logAgeSec<60?"just now":fmtDur(u.logAgeSec)+" ago"):"";
       body+=`<div class="kd" style="color:${doneLine.startsWith("✅")
-        ?"var(--felt)":"var(--ruby)"}">${esc(doneLine.trim())}</div>`;
+        ?"var(--felt)":"var(--ruby)"}">${esc(doneLine.trim())}${
+        age?` <span style="color:var(--faint)">(${esc(age)})</span>`:""}</div>`;
     } else {
       // ending-less AND stale (inflight already went to the progress bar):
-      // the run was interrupted — say so instead of implying it finished
-      body+=`<div class="kd" style="color:var(--gold)">this run never wrote its
-        ending — it looks interrupted. Check data/update_last.log on the hub.</div>`;
+      // the run was interrupted — say so, point at the fold, and hand the
+      // collector a live retry instead of a file path (2026-08-17)
+      body+=`<div class="kd" style="color:var(--gold)">This run stopped without
+        writing its ending — the transcript below shows how far it got.</div>
+        <div class="btnrow" style="margin-top:6px">
+          <button class="btn slim" onclick="updCheck(this)" ${CHECKBUSY?"disabled":""}>
+            <span class="bl">Check now</span>
+            <span class="ba">asks the update server</span></button></div>`;
     }
     body+=warns.map(o=>`<div class="kd" style="color:var(--gold)">${
       esc(o)}</div>`).join("");
     if(done.length){
+      /* ⑤ the ✓-checklist in collector phase names; on a ❌ the phase the
+         run died in (the furthest header reached) wears ✗ ruby instead of
+         a lying ✓ — it used to show "✓ gates" directly above the ❌ line
+         that named the failed gate (2026-08-17) */
+      const failIx=doneLine.startsWith("❌")?lastIx:-1;
       body+=`<div class="kd" style="color:var(--faint);margin-top:4px">${
-        done.map(d=>"✓ "+esc(d)).join(" · ")}${
+        done.map(i=>i===failIx
+          ?`<span style="color:var(--ruby)">✗ ${esc(UPD_PHASES[i][1])}</span>`
+          :"✓ "+esc(UPD_PHASES[i][1])).join(" · ")}${
         rolling?` · <span style="color:var(--ruby)">rolled back</span>`:""}</div>`;
     }
     body+=`<details style="margin-top:6px">
-      <summary class="kd" style="cursor:pointer;color:var(--faint)">full transcript</summary>
+      <summary class="kd" style="cursor:pointer;color:var(--faint)">the whole story</summary>
       <div class="kd" style="font-family:var(--mono);white-space:pre-wrap;color:var(--faint);margin-top:4px">${
         esc(tail.join("\n"))}</div></details></div>`;
   }

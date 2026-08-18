@@ -124,7 +124,18 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # rooms, and reaching out uninvited is not ours to assume
                      # (AJ 2026-07-27). Manual "Check now" always works and is
                      # user-initiated by definition.
-                     "update_auto_check")
+                     "update_auto_check",
+                     # Gameroom Board (wall TV) render toggle, "1"/"0".
+                     # ⚠️ Was MISSING from this whitelist since the board
+                     # shipped — every Disable-board press 400'd "unknown
+                     # host setting" (found by the 2026-08-18 verify pass
+                     # while whitelisting its sibling below).
+                     "board_enabled",
+                     # What a locked machine's own screen blames: "1" = the
+                     # collector's gameroom name in lights, absent/"0" = the
+                     # neutral "the host". The product name never appears
+                     # either way (AJ, 2026-08-18).
+                     "lock_brand_gameroom")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
 MAX_TICKET_FIELD_LEN = 64
