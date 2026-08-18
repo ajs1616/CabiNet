@@ -19,7 +19,8 @@
 
   Kiosk mode: auto-enables on the Pi's 800x480 DSI touchscreen (or ?kiosk=1)
   — bottom tab bar, >=48px touch targets, compacted spacing. ?kiosk=0 forces
-  it off. Sister page to webui/index.html (the bench console at /).
+  it off. Sister page to webui/index.html (the bench console at /test —
+  the host root / serves THIS page).
 -->
 <style>
   /* ---- tokens: mahogany lounge ---------------------------------------- */
@@ -704,8 +705,7 @@
               <span class="ba">/test · full bench console</span></a>
           </div>
           <p class="none" style="margin:10px 0 0">On the kiosk this leaves the Home UI —
-            restart the kiosk service (or tap the browser back gesture) to come back.
-            The bench console also answers at the host root <span style="font-family:var(--mono)">/</span>.</p>
+            restart the kiosk service (or tap the browser back gesture) to come back.</p>
         </div></div>
     </div>
   </section>
@@ -1520,18 +1520,25 @@ async function sasLinkSet(egm,sel){
   else{delete SASLNK[egm]; if(S.tab==="floor"&&!GM.egm) renderFloor();}
 }
 /* SAS jackpot banner — the satellite latched a 0x51 handpay lockup; same
-   chase-light block the G2S tiles use. SAS carries no amount on the
-   wire, so the headline IS the banner; the 🔑 button blind-fires
-   handpay_reset (no modal — an idle machine answers no_handpay).
+   chase-light block the G2S tiles use, same "JACKPOT · HANDPAY" headline
+   (2026-08-17: the raw exception code moved off the face into the lockup
+   chip's hover — the twin banners must read the same). SAS carries no
+   amount on the wire, so an unlinked tile draws no big number at all
+   (never a fake one); linked tiles pass the G2S record's amount in. The
+   🔑 button blind-fires handpay_reset (no modal — an idle machine
+   answers no_handpay). ⚖️ MONEY LAW: this button keys off to the CREDIT
+   METER, always — the "pays the win to the carded-in wallet" wording is
+   the G2S over-limit variant's alone and never appears here.
    Shared: rendered on the sasTile AND on a G2S card whose linked SAS
    leg has the lockup — the SAME banner + reset, never a fork. */
 function sasJackBanner(key,m,amtMc){
   const hp=(m||{}).pendingHandpay;
   const amt=Number(amtMc)||0;   // linked tiles pass the G2S record's amount
   return hp?`<div class="jackpot">
-      <div class="jt">SAS ${esc(String(hp.code||"0x51"))} · lockup</div>
-      <div class="ja">${amt>0?esc(fmtAmt(amt)):"HANDPAY"}</div>
-      <div class="js">since ${clock(hp.since)} · machine is asking for a key-off</div>
+      <div class="jt">JACKPOT · HANDPAY</div>
+      ${amt>0?`<div class="ja">${esc(fmtAmt(amt))}</div>`:""}
+      <div class="js">${chip("lockup","warn","SAS "+String(hp.code||"0x51"))}
+        since ${clock(hp.since)} · machine is asking for a key-off</div>
       <button class="btn" onclick="sasHpClear('${jsq(key)}',this)">
         <span class="bl">🔑 Reset to Credits</span>
         <span class="ba">key off to the credit meter</span></button>
@@ -1611,8 +1618,11 @@ function sasTile(key,m){
       <button class="name" onclick="nickOpen('${jsq(key)}')"
         title="Tap to name this machine" aria-label="Name this machine">
         ${esc(name)}<span class="pen">✎</span></button>
-      <div class="sub">SAS · addr ${esc(String(m.address||"?"))} · ${esc(m.port||"")}
-        · ${esc(sub)}</div>
+      ${/* face identity (2026-08-17): "addr N" stays — it matches what the
+            machine's own SAS menu shows, so a collector can pair tile and
+            cabinet standing at the machine. The serial device path is
+            plumbing and came OFF the face. */""}
+      <div class="sub">SAS · addr ${esc(String(m.address||"?"))} · ${esc(sub)}</div>
     </div>
     <div class="mbody">
       ${jack}
@@ -1624,12 +1634,20 @@ function sasTile(key,m){
       </div>
       <div class="mstate">
         ${chip("SAS","gold")}
-        ${chip(`polls ${m.polls??0}`,"")}
-        ${chip(`events ${m.events??0}`, m.events?"warn":"")}
+        ${/* chip diet (2026-08-17): the polls counter was wire plumbing
+              (nobody at a party cares how many times the link chirped) —
+              gone from the face. The events counter stays but reads
+              NEUTRAL: events are normal life on a slot floor, amber made
+              every tile look like a warning. The last event only earns a
+              chip while it is NEWS (<10 min old), worded as label + age;
+              the raw exception code lives in the chip's hover, never on
+              the face. */""}
+        ${chip(`events ${m.events??0}`,"")}
         ${t.total?chip(`tickets ${t.total}`,"ok"):""}
         ${sasAftChip(m)}
         ${denomMismatchChip(m,key)}
-        ${ev?chip(`${ev.code} ${ev.label||""}`.trim(),"warn"):""}
+        ${(ev&&ev.when&&Date.now()-Date.parse(ev.when)<600000)
+          ?chip((ev.label||"machine event")+" · "+ago(ev.when),"warn",ev.code):""}
         ${sasCmdChip(lb)}
       </div>
       <div class="mact">
@@ -1833,9 +1851,13 @@ async function sasForgetSend(key,btn){
       body:JSON.stringify({key})});
     const j=await r.json().catch(()=>({}));
     if(j.ok){
+      /* hardware words (2026-08-17): the fix a collector can DO is pulling
+         a plug, not stopping a service — Remove stays this verb, Park stays
+         its own; only the wording changed. */
       toast(j.stillReporting
-        ? "Removed — but its satellite is still reporting, so it'll return; "
-          +"stop that service to remove for good"
+        ? "Removed — but that machine's CabiNet box is still reporting, so "
+          +"it'll return; unplug that machine's CabiNet box to remove it "
+          +"for good"
         : "🗑️ Removed from the floor", true);
       tickStatus();                        // repaint now so the tile drops
     }else{
@@ -2044,7 +2066,11 @@ function floorTile(s){
     return `<div class="jackpot">
       <div class="jt">${esc(T[h.handpayType]||"HANDPAY")}</div>
       <div class="ja">${esc(fmtAmt(amt))}</div>
-      <div class="js">txn ${esc(h.transactionId||"—")} · ${clock(h.seenAt)}</div>
+      ${/* the transaction id is bookkeeping, not celebration (2026-08-17):
+            it moved off the face into the hover — hpClear still carries it
+            in data-hp, so the reset path never depended on the display. */""}
+      <div class="js" title="txn ${esc(h.transactionId||"—")}">since ${clock(h.seenAt)}
+        · machine is asking for a key-off</div>
       ${/* NEVER disable this button (2026-07-29, wire-proven): the
             handpayRequest flags are an ADVISORY SNAPSHOT, not a lifetime
             contract. txn 173 came in with remoteHandpay=false, yet once
@@ -2209,7 +2235,17 @@ function floorTile(s){
       <button class="name" onclick="nickOpen('${jsq(egm)}')"
         title="Tap to name this machine" aria-label="Name this machine">
         ${esc(name)}<span class="pen">✎</span></button>
-      <div class="sub">${esc(brand)} · ${esc(egm)}
+      ${/* face identity (2026-08-17): the sub-line shows the machine's REAL
+            make/model + release from its own cabinet descriptor ("IGT AVP ·
+            AVP014 R2"), never the raw egmId/MAC — that's wire plumbing, and
+            it stays one hover away here plus visible in the ✎ modal. A
+            cabinet that hasn't revealed identity yet falls back to the
+            brand prefix alone. */""}
+      <div class="sub" title="${esc(egm)}">${esc((function(){
+          const ident=identityName(s);
+          const rel=(((s.cabinet||{}).identity||{}).releaseNum||"").trim();
+          return ident?(rel?ident+" · "+rel:ident):brand;
+        })())}
         · ${online?(s.joinedAt?"on the floor "+ago(s.joinedAt).replace(" ago",""):"joined"):
             (s.offlineSince?"dark since "+clock(s.offlineSince)
              :joining?"connecting… (join in progress)"
@@ -2407,34 +2443,37 @@ function renderNickModal(egm){
 function denomSuggestRow(egm, sm){
   const ds=sm&&sm.denomSuggest;
   if(!ds||typeof ds!=="object") return "";
-  const codeTxt="0x1F code "+esc(String(ds.code));
+  // the raw report code is plumbing (2026-08-17): it moved off the visible
+  // text into a hover on each row — support conversations still get it,
+  // the collector just reads "the machine's own report".
+  const codeT=` title="0x1F code ${esc(String(ds.code))}"`;
   if(ds.state==="match")
-    return `<p class="none" style="margin:6px 0 0">✓ Matches the machine's own
-      report (${codeTxt}).</p>`;
+    return `<p class="none" style="margin:6px 0 0"${codeT}>✓ Matches the
+      machine's own report.</p>`;
   if(ds.state==="confirm"&&ds.cents){
     const inUse=(Number(sm.denomCents)>=1)?Number(sm.denomCents):1;
     if(ds.cents===inUse)
       // the machine's report already matches the value credits run on —
       // nothing to confirm, just say so (no "Use" nag).
-      return `<p class="none" style="margin:6px 0 0">✓ Running at the machine's
-        reported <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}).</p>`;
-    return `<p class="none" style="margin:6px 0 0">📖 The machine reports
-      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}) but credits are
+      return `<p class="none" style="margin:6px 0 0"${codeT}>✓ Running at the
+        machine's reported <b>${esc(fmtDenom(ds.cents*1000))}/credit</b>.</p>`;
+    return `<p class="none" style="margin:6px 0 0"${codeT}>📖 The machine reports
+      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> but credits are
       valued at ${esc(fmtDenom(inUse*1000))} —
       <button class="fchip on" onclick="denomUse('${jsq(egm)}',${+ds.cents})">Use
       ${esc(fmtDenom(ds.cents*1000))}</button></p>`;
   }
   if(ds.state==="mismatch"&&ds.cents)
     return `<p class="none" style="margin:6px 0 0;color:var(--gold);
-      font-style:normal">⚠ The machine reports
-      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> (${codeTxt}) but the
+      font-style:normal"${codeT}>⚠ The machine reports
+      <b>${esc(fmtDenom(ds.cents*1000))}/credit</b> but the
       setting says ${esc(fmtDenom(Number(sm.denomCents)*1000))} — one of them
       is wrong. <button class="fchip on"
       onclick="denomUse('${jsq(egm)}',${+ds.cents})">Use
       ${esc(fmtDenom(ds.cents*1000))}</button></p>`;
-  return `<p class="none" style="margin:6px 0 0">The machine reports denom
-    code ${esc(String(ds.code))} — no verified value for this code yet, so set
-    the denomination by hand. (A support bundle from this machine teaches the
+  return `<p class="none" style="margin:6px 0 0"${codeT}>The machine's own
+    denomination report doesn't match a value this hub knows yet, so set the
+    denomination by hand. (A support bundle from this machine teaches the
     hub the code.)</p>`;
 }
 function denomUse(egm, cents){
@@ -2517,8 +2556,8 @@ function renderBonusModal(key){
   $("m-title").textContent="🎁 Legacy bonus — "+name;
   setHTML($("m-body"),`
     <p class="none" style="margin:0 0 10px">Credits land straight on the
-      meter (raw SAS credits — this cabinet's denom applies). The machine's
-      answer arrives with the smib's next report, about 2 seconds.</p>
+      meter (raw SAS credits — this cabinet's denom applies). The machine
+      answers in a moment.</p>
     <div class="btnrow" style="margin-bottom:10px">
       ${BONUS_PRESETS.map(v=>`<button class="btn slim"
         onclick="$('m-bonus').value='${v}'"><span class="bl">${v}</span>
@@ -2531,7 +2570,7 @@ function renderBonusModal(key){
     <div class="btnrow">
       <button class="btn slim gold" onclick="bonusSend('${jsq(key)}')">
         <span class="bl">Send bonus</span>
-        <span class="ba">queues to the smib</span></button>
+        <span class="ba">lands on the machine</span></button>
     </div>`);
 }
 async function bonusSend(key){
@@ -2729,8 +2768,11 @@ function koVerdict(r){
     return {ok:true, msg:String(r.detail||"reset reported ok").slice(0,120)};
   const raw=String(r.detail||r.result||"no reply");
   if(/unknown type/i.test(raw))
+    /* honest naming (2026-08-17): the stale part is CabiNet's own software,
+       and the fix lives where the problem is named — point at the Updates
+       card, never at a component or a command. */
     return {ok:false,
-      msg:"this smib predates the handpay reset — update sas_host"};
+      msg:"CabiNet needs an update — Settings ▸ Updates ▸ Update now"};
   return {ok:false, msg:raw.slice(0,120)};
 }
 function keyOffOpen(key){
@@ -2748,11 +2790,11 @@ function renderKeyOffModal(key){
     <p class="none" style="margin:0 0 10px">Keys a locked-up handpay off to
       the CREDIT METER — no paper, the attendant-key moment without the
       key. If the machine is not in a handpay lockup it will say so. The
-      verdict arrives with the smib's next report, about 2 seconds.</p>
+      machine answers in a moment.</p>
     <div class="btnrow">
       <button class="btn slim gold" onclick="keyOffSend('${jsq(key)}')">
         <span class="bl">🔑 Reset to credits</span>
-        <span class="ba">sends to the smib</span></button>
+        <span class="ba">sends to the machine</span></button>
     </div>
     ${koNote(KEYOFF[key])}`);
 }
@@ -2771,7 +2813,7 @@ async function keyOffSend(key){
   const sendingLive=cur&&cur.sending&&Date.now()-cur.at<10000;
   if(sendingLive||(cur&&cur.cmdId&&!cur.done)) return;
   KEYOFF[key]={sending:true, at:Date.now(),
-    msg:"Sending to the smib…", ok:true};
+    msg:"Sending to the machine…", ok:true};
   keyOffPaint(key);
   try{
     const r=await fetch("/api/sas/command",{method:"POST",
@@ -2783,14 +2825,16 @@ async function keyOffSend(key){
         msg:"Handpay reset — awaiting host update"};
     else if(j.ok&&j.id)
       KEYOFF[key]={cmdId:String(j.id), at:Date.now(), ok:true,
-        msg:"Queued — the smib answers with its next report (~2s)…"};
+        msg:"Queued — the machine answers in a moment…"};
     else if(j.ok)   // queued but no id to track — unexpected reply shape
       KEYOFF[key]={done:true, ok:true, msg:"Queued — watch the machine"};
     else{
       const err=String(j.error||("HTTP "+r.status));
+      /* same honest naming as koVerdict (2026-08-17): stale CabiNet, and
+         the fix is named where the problem is. */
       KEYOFF[key]={done:true, ok:false,
         msg:/legacy_bonus|unknown type/i.test(err)
-          ?"This hub predates the handpay reset — update the host"
+          ?"CabiNet needs an update — Settings ▸ Updates ▸ Update now"
           :"Refused · "+err.slice(0,120)};
     }
   }catch(e){
@@ -2826,7 +2870,10 @@ function keyOffCheck(j){
     if(!r){
       if(Date.now()-ko.at>45000){   // hub expires queued commands at 30s
         ko.done=true; ko.ok=false;
-        ko.msg="No verdict after 45s — is the smib reporting?";
+        /* hardware words (2026-08-17): the thing a collector can check is
+           the machine and its CabiNet box, not a process name */
+        ko.msg="No verdict after 45s — is the machine on and its "
+          +"CabiNet box connected?";
         keyOffPaint(key);
       }
       continue;
@@ -3660,6 +3707,20 @@ function renderPlayerFundModal(id){
 async function playerFundSend(id, sign){
   const mc=parseDollars(($("m-fund")||{}).value);
   if(!(mc>0)){toast("Type an amount first",false);return;}
+  /* pull-back pre-check (2026-08-17): refuse an overdraw HERE, with the
+     send-flow's friendly grammar — every refusal names the numbers — instead
+     of bouncing it off the hub for a raw error. Client-side nicety only:
+     the hub still enforces (our snapshot can lag a beat), this just makes
+     the common case read like a host, not a terminal. */
+  if(sign<0){
+    const p=playerById(id);
+    const bal=Number((p||{}).cashableMillicents||0);
+    if(mc>bal){
+      toast(((p&&p.name)||"That player")+" has "+fmtAmt(bal)
+        +" — can't pull back "+fmtAmt(mc)+". Try a smaller amount.",false);
+      return;
+    }
+  }
   const cents=Math.round(mc/1000);   // the fund action speaks CENTS
   const j=await playerPost({action:"fund", accountId:id, cents:sign*cents},
     (sign>0?"Fund ":"Pull back ")+fmtAmt(mc));
@@ -5240,7 +5301,14 @@ function renderUpdates(){
      ~3.5 min) — only a STALE ending-less log means an interrupted run. */
   const inflight=!doneLine&&tail.length>0
     &&u.logAgeSec!=null&&u.logAgeSec<300;
-  const busy=u.state==="running"||inflight||(UPDBUSY&&!doneLine);
+  /* BELT (2026-08-17): a wedged server-side "running" must not freeze the
+     card in an old tab forever. The transcript is the completion authority
+     (the rule above) — so when it carries its ending line AND the log has
+     gone cold (>~1000s, well past the verify window), the run is OVER no
+     matter what u.state says; that flag is in-memory hub state and a died
+     updater thread can leave it stuck until a restart. */
+  const wedged=!!doneLine&&u.logAgeSec!=null&&u.logAgeSec>1000;
+  const busy=(u.state==="running"&&!wedged)||inflight||(UPDBUSY&&!doneLine);
   if(doneLine) UPDBUSY=false;
   if(busy&&tail.length){
     const pct=rolling?100:Math.round(((lastIx+1)/UPD_PHASES.length)*100);

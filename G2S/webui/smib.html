@@ -30,9 +30,11 @@
 
      Behavior contract (mirrors glass.html):
        * carded=false while a menu is up -> attract (hub-side card-out wins)
-       * 4 consecutive poll failures -> attract + "hub offline" note, polling
+       * 4 consecutive poll failures -> attract + "Reconnecting" note, polling
          continues (honest note, self-heals on the next good reply)
-       * ok:false (hub disowns the egm) -> attract + the hub's own words
+       * ok:false (hub disowns the egm) -> attract + "reconnecting" for the
+         first ~2 min, then "not set up" (a hub restart disowns everyone
+         briefly; only a persistent not-known is worth a human's attention)
        * money moves (walletFund ADD, handpay CLEAR) go through the confirm
          dialog; hub refusals are surfaced verbatim, never papered over
        * logout tombstones its token (deadSess) so a stale in-flight poll
@@ -527,6 +529,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var POLL_MS = 1500;        // contract: ~1.5s state poll
   var DATA_MS = 2000;        // cashout live-data re-poll while its view is up
   var OFFLINE_AFTER = 4;     // contract: 4 failed polls -> offline note
+  var UNKNOWN_AFTER = 80;    // ~2 min of consecutive "not known" replies
+                             // (80 polls at 1.5s) before the attract note
+                             // escalates from "reconnecting" to "not set
+                             // up" — every hub restart disowns the whole
+                             // floor until machines re-register, and that
+                             // routine window must never read as a fault
+                             // to a guest (glass.html parity, 2026-08-17)
   var XHR_MS = 6000;         // watchdog abort on a wedged request
 
   // ---- page identity from our own URL (?egm=...) ------------------------
@@ -558,6 +567,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var deadSess = null;       // token we just logged out: a stale in-flight
                              // poll must NOT resurrect the menu with it
   var failStreak = 0, hubOffline = false;
+  var unknownStreak = 0;     // consecutive ok:false ("not known") replies;
+                             // gates the attract-note escalation. NOT reset
+                             // by transport failures — a flapping link must
+                             // not let a truly unprovisioned panel sit on
+                             // "reconnecting" forever; only an ok:true
+                             // state clears it.
   var hubNote = false;       // an ok:false note is painted; ok:true clears
   var view = '';             // which .view is showing
   var logoutBusy = false;
@@ -667,7 +682,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           if (failStreak >= OFFLINE_AFTER && !hubOffline) {
             hubOffline = true;
             if (view !== 'attract') { show('attract'); }
-            note('hub offline — retrying');
+            // guest wording, not plumbing: "hub offline" named a component
+            // no player has ever met (2026-08-17)
+            note('Reconnecting — back in a moment');
           }
         }
         window.setTimeout(poll, POLL_MS);
@@ -676,14 +693,24 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 
   function renderState(s) {
     if (s.ok === false) {
-      // hub answered but disowns us ("unknown egm") -> attract + say why
+      // hub answered but disowns us ("unknown egm"). This is ROUTINE, not a
+      // fault: every hub restart disowns the whole floor until each machine
+      // re-registers (a minute or two), so the raw hub wording ("hub:
+      // unknown egm") used to jargon-blast every guest on every restart.
+      // Paint "reconnecting" for the first ~2 min of persistent not-known;
+      // only a not-known that OUTLIVES that window is a real setup problem
+      // worth a human's attention (glass.html parity, 2026-08-17).
       sess = null;
       if (view !== 'attract') { show('attract'); }
-      note('hub: ' + (s.error || 'bad reply'));
+      unknownStreak++;
+      note(unknownStreak > UNKNOWN_AFTER
+        ? 'This screen isn’t set up yet — ask your host.'
+        : 'This machine is reconnecting…');
       hubNote = true;
       updateTexts();
       return;
     }
+    unknownStreak = 0;         // any owned state re-arms the grace window
     // a good state clears any lingering ok:false note; the hubOffline
     // recovery clear fires only ONCE and can be the very reply that
     // painted the note, so recovery is re-checked here (glass.html lesson)
@@ -775,10 +802,24 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     c = c || 0;
     var neg = c < 0; if (neg) { c = -c; }
     var d = Math.floor(c / 100), r = c % 100;
-    return (neg ? '-$' : '$') + d + '.' + (r < 10 ? '0' + r : '' + r);
+    // comma-group the dollars (house style: $1,061,910.00 — a Monopoly-scale
+    // balance must parse at a glance). Plain ES5 regex — this page keeps
+    // glass.html's engine floor, so no toLocaleString options (2026-08-17).
+    var ds = String(d).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return (neg ? '-$' : '$') + ds + '.' + (r < 10 ? '0' + r : '' + r);
   }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
+  // paint a money string; a below-zero amount goes RED (house rule: negative
+  // balances read red on every surface). '' hands the color back to the
+  // stylesheet (gold/white per element) so positives repaint exactly as
+  // before; #ff7a6e is the red that stays readable on this dark panel.
+  // Matches '-$' anywhere so prefixed strings catch too (glass.html parity).
+  function setMoney(id, s) {
+    setText(id, s);
+    setStyle($(id), 'color',
+      (s && s.indexOf('-$') !== -1) ? '#ff7a6e' : '');
+  }
   function sdot(a, b) {
     a = (a === null || a === undefined) ? '' : String(a);
     b = (b === null || b === undefined) ? '' : String(b);
@@ -788,6 +829,17 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (status === 403) { return 'Not permitted'; }
     if (status === 401) { return 'Session ended'; }
     return 'Could not load — try again';
+  }
+  // refusal wording for WRITE actions (the money paths) — dataErr's sibling.
+  // The hub owns the human wording: whenever it sent data.error, show that
+  // VERBATIM (the glass.html wl-toggle lesson) — never a developer
+  // "refused (HTTP nnn)" wrapper a guest must never see (2026-08-17). Only
+  // when the hub gave no words: 401 = the session died under us (a re-tap
+  // re-mints it), and the rest collapse to one honest retry line.
+  function actionErr(status, data) {
+    if (data && data.error) { return String(data.error); }
+    if (status === 401) { return 'Session ended — tap your card again'; }
+    return 'Couldn’t complete that — try again';
   }
   function fmtLink(v) {
     if (v === true) { return 'linked'; }
@@ -803,7 +855,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
 
   function updateTexts() {
-    var place = nick || egmId || '';
+    // Attract + menu headers show the NICKNAME only — never the EGM id
+    // (serial-derived; keeping it off menu screens makes machine photos
+    // shareable — the glass.html rule, applied here 2026-08-17). Admin
+    // diagnostics keep it: the MACHINE INFO panel's EGM ID row below.
+    var place = nick || '';
     var brand = brandName();
     setText('at-brand', brand);
     // Fit the attract brand on ONE line (1024px panel): step the size +
@@ -819,14 +875,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('at-nick', place);
     setText('ph-hello', 'Hello ' + (who || 'Player'));
     setText('ph-nick', place);
-    setText('ph-credits', credits || '');
+    // setMoney = setText + the red-negative rule (the hub pre-formats the
+    // string; a leading '-$' is the whole signal)
+    setMoney('ph-credits', credits || '');
     setStyle($('ph-credits'), 'display', credits ? 'block' : 'none');
     setStyle($('ph-cr-l'), 'display', credits ? 'block' : 'none');
     // the 320px identity column clips silently on very long balances at
     // 40px bold, so step the font DOWN: every digit stays on the panel
     setStyle($('ph-credits'), 'fontSize',
       (credits && credits.length > 13) ? '28px' : '40px');
-    setText('wl-bal', credits || '—');
+    setMoney('wl-bal', credits || '—');
     // the 320px balance column clips silently on long balances at 44px bold,
     // so step the font DOWN: every digit stays on the panel
     var wlLen = (credits || '—').length;
@@ -876,8 +934,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
           setText('lo-note', '');
           show('attract');
         } else {
-          setText('lo-note', 'hub refused (' +
-            (status > 0 ? 'HTTP ' + status : 'no reply') + ') — try again');
+          // hub said no (or nothing): surface its own words, never an
+          // HTTP-status wrapper (actionErr; guest wording, 2026-08-17)
+          setText('lo-note', actionErr(status, data));
         }
       });
   }
@@ -940,8 +999,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     coCanFund = (d.canFund === true);
     coCashToWat = (d.cashOutToWat === true);
     coHasWallet = (coWalletMc !== null) || coCanFund;
-    setText('co-mc-v', fmtMc(coMachineMc));
-    setText('co-wl-v', d.walletCredits ? String(d.walletCredits)
+    setMoney('co-mc-v', fmtMc(coMachineMc));
+    setMoney('co-wl-v', d.walletCredits ? String(d.walletCredits)
       : (coWalletMc === null ? '—' : fmtMc(coWalletMc)));
     setText('co-note', coHasWallet ? ''
       : 'Link a card to send your cash-out to your wallet.');
@@ -965,7 +1024,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     el.className = off ? (base + ' nb-off') : base;
   }
   function resetCashout() {
-    setText('co-mc-v', '—'); setText('co-wl-v', '—');
+    // setMoney (not setText) so a lingering red from a negative balance
+    // clears with the number
+    setMoney('co-mc-v', '—'); setMoney('co-wl-v', '—');
     setText('co-note', '');
     coCanFund = false; coHasWallet = false; coCashToWat = false;
     setToggleFace();
@@ -989,7 +1050,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     coCanFund = (d.canFund === true);
     coCashToWat = (d.cashOutToWat === true);
     coHasWallet = (coWalletMc !== null) || coCanFund;
-    setText('wl-mc-v', fmtMc(coMachineMc));
+    setMoney('wl-mc-v', fmtMc(coMachineMc));
     setText('wl-note', coHasWallet ? ''
       : 'Link a card to move money to and from your wallet.');
     paintWalletChips();
@@ -1237,9 +1298,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
         pendingConfirm = null;
         returnFrom(pc.back);
       } else {
-        setText('cf-note', 'hub refused (' +
-          (status > 0 ? 'HTTP ' + status : 'no reply') + ') — ' +
-          ((data && data.error) ? String(data.error) : 'try again'));
+        // money refusal: the hub's own wording VERBATIM when it gave any
+        // (it names the numbers), else one honest retry line; 401 = the
+        // session died under us (actionErr — applied to the shared
+        // ADD/CLEAR/CASH OUT confirm, 2026-08-17)
+        setText('cf-note', actionErr(status, data));
       }
     });
   }
@@ -1348,7 +1411,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 
   // ---- boot -----------------------------------------------------------------
   show('attract');
-  if (!egmId) { note('missing egm= in page URL'); }
+  // No machine identity in our URL -> this panel was never provisioned.
+  // A guest surface never explains URL anatomy — which query the kiosk
+  // should carry is the hub console's business, not a player's (2026-08-17).
+  if (!egmId) { note('This screen isn’t set up yet.'); }
   poll();
 })();
 </script>

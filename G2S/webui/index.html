@@ -5,8 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CabiNet · G2S Bench Console</title>
 <!--
-  G2S-36 Test Panel — the bench cockpit. Served by g2s_host.py at / (and
-  /webui/index.html). Single self-contained page: inline CSS + vanilla JS,
+  G2S-36 Test Panel — the bench cockpit. Served by g2s_host.py at /test (and
+  /webui/index.html); root / belongs to the Home UI since G2S-40, so this
+  page no longer claims it (stale claim fixed 2026-08-17).
+  Single self-contained page: inline CSS + vanilla JS,
   NO external/CDN assets (the slot VLAN is offline). Polls /api/status every
   2s and drives POST /api/command. Supersedes webui/console.html (first cut,
   still served at /console). Sized for the Pi's 800x480 DSI touchscreen and
@@ -40,10 +42,10 @@
   .spacer{flex:1}
   #poll{font:11px var(--mono);color:var(--dim);white-space:nowrap}
   #poll.err{color:var(--bad)}
-  #home-link{font:600 10px var(--sans);letter-spacing:.18em;color:var(--amber);
+  #home-link,#console-link{font:600 10px var(--sans);letter-spacing:.18em;color:var(--amber);
     text-decoration:none;border:1px solid var(--line);border-radius:12px;
     padding:4px 11px;white-space:nowrap}
-  #home-link:hover{border-color:var(--amber)}
+  #home-link:hover,#console-link:hover{border-color:var(--amber)}
 
   /* ---- machine section ------------------------------------------------ */
   main{padding:12px 14px;max-width:1500px;margin:0 auto}
@@ -247,7 +249,10 @@
   <span id="engine"></span>
   <span class="spacer"></span>
   <!-- G2S-40: the Home UI front door ( / prefers it; this panel stays at
-       /test — home.html links back here the same way) -->
+       /test — home.html links back here the same way). The /console link
+       (2026-08-17) closes the loop with the first-cut glass-windows console,
+       which links forward here the same way. -->
+  <a id="console-link" href="/console">← GLASS WINDOWS CONSOLE</a>
   <a id="home-link" href="/home">HOME UI</a>
   <span id="poll">connecting…</span>
 </header>
@@ -445,6 +450,7 @@ const GROUPS = [
 
 let TARGET = null;        // egmId the Test Panel drives
 let EGM_SIG = "";         // signature of the connected-machine set
+let NAMES = {};           // data.names — collector's machine names, keyed by egmId
 let ARMED = null;         // {btn, timer} for the two-step danger confirm
 const HTML_SIG = new WeakMap();  // element -> last innerHTML (skip no-op writes)
 const TAPE = [];
@@ -789,6 +795,9 @@ function renderBanner(el, s){
   const skewCls = skew==null ? "" : Math.abs(skew)>30 ? "bad" : Math.abs(skew)>5 ? "warn" : "ok";
   const cs = s.clockSync||{};
   const outFail = s.outboundFail||0;
+  /* Banner identity: the collector's name (data.names) fronts the .egmid
+     line, with the raw egmId demoted to a title= hover — desktop page, so
+     hovers exist. Name OR id, never both jammed together (2026-08-17). */
   setHTML(el, `
     <div class="lamps">
       <div class="lampu"><span class="lamp ${lampCls("link",s)}"></span><label>LINK</label>
@@ -799,7 +808,7 @@ function renderBanner(el, s){
         <span class="lval">${esc(s.commConfigStage||"—")}</span></div>
     </div>
     <div class="ident">
-      <div class="egmid">${esc(s.egmId)}</div>
+      <div class="egmid"${NAMES[s.egmId]?` title="${esc(s.egmId)}"`:""}>${esc(NAMES[s.egmId]||s.egmId)}</div>
       <div class="below">${s.joinedAt?`joined ${ago(s.joinedAt)}`:"not joined yet"}
         · onLine ×${s.commsOnLineSeen||0}</div>
     </div>
@@ -1227,8 +1236,20 @@ function renderTargets(egms){
 }
 
 function render(data){
-  // "activity" (the G2S-13 tape) and "_engine" are meta keys, not EGMs
-  const egms=Object.keys(data).filter(k=>k!=="_engine"&&k!=="activity"&&k!=="sas"&&k!=="names"&&k!=="uiStamp").sort();
+  NAMES=data.names||{};
+  const egms=Object.keys(data).filter(k=>{
+    const s=data[k];
+    /* A machine entry is an OBJECT carrying a commsState string; the meta
+       sections (_engine/activity/sas/names/tito/tournament/companions/
+       cardSessions/devices/glassSessions/hostOptions) and the scalar
+       watermarks (uiStamp/smibStamp/boardStamp) all fail that shape.
+       Structural predicate ported from home.html's egmList — the old
+       key-denylist here went stale each time /api/status grew a section and
+       every new one rendered as a phantom machine card (2026-08-17).
+       Deliberately WITHOUT home's join gate: the bench must show a machine
+       mid-first-handshake. */
+    return !!s && typeof s==="object" && typeof s.commsState==="string";
+  }).sort();
   const eng=data._engine||{};
   renderActivity(data.activity||[]);
   setHTML($("engine"),

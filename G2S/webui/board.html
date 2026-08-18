@@ -818,18 +818,32 @@ function maybeReload(){
 }
 
 /* ---- jackpot detection + fireworks -------------------------------------- */
+const hpAmt=h=>h?(Number(h.pendingCashableAmt)||0)+(Number(h.pendingPromoAmt)||0)
+   +(Number(h.pendingNonCashAmt)||0):null;
 function checkJackpots(){
   const now=new Set();
-  let sasPending=false;
   const sas=(S.status||{}).sas||{};
-  for(const k of Object.keys(sas))
-    if((sas[k]||{}).pendingHandpay){now.add("sas:"+k);sasPending=true;}
+  // leg → linked cabinet (one leg one owner): a linked cabinet's G2S entry
+  // carries sasLink in the status payload; invert it once so the dedupe and
+  // the takeover below both think PER-CABINET, never floor-wide.
+  const legOwner={};
   for(const egm of egmList()){
-    const pend=(S.status[egm]||{}).pendingHandpays||[];
-    // dual-leg dedupe (the home.html rule): while a SAS leg holds the
-    // lockup, the G2S copy of the SAME lockup is suppressed
-    if(pend.length&&!sasPending) now.add("g2s:"+egm);
-    if(pend.length&&sasPending){/* linked: SAS key carries the show */}
+    const l=(S.status[egm]||{}).sasLink;
+    if(l) legOwner[l]=egm;
+  }
+  for(const k of Object.keys(sas))
+    if((sas[k]||{}).pendingHandpay) now.add("sas:"+k);
+  for(const egm of egmList()){
+    const m=S.status[egm]||{};
+    const pend=m.pendingHandpays||[];
+    if(!pend.length) continue;
+    // dual-leg dedupe (the home.html rule), made per-cabinet 2026-08-17:
+    // suppress the G2S copy only while THIS cabinet's OWN linked SAS leg
+    // holds the lockup — that leg's key carries the show. The old global
+    // "any SAS lockup anywhere" check muted every other machine's
+    // celebration on the floor while one SAS machine sat pending.
+    if(m.sasLink&&(sas[m.sasLink]||{}).pendingHandpay) continue;
+    now.add("g2s:"+egm);
   }
   for(const key of now){
     if(jackActive.has(key)||firstPoll) continue;
@@ -837,18 +851,21 @@ function checkJackpots(){
     let amt=null, egm=null;
     if(key.startsWith("g2s:")){
       egm=key.slice(4);
-      const h=((S.status[egm]||{}).pendingHandpays||[])[0]||{};
-      amt=(Number(h.pendingCashableAmt)||0)+(Number(h.pendingPromoAmt)||0)
-         +(Number(h.pendingNonCashAmt)||0);
+      amt=hpAmt(((S.status[egm]||{}).pendingHandpays||[])[0]||{});
     }else{
-      // SAS lockup has no amount on the wire; borrow the freshest G2S
-      // record if a linked leg reported one this poll
-      for(const e of egmList()){
-        const h=((S.status[e]||{}).pendingHandpays||[])[0];
-        if(h){egm=e;amt=(Number(h.pendingCashableAmt)||0)
-          +(Number(h.pendingPromoAmt)||0)+(Number(h.pendingNonCashAmt)||0);break;}
-      }
-      if(!egm) egm=key.slice(4);
+      // SAS carries no amount on the wire (the latch is just since/code),
+      // so only THIS leg's own linked cabinet may lend its G2S record —
+      // "borrow the freshest record on the floor" (pre-2026-08-17) once
+      // put machine A's name and money on machine B's lockup. An unlinked
+      // leg, or a linked cabinet whose G2S copy hasn't landed this poll,
+      // celebrates by name alone: money correctness beats spectacle
+      // (celebrate() headlines "JACKPOT!" when amt is unknown, and
+      // nightSave keeps the record honest by storing null, not 0).
+      const leg=key.slice(4), owner=legOwner[leg];
+      if(owner){
+        egm=owner;
+        amt=hpAmt(((S.status[owner]||{}).pendingHandpays||[])[0]);
+      }else egm=leg;
     }
     celebrate(egm,amt);
   }

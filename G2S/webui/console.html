@@ -35,6 +35,10 @@
   #egm-select:focus{outline:none;border-color:var(--accent)}
   #egm-select option{background:var(--panel2);color:var(--txt)}
   #poll{font-size:12px;color:var(--dim)}
+  /* header cross-link to the newer bench cockpit at /test (2026-08-17) */
+  #test-link{font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;
+    border:1px solid var(--line);border-radius:20px;padding:4px 11px;white-space:nowrap}
+  #test-link:hover{border-color:var(--accent)}
   main{padding:16px;display:grid;gap:14px;
     grid-template-columns:repeat(auto-fit,minmax(320px,1fr));max-width:1600px;margin:0 auto}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -118,6 +122,7 @@
   <span class="spacer"></span>
   <span id="mcount-h" class="muted"></span>
   <select id="egm-select" title="Select machine"><option>—</option></select>
+  <a id="test-link" href="/test">Test Panel →</a>
   <span id="poll">—</span>
 </header>
 <main id="main">
@@ -403,9 +408,15 @@ function rebuildEgmSelect(egms, data){
     sel.innerHTML=egms.map(id=>`<option value="${esc(id)}"></option>`).join("");
     sel.onchange=()=>{CUR_EGM=sel.value; if(LAST_DATA) render(LAST_DATA);};
   }
+  const names=data.names||{};
   for(const opt of sel.options){
     const st=(data[opt.value]||{}).commsState||"—";
-    opt.textContent=`🎰 ${opt.value} · ${st}`;
+    /* The collector's own name (data.names) fronts the option; the raw id
+       demotes to a title= hover — desktop-only page, so hovers exist here.
+       Name OR id, never both jammed into the visible text (2026-08-17). */
+    const nm=names[opt.value];
+    opt.textContent=`🎰 ${nm||opt.value} · ${st}`;
+    opt.title=nm?opt.value:"";
   }
   if(CUR_EGM) sel.value=CUR_EGM;
   document.getElementById("mcount-h").textContent=
@@ -421,7 +432,19 @@ function badge(state){
 
 function render(data){
   LAST_DATA=data;
-  const egms=Object.keys(data).filter(k=>k!=="_engine"&&k!=="activity"&&k!=="sas"&&k!=="names"&&k!=="uiStamp");
+  const egms=Object.keys(data).filter(k=>{
+    const s=data[k];
+    /* A machine entry is an OBJECT carrying a commsState string; the meta
+       sections (_engine/activity/sas/names/tito/tournament/companions/
+       cardSessions/devices/glassSessions/hostOptions) and the scalar
+       watermarks (uiStamp/smibStamp/boardStamp) all fail that shape.
+       Discriminate structurally — same predicate as home.html's egmList —
+       because the old key-denylist went stale every time /api/status grew a
+       section, and each new one rendered here as a dead "🎰 tito · —"
+       phantom in the dropdown (2026-08-17). Deliberately WITHOUT home's
+       join gate: this bench page must show a machine mid-first-handshake. */
+    return !!s && typeof s==="object" && typeof s.commsState==="string";
+  });
   const eng=data._engine||{};
   if(!egms.length){
     document.getElementById("conn").className="pill bad";
@@ -517,7 +540,11 @@ function render(data){
       <span class="lb">${esc(e.label||e.eventCode)}
         <small>${esc(e.eventCode)} · ${esc(e.deviceClass)}/${esc(e.deviceId)}${e.affectedMeters?` · ${e.affectedMeters} meters`:""}${e.eventText?` · ${esc(e.eventText)}`:""}</small></span>
       <span class="tm">${esc(timeShort(e.seenAt))}</span></div>`).join("")
-    : '<p class="none">no events yet. On this AVP the event stream is gated behind ownership — run the ownership cycle, or trigger a door/bill once subscribed.</p>');
+    /* Empty-state wording: the old text told the operator to "run the
+       ownership cycle" to get events — DISPROVEN (subscriptions install at
+       join without it) and it disables play, so no action is recommended.
+       Events simply appear once the machine starts narrating (2026-08-17). */
+    : '<p class="none">no events yet — they show up once the machine has something to say: a door, a bill, a game played.</p>');
 }
 
 let LAST_ETAG=null;

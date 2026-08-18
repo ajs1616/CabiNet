@@ -33,6 +33,7 @@ Run from G2S/:  python3 g2s_host.py            (NO sudo — see bench checklist)
 import argparse
 import collections
 import errno
+import fcntl
 import hashlib
 import html
 import itertools
@@ -3563,10 +3564,23 @@ class AccountStore:
             if rec.get("kind") != "house":
                 for (field, _), d in zip(self.BUCKETS, deltas):
                     if int(rec.get(field, 0)) + d < 0:
+                        # This string reaches the operator's toast VERBATIM
+                        # (home.html passes hub refusals through), so it
+                        # speaks collector: the guest's name and two dollar
+                        # figures — never field names, ids, or millicents
+                        # (live-hit 2026-08-17: "insufficient
+                        # cashableMillicents on 'p2' (have 45903950000…)"
+                        # on a party surface). Same grammar as the proven
+                        # SAS aft gate. The invariant is unchanged: player
+                        # accounts may not go negative.
+                        have = int(rec.get(field, 0))
+                        kindword = {"promoMillicents": " in promo credits",
+                                    "nonCashMillicents":
+                                        " in non-cash credits"}.get(field, "")
                         return None, (
-                            f"insufficient {field} on {rec['id']!r} "
-                            f"(have {rec.get(field, 0)}, delta {d}) — "
-                            "player accounts may not go negative")
+                            f"{rec.get('name') or rec['id']} has "
+                            f"${have / 100000:,.2f}{kindword} — can't take "
+                            f"${-d / 100000:,.2f}. Try a smaller amount.")
             ts = now_iso()
             for (field, kind), d in zip(self.BUCKETS, deltas):
                 if d == 0:
@@ -4441,9 +4455,76 @@ class G2SHost:
         except Exception as e:
             return 1, "", str(e)
 
+    def _update_run_reconciled(self):
+        """Clear a stored update state=='running' whose run is provably DEAD;
+        True if cleared. Every pre-restart failure (failed gate, dirty tree,
+        dead network) used to wedge the card FOREVER: start_update sets
+        'running' and only process init ever cleared it — which only an
+        APPLIED update performs. The card froze on a full ruby bar with both
+        buttons dead, and the collector could not even retry (the single
+        worst 'feels unfinished' moment in the 2026-08-17 UI review).
+
+        Two liveness probes, both critic-hardened; NO bare staleness leg:
+        (1) the transcript carries a column-0 ✅/❌ outcome line — the run
+            WROTE ITS ENDING (start_update truncates the log at spawn, so a
+            live run can never carry a stale one; mid-run narration is
+            indented by design, column 0 is outcomes only — the same rule
+            the card's doneLine picker lives by);
+        (2) the updater's own .cabinet-update.lock flock probes FREE after a
+            ~60s grace from launch. The flock is authoritative — the kernel
+            drops it even on kill -9 — but update.py only takes it ~1-2s
+            into the run, so the grace keeps a genuinely starting run from
+            being declared dead. Log-staleness is deliberately NOT a probe:
+            a gate phase may legally sit silent longer than any threshold
+            (run() buffers child output, timeouts up to 900s), and a false
+            positive here would let a second run truncate the LIVE
+            transcript — the completion authority."""
+        with self.update_lock:
+            if self._update.get("state") != "running":
+                return False
+            started = self._update.get("startedTs") or 0.0
+        dead = False
+        try:
+            log_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data",
+                self.UPDATE_LOG)
+            with open(log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 8192))
+                tail = f.read().decode("utf-8", "replace")
+            dead = any(l.startswith(("✅", "❌"))
+                       for l in tail.splitlines())
+        except OSError:
+            pass
+        if not dead and time.time() - started > 60:
+            try:
+                lf = open(os.path.join(self._repo_dir(),
+                                       ".cabinet-update.lock"), "a+")
+                try:
+                    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                    dead = True
+                except OSError:
+                    pass        # held — the run is alive, leave it be
+                finally:
+                    lf.close()
+            except OSError:
+                pass
+        if not dead:
+            return False
+        with self.update_lock:
+            if self._update.get("state") != "running":
+                return False
+            self._update["state"] = None
+        log.warning("⬆️  update state 'running' reconciled to idle — the run "
+                    "is over (ending written or lock released); the card's "
+                    "buttons work again")
+        return True
+
     def update_state(self, check=False):
         """The Settings ▸ Updates payload. `check=True` is the only path that
         touches the network."""
+        self._update_run_reconciled()
         with self.update_lock:
             st = dict(self._update)
         # HEAD/isClone only move when deploy/update.py applies — which
@@ -4510,10 +4591,15 @@ class G2SHost:
         if not os.path.isfile(script):
             return {"ok": False, "error": "deploy/update.py is missing from "
                                           "this install"}
+        # A wedged 'running' must not block a retry forever — reconcile
+        # first (2026-08-17; the check-and-set below stays atomic under
+        # update_lock, so two simultaneous presses still race to ONE run).
+        self._update_run_reconciled()
         with self.update_lock:
             if self._update.get("state") == "running":
                 return {"ok": False, "error": "an update is already running"}
-            self._update.update(state="running", startedAt=now_iso())
+            self._update.update(state="running", startedAt=now_iso(),
+                                startedTs=time.time())
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "data", self.UPDATE_LOG)
         try:
@@ -13223,10 +13309,19 @@ class G2SHost:
             for (field, _), want in zip(AccountStore.BUCKETS,
                                         (cashable, promo, non_cash)):
                 if int(account.get(field, 0)) < want:
+                    # Toast-bound (the WAT twin of the AccountStore.adjust
+                    # wording, 2026-08-17): guest name + dollars, in the
+                    # proven SAS-gate grammar — never field names or raw
+                    # millicents on a party surface.
+                    have = int(account.get(field, 0))
+                    kindword = {"promoMillicents": " in promo credits",
+                                "nonCashMillicents":
+                                    " in non-cash credits"}.get(field, "")
                     return {"ok": False,
-                            "error": f"insufficient {field} on "
-                                     f"{account_id!r} (have "
-                                     f"{account.get(field, 0)}, want {want})"}
+                            "error": f"{account.get('name') or account_id} "
+                                     f"has ${have / 100000:,.2f}{kindword} — "
+                                     f"can't fund a ${want / 100000:,.2f} "
+                                     "push"}
         rid, rec = self.wat_store.new_request(
             assoc.egm_id, device_id, account_id, "G2S_payCredit",
             cashable, promo, non_cash)
