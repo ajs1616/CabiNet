@@ -123,7 +123,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.1.0"
+CABINET_VERSION = "0.2.0"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -319,7 +319,7 @@ TOURNAMENT_G2S_WON_METERS = ("G2S_egmPaidGameWonAmt",
 # Anything outside these answers an honest 403 — never a 500. The hub ALWAYS
 # forces the egmId from the token (a page can only ever act on its own
 # cabinet) and re-resolves access server-side (a stale glass never decides).
-GLASS_BASE_ACTIONS = ("logout",)
+GLASS_BASE_ACTIONS = ("logout", "hideGlass")
 GLASS_WALLET_ACTIONS = ("walletFund", "cashOutToWallet", "cashOutNow")
 GLASS_ADMIN_ACTIONS = ("clearHandpay", "refreshGames")
 # 0x74 "available transfers" bit for machine->host cash-out (real SAS 6.02
@@ -889,6 +889,23 @@ def event_meta(code):
             "icon": icon}
 
 
+# ---- money symbol (Settings ▸ Gameroom ▸ Currency) -------------------------
+# ONE process-wide value so the module-level formatters (denom_dollars) and
+# every engine f-string agree. The engine sets it from the host setting at
+# startup / on change, or adopts the cabinet's own currencyId (cabinetProfile)
+# when no setting is stored — a European floor showed "$500,000.00" on the
+# glass next to a machine paying "€29.800,00" (live-hit 2026-09-12).
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CAD": "$", "AUD": "$",
+                    "NZD": "$", "JPY": "¥", "CHF": "CHF ", "SEK": "kr ",
+                    "NOK": "kr ", "DKK": "kr ", "PLN": "zł "}
+_MONEY = {"symbol": "$", "source": "default"}   # source: setting|machine|default
+
+
+def money_symbol():
+    """The symbol every money string on every surface leads with."""
+    return _MONEY["symbol"]
+
+
 def denom_dollars(millicents):
     """G2S millicents -> a human note/denom label: 2000000 -> '$20',
     25000 -> '$0.25'. Best-effort — a garbage value echoes back verbatim
@@ -899,8 +916,8 @@ def denom_dollars(millicents):
     except (TypeError, ValueError):
         return str(millicents)
     if mc % 100000 == 0:
-        return f"${mc // 100000:,}"
-    return f"${mc / 100000:,.2f}"
+        return f"{money_symbol()}{mc // 100000:,}"
+    return f"{money_symbol()}{mc / 100000:,.2f}"
 
 
 # ----------------------------------------------------------------------------
@@ -932,7 +949,16 @@ EVENT_HOOK_CODES = {
     # (~300ms to the hub), so the HUB is the app that controls it: the
     # service_button hook toggles the resident glass menu (AJ's design —
     # the cabinet's own button opens the player panel).
+    # CBE302 Service Lamp Off is a press as well (bench 2026-09-14, IGT
+    # CrystalCurve/CrystalSlant, Windows-era): those cabinets narrate only
+    # LAMP TRANSITIONS, never the press itself. With "application handles
+    # service button" = NO the lamp toggles per press (301, 302, 301, ...)
+    # and every press reaches the hub; with YES the lamp goes on at the
+    # first press and never off again (only EMDI content could clear it),
+    # so the button worked exactly once per cabinet. The hook toggles the
+    # menu off its own visibility belief, never off the lamp state.
     "G2S_CBE301": ("service_button", {}),
+    "G2S_CBE302": ("service_button", {}),
     # tilt — §3.24.9 General Cabinet Tilt (live-proven overnight 2026-07-02)
     # and §3.24.13 Cabinet Tilt Cleared
     "G2S_CBE309": ("tilt", {}),
@@ -1794,7 +1820,12 @@ class EgmAssociation:
         # idempotent). glass_button_ts debounces CBE301 bursts (a press
         # can chirp several events).
         self.glass_visible = False
+        # HIDE WINDOW pressed on the glass (2026-09-14): the ONLY state in
+        # which a same-fob re-tap means 'show my menu again' instead of
+        # card-out. Any hub-driven show/hide clears it.
+        self.glass_hidden_by_player = False
         self.glass_button_ts = 0.0
+        self.glass_button_code = ""     # last event code the hook acted on
         # voucher device picture (G2S-39 companion): nested "status"/
         # "profile" replaced wholesale by the voucherStatus/voucherProfile
         # response handlers — the device-level view beside the VoucherStore's
@@ -1890,7 +1921,12 @@ class EgmAssociation:
         # visibility belief resets to unknown-hidden; the button toggle
         # self-corrects in one press if the window survived visible
         self.glass_visible = False
+        # HIDE WINDOW pressed on the glass (2026-09-14): the ONLY state in
+        # which a same-fob re-tap means 'show my menu again' instead of
+        # card-out. Any hub-driven show/hide clears it.
+        self.glass_hidden_by_player = False
         self.glass_button_ts = 0.0
+        self.glass_button_code = ""     # last event code the hook acted on
         # The window census asks each window ONCE per join (not on a timer —
         # nothing about this class polls). Clearing the asked-set here is
         # what makes a rejoin the retry: a window that stayed silent last
@@ -3612,8 +3648,8 @@ class AccountStore:
                                         " in non-cash credits"}.get(field, "")
                         return None, (
                             f"{rec.get('name') or rec['id']} has "
-                            f"${have / 100000:,.2f}{kindword} — can't take "
-                            f"${-d / 100000:,.2f}. Try a smaller amount.")
+                            f"{money_symbol()}{have / 100000:,.2f}{kindword} — can't take "
+                            f"{money_symbol()}{-d / 100000:,.2f}. Try a smaller amount.")
             ts = now_iso()
             for (field, kind), d in zip(self.BUCKETS, deltas):
                 if d == 0:
@@ -3926,6 +3962,9 @@ class G2SHost:
         # tables migrate here in a later phase; this slice is names only.
         self.hub_store = HubStore(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "data", "hub.db"))
+        # Money symbol: the stored setting wins; else the first cabinet's
+        # currencyId adopts it when its profile arrives (refresh_currency).
+        self.refresh_currency()
         # hub.db phase 2: the ONE cross-machine redemption authority — the
         # union of the VoucherStore (G2S-issued ids, delegated untouched)
         # and the hub's SQLite tito ledger (SAS-minted tickets). Every
@@ -6398,7 +6437,7 @@ class G2SHost:
             self.event_hooks.fire("money_hold", {
                 "hook": "money_hold", "egmId": machine, "code": None,
                 "label": (f"🚨 UNHOMED cash-out HOLD — "
-                          f"${int(millicents) / 100000:.2f} off {machine} "
+                          f"{money_symbol()}{int(millicents) / 100000:.2f} off {machine} "
                           f"(txn {txn}): {why}"),
                 "category": "money", "icon": "🚨",
                 "dateTime": now_iso(), "device": path,
@@ -6896,6 +6935,19 @@ class G2SHost:
                      prev.get("name"))
             return
         if prev and prev.get("uid") == uid:
+            # Re-tap of the SAME fob: card-OUT — unless the player hid the
+            # menu with the glass's HIDE WINDOW button (2026-09-14). Then
+            # the re-tap means "bring my menu back", never a logout: a tap
+            # that logged out would kill the session the button exists to
+            # protect (and everything tracked against it). A VISIBLE menu
+            # re-tapped still logs out — the fob stays the light switch.
+            if getattr(assoc, "glass_hidden_by_player", False):
+                assoc.glass_hidden_by_player = False
+                self._glass_follow(assoc, True)
+                log.info("💳 [%s] re-tap by %s (%s) — the menu was hidden, "
+                         "showing it again (session kept)", egm_id,
+                         prev.get("name"), uid)
+                return
             self._glass_card_out(egm_id)            # re-tap = card-out
             log.info("💳 [%s] card OUT — %s (%s)", egm_id,
                      prev.get("name"), uid)
@@ -6954,18 +7006,26 @@ class G2SHost:
         self._glass_follow(assoc, True)
 
     def _glass_service_button(self, info):
-        """service_button hook (G2S_CBE301): the cabinet's own SERVICE
-        button toggles the glass menu — AJ's design, live-adjudicated
-        2026-07-10: with the operator's 'app controls service button'
-        enabled the AVP does NOT drive the window itself, it narrates each
-        press as CBE301 (~300ms), so the hub IS the app. Toggle keys off
-        the glass_visible belief (self-correcting — the verbs are
-        idempotent); bursts debounce (one press chirps several CBE301s);
-        and a press with NO resident SPA runs the recovery push instead —
-        the button self-heals the page after a media-system wipe. Runs on
-        the eventReport handler thread OUTSIDE assoc.lock (the hook
-        contract): quick, never raises (fire() also guards)."""
+        """service_button hook (G2S_CBE301 lamp on / CBE302 lamp off):
+        the cabinet's own SERVICE button toggles the glass menu — AJ's
+        design, live-adjudicated 2026-07-10: with the operator's 'app
+        controls service button' enabled the QNX AVP does NOT drive the
+        window itself, it narrates each press as CBE301 (~300ms), so the
+        hub IS the app. The Windows-era cabinets (CrystalCurve/CrystalSlant,
+        bench 2026-09-14) narrate lamp TRANSITIONS only, so there the
+        operator setting must be NO (lamp toggles per press: 301, 302,
+        301, ...) and both codes are a press. Toggle keys off the
+        glass_visible belief (self-correcting — the verbs are idempotent),
+        never off the lamp: HIDE WINDOW on the glass desyncs the two on
+        purpose. Bursts debounce (one press chirps several CBE301s on the
+        AVP) — but only a REPEAT of the same code; the opposite code is a
+        new press by definition, even 1.5s after the last one. A press
+        with NO resident SPA runs the recovery push instead — the button
+        self-heals the page after a media-system wipe. Runs on the
+        eventReport handler thread OUTSIDE assoc.lock (the hook contract):
+        quick, never raises (fire() also guards)."""
         egm_id = info.get("egmId") or ""
+        code = str(info.get("code") or "")
         with self.assoc_lock:
             assoc = self.associations.get(egm_id)
         if assoc is None or assoc.comms_state != "onLine":
@@ -6976,9 +7036,11 @@ class G2SHost:
         dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
-            if now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC:
+            if (now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC
+                    and code == assoc.glass_button_code):
                 return
             assoc.glass_button_ts = now
+            assoc.glass_button_code = code
             push = assoc.glass_push.get(dev)
             resident = bool(push and push.get("stage") == "shown"
                             and GLASS_PAGE in str(push.get("uri") or ""))
@@ -6999,8 +7061,27 @@ class G2SHost:
         else:
             self.enqueue_show_media_display(assoc, dev)
         assoc.glass_visible = not visible
+        assoc.glass_hidden_by_player = False
         log.info("🛎️ [%s] service button: %s the menu (dev=%s)",
                  egm_id, "hide" if visible else "SHOW", dev)
+
+    def _glass_page_live(self, assoc):
+        """True when the glass page is KNOWN to be in the window: a push
+        that completed this epoch, or a fresh src=spa heartbeat from the
+        page itself. The same test _glass_follow applies before touching
+        the wire — factored out for the re-tap rule (2026-09-14)."""
+        if assoc is None:
+            return False
+        dev = self.glass_target_device(assoc)
+        now = time.time()
+        with assoc.lock:
+            push = assoc.glass_push.get(dev)
+            resident = bool(push and push.get("stage") == "shown"
+                            and GLASS_PAGE in str(push.get("uri") or ""))
+        spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+        return resident or (spa.get("dev") == dev
+                            and now - (spa.get("ts") or 0)
+                            <= GLASS_SPA_LIVE_SEC)
 
     def _glass_follow(self, assoc, visible):
         """GLASS_FOLLOW_CARD: show the resident SPA's window at card-IN,
@@ -7031,6 +7112,7 @@ class G2SHost:
         else:
             self.enqueue_hide_media_display(assoc, dev)
         assoc.glass_visible = visible
+        assoc.glass_hidden_by_player = False
         log.info("🪟 [%s] glass follows card: %s dev=%s (game %s)",
                  assoc.egm_id, "show" if visible else "hide", dev,
                  "shares the screen" if visible else "full screen")
@@ -8178,6 +8260,43 @@ class G2SHost:
             return bool(acct.get("admin"))
         return str(tier or "") in ("attendant", "manager")
 
+    def any_cabinet_currency(self):
+        """The currencyId of the first machine that has reported a
+        cabinetProfile, or None — the floor's own answer to "which money"."""
+        lock = getattr(self, "assoc_lock", None)   # __init__ asks before
+        if lock is None:                            # the floor exists
+            return None
+        with lock:
+            assocs = list(self.associations.values())
+        for a in assocs:
+            with a.lock:
+                code = (a.cabinet.get("profile") or {}).get("currencyId")
+            if code:
+                return str(code)
+        return None
+
+    def refresh_currency(self, cabinet_currency=None):
+        """Settings ▸ Gameroom ▸ Currency. An explicit host setting wins;
+        else the machines' own currencyId (cabinetProfile) is adopted; else
+        '$'. Idempotent, logs only on a change."""
+        try:
+            sym = (self.hub_store.host_setting("currency_symbol", "")
+                   or "").strip()
+        except Exception:   # noqa: BLE001 — a db fault keeps the last symbol
+            sym = ""
+        if sym:
+            new = (sym, "setting")
+        else:
+            code = str(cabinet_currency or self.any_cabinet_currency()
+                       or "").upper()
+            new = ((CURRENCY_SYMBOLS[code], "machine")
+                   if code in CURRENCY_SYMBOLS else ("$", "default"))
+        if (new[0], new[1]) != (_MONEY["symbol"], _MONEY["source"]):
+            _MONEY["symbol"], _MONEY["source"] = new
+            log.info("💱 money symbol %r (%s)%s", new[0], new[1],
+                     " — Settings ▸ Gameroom overrides" if new[1] == "machine"
+                     else "")
+
     def glass_state(self, egm_id, peer=None, src=None, dev=None):
         """GET /api/glass/state?egm= — the resident SPA's ~1.5s poll: the
         carded/attract flip plus the session token for THIS egm (token
@@ -8231,7 +8350,25 @@ class G2SHost:
         except Exception:   # noqa: BLE001 — a db fault must not kill the poll
             gameroom = ""
         out = {"ok": True, "egmId": egm_id, "nick": nick, "carded": False,
-               "gameroom": gameroom, "uiBuild": self._glass_ui_build()}
+               "gameroom": gameroom, "uiBuild": self._glass_ui_build(),
+               "currency": money_symbol()}
+        # The window this page lives in, as the cabinet described it in the
+        # profile census — the page picks its layout (tall strip vs wide
+        # band) from its own viewport first and falls back to this when the
+        # renderer won't say (a CrystalCurve's Service Window is 840x292 at
+        # the bottom, the AVP's is 256x1024 at the left; live-hit 2026-09-12).
+        try:
+            with assoc.lock:
+                prof = dict(((assoc.media.get(str(dev or "")) or {})
+                             .get("mediaDisplayProfile")) or {})
+            gw, gh_ = int(prof.get("contentWidth") or 0), \
+                int(prof.get("contentHeight") or 0)
+            if gw > 0 and gh_ > 0:
+                out["glassWindow"] = {
+                    "dev": str(dev or ""), "w": gw, "h": gh_,
+                    "position": str(prof.get("mediaDisplayPosition") or "")}
+        except Exception:   # noqa: BLE001 — a hint, never the poll
+            pass
         with self.companion_lock:
             card = self.card_sessions.get(egm_id)
             card = dict(card) if card else None
@@ -8323,7 +8460,7 @@ class G2SHost:
             if acct is not None and acct.get("kind") == "player":
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["creditsMc"] = mc
-                out["credits"] = f"${mc / 100000:,.2f}"
+                out["credits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 if str(acct.get("name") or "").strip():
                     out["name"] = acct.get("name")
         except Exception as e:  # noqa: BLE001 — poll keeps answering
@@ -8532,7 +8669,7 @@ class G2SHost:
             if acct is not None and acct.get("kind") == "player":
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["walletMc"] = mc
-                out["walletCredits"] = f"${mc / 100000:,.2f}"
+                out["walletCredits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 out["canFund"] = True
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
@@ -8562,7 +8699,7 @@ class G2SHost:
                 amt = v.get("amountMillicents")
                 tickets.append({
                     "id": v.get("validationId"),
-                    "amount": f"${(amt or 0) / 100000:,.2f}"
+                    "amount": f"{money_symbol()}{(amt or 0) / 100000:,.2f}"
                     if amt is not None else "",
                     "state": v.get("state"),
                     "when": (v.get("redeemedAt") or v.get("issuedAt")
@@ -8582,7 +8719,7 @@ class G2SHost:
                     mc = t.get("amountMc")
                     tickets.append({
                         "id": t.get("canonical") or t.get("vn16"),
-                        "amount": f"${(mc or 0) / 100000:,.2f}"
+                        "amount": f"{money_symbol()}{(mc or 0) / 100000:,.2f}"
                         if mc is not None else "",
                         "state": t.get("state"),
                         "when": (t.get("redeemedAt") or t.get("issuedAt")
@@ -8609,7 +8746,7 @@ class G2SHost:
                            + int(r.get("pendingPromoAmt") or 0)
                            + int(r.get("pendingNonCashAmt") or 0))
                     pending.append({
-                        "amount": f"${amt / 100000:,.2f}",
+                        "amount": f"{money_symbol()}{amt / 100000:,.2f}",
                         "type": r.get("handpayType"),
                         "when": r.get("handpayDateTime") or r.get("seenAt")})
                 can_clear = bool(recs) and online
@@ -8761,8 +8898,8 @@ class G2SHost:
         if have < cents * 1000:
             return 400, {"ok": False,
                          "error": f"{acct.get('name') or account_id} has "
-                                  f"${have / 100000:.2f} — can't fund a "
-                                  f"${cents / 100:.2f} push"}
+                                  f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                                  f"{money_symbol()}{cents / 100:.2f} push"}
         # SAS-linked leg = the meter/money authority while linked (the
         # sendCredits `sm` branch): route the push there in CENTS.
         leg = self.sas_links.get(egm_id)
@@ -8788,7 +8925,7 @@ class G2SHost:
                                           f"has ${avail / 100000:.2f} "
                                           "available (a fund is already in "
                                           f"flight) — can't fund a "
-                                          f"${cents / 100:.2f} push"}
+                                          f"{money_symbol()}{cents / 100:.2f} push"}
                 self._glass_fund_reserves.append(resv)
             cmd = {"id": f"glass{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_transfer", "cents": cents,
@@ -18613,6 +18750,8 @@ class G2SHost:
                      "timeZone=%s", assoc.egm_id, data.get("currencyId"),
                      data.get("localeId"), data.get("machineNum"),
                      data.get("timeZoneOffset"))
+            # No stored currency setting -> the floor follows its machines.
+            self.refresh_currency(data.get("currencyId"))
 
         elif cmd == "dateTime" and stype == "G2S_response":
             el = req["commandEl"]
@@ -19569,7 +19708,7 @@ class G2SHost:
             }
             dup = self.voucher_store.record_voucher(assoc.egm_id, rec)
             try:
-                dollars = f"${int(rec['voucherAmt']) / 100000:,.2f}"
+                dollars = f"{money_symbol()}{int(rec['voucherAmt']) / 100000:,.2f}"
             except (TypeError, ValueError):
                 dollars = f"amt={rec['voucherAmt']}"
             if dup:
@@ -19661,7 +19800,7 @@ class G2SHost:
                     if id_number:
                         rrec["idNumber"] = id_number
                 try:
-                    dollars = f"${int(dec['amt']) / 100000:,.2f}"
+                    dollars = f"{money_symbol()}{int(dec['amt']) / 100000:,.2f}"
                 except (TypeError, ValueError):
                     dollars = f"amt={dec['amt']}"
                 if exc == 0:
@@ -19763,7 +19902,7 @@ class G2SHost:
                     else:
                         assoc.redeem_rejected_count += 1
             try:
-                dollars = f"${int(rec['transferAmt']) / 100000:,.2f}"
+                dollars = f"{money_symbol()}{int(rec['transferAmt']) / 100000:,.2f}"
             except (TypeError, ValueError):
                 dollars = f"transferAmt={rec['transferAmt']}"
             if dup:
@@ -21614,6 +21753,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # host". The product name never appears either way.
                         "lockBrandGameroom": engine.hub_store.host_setting(
                             "lock_brand_gameroom", "0") == "1",
+                        # Money symbol in force + where it came from
+                        # (setting | machine | default) — Settings ▸ Gameroom
+                        # ▸ Currency; "" stored = follow the machines.
+                        "currencySymbol": money_symbol(),
+                        "currencySymbolSource": _MONEY["source"],
+                        "currencySymbolSetting": engine.hub_store.host_setting(
+                            "currency_symbol", "") or "",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
                         # current balance (so Options ▸ House Bankroll prefills) and
                         # whether it may run negative. The Bank is just bankroll
@@ -22929,6 +23075,26 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             return self._send(status, json.dumps(payload),
                               "application/json", soap=False)
 
+        if action == "hideGlass":
+            # HIDE WINDOW on the glass (2026-09-14): the game goes full
+            # screen, the SESSION STAYS. A second fob tap used to be the
+            # only way to get the menu off the screen — and that logged the
+            # player out, killing the session (and anything tracked against
+            # it). Reopen: a re-tap of the same fob (see _card_session_tap)
+            # or the cabinet's SERVICE button where it still narrates.
+            with engine.assoc_lock:
+                assoc = engine.associations.get(egm_id)
+            if assoc is None or assoc.comms_state != "onLine":
+                return done(200, {"ok": False,
+                                  "error": "this machine is offline"})
+            dev = engine.glass_target_device(assoc)
+            engine.enqueue_hide_media_display(assoc, dev)
+            assoc.glass_visible = False
+            assoc.glass_hidden_by_player = True
+            log.info("🪟 [%s] glass hidden by the player (%s) — session "
+                     "kept; re-tap or SERVICE brings it back", egm_id, uid)
+            return done(200, {"ok": True, "hidden": True})
+
         if action == "logout":
             if is_overlay_tok:
                 # "Done" on an admin overlay ENDS THE OVERLAY, it does not log
@@ -23167,7 +23333,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 reissued = r["collision"] == "reissued"
                 prior_mc = int(r.get("priorAmountMc") or 0)
                 label = (f"⚠️ Ticket number {vn} was reused — re-issued for "
-                         f"${cents / 100:.2f} (prior ${prior_mc / 100000:.2f} "
+                         f"{money_symbol()}{cents / 100:.2f} (prior {money_symbol()}{prior_mc / 100000:.2f} "
                          f"{r.get('priorState')}); paper is redeemable"
                          if reissued else
                          f"⛔ Ticket number {vn} reused while a live ticket "
@@ -23558,8 +23724,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             have = int(acct.get("cashableMillicents") or 0)
             if have < mc:
                 return bad(400, f"{acct.get('name') or account_id} has "
-                                f"${have / 100000:.2f} — can't fund a "
-                                f"${cents / 100:.2f} push (players can't "
+                                f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                                f"{money_symbol()}{cents / 100:.2f} push (players can't "
                                 "go negative)")
         # C5 parity: an operator-disabled leg refuses at the hub edge (the
         # parked satellite would only answer with an honest rejection).
@@ -23850,8 +24016,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         return self._send(400, json.dumps(
                             {"ok": False, "error":
                              f"{acct.get('name') or account_id} has "
-                             f"${have / 100000:.2f} — can't fund a "
-                             f"${cents / 100:.2f} push (players can't go "
+                             f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                             f"{money_symbol()}{cents / 100:.2f} push (players can't go "
                              "negative)"}),
                             "application/json", soap=False)
                 cmd["accountId"] = account_id
@@ -24247,6 +24413,20 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                      f"{MAX_GAMEROOM_NAME_LEN} characters")
                 engine.hub_store.set_host_setting("gameroom_name", gn)
                 out["gameroomName"] = gn or None      # cleared echoes null
+            if "currencySymbol" in req:
+                # Settings ▸ Gameroom ▸ Currency: the symbol every money
+                # string leads with, on every surface (hub UI, glass, SMIB
+                # screen, lock/handpay text). "" clears it -> the floor
+                # follows its machines' currencyId again (refresh_currency).
+                cs = req.get("currencySymbol")
+                if not isinstance(cs, str):
+                    raise ValueError("currencySymbol must be a string")
+                cs = re.sub(r"[\x00-\x1f\x7f]", "", cs).strip()
+                if len(cs) > 4:
+                    raise ValueError("currencySymbol must be <= 4 characters")
+                engine.hub_store.set_host_setting("currency_symbol", cs)
+                engine.refresh_currency()
+                out["currencySymbol"] = money_symbol()
             if "boardEnabled" in req:
                 # Gameroom Board toggle (Settings ▸ Gameroom board). Strict
                 # boolean; stored "1"/"0"; the board page reads it live off

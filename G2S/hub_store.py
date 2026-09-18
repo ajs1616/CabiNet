@@ -135,7 +135,12 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # collector's gameroom name in lights, absent/"0" = the
                      # neutral "the host". The product name never appears
                      # either way (AJ, 2026-08-18).
-                     "lock_brand_gameroom")
+                     "lock_brand_gameroom",
+                     # The money symbol every amount leads with, on every
+                     # surface; "" = follow the machines' own currencyId
+                     # (a European floor showed "$" next to a machine paying
+                     # in euro, 2026-09-12).
+                     "currency_symbol")
 TICKET_TEXT_KEYS = ("ticket_prop_name", "ticket_line1", "ticket_line2",
                     "ticket_title_cash")
 MAX_TICKET_FIELD_LEN = 64

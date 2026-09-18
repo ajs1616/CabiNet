@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2.0
+- **The on-glass player screen now fits wide, low windows** such as the
+  service window at the bottom of an IGT CrystalCurve (840×292). The hub
+  passes the machine's own description of the window to the screen and
+  it lays itself out as a wide band: balance and greeting on the left,
+  buttons in a grid on the right, a two-row keypad. Machines with the
+  tall side window (the AVP) are untouched.
+- **Currency is now a setting.** Settings ▸ Gameroom ▸ Money symbol:
+  leave it blank and the floor follows the machines' own currency
+  (a euro machine shows €), or type a symbol to force one. Every amount
+  on every screen follows it — the hub UI, the player glass, the SMIB
+  screen, and the wording of lock and handpay messages.
+- Machine info on the player screen now shows the window size and
+  layout it is using, which helps when a screen looks wrong.
+- **HIDE WINDOW on the player screen.** A carded player can now put the
+  game back to full screen without logging out: the new HIDE WINDOW
+  button (next to LOG OUT) hides the service window while the session
+  stays open, so everything tracked against it (balance, points, the
+  running game) continues. Until now a second tap of the fob was the
+  only way to get the menu off the screen, and that logged the player
+  out.
+- **Tapping the same fob again brings the hidden menu back** instead of
+  logging out. A tap on a menu that is still on screen keeps its old
+  meaning (log out), and a different fob still switches players.
+- Admin fobs, which see nine buttons, get a denser grid so the extra
+  button still fits on both the tall side window and the wide bottom
+  band.
+- **The SERVICE button now works every time on IGT's Windows-era cabinets**
+  (CrystalCurve, CrystalSlant). Those machines only tell the hub when the
+  service lamp goes on or off, not when the button is pressed. With the
+  operator setting "Application handles service button" on YES the lamp
+  came on at the first press and stayed on, so the button opened the menu
+  once and then went dead. Set it to **NO** on these cabinets (see
+  deploy/AVP_SETUP.md): the lamp then toggles with every press and the hub
+  opens or closes the menu on both the "lamp on" and the "lamp off" report.
+  The original AVP keeps working with YES.
+- Two presses close together are still treated as one, but a press that
+  flips the lamp the other way always counts, even right after the last one.
+
 ## v0.1.0
 First explicit version number: the host now reports it (with its platform and
 its own address) in the `_engine` block of `/api/status`.

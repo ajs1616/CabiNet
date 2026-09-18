@@ -584,6 +584,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var gmData = null;                 // last games payload (grouped by game)
   var gmGame = -1;                   // drilled-into game index, -1 = list
   var pendingConfirm = null;         // {body, back} armed for the confirm view
+  var CUR = '$';                     // money symbol; the state poll's
+                                     // "currency" (hub setting or the
+                                     // machine's currencyId) overrides it
   var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (walletFund sends it)
@@ -717,6 +720,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (hubNote) { hubNote = false; note(''); }
     if (s.nick !== undefined) { nick = s.nick || ''; }
     if (s.gameroom !== undefined) { gameroom = s.gameroom || ''; }
+    if (s.currency && s.currency !== CUR) { CUR = s.currency; repaintCurrency(); }
     if (s.egmId) { egmId = s.egmId; }   // hub-canonical casing wins
     // uiBuild (AVP page mtime) is ignored here; smibStamp is THIS page's
     // mtime. This panel is a kiosk with no keyboard, so it self-reloads when
@@ -806,10 +810,18 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // balance must parse at a glance). Plain ES5 regex — this page keeps
     // glass.html's engine floor, so no toLocaleString options (2026-08-17).
     var ds = String(d).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-    return (neg ? '-$' : '$') + ds + '.' + (r < 10 ? '0' + r : '' + r);
+    return (neg ? '-' + CUR : CUR) + ds + '.' + (r < 10 ? '0' + r : '' + r);
   }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
+  // the preset chips are static HTML ("$1 $5 $20"); repaint them and the
+  // live amount button whenever the hub's money symbol changes
+  function repaintCurrency() {
+    for (var i = 0; i < 3; i++) {
+      setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
+    }
+    setText('wl-custom', fmtCents(selCents));
+  }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
   // stylesheet (gold/white per element) so positives repaint exactly as
@@ -818,7 +830,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function setMoney(id, s) {
     setText(id, s);
     setStyle($(id), 'color',
-      (s && s.indexOf('-$') !== -1) ? '#ff7a6e' : '');
+      (s && s.indexOf('-' + CUR) !== -1) ? '#ff7a6e' : '');
   }
   function sdot(a, b) {
     a = (a === null || a === undefined) ? '' : String(a);

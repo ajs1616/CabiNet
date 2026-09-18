@@ -802,10 +802,14 @@ function fmtDur(sec){
   return Math.floor(sec/86400)+"d";
 }
 function ago(iso){const t=Date.parse(iso);return isNaN(t)?"—":fmtDur((Date.now()-t)/1000)+" ago";}
+/* the money symbol every amount leads with — Settings ▸ Gameroom ▸ Currency,
+   or the machines' own currencyId (hostOptions.currencySymbol); "$" until
+   the first status poll lands */
+function CUR(){ return String((((S.status||{}).hostOptions||{}).currencySymbol)||"$"); }
 function fmtAmt(mc){ // millicents on the wire: 100000 = $1.00
-  const n=Number(mc); if(!isFinite(n)) return "$ —";
+  const n=Number(mc); if(!isFinite(n)) return CUR()+" —";
   const neg=n<0, a=Math.abs(n);
-  return (neg?"−$":"$")+(a/100000).toLocaleString("en-US",
+  return (neg?"−"+CUR():CUR())+(a/100000).toLocaleString("en-US",
     {minimumFractionDigits:2,maximumFractionDigits:2});
 }
 function amtHtml(mc){ // fmtAmt as HTML: negative balances paint RED (.negmoney)
@@ -815,7 +819,7 @@ function amtHtml(mc){ // fmtAmt as HTML: negative balances paint RED (.negmoney)
 function fmtDenom(mc){ // denomId millicents -> 25¢ / $1 / $2.50
   const c=Number(mc)/1000; if(!isFinite(c)) return String(mc);
   if(c<100) return (c%1?c.toFixed(1):c)+"¢";
-  return "$"+((c/100)%1?(c/100).toFixed(2):(c/100));
+  return CUR()+((c/100)%1?(c/100).toFixed(2):(c/100));
 }
 function parseDollars(v){
   const n=parseFloat(String(v).replace(/[$,\s]/g,""));
@@ -2622,7 +2626,7 @@ function renderBonusModalG2S(egm){
       shows in the activity feed.</p>
     <div class="btnrow" style="margin-bottom:10px">
       ${G2S_BONUS_PRESETS.map(v=>`<button class="btn slim"
-        onclick="$('m-gbonus').value='${v}'"><span class="bl">$${v}</span>
+        onclick="$('m-gbonus').value='${v}'"><span class="bl">${CUR()}${v}</span>
         </button>`).join("")}
     </div>
     <div class="mrowset">
@@ -2715,7 +2719,7 @@ function sasVerdictToast(r, name){
       const cents=Number(r.amountCents||0);
       const who=r.accountId?acctName(r.accountId):"House";
       if(r.ok===true)
-        toast(`🪙 ${name} — $${(cents/100).toFixed(2)} landed · ${who} debited`, true);
+        toast(`🪙 ${name} — ${CUR()}${(cents/100).toFixed(2)} landed · ${who} debited`, true);
       else
         toast(`🪙 ${name}: ${String(r.outcome||"no reply")}`
               +(r.detail?" — "+String(r.detail).slice(0,60):""), false);
@@ -3702,7 +3706,7 @@ function renderPlayerFundModal(id){
       +amtHtml(h.cashableMillicents)+" — set your bankroll in Options ▸ House Bankroll.":""}</p>
     <div class="btnrow" style="margin-bottom:10px">
       ${[1,5,20,100].map(v=>`<button class="btn slim"
-        onclick="$('m-fund').value='${v}'"><span class="bl">$${v}</span>
+        onclick="$('m-fund').value='${v}'"><span class="bl">${CUR()}${v}</span>
         </button>`).join("")}
     </div>
     <div class="mrowset">
@@ -4000,7 +4004,7 @@ async function sendCredits(btn){
         flash(btn,false); return;}
       const j=await r.json().catch(()=>({}));
       if(j.ok){
-        toast(`🪙 Credits queued — $${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
+        toast(`🪙 Credits queued — ${CUR()}${(cents/100).toFixed(2)} to ${name} (verdict ~2s)`, true);
         flash(btn,true); padClear(); S.accountsAt=0; auxFetch(true);
       }else{
         toast("Add credits refused · "
@@ -4665,6 +4669,18 @@ async function gameroomSave(){
     v?("Gameroom name set to "+v):"Gameroom name cleared");
   if(ok) tickStatus();
 }
+async function currencySave(){
+  /* Money symbol save (Settings ▸ Gameroom ▸ Currency). "" clears the
+     setting so the floor follows its machines' currencyId again. Every
+     surface repaints on its next poll — hub UI, glass, SMIB screen. */
+  const el=$("st-currency"); if(!el) return;
+  const cur=String((((S.status||{}).hostOptions||{}).currencySymbolSetting)||"");
+  const v=(el.value||"").trim();
+  if(v===cur){ toast("Money symbol — nothing changed",true); return; }
+  const ok=await settingsPost({currencySymbol:v},
+    v?("Money symbol set to "+v):"Money symbol cleared — following the machines");
+  if(ok) tickStatus();
+}
 /* ? explanation toggles — persist across the 2s repaint (the OPTSOPEN
    pattern). htLine() builds a block title with a ? button; the caller
    gates its explanation paragraph on HINTS[id]. Default hidden = compact
@@ -4695,7 +4711,8 @@ function renderSettings(){
   const ae=document.activeElement;
   if(ae && (ae.tagName==="INPUT" || ae.tagName==="TEXTAREA") &&
      (String(ae.id).indexOf("st-ticket-")===0 || ae.id==="st-bankroll" ||
-      ae.id==="st-gameroom" || String(ae.id).indexOf("st-tour-")===0)) return;
+      ae.id==="st-gameroom" || ae.id==="st-currency" ||
+      String(ae.id).indexOf("st-tour-")===0)) return;
   /* Host options — hostOptions is feature-detected: an old hub omits it
      from /api/status and gets the pending chip until the update lands. */
   const ho=(S.status||{}).hostOptions;
@@ -4722,6 +4739,21 @@ function renderSettings(){
           <button class="btn slim gold" onclick="gameroomSave()">
             <span class="bl">Save name</span></button>
         </div>
+        ${ho.currencySymbol===undefined?"":`
+        <div class="tkf" style="margin-top:12px"><label for="st-currency">Money symbol</label>
+          <input type="text" id="st-currency" maxlength="4" style="width:5em"
+            value="${esc(String(ho.currencySymbolSetting||""))}"
+            placeholder="${esc(String(ho.currencySymbol||"$"))}"></div>
+        <p class="none">Leads every amount on every screen. Blank = follow the
+          machines (${esc(ho.currencySymbolSource==="machine"
+            ?"now "+String(ho.currencySymbol||"$")+" from a machine's own currency"
+            :ho.currencySymbolSource==="setting"
+              ?"your setting, "+String(ho.currencySymbol||"$")
+              :"no machine has said yet, so $")}).</p>
+        <div class="btnrow" style="margin-top:8px">
+          <button class="btn slim gold" onclick="currencySave()">
+            <span class="bl">Save symbol</span></button>
+        </div>`}
         ${ho.lockBrandGameroom===undefined?"":`
         <div class="tkf" style="margin-top:12px"><label>When you lock a
           machine, its screen says</label></div>
