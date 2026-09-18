@@ -60,7 +60,12 @@ ExecStart=/usr/bin/cage -s -d -- /usr/bin/chromium \
     --no-first-run \
     --touch-events=enabled \
     --ozone-platform=wayland \
+    --password-store=basic \
     "http://127.0.0.1:8081/home?kiosk=1"
+# --password-store=basic: without it Chromium asks gnome-keyring for a
+# secrets store, the daemon gets D-Bus-activated, and its "unlock keyring"
+# dialog lands on the hub's touchscreen over the kiosk (AJ, 2026-09-18).
+# The kiosk stores no passwords; basic = in-memory, no prompt.
 Restart=on-failure
 RestartSec=3
 

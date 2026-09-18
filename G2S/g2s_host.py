@@ -11793,26 +11793,82 @@ class G2SHost:
             return inner, f"getSupportedEvents(cid={cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
-    def enqueue_set_event_sub(self, assoc, epoch=None):
-        """eventHandler.setEventSub — step 3, the payoff. Subscribe host 1 to the
-        wildcard firehose: EVERY event from EVERY device (deviceClass=G2S_all,
-        deviceId=-1, eventCode=G2S_all), with device-status + transaction records
-        riding along (spec §4.10, Table 4.12). eventPersist=true makes each event
-        a request/response pair the AVP persists until we eventAck it, so nothing
-        is lost. Owner-only command; host 1 owns eventHandler device 1 (§4.1)."""
+    # Per-spin gamePlay events the hub only ever LABELS (activity hooks fire
+    # on GPE103 start + GPE112 end; the failures 102/108 stay for diagnosis).
+    # Each one is a message on the AVP's ~300 ms-paced outbound queue, and a
+    # fast player fires five per spin — the SERVICE-button event (CBE301)
+    # queued behind them 1–7 s deep (glass_button_trace, 2026-09-18). Not
+    # subscribing to them is the only lever on OUR side of the wire.
+    EVENT_SUB_SKIP = frozenset((
+        "G2S_GPE101",   # primary game escrow
+        "G2S_GPE104",   # wager changed
+        "G2S_GPE105",   # primary game ended (GPE112 is the real cycle end)
+        "G2S_GPE106",   # secondary game choice
+        "G2S_GPE107",   # secondary game escrow
+        "G2S_GPE109",   # secondary game started
+        "G2S_GPE110",   # secondary game ended
+        "G2S_GPE111",   # game result
+        "G2S_GPE113",   # game idle
+        # IGT mediaDisplay vendor events fired by OUR OWN show/hide — ladder
+        # evidence only, never acted on (IGT_MDE102 contentLoaded and
+        # IGT_MDE105 ARE acted on and stay subscribed).
+        "IGT_MDE106",
+        "IGT_MDE107",
+    ))
+    _EVENT_SUB_FLAGS = ('g2s:sendDeviceStatus="true" g2s:sendTransaction="true" '
+                        'g2s:sendClassMeters="false" g2s:sendDeviceMeters="true" '
+                        'g2s:sendUpdatableMeters="true" g2s:eventPersist="true"')
+
+    def enqueue_clear_event_sub(self, assoc, epoch=None):
+        """eventHandler.clearEventSub — drop host 1's WILDCARD subscription
+        (deviceClass=G2S_all, deviceId=-1, eventCode=G2S_all) so the explicit
+        list that follows is the only thing the AVP reports on. Sent right
+        before the explicit setEventSub; harmless when nothing matches."""
         def build(a):
             sid = a.next_session_id()
-            sub = (
-                '<g2s:setEventSub>'
-                '<g2s:eventHostSubscription g2s:deviceClass="G2S_all" '
-                'g2s:deviceId="-1" g2s:eventCode="G2S_all" '
-                'g2s:sendDeviceStatus="true" g2s:sendTransaction="true" '
-                'g2s:sendClassMeters="false" g2s:sendDeviceMeters="true" '
-                'g2s:sendUpdatableMeters="true" g2s:eventPersist="true"/>'
-                '</g2s:setEventSub>')
+            # Spec §4.14 Table 4.18: the child is eventSelect (deviceClass /
+            # deviceId / eventCode); all three wildcarded = clear EVERY
+            # subscription this host holds. (eventSubscription → G2S_MSX004.)
+            sub = ('<g2s:clearEventSub>'
+                   '<g2s:eventSelect g2s:deviceClass="G2S_all" '
+                   'g2s:deviceId="-1" g2s:eventCode="G2S_all"/>'
+                   '</g2s:clearEventSub>')
             inner, cid = self.build_inner_request(
                 a, "eventHandler", "1", sub, str(sid), "30000")
-            return inner, f"setEventSub(cid={cid})"
+            return inner, f"clearEventSub(wildcard,cid={cid})"
+        self._enqueue(assoc, build, epoch=epoch)
+
+    def enqueue_set_event_sub(self, assoc, epoch=None):
+        """eventHandler.setEventSub — step 3, the payoff. With the catalog in
+        hand (supportedEvents), subscribe host 1 to every (deviceClass,
+        eventCode) pair the EGM offers, deviceId=-1 (all devices of the class),
+        EXCEPT EVENT_SUB_SKIP — device-status + transaction records riding
+        along (spec §4.10, Table 4.12). eventPersist=true makes each event a
+        request/response pair the AVP persists until we eventAck it, so nothing
+        is lost. Without a catalog yet (first join, before supportedEvents
+        answers) this is the old wildcard firehose; the catalog handler then
+        re-arms it explicitly. Owner-only; host 1 owns eventHandler 1 (§4.1)."""
+        def build(a):
+            sid = a.next_session_id()
+            pairs = sorted({(e.get("deviceClass"), e.get("eventCode"))
+                            for e in (a.supported_events or [])
+                            if e.get("deviceClass") and e.get("eventCode")
+                            and e.get("eventCode") not in self.EVENT_SUB_SKIP})
+            if pairs:
+                body = ''.join(
+                    f'<g2s:eventHostSubscription g2s:deviceClass="{cls}" '
+                    f'g2s:deviceId="-1" g2s:eventCode="{code}" '
+                    f'{self._EVENT_SUB_FLAGS}/>' for cls, code in pairs)
+                label = f"setEventSub(explicit {len(pairs)} pairs, skip {len(self.EVENT_SUB_SKIP)},cid="
+            else:
+                body = (f'<g2s:eventHostSubscription g2s:deviceClass="G2S_all" '
+                        f'g2s:deviceId="-1" g2s:eventCode="G2S_all" '
+                        f'{self._EVENT_SUB_FLAGS}/>')
+                label = "setEventSub(wildcard,cid="
+            sub = f'<g2s:setEventSub>{body}</g2s:setEventSub>'
+            inner, cid = self.build_inner_request(
+                a, "eventHandler", "1", sub, str(sid), "30000")
+            return inner, f"{label}{cid})"
         self._enqueue(assoc, build, epoch=epoch)
 
     def enqueue_event_ack(self, assoc, req, event_id):
@@ -12284,7 +12340,20 @@ class G2SHost:
         if not online:
             return
         if known:
-            self.enqueue_get_game_play_status(assoc, dev)
+            # NOT for the play cycle (GPE101–GPE113: escrow / started / wager /
+            # ended / idle / result). Those narrate every spin, not a config
+            # change, and each one used to cost an extra getGamePlayStatus →
+            # gamePlayStatus round trip. The AVP pays its outbound messages
+            # out one per ~300 ms, so during play the SERVICE-button event
+            # (CBE301) queued behind 4–7 of them and the glass menu arrived
+            # 1–2 s late; idle, 0.03 s (glass_button_trace, 2026-09-18 —
+            # AJ: "I think it's when other stuff is going on, like if I've
+            # been playing"). Config/denom events (GPE0xx, GPE2xx) still
+            # trigger the read — that is what GR-31 was for.
+            code = str(ev.get("eventCode") or "")
+            play_cycle = code.startswith("G2S_GPE1") and code[8:].isdigit()
+            if not play_cycle:
+                self.enqueue_get_game_play_status(assoc, dev)
             # GPE201 = Active Denominations Changed (§6.23.22) — fired when
             # the EGM APPLIES a setActiveDenoms (possibly long after our
             # send, §6.15 deferred-apply) AND when the operator flips denoms
@@ -17982,6 +18051,13 @@ class G2SHost:
                 "eventText": attr(e, "eventText"),
             } for e in el if localname(e.tag) == "supportedEvent"]
             assoc.supported_events = evs
+            # The catalog is the input to the explicit subscription: drop the
+            # wildcard (the join sent it while the catalog was still in flight
+            # — or a previous host left it standing) and re-arm with every
+            # pair the EGM offers minus EVENT_SUB_SKIP (2026-09-18).
+            if evs:
+                self.enqueue_clear_event_sub(assoc)
+                self.enqueue_set_event_sub(assoc)
             by_class = {}
             for e in evs:
                 by_class[e["deviceClass"]] = by_class.get(e["deviceClass"], 0) + 1
