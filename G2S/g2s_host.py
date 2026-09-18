@@ -4832,6 +4832,13 @@ class G2SHost:
             # its own runs with flock — Linux-only. None = the card is
             # simply absent on a Windows hub, exactly the pre-doctor face.
             return None
+        if self.host_base != DEFAULT_HOST_BASE:
+            # Lite mode (deploy/LITE_DEPLOY.md): the doctor judges the
+            # floor by the full-mode address (192.168.50.2 on a NIC, the
+            # gateway-is-hub satellite path) and would report a dark slot
+            # segment on a perfectly healthy lite host. Absent, like Windows,
+            # until it learns lite (PR #2 review, 2026-09-19).
+            return None
         p = os.path.join(self._repo_dir(), FLEET_SCRIPT_REL)
         return p if os.path.isfile(p) else None
 

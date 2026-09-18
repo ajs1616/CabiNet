@@ -40,7 +40,7 @@ class _CabinetHubHandler(http.server.BaseHTTPRequestHandler):
     POST path it receives (so a test can assert whether a report landed)."""
 
     def do_GET(self):
-        if self.path == "/api/status":
+        if self.path.split("?")[0] == "/api/status":
             body = json.dumps({"_engine": {"version": "0.10.0"}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -96,7 +96,7 @@ class _TitoHubHandler(http.server.BaseHTTPRequestHandler):
     the gate opens) — everything else gets a bare {"ok": true}."""
 
     def do_GET(self):
-        if self.path == "/api/status":
+        if self.path.split("?")[0] == "/api/status":
             body = json.dumps({"_engine": {}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

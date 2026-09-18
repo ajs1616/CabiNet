@@ -1226,7 +1226,10 @@ _PROBE_MAX_BYTES = 4 * 1024 * 1024
 
 def _looks_like_cabinet_hub(base_url, timeout=2.0):
     """Identity gate for an AUTO-DERIVED hub URL (see _gateway_hub_url):
-    GET base_url + '/api/status' and require HTTP 200 with a JSON body that
+    GET base_url + '/api/status?slim=1' (the slim variant: ~70 KB
+    against ~3 MB for the full floor snapshot, which would cross
+    _PROBE_MAX_BYTES on a busy floor and falsely reject a REAL hub — live
+    hub measured 2026-09-19) and require HTTP 200 with a JSON body that
     carries a top-level '_engine' key — only a real CabiNet host answers
     that shape. In full-mode deployment the gateway genuinely IS the hub, so
     this always passes; on a home/office LAN (lite mode — the gateway is
@@ -1235,7 +1238,7 @@ def _looks_like_cabinet_hub(base_url, timeout=2.0):
     raises — any failure (refused, timeout, non-200, bad JSON, missing key,
     oversized body — see _PROBE_MAX_BYTES) returns False."""
     try:
-        req = urllib.request.Request(base_url.rstrip("/") + "/api/status")
+        req = urllib.request.Request(base_url.rstrip("/") + "/api/status?slim=1")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 return False

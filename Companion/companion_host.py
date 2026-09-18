@@ -248,7 +248,10 @@ def _looks_like_cabinet_hub(base_url, timeout=2.0):
     _looks_like_cabinet_hub byte-for-byte (deliberate duplication: neither
     daemon shares a module with the other, the same posture as the
     already-duplicated _default_gateway_ip/gateway-derivation helpers
-    between them). GET base_url + '/api/status' and require HTTP 200 with a
+    between them). GET base_url + '/api/status?slim=1' (the slim variant: ~70 KB
+    against ~3 MB for the full floor snapshot, which would cross
+    _PROBE_MAX_BYTES on a busy floor and falsely reject a REAL hub — live
+    hub measured 2026-09-19) and require HTTP 200 with a
     JSON body carrying a top-level '_engine' key — only a real CabiNet host
     answers that shape. On a home/office LAN (lite mode — the gateway is
     the user's own router, not the hub) this correctly fails instead of
@@ -256,7 +259,7 @@ def _looks_like_cabinet_hub(base_url, timeout=2.0):
     never raises — any failure (including an oversized body — see
     _PROBE_MAX_BYTES) returns False."""
     try:
-        req = urllib.request.Request(base_url.rstrip("/") + "/api/status")
+        req = urllib.request.Request(base_url.rstrip("/") + "/api/status?slim=1")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 return False
