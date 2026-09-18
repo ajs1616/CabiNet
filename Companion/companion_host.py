@@ -179,11 +179,17 @@ def _i2c_bus():
 
 
 def _default_gateway_ip():
-    """The IPv4 default-route gateway from /proc/net/route, or None. On the
-    CabiNet slot VLAN (and the Wi-Fi AP) the hub IS the DHCP server AND the
-    default gateway, so the gateway is the hub — that coupling is what makes
-    a flagless image find the hub with no config. (Falls back cleanly to the
-    known hub IP when there is no default route.)
+    """The IPv4 default-route gateway from /proc/net/route, or None.
+
+    Two-mode story: on the FULL-deployment CabiNet slot VLAN (and the Wi-Fi
+    AP) the hub IS the DHCP server AND the default gateway, so the gateway
+    is the hub — that coupling is what makes a flagless image find the hub
+    with no config. On a LITE deployment (deploy/LITE_DEPLOY.md — the host
+    is a plain server on an existing LAN) the gateway is just the user's own
+    router, NOT the hub, so a URL derived from this function is only a
+    guess. resolve_hub_url's caller wires that guess through
+    _looks_like_cabinet_hub before it is ever trusted. (Falls back cleanly
+    to the known hub IP when there is no default route.)
 
     A satellite is often DUAL-HOMED (wired eth0 + Wi-Fi wlan0), so there are
     TWO default routes — pick the LOWEST-METRIC one, which is the kernel's
@@ -211,8 +217,11 @@ def _default_gateway_ip():
 
 def resolve_hub_url(explicit, port=8081, fallback="http://192.168.50.2:8081"):
     """Pick the hub URL: an explicit --hub wins (co-located passes
-    127.0.0.1); else derive http://<default-gateway>:PORT; else the known
-    hub IP. Both consumers of self.url (report loop) are late-bound and
+    127.0.0.1, and an explicit URL is trusted outright — the operator typed
+    it); else derive http://<default-gateway>:PORT (lite deployment: this is
+    a GUESS — the caller must gate it through _looks_like_cabinet_hub before
+    trusting it, see CompanionHost's verify_identity); else the known hub
+    IP. Both consumers of self.url (report loop) are late-bound and
     retry-forgiving, so a wrong/late gateway just starts working later."""
     if explicit:
         return explicit
@@ -220,6 +229,44 @@ def resolve_hub_url(explicit, port=8081, fallback="http://192.168.50.2:8081"):
     if gw:
         return f"http://{gw}:{port}"
     return fallback
+
+
+# Memory-protection cap on the probe's response body. Deliberately generous
+# — NOT the few-KB cap a naive gate would reach for: /api/status is the
+# FULL floor snapshot (associations, meters, recent events) and can
+# legitimately run into the hundreds of KB on a live floor. A small cap
+# would TRUNCATE a real hub's valid JSON and make the gate falsely REJECT
+# it — silently refusing to report is worse than the memory this guards
+# against. 4MB is "this obviously isn't a real /api/status reply" territory,
+# not "the floor is busy today" territory. Mirrors SAS/sas_host.py's
+# _PROBE_MAX_BYTES byte-for-byte.
+_PROBE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _looks_like_cabinet_hub(base_url, timeout=2.0):
+    """Identity gate for an AUTO-DERIVED hub URL — mirrors SAS/sas_host.py's
+    _looks_like_cabinet_hub byte-for-byte (deliberate duplication: neither
+    daemon shares a module with the other, the same posture as the
+    already-duplicated _default_gateway_ip/gateway-derivation helpers
+    between them). GET base_url + '/api/status' and require HTTP 200 with a
+    JSON body carrying a top-level '_engine' key — only a real CabiNet host
+    answers that shape. On a home/office LAN (lite mode — the gateway is
+    the user's own router, not the hub) this correctly fails instead of
+    quietly reporting taps into the void. stdlib-only (urllib.request);
+    never raises — any failure (including an oversized body — see
+    _PROBE_MAX_BYTES) returns False."""
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/api/status")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            body = resp.read(_PROBE_MAX_BYTES + 1)
+            if len(body) > _PROBE_MAX_BYTES:
+                return False
+            data = json.loads(body)
+        return isinstance(data, dict) and "_engine" in data
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 class CompanionHost:
@@ -236,9 +283,10 @@ class CompanionHost:
 
     def __init__(self, reader, hub_url, companion_id, g2s_egm=None,
                  sas_smib=None, sas_address=None, report_sec=1.0,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, hub_auto_derived=False):
         self.reader = reader
-        self.url = hub_url.rstrip("/") + "/api/companion/report"
+        self.hub_base = hub_url.rstrip("/")
+        self.url = self.hub_base + "/api/companion/report"
         self.companion_id = companion_id
         # This board's silicon serial tail, resolved ONCE (it cannot change
         # while we run) and reported as piTail. companionId usually embeds it,
@@ -284,6 +332,13 @@ class CompanionHost:
         #                                   (200 reply with ok != true)
         self._last_report_mono = None     # last ATTEMPT (success or not)
         self.stop = False
+        # Identity gate (lite-mode safety net — deploy/LITE_DEPLOY.md): True
+        # means hub_url was AUTO-derived from the default gateway and is NOT
+        # yet proven to be a real CabiNet hub — report() must probe it
+        # before its first POST. An explicit --hub is trusted outright and
+        # never sets this.
+        self.hub_auto_derived = hub_auto_derived
+        self._identity_verified = not hub_auto_derived
 
     # ---- reader side -------------------------------------------------------
 
@@ -404,6 +459,27 @@ class CompanionHost:
         """One POST to the hub. Returns True on a 200 (taps <= ackTapId
         dropped), False on failure (taps stay queued for the next cycle)."""
         self._last_report_mono = now
+        # Identity gate (lite-mode safety net): an auto-derived hub URL must
+        # answer /api/status like a real CabiNet host before the first tap
+        # is ever POSTed there. Fail closed — a URL that never verifies
+        # never reports; taps stay queued (bounded) rather than vanish into
+        # whatever happens to be at the router's IP.
+        if self.hub_auto_derived and not self._identity_verified:
+            if _looks_like_cabinet_hub(self.hub_base):
+                self._identity_verified = True
+                self.failing = False
+                logger.info("hub identity CONFIRMED — %s answers like a "
+                            "CabiNet host, reporting begins", self.hub_base)
+            else:
+                if not self.failing:
+                    self.failing = True
+                    logger.warning(
+                        "auto-derived hub %s does not look like a CabiNet "
+                        "host — NOT reporting (lite deployment? pass --hub "
+                        "http://<host-ip>:8081); taps stay queued, "
+                        "retrying quietly every %.1fs",
+                        self.hub_base, self.report_sec)
+                return False
         body = json.dumps(self.snapshot(now)).encode()
         req = urllib.request.Request(
             self.url, data=body,
@@ -520,7 +596,13 @@ def main():
     if args.report_sec <= 0:
         ap.error("--report-sec must be > 0")
 
-    hub_url = resolve_hub_url(args.hub_opt or args.hub)
+    # Provenance for the identity gate: an EXPLICIT hub (either flag form)
+    # is trusted outright (the operator typed it); a derived one is only
+    # ever the default-gateway GUESS and must prove itself before use (see
+    # CompanionHost.report / _looks_like_cabinet_hub).
+    explicit_hub = args.hub_opt or args.hub
+    hub_url = resolve_hub_url(explicit_hub)
+    hub_auto_derived = not explicit_hub
     companion_id = args.companion_id or default_companion_id()
 
     if args.mock:
@@ -541,7 +623,8 @@ def main():
     host = CompanionHost(reader, hub_url, companion_id,
                          g2s_egm=args.g2s_egm, sas_smib=args.sas_smib,
                          sas_address=args.sas_address,
-                         report_sec=args.report_sec)
+                         report_sec=args.report_sec,
+                         hub_auto_derived=hub_auto_derived)
     try:
         host.run()
     except KeyboardInterrupt:

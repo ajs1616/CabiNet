@@ -33,7 +33,10 @@ Run from G2S/:  python3 g2s_host.py            (NO sudo — see bench checklist)
 import argparse
 import collections
 import errno
-import fcntl
+try:
+    import fcntl                # POSIX only — see IS_WINDOWS below
+except ImportError:             # Windows hub (lite mode): no flock, no ioctl
+    fcntl = None
 import hashlib
 import html
 import itertools
@@ -56,6 +59,17 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# A Windows box can host CabiNet in LITE MODE ONLY (deploy/WINDOWS_HUB.md):
+# the G2S engine, web UI and hub store are platform-neutral, but the four
+# network-bootstrap services (DHCP/DNS/NTP/TFTP) and the fleet tooling
+# (deploy/update.py, deploy/cabinetconfig.py — systemd, ssh, rsync, flock)
+# are Linux-only. Everything that keys off this flag degrades to an honest
+# "not on this host" instead of a traceback.
+IS_WINDOWS = os.name == "nt"
+WINDOWS_UPDATES_UNSUPPORTED = (
+    "Updates aren't available from this card on a Windows host. Update the "
+    "checkout with git and restart the hub (deploy/WINDOWS_HUB.md).")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hub_store import HubStore, MAX_TICKET_FIELD_LEN   # noqa: E402  (sibling module, stdlib sqlite3)
@@ -105,6 +119,12 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # Namespaces / constants
 # ----------------------------------------------------------------------------
 
+# First explicit version (the lite-deployment-mode + Windows-hub feature is
+# the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
+# /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
+# section on every commit with a user-visible change.
+CABINET_VERSION = "0.1.0"
+
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -147,20 +167,33 @@ MD_PROBE_RUNGS = ("status", "profile", "enable", "disable", "load",
                   "logstatus", "log", "setactive", "show", "hide",
                   "release", "contentstatus")
 
+# Install-time base URL for THIS host, as machines on the floor must be able
+# to reach it. Full-mode default: the host IS the isolated network's gateway
+# at 192.168.50.2:8081. Lite mode (the host is a plain server on someone
+# else's LAN — see deploy/LITE_DEPLOY.md) overrides this via --host-base;
+# G2SHost.__init__ derives every self-URL (mediaDisplay content, glass
+# content, and — absent an explicit --host-uri — setCommChange hostLocation)
+# from it. Module-level constants below stay as the DEFAULTS (used by the
+# in-process test harness and anything constructing G2SHost() bare); the
+# live host always reads the per-instance self.md_default_content_uri /
+# self.glass_content_uri_base instead.
+DEFAULT_HOST_BASE = "http://192.168.50.2:8081"
+
 # The load rung's default content: the FUNCINO hello page this host serves
 # itself — the decisive later rung is the AVP's built-in browser GETting it
 # (the UA-stamped journal line in _serve_webui is the P9 proof).
-MD_DEFAULT_CONTENT_URI = "http://192.168.50.2:8081/webui/hello.html"
+MD_DEFAULT_CONTENT_URI = f"{DEFAULT_HOST_BASE}/webui/hello.html"
 
 # Glass navigation v1 (#18 P4): ONE resident SPA per glass window — the hub
 # pushes webui/glass.html onto the cabinet's Service Window ONCE (glassShow),
 # the page stays resident and polls /api/glass/state every ~1.5s, and RFID
 # taps flip hub-side session state so the NEXT poll flips the view. A poll
 # flip costs <=1.5s; a G2S content swap costs ~5-8s — which is why navigation
-# never re-pushes content. Same hardcoded host base as MD_DEFAULT_CONTENT_URI
-# (the hub IS 192.168.50.2:8081 on the slot VLAN).
+# never re-pushes content. Same install-time base as MD_DEFAULT_CONTENT_URI
+# (DEFAULT_HOST_BASE — install-time configurable via --host-base for lite
+# mode; see deploy/LITE_DEPLOY.md).
 GLASS_PAGE = "glass.html"
-GLASS_CONTENT_URI_BASE = "http://192.168.50.2:8081/webui/"
+GLASS_CONTENT_URI_BASE = f"{DEFAULT_HOST_BASE}/webui/"
 # Device 1 = the AVP's left Service Window (256x1024) — the wire-proven HTML
 # renderer (dev 5 does not render; 3/4 are RAM-gated overlays). This is the
 # FALLBACK, no longer the assumption: it is true of ONE collector's AVP and
@@ -2296,6 +2329,22 @@ def wat_present(rec):
     return out
 
 
+def _fsync_dir(path):
+    """Flush a directory's metadata so a just-completed os.replace survives a
+    power pull (POSIX). On Windows a directory cannot be opened with os.open
+    (EACCES every time) and NTFS commits the rename with the file's own
+    FlushFileBuffers, so this is a no-op there — without the guard every
+    store save logged a false "save FAILED" on a Windows hub although the
+    file had already been replaced (live-hit 2026-09-12)."""
+    if IS_WINDOWS:
+        return
+    dfd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
 class VoucherStore:
     """Durable state behind the voucher class (spec ch.21, G2S-26 tiers 1+2).
 
@@ -2381,11 +2430,7 @@ class VoucherStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            _fsync_dir(os.path.dirname(self.path) or ".")
         except OSError as e:
             log.error("voucher store save FAILED (%s) — continuing with "
                       "in-memory state", e)
@@ -2998,11 +3043,7 @@ class ConfigInventoryStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            _fsync_dir(os.path.dirname(self.path) or ".")
         except OSError as e:
             log.error("config inventory save FAILED (%s) — continuing "
                       "with in-memory state", e)
@@ -3075,11 +3116,7 @@ class WatStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            _fsync_dir(os.path.dirname(self.path) or ".")
         except OSError as e:
             log.error("wat store save FAILED (%s) — continuing with "
                       "in-memory state", e)
@@ -3454,11 +3491,7 @@ class AccountStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            _fsync_dir(os.path.dirname(self.path) or ".")
         except OSError as e:
             log.error("account store save FAILED (%s) — continuing with "
                       "in-memory state", e)
@@ -3781,12 +3814,35 @@ class GlassSessionStore:
 # ----------------------------------------------------------------------------
 
 class G2SHost:
+    # Class-level defaults for the self-URLs, so a bare or stubbed instance
+    # (the tools/test_*.py harnesses build one via __new__ and never run
+    # __init__) still derives today's full-mode URLs; __init__ overrides
+    # them per instance from --host-base.
+    host_base = DEFAULT_HOST_BASE
+    md_default_content_uri = MD_DEFAULT_CONTENT_URI
+    glass_content_uri_base = GLASS_CONTENT_URI_BASE
+
     def __init__(self, host_id="1", sync_timer=30000, inline=False,
                  auto_enable=True, keepalive_ms=0, harvest=False,
-                 subscribe=True, host_uri="http://192.168.50.2:8081/G2S",
+                 subscribe=True, host_uri=None, host_base=DEFAULT_HOST_BASE,
                  auto_clock=True, game_sweep=False):
         self.host_id = host_id
         self.sync_timer = sync_timer
+        # host_base: this host's own reachable base URL (install-time
+        # configurable via --host-base — lite mode puts the host on a plain
+        # LAN instead of owning 192.168.50.2 itself; see
+        # deploy/LITE_DEPLOY.md). Normalize: strip a trailing slash, assume
+        # http:// if no scheme was given (a bare "--host-base 10.0.0.5:8081"
+        # typo shouldn't silently become a relative/invalid URL).
+        host_base = (host_base or DEFAULT_HOST_BASE).rstrip("/")
+        if "://" not in host_base:
+            host_base = f"http://{host_base}"
+        self.host_base = host_base
+        # mediaDisplay/glass content URLs always derive from host_base — the
+        # AVP's on-glass browser and the glass SPA push both dereference
+        # these over plain HTTP, so they must be reachable from the EGM.
+        self.md_default_content_uri = f"{self.host_base}/webui/hello.html"
+        self.glass_content_uri_base = f"{self.host_base}/webui/"
         # /api/status snapshot cache (STATUS_CACHE_TTL_SEC): variant key
         # ("full"/"slim") -> {"body": str, "etag": str, "at": float}.
         # status_cache_building is the single-flight marker per variant —
@@ -3804,8 +3860,15 @@ class G2SHost:
         # commConfig.setCommChange's setHostItem.hostLocation (spec §8.15 Table
         # 8.14, a REQUIRED attribute). getCommHostList is silent on this AVP so
         # we can't read it back; this must match what's typed in the AVP's
-        # "Override DHCP Configured Host" URI.
-        self.host_uri = host_uri
+        # "Override DHCP Configured Host" URI. Precedence: an explicit
+        # --host-uri always wins (it may legitimately differ, e.g. a
+        # non-default port/path); otherwise derive it from host_base.
+        self.host_uri = host_uri or f"{self.host_base}/G2S"
+        # Lite-mode sanity check (log-only, no behavior change): EGMs that
+        # reach this host on an address other than host_base's hostname are
+        # probably talking to a router/gateway instead of the server — warn
+        # at most once per EGM. See _maybe_warn_host_base_mismatch.
+        self._hostbase_mismatch_seen = set()
         # Host-assigned configurationId sequence for commConfig/optionConfig
         # change sets (spec §8.3.1). Monotonic; seeded off wall-clock so it does
         # not collide with a prior run's ids the EGM may still remember.
@@ -4496,7 +4559,9 @@ class G2SHost:
                        for l in tail.splitlines())
         except OSError:
             pass
-        if not dead and time.time() - started > 60:
+        # No flock on Windows (fcntl is None): a run can't be proven dead by
+        # its lock, so it is left alone — never declared dead on a guess.
+        if not dead and time.time() - started > 60 and fcntl is not None:
             try:
                 lf = open(os.path.join(self._repo_dir(),
                                        ".cabinet-update.lock"), "a+")
@@ -4548,6 +4613,13 @@ class G2SHost:
             cached = (head if (rc == 0 and is_clone) else None, is_clone)
             self._update_git_cache = (cached, now)
         st["current"], st["isClone"] = cached
+        if IS_WINDOWS:
+            # deploy/update.py restarts systemd units and fans out over
+            # ssh/rsync to satellite Pis — Linux-only. The card keeps the
+            # version line and gets the hub's own sentence; never fetches.
+            st.update(unsupported=True, error=WINDOWS_UPDATES_UNSUPPORTED,
+                      autoCheck=False, behind=0, commits=[])
+            return st
         st["autoCheck"] = self.hub_store.host_setting("update_auto_check",
                                                       "0") == "1"
         if not check:
@@ -4609,6 +4681,8 @@ class G2SHost:
         most. start_new_session detaches it, and its whole transcript lands in
         data/update_last.log so the UI can show what happened AFTER the service
         comes back."""
+        if IS_WINDOWS:
+            return {"ok": False, "error": WINDOWS_UPDATES_UNSUPPORTED}
         script = os.path.join(self._repo_dir(), "deploy", "update.py")
         if not os.path.isfile(script):
             return {"ok": False, "error": "deploy/update.py is missing from "
@@ -4655,6 +4729,9 @@ class G2SHost:
         effect without a restart. Deliberately a slow heartbeat: this is the
         only thing in the host that ever reaches the internet, and a hub on an
         isolated slot VLAN must be able to sit here forever doing nothing."""
+        if IS_WINDOWS:          # nothing to apply with — see update_state
+            return
+
         def loop():
             # a short settle so a boot burst never coincides with a fetch
             time.sleep(90)
@@ -4750,6 +4827,11 @@ class G2SHost:
         answers 404 on the endpoints, home.html drops S.caps.fleet, and The
         Back Office renders exactly as it does today (the graceful-degradation
         habit every other card here already follows)."""
+        if IS_WINDOWS:
+            # The doctor drives satellites over ssh/rsync/systemd and pins
+            # its own runs with flock — Linux-only. None = the card is
+            # simply absent on a Windows hub, exactly the pre-doctor face.
+            return None
         p = os.path.join(self._repo_dir(), FLEET_SCRIPT_REL)
         return p if os.path.isfile(p) else None
 
@@ -4783,7 +4865,10 @@ class G2SHost:
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
-                os.killpg(p.pid, signal.SIGKILL)     # pgid == pid (own session)
+                if hasattr(os, "killpg"):            # POSIX: the whole group
+                    os.killpg(p.pid, signal.SIGKILL)  # pgid == pid (own session)
+                else:                                # Windows: no groups
+                    p.kill()
             except Exception:                        # already gone / no perm
                 p.kill()
             try:
@@ -11116,7 +11201,38 @@ class G2SHost:
                 "autoEnable": self.auto_enable,
                 "autoClock": self.auto_clock,
                 "gameSweep": self.game_sweep,
-                "inline": self.inline}
+                "inline": self.inline,
+                "hostBase": self.host_base,
+                "platform": "windows" if IS_WINDOWS else "posix",
+                "version": CABINET_VERSION}
+
+    def _maybe_warn_host_base_mismatch(self, egm_id, connection):
+        """Log-only sanity check (no behavior change): do_POST's /G2S branch
+        calls this with the raw request socket (self.connection) so this
+        method — not the call site — owns the getsockname() try/except; a
+        socket-layer hiccup here must never bubble into the sync reply path.
+        In lite mode (deploy/LITE_DEPLOY.md) a misconfigured/default-
+        gateway-assuming satellite or a stale --host-base can mean the
+        machine is talking to this host on one IP while mediaDisplay/glass
+        content URLs (and, absent --host-uri, setCommChange's hostLocation)
+        advertise a different one — the AVP's on-glass browser would then
+        dereference an address the EGM can reach us on by luck only. Warns
+        at most once per EGM; never raises, never changes what gets sent."""
+        if not egm_id or egm_id in self._hostbase_mismatch_seen:
+            return
+        try:
+            local_ip = connection.getsockname()[0]
+        except Exception:
+            return
+        try:
+            advertised = urllib.parse.urlparse(self.host_base).hostname
+        except Exception:
+            return
+        if advertised and local_ip and advertised != local_ip:
+            self._hostbase_mismatch_seen.add(egm_id)
+            log.warning("[%s] EGM reached this host on %s but content URLs "
+                        "advertise %s — check --host-base (see "
+                        "deploy/LITE_DEPLOY.md)", egm_id, local_ip, advertised)
 
     # ------------------------------------------------------------------ build
 
@@ -14792,9 +14908,9 @@ class G2SHost:
             # buttons. Hub-built on the slot-VLAN base (never the caller's
             # own address); an explicit uri still wins for raw bench work.
             target_uri = str(uri) if uri else (
-                f"{GLASS_CONTENT_URI_BASE}{page}"
+                f"{self.glass_content_uri_base}{page}"
                 f"{'?probe=1' if with_query else ''}"
-                if page else MD_DEFAULT_CONTENT_URI)
+                if page else self.md_default_content_uri)
             # Occupied-window refusal (live-hit 2026-08-17): AJ pressed every
             # Try button at the one window ALREADY SHOWING the glass — the
             # machine holds ONE page per window (maxContentLoaded=1), so each
@@ -14923,7 +15039,7 @@ class G2SHost:
         # step, degenerate capability profile) never cared. One URI shape
         # for BOTH eras — never branch on model/platform; a legal .html-
         # final URI costs the QNX path nothing.
-        uri = (f"{GLASS_CONTENT_URI_BASE}glass/"
+        uri = (f"{self.glass_content_uri_base}glass/"
                f"{urllib.parse.quote(assoc.egm_id or '', safe='')}/{dev}/"
                f"{page}")
         # <epoch><2-digit seq> — the probe ladder's pure-numeric contentId
@@ -24621,6 +24737,13 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             self._send(500, "")
             return
 
+        # Lite-mode sanity check (log only): self.connection is the raw
+        # request socket — the method itself owns getsockname() and its own
+        # try/except, so a socket-layer error here can never break this
+        # synchronous reply path.
+        self.host_engine._maybe_warn_host_base_mismatch(
+            egm_id, self.connection)
+
         reply_inner = self.host_engine.handle_g2s_message(
             html.unescape(inner), egm_id)
         body = self.host_engine.wrap_sync_response(reply_inner)
@@ -24850,10 +24973,22 @@ def main():
                     help="disable the join-time auto clock-sync (cabinet."
                          "setDateTime when the observed EGM skew exceeds "
                          f"{CLOCK_SKEW_SYNC_SEC}s)")
-    ap.add_argument("--host-uri", default="http://192.168.50.2:8081/G2S",
+    ap.add_argument("--host-base", default=DEFAULT_HOST_BASE,
+                    help="this host's own base URL, as machines on the floor "
+                         "must be able to reach it (default: "
+                         f"{DEFAULT_HOST_BASE}, the full-mode isolated-"
+                         "network address). Lite mode (host runs as a plain "
+                         "server on someone else's LAN — see "
+                         "deploy/LITE_DEPLOY.md) needs this set to the "
+                         "host's real LAN address, e.g. "
+                         "http://192.168.1.50:8081. Feeds the mediaDisplay/"
+                         "glass content URLs and, unless --host-uri is set, "
+                         "setCommChange's hostLocation.")
+    ap.add_argument("--host-uri", default=None,
                     help="our own G2S host URL as the AVP has it configured — "
                          "used for commConfig.setCommChange's hostLocation. Must "
-                         "match the AVP's Override-DHCP-Configured-Host URI.")
+                         "match the AVP's Override-DHCP-Configured-Host URI. "
+                         "Defaults to <host-base>/G2S.")
     ap.add_argument("--game-sweep", action="store_true",
                     help="run the full 119-device gamePlay status/profile/denom "
                          "sweep at join (357 reads — OFF by default because it "
@@ -24875,6 +25010,18 @@ def main():
                          "digest — ~15MB/h machine-on; -v implies this")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+    if IS_WINDOWS:
+        # Windows hosts run LITE MODE ONLY (deploy/WINDOWS_HUB.md): the
+        # network-bootstrap services that make 192.168.50.2 reachable are
+        # Linux-only, so the full-mode base can never be right here. Refuse
+        # it loudly instead of advertising content URLs no machine can reach.
+        hb = (args.host_base or DEFAULT_HOST_BASE).rstrip("/")
+        if "://" not in hb:
+            hb = f"http://{hb}"
+        if hb == DEFAULT_HOST_BASE:
+            ap.error("a Windows hub runs lite mode only — pass --host-base "
+                     "http://<this PC's LAN address>:8081 (the address you "
+                     "reserved on your router); see deploy/WINDOWS_HUB.md")
 
     # GR-20: claim the port FIRST, before any log-file or engine work. Under
     # systemd Restart=on-failure a held :8081 (manual bench run vs the unit)
@@ -24929,6 +25076,7 @@ def main():
                      inline=args.inline, auto_enable=not args.no_auto_enable,
                      keepalive_ms=args.keepalive * 1000, harvest=args.harvest,
                      subscribe=not args.no_subscribe, host_uri=args.host_uri,
+                     host_base=args.host_base,
                      auto_clock=not args.no_auto_clock,
                      game_sweep=args.game_sweep)
     # G2S-39: /api/debug/log tails the ACTIVE rotating host log this run.
@@ -24963,7 +25111,10 @@ def main():
     log.info("status: http://%s:%d/api/status — wire log: %s",
              args.bind, args.port,
              os.path.join(args.log_dir, f"g2s_wire_{stamp}.log"))
-    if os.geteuid() == 0:
+    if IS_WINDOWS:
+        log.info("platform: Windows — lite mode only (no DHCP/DNS/NTP/TFTP "
+                 "on this host); content base %s", engine.host_base)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         log.warning("running as root is NOT required and the old integrated-"
                     "DHCP behavior is gone; prefer running unprivileged")
     try:

@@ -161,7 +161,8 @@ class HubTicketAuthority:
                  local_store: Optional[TicketStore] = None,
                  timeout: float = DEFAULT_TIMEOUT_SEC,
                  journal_path: str = DEFAULT_JOURNAL_PATH,
-                 start_sync_thread: bool = True):
+                 start_sync_thread: bool = True,
+                 allow_network: Optional[callable] = None):
         self.base = hub_url.rstrip("/") + "/api/tito/"
         self.smib_id = smib_id
         self.local = local_store if local_store is not None else TicketStore()
@@ -170,6 +171,16 @@ class HubTicketAuthority:
         self.MAX_TICKET_CENTS = self.local.MAX_TICKET_CENTS
         self.journal_path = journal_path
         self.fallback_sid = derive_fallback_sid(smib_id)
+        # Optional external gate (default None = always allowed, so this
+        # class stays generic and every existing caller/test is unaffected).
+        # When given, _post() consults it before EVERY POST and treats a
+        # False the same as "hub unreachable" — the caller-side sees no
+        # difference, so mint/authorize/close/issued/sync all take their
+        # normal fallback path. The one deployment-specific caller is
+        # sas_host.py's main(): a lite-mode auto-derived hub URL is unproven
+        # until its own identity probe passes (see HubIdentityGate there),
+        # and this ticket authority must not POST anywhere until it does.
+        self.allow_network = allow_network
         self._jlock = threading.Lock()
         # issued-capture journal: a collision print during a hub outage keeps
         # the OLD local row (the conservative local conflict branch), so the
@@ -219,8 +230,15 @@ class HubTicketAuthority:
 
     def _post(self, op: str, payload: Dict) -> Dict:
         """POST one tito op. Raises OSError/ValueError on ANY failure —
-        network, HTTP status, or an ok:false hub refusal — so every caller
-        goes through its single explicit fallback path."""
+        network, HTTP status, an ok:false hub refusal, OR the network gate
+        being closed — so every caller goes through its single explicit
+        fallback path. The gate check runs FIRST, before any bytes leave
+        this process: a caller must never learn "the hub said no" when the
+        real answer is "we were never allowed to ask"."""
+        if self.allow_network is not None and not self.allow_network():
+            raise OSError(f"hub {op} blocked — hub identity not yet "
+                          "verified (lite deployment? see "
+                          "deploy/LITE_DEPLOY.md)")
         body = json.dumps(payload).encode()
         status, raw = self._http.post_json(body, op)
         if not 200 <= status < 300:

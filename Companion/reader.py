@@ -21,7 +21,10 @@ error propagate (the host marks readerOk=false for that cycle; the next
 poll runs on the fresh handle).
 """
 
-import fcntl
+try:
+    import fcntl            # POSIX only: the I2C ioctl. Absent on Windows,
+except ImportError:         # where only the tests and the mock reader run —
+    fcntl = None            # PN532Reader._open then fails like a missing bus.
 import time
 
 I2C_SLAVE = 0x0703                    # linux/i2c-dev.h ioctl: bind slave addr
@@ -79,6 +82,9 @@ class PN532Reader(RfidReader):
 
     def _open(self):
         f = open(self.bus, "r+b", buffering=0)
+        if fcntl is None:
+            f.close()
+            raise OSError("I2C needs a POSIX host (no fcntl on this platform)")
         fcntl.ioctl(f, I2C_SLAVE, self.addr)
         self._f = f
 

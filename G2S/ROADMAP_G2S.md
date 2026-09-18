@@ -106,3 +106,13 @@ Remaining live validation: event hooks/activity tape tonight (G2S-12/13), a remo
 reset-to-credits (G2S-25), cabinet/gamePlay control (G2S-20/22), bill-in (G2S-23), and the voucher
 cold-boot check (G2S-26). Printer work (G2S-24) stays blocked until the replacement Netplex cable
 arrives.
+
+**2026-07-15:** lite deployment mode shipped (v0.1.0, first explicit version) — the host can now run as a plain server on
+someone's existing router-served LAN instead of owning its own isolated network. `--host-base`
+feeds mediaDisplay/glass content URLs and (absent an explicit `--host-uri`) `setCommChange`'s
+hostLocation from one install-time value; a log-only check warns once per EGM if it reaches the
+host on a different address than what's advertised. SAS/Companion satellites gained an identity
+gate on their auto-derived hub URL (`_looks_like_cabinet_hub`, probes `/api/status` before trusting
+a zero-config guess) so a lite-mode satellite fails closed — skips reporting with a loud journal
+warning — instead of silently reporting machine state to whatever sits at the LAN gateway. Full
+runbook: `deploy/LITE_DEPLOY.md`.

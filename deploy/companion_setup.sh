@@ -79,6 +79,40 @@ RSYNC_SSH="${SSH[*]}"
 
 say() { printf '\n=== %s\n' "$*"; }
 
+# copy_tree <local-dir/> <remote-dir/> [--exclude PAT ...] and
+# copy_file <local-file> <remote-dir/>: rsync when the box has it (a Linux
+# hub always does), else the same bytes over the same ssh — tar for a tree,
+# scp for a file. Git Bash on a Windows hub (deploy/WINDOWS_HUB.md) ships ssh
+# and scp but no rsync, and "run the setup script from the hub" must keep
+# working there. Anchored rsync excludes ('/data') become tar's './data'.
+copy_tree() {
+    local src="$1" dst="$2"; shift 2
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a -e "$RSYNC_SSH" "$@" "$src" "$HOST:$dst"
+        return
+    fi
+    local ex=() pat
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --exclude) pat="$2"; shift 2 ;;
+            --exclude=*) pat="${1#--exclude=}"; shift ;;
+            *) shift; continue ;;
+        esac
+        case "$pat" in /*) ex+=("--exclude=.${pat}") ;; *) ex+=("--exclude=${pat}") ;; esac
+    done
+    tar -C "$src" "${ex[@]}" -cf - . \
+        | "${SSH[@]}" "$HOST" "mkdir -p '$dst' && tar -C '$dst' -xf -"
+}
+copy_file() {
+    local src="$1" dst="$2"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a -e "$RSYNC_SSH" "$src" "$HOST:$dst"
+    else
+        "${SSH[@]}" "$HOST" "mkdir -p '$dst'"
+        scp -q "${SSH[@]:1}" "$src" "$HOST:$dst"
+    fi
+}
+
 say "checking SSH + passwordless sudo on $HOST"
 # Two distinct failures, two distinct fixes — a connect/auth failure used to
 # fall into the sudo hint below and send the operator to the wrong one.
@@ -134,10 +168,10 @@ echo "$I2C_OUT"
 
 say "rsync Companion/ (stdlib-only, no venv)"
 "${SSH[@]}" "$HOST" 'mkdir -p ~/CabiNet/deploy'
-rsync -a -e "$RSYNC_SSH" --exclude '__pycache__' --exclude '.pytest_cache' \
-      "$REPO/Companion/" "$HOST:CabiNet/Companion/"
+copy_tree "$REPO/Companion/" "CabiNet/Companion/" \
+          --exclude '__pycache__' --exclude '.pytest_cache'
 # support_bundle.py rides along so "grab a bundle on the satellite" works
-rsync -a -e "$RSYNC_SSH" "$REPO/deploy/support_bundle.py" "$HOST:CabiNet/deploy/"
+copy_file "$REPO/deploy/support_bundle.py" "CabiNet/deploy/"
 
 say "import check (proves stdlib deps resolve on the Pi)"
 "${SSH[@]}" "$HOST" 'cd ~/CabiNet/Companion && python3 -c "import companion_host, reader; print(\"companion import OK\")"'

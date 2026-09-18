@@ -270,10 +270,10 @@ def _run_settings_channel():
         # keep the TITO plumbing off the repo's data files / network
         sas_host.TicketStore = lambda: TicketStore(
             path=os.path.join(tmp, "tickets.json"))
-        sas_host.HubTicketAuthority = lambda hub, smib, local: \
+        sas_host.HubTicketAuthority = lambda hub, smib, local, **kw: \
             HubTicketAuthority(hub, smib, local,
                                journal_path=os.path.join(tmp, "journal.json"),
-                               start_sync_thread=False)
+                               start_sync_thread=False, **kw)
         sys.argv = ["sas_host.py", "--mock", "--interval", "0.002",
                     "--hub", f"http://127.0.0.1:{httpd.server_address[1]}",
                     "--smib-id", "pytest-smib"]

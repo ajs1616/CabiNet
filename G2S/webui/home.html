@@ -5380,6 +5380,19 @@ function renderUpdates(){
   if(ARM && box.contains(ARM.btn)) return;
   const u=(((S.status||{}).hostOptions||{}).updates)||null;
   if(!u){ setHTML(box, pendChip("Updates")); setHTML($("st-upd-n"),""); return; }
+  if(u.unsupported){
+    /* Windows hub (lite only): deploy/update.py is Linux-only. The version
+       line plus the hub's own sentence, and no buttons — nothing here can
+       act, so nothing here may look like it can. */
+    const [sha,msg]=updSplitSha(u.current);
+    setHTML($("st-upd-n"),"");
+    setHTML(box,`<div class="kd" style="margin:0 0 10px"${
+        msg?` title="${esc(msg)}"`:""}><span style="color:var(--faint)">CabiNet · version</span>
+      <span style="font:600 13px var(--mono)">${
+      esc(sha||String(u.current||"unknown"))}</span></div>
+      <p class="none">${esc(u.error||"Updates are not available on this host.")}</p>`);
+    return;
+  }
   const behind=Number(u.behind||0);
   setHTML($("st-upd-n"), behind?(behind+" available"):"");
   /* header: a version line a collector can read aloud — "CabiNet · version

@@ -131,3 +131,6 @@ Companion/data/
 .openg2s_pids
 .cabinet-adopt-pending
 .cabinet-update.lock
+
+# Windows hub launcher config (per-PC: this box's LAN address)
+deploy/windows/hub.env
