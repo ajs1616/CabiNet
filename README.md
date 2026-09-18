@@ -88,6 +88,11 @@ It picks the slot-side port with you, sets the hub address
 retires and carries data over from an old hand-installed hub. Machine-side
 setup (G2S flavor, host URL, media display enable) is in the same doc.
 
+No dedicated switch handy? A **lite mode** exists where your own router
+serves DHCP instead and the host is just a server on your LAN — see
+[`deploy/LITE_DEPLOY.md`](deploy/LITE_DEPLOY.md). A **Windows PC** can be
+that lite-mode host too: [`deploy/WINDOWS_HUB.md`](deploy/WINDOWS_HUB.md).
+
 - `G2S/` — the host: G2S engine, web UI, DHCP/DNS/NTP/TFTP bootstrap servers,
   the SQLite hub spine, test gates under `G2S/tools/`
 - `SAS/` — the SAS bridge stack that runs on the SMIB Pi (3B+ recommended)

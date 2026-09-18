@@ -36,6 +36,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -564,6 +565,29 @@ def apply_ticket_header(transport, address, target, protocol=None,
                    f"rejoin){note}")
 
 
+class HubIdentityGate:
+    """Shared verified-flag for an AUTO-DERIVED (unproven) hub URL, so that
+    EVERY satellite->hub POST — not just HubReporter's periodic snapshot,
+    but HubTicketAuthority's /api/tito/* ticket traffic too — waits on the
+    SAME identity probe before it ever leaves this process (lite-mode
+    safety net; deploy/LITE_DEPLOY.md).
+
+    HubReporter's probe (_looks_like_cabinet_hub, run on its own thread
+    before its first report) is the only thing that ever sets `verified`;
+    once True it stays True for the life of the process — no re-probing.
+    allow() is what gets handed to HubTicketAuthority as allow_network.
+
+    Constructed only in main() when hub_auto_derived is True; an explicit
+    --hub is trusted outright and never gets a gate (both HubReporter and
+    HubTicketAuthority receive None, which means "always allowed")."""
+
+    def __init__(self):
+        self.verified = False
+
+    def allow(self):
+        return self.verified
+
+
 class HubReporter:
     """POSTs machine-state snapshots to the hub's /api/sas/report every
     REPORT_SEC (the protocol-agnostic floor: the hub's ONE Home UI shows
@@ -602,8 +626,10 @@ class HubReporter:
 
     def __init__(self, hub_url, smib_id, port_path, address, poller, stats,
                  recent_events, store, sas_enabled=None, handpay_latch=None,
-                 on_settings=None, ticket_header=None):
-        self.url = hub_url.rstrip("/") + "/api/sas/report"
+                 on_settings=None, ticket_header=None, verify_identity=False,
+                 identity_gate=None):
+        self.hub_base = hub_url.rstrip("/")
+        self.url = self.hub_base + "/api/sas/report"
         # One persistent keep-alive connection to the hub (this report
         # thread is its sole caller) — urlopen re-dialed TCP for every
         # 1-4 Hz report.
@@ -622,6 +648,19 @@ class HubReporter:
         self.stats = stats
         self.recent_events = recent_events
         self.store = store
+        # Identity gate (lite-mode safety net — deploy/LITE_DEPLOY.md): when
+        # True, self.url was AUTO-derived from the default gateway and is
+        # NOT yet proven to be a real CabiNet hub. An explicit --hub URL
+        # never sets this (the operator's word is trusted outright). Once
+        # verified the flag flips permanently — no re-probing every cycle.
+        self.verify_identity = verify_identity
+        self._identity_verified = not verify_identity
+        # Optional HubIdentityGate this reporter's probe also drives — when
+        # given, a successful probe flips it too, unblocking any other
+        # satellite traffic (namely HubTicketAuthority) gated on the SAME
+        # identity check. None (bare/test constructions) = this reporter's
+        # own verified flag is the only thing that changes.
+        self.identity_gate = identity_gate
         # C2/C3 wiring (all optional so bare constructions keep today's
         # behavior): sas_enabled is main()'s park Event (set = polling),
         # handpay_latch the HandpayLatch, on_settings the applier for the
@@ -814,6 +853,33 @@ class HubReporter:
 
     def run(self):
         while not self.stop:
+            # Identity gate (lite-mode safety net): an auto-derived hub URL
+            # is unproven until it answers /api/status like a real CabiNet
+            # host. Probed once on the reporter thread, before its first
+            # POST — never touches the SAS transport. A URL that never
+            # verifies never reports (fail closed): silently posting machine
+            # state to whatever happens to be at the router's IP is worse
+            # than not reporting at all.
+            if self.verify_identity and not self._identity_verified:
+                if _looks_like_cabinet_hub(self.hub_base):
+                    self._identity_verified = True
+                    self.failing = False
+                    if self.identity_gate is not None:
+                        self.identity_gate.verified = True
+                    logger.info("hub identity CONFIRMED — {} answers like a "
+                                "CabiNet host, reporting begins",
+                                self.hub_base)
+                else:
+                    if not self.failing:
+                        self.failing = True
+                        logger.warning(
+                            "auto-derived hub {} does not look like a "
+                            "CabiNet host — NOT reporting (lite deployment? "
+                            "pass --hub http://<host-ip>:8081 in the unit / "
+                            "setup script); retrying quietly every {}s",
+                            self.hub_base, REPORT_SEC)
+                    time.sleep(REPORT_SEC)
+                    continue
             # Clear BEFORE the snapshot: a result already in command_results
             # rides THIS report and its stale set is cleared; a result the
             # poll thread deposits during/after the POST re-sets the event and
@@ -1087,13 +1153,21 @@ def denom_disable_guard(transport, address, protocol, game, denom,
 
 
 def _gateway_hub_url(port=8081, fallback="http://192.168.50.2:8081"):
-    """Derive the hub URL from the IPv4 default gateway (/proc/net/route) —
-    on the slot VLAN + Wi-Fi AP the hub IS the DHCP server AND the default
-    gateway, so a SAS SMIB can find it with no hardcoded IP. Used only when
-    --hub is the literal 'auto' (omitting --hub still means NO reporting, the
-    dev/smoke default). Falls back to the known hub IP with no default
-    route; HubReporter is late-bound + retry-forgiving, so a late gateway
-    just starts working."""
+    """Derive the hub URL from the IPv4 default gateway (/proc/net/route).
+
+    Two-mode story: in FULL deployment the hub owns the isolated slot VLAN
+    and IS both the DHCP server and the default gateway, so a SAS SMIB can
+    find it with no hardcoded IP — the assumption this function encodes. In
+    LITE deployment (deploy/LITE_DEPLOY.md — the host is a plain server on
+    someone's existing LAN) the default gateway is just their router, and
+    this function would happily hand back the router's URL. That is why a
+    URL derived here is never trusted blindly: see _looks_like_cabinet_hub
+    and HubReporter's verify_identity gate, which probe it before the first
+    report and skip reporting (loudly, in the journal) if it doesn't answer
+    like a CabiNet host. Used only when --hub is the literal 'auto' (omitting
+    --hub still means NO reporting, the dev/smoke default). Falls back to the
+    known hub IP with no default route; HubReporter is late-bound + retry-
+    forgiving, so a late gateway just starts working."""
     # Dual-homed satellites have TWO default routes (wired + Wi-Fi) — pick the
     # LOWEST-METRIC one (the kernel's preferred egress = wired), never the first
     # line seen, or a Zero could report over the flaky Wi-Fi leg.
@@ -1137,6 +1211,41 @@ def _pi_serial_tail():
     except OSError:
         pass
     return None
+
+
+# Memory-protection cap on the probe's response body. Deliberately generous
+# — NOT the few-KB cap a naive gate would reach for: /api/status is the
+# FULL floor snapshot (associations, meters, recent events) and can
+# legitimately run into the hundreds of KB on a live floor. A small cap
+# would TRUNCATE a real hub's valid JSON and make the gate falsely REJECT
+# it — silently refusing to report is worse than the memory this guards
+# against. 4MB is "this obviously isn't a real /api/status reply" territory,
+# not "the floor is busy today" territory.
+_PROBE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _looks_like_cabinet_hub(base_url, timeout=2.0):
+    """Identity gate for an AUTO-DERIVED hub URL (see _gateway_hub_url):
+    GET base_url + '/api/status' and require HTTP 200 with a JSON body that
+    carries a top-level '_engine' key — only a real CabiNet host answers
+    that shape. In full-mode deployment the gateway genuinely IS the hub, so
+    this always passes; on a home/office LAN (lite mode — the gateway is
+    the user's own router) it correctly fails instead of quietly reporting
+    machine state into the void. stdlib-only (urllib.request); never
+    raises — any failure (refused, timeout, non-200, bad JSON, missing key,
+    oversized body — see _PROBE_MAX_BYTES) returns False."""
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/api/status")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            body = resp.read(_PROBE_MAX_BYTES + 1)
+            if len(body) > _PROBE_MAX_BYTES:
+                return False
+            data = json.loads(body)
+        return isinstance(data, dict) and "_engine" in data
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def _default_smib_id():
@@ -1193,9 +1302,20 @@ def main():
 
     # Zero-config hub discovery: 'auto' derives the gateway (= the hub). A
     # real URL passes through; omitting --hub still means no reporting.
-    if args.hub == "auto":
+    # hub_auto_derived is provenance for HubReporter's identity gate — an
+    # EXPLICIT --hub URL is trusted outright (the operator typed it), an
+    # auto-derived one is only ever the default-gateway GUESS and must be
+    # probed before the first report (see _looks_like_cabinet_hub).
+    hub_auto_derived = args.hub == "auto"
+    if hub_auto_derived:
         args.hub = _gateway_hub_url()
         logger.info("--hub auto -> {}", args.hub)
+    # Shared identity gate (lite-mode safety net): when the URL is a GUESS,
+    # both satellite->hub channels — HubReporter's periodic state POSTs
+    # AND HubTicketAuthority's /api/tito/* ticket POSTs — hold everything
+    # until HubReporter's probe (run once, on its own thread) confirms the
+    # URL. An explicit --hub is trusted outright: no gate, no probing.
+    hub_gate = HubIdentityGate() if hub_auto_derived else None
 
     if args.aft_key:
         try:
@@ -1337,7 +1457,9 @@ def main():
     # Without --hub (bench/mock runs) the plain local store is the authority,
     # exactly as before.
     if args.hub:
-        store = HubTicketAuthority(args.hub, args.smib_id, TicketStore())
+        store = HubTicketAuthority(
+            args.hub, args.smib_id, TicketStore(),
+            allow_network=(hub_gate.allow if hub_gate is not None else None))
         logger.info("ticket authority: HUB {} (local store is fallback/"
                     "journal)", args.hub)
     else:
@@ -1426,7 +1548,9 @@ def main():
                                sas_enabled=sas_enabled,
                                handpay_latch=hp_latch,
                                on_settings=apply_hub_settings,
-                               ticket_header=ticket_header)
+                               ticket_header=ticket_header,
+                               verify_identity=hub_auto_derived,
+                               identity_gate=hub_gate)
         threading.Thread(target=reporter.run, daemon=True,
                          name="hub-reporter").start()
         logger.info("reporting to hub {} every {}s as smibId={}",

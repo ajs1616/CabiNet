@@ -16,6 +16,9 @@ Type=simple
 User=owner
 Group=owner
 WorkingDirectory=/home/owner/CabiNet/G2S
+# LITE MODE (router serves DHCP; see deploy/LITE_DEPLOY.md): point --host-base
+# at this host's LAN IP:
+#ExecStart=/usr/bin/python3 -u g2s_host.py --harvest --host-base http://192.168.1.50:8081
 ExecStart=/usr/bin/python3 -u g2s_host.py --harvest
 Restart=on-failure
 RestartSec=3
