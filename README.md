@@ -28,7 +28,8 @@ whole casino *experience*, at home, for friends.
   in) — meters, AFT credit transfers both directions, TITO, legacy
   bonusing, handpay reset.
 - **Cross-machine TITO** — print a ticket on one machine, redeem it in another.
-- **Player wallets + RFID cards** — tap a fob, the machine knows who's playing;
+- **Player wallets + RFID cards or a PIN** — tap a fob (or type a PIN on the
+  machine's screen), the machine knows who's playing;
   fund friends from the House bank; wallet↔machine transfers.
 - **On-glass UI** (IGT mediaDisplay) and a touchscreen kiosk for SAS machines —
   both showing *your* game room's name in lights.

@@ -136,6 +136,13 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # neutral "the host". The product name never appears
                      # either way (AJ, 2026-08-18).
                      "lock_brand_gameroom",
+                     # PIN login on the glass (2026-09-14): the shortest PIN
+                     # a player may set/type, "6" (default, absent) or "4";
+                     # and whether a PIN login on an admin-flagged account
+                     # gets the admin menu, "1"/"0" (absent = never — a PIN
+                     # typed on a public keypad is easy to shoulder-surf, so
+                     # admin stays card-only unless the collector opts in).
+                     "pin_min_digits", "pin_admin_allowed",
                      # The money symbol every amount leads with, on every
                      # surface; "" = follow the machines' own currencyId
                      # (a European floor showed "$" next to a machine paying
@@ -1087,6 +1094,10 @@ class HubStore:
                     "DELETE FROM host_settings WHERE k=?", (key,))
                 self._conn.commit()
             return value
+        if key == "pin_min_digits" and value not in ("4", "6"):
+            raise ValueError("pin_min_digits must be 4 or 6")
+        if key == "pin_admin_allowed" and value not in ("0", "1"):
+            raise ValueError("pin_admin_allowed must be 0 or 1")
         if len(value) > MAX_SETTING_VAL_LEN:
             raise ValueError(
                 f"value must be <= {MAX_SETTING_VAL_LEN} characters")

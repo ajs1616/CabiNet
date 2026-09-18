@@ -3511,6 +3511,17 @@ function renderPlayers(){
     // marks admin rows; the toggle below grants/revokes it. The House never
     // appears as a row (it lives in S.players.house) so it is never toggleable.
     const adminChip = p.admin ? chip("ADMIN","gold") : "";
+    // PIN login (2026-09-14): a chip marks accounts that can log in by PIN;
+    // the button opens the set/clear modal. Feature-detected on hasPin
+    // (an older hub omits the key -> no button).
+    const pinChip = p.hasPin ? chip("PIN","ok") : "";
+    const pinBtn = p.hasPin===undefined ? "" : `
+      <button class="btn slim ${p.hasPin?"gold":""}"
+        title="PIN login — lets ${esc(p.name)} log in on a machine's screen without a card"
+        aria-label="PIN login for ${esc(p.name)}"
+        onclick="playerPinOpen('${esc(id)}')">
+        <span class="bl">${p.hasPin?"PIN ✓":"Set PIN"}</span>
+        <span class="ba">${p.hasPin?"change or clear":"login without a card"}</span></button>`;
     return `<div class="acct" style="flex-wrap:wrap">
       <div class="an" style="min-width:140px">
         <div class="nm"><button class="pname" title="Rename ${esc(p.name)}"
@@ -3518,7 +3529,7 @@ function renderPlayers(){
         <div class="kd">${p.tier?esc(String(p.tier).toUpperCase())+" · ":""}${
           p.lastActivity?"active "+esc(ago(p.lastActivity))
           :(p.createdAt?"joined "+esc(ago(p.createdAt)):"PLAYER")}</div></div>
-      ${carded}${adminChip}
+      ${carded}${adminChip}${pinChip}
       <div class="bal"><div class="b1">${amtHtml(p.cashableMillicents)}</div>
         ${b2.length?`<div class="b2">${esc(b2.join(" · "))}</div>`:""}</div>
       <div class="chips">${fobs}
@@ -3529,6 +3540,7 @@ function renderPlayers(){
         onclick="playerAdminToggle(this,'${esc(id)}',${p.admin?0:1})">
         <span class="bl">${p.admin?"Admin ✓":"Make admin"}</span>
         <span class="ba">${p.admin?"backend access":"grant backend access"}</span></button>
+      ${pinBtn}
       <button class="btn slim gold" onclick="playerFundOpen('${esc(id)}')">
         <span class="bl">Fund</span></button>
       <button class="btn slim danger" onclick="playerRemove(this,'${esc(id)}')">
@@ -3791,6 +3803,50 @@ async function playerAdminToggle(btn, id, on){
   const j=await playerPost({action:"setAdmin", accountId:id, admin:!!on},
     (on?"Grant admin to ":"Remove admin from ")+p.name);
   flash(btn,!!j);
+}
+
+/* ---- PIN login (2026-09-14): Set / change / clear a player's PIN. The
+   modal is NOT re-rendered on the players poll (a half-typed PIN must
+   survive the 4s repaint); the hub owns shape, uniqueness and the house
+   refusal, and the reply toast carries its reason. The PIN is shown while
+   typing (the collector sets it at their own screen) and never echoed
+   back — a set PIN is only ever "PIN ✓". */
+function playerPinOpen(id){
+  const p=playerById(id); if(!p) return;
+  S.modal={kind:"ppin", id};
+  const min=Number((((S.status||{}).hostOptions||{}).pinMinDigits)||6);
+  $("m-title").textContent="🔢 PIN for "+p.name;
+  setHTML($("m-body"),`
+    <p class="none" style="margin:0 0 10px">${p.hasPin
+      ?"This player has a PIN. Type a new one to change it, or clear it."
+      :"A PIN lets "+esc(p.name)+" log in on a machine's screen (ENTER PIN) without a card."}
+      ${min} to 8 digits, and no two players may share one.</p>
+    <div class="mrowset">
+      <input type="text" id="m-pin" inputmode="numeric" pattern="[0-9]*"
+        maxlength="8" autocomplete="off" placeholder="${"•".repeat(min)}"
+        aria-label="New PIN, digits only">
+    </div>
+    <div class="btnrow">
+      <button class="btn slim gold" onclick="playerPinSave('${esc(p.id)}')">
+        <span class="bl">${p.hasPin?"Change PIN":"Set PIN"}</span></button>
+      ${p.hasPin?`<button class="btn slim danger" onclick="playerPinClear('${esc(p.id)}')">
+        <span class="bl">Clear PIN</span>
+        <span class="ba">card login only</span></button>`:""}
+    </div>`);
+  $("modal").classList.add("on");
+  const el=$("m-pin"); if(el) el.focus();
+}
+async function playerPinSave(id){
+  const p=playerById(id); if(!p) return;
+  const pin=(($("m-pin")||{}).value||"").trim();
+  if(!/^[0-9]+$/.test(pin)){toast("Digits only",false);return;}
+  const j=await playerPost({action:"setPin", accountId:id, pin},"PIN set for "+p.name);
+  if(j) closeModal();
+}
+async function playerPinClear(id){
+  const p=playerById(id); if(!p) return;
+  const j=await playerPost({action:"clearPin", accountId:id},"PIN cleared for "+p.name);
+  if(j) closeModal();
 }
 
 /* ---- 💳 The Players page — the Players card + Cards -------------------
@@ -4656,6 +4712,23 @@ async function lockBrandToggle(btn){
   flash(btn,ok);
   if(ok) tickStatus();
 }
+/* PIN login knobs (Settings ▸ Gameroom ▸ PIN login) — reversible, no arm;
+   the same settingsPost + reconcile idiom as lockBrandToggle. */
+async function pinLengthToggle(btn){
+  const cur=Number((((S.status||{}).hostOptions||{}).pinMinDigits)||6);
+  const next=cur===4?6:4;
+  const ok=await settingsPost({pinMinDigits:next},
+    next===4?"4-digit PINs now allowed":"PINs must be 6 digits again");
+  flash(btn,ok);
+  if(ok) tickStatus();
+}
+async function pinAdminToggle(btn){
+  const cur=!!(((S.status||{}).hostOptions||{}).pinAdminAllowed);
+  const ok=await settingsPost({pinAdminAllowed:!cur},
+    !cur?"Admins may now log in by PIN":"Admin menu is card-only again");
+  flash(btn,ok);
+  if(ok) tickStatus();
+}
 async function gameroomSave(){
   /* Gameroom name save — reversible personalization, no arm. Posts only when
      it differs from the hub face ("" clears it back to the neutral default).
@@ -4754,6 +4827,22 @@ function renderSettings(){
           <button class="btn slim gold" onclick="currencySave()">
             <span class="bl">Save symbol</span></button>
         </div>`}
+        ${ho.pinMinDigits===undefined?"":`
+        <div class="tkf" style="margin-top:12px"><label>PIN login on the
+          machines' screens</label></div>
+        <div class="btnrow">
+          <button class="btn slim" onclick="pinLengthToggle(this)">
+            <span class="bl">${ho.pinMinDigits===4?"4-digit PINs allowed":"6-digit PINs (recommended)"}</span>
+            <span class="ba">tap to switch</span></button>
+          <button class="btn slim ${ho.pinAdminAllowed?"gold":""}" onclick="pinAdminToggle(this)">
+            <span class="bl">${ho.pinAdminAllowed?"Admins may log in by PIN":"Admin menu: card only"}</span>
+            <span class="ba">tap to switch</span></button>
+        </div>
+        <p class="none">Give a player a PIN on the 💳 Players tab and they can
+          log in with ENTER PIN on a machine's screen, no card needed.
+          ${ho.pinAdminAllowed
+            ?"A PIN login on an admin account gets the admin menu."
+            :"A PIN login never gets the admin menu, whatever the account's flag — a PIN typed on a public keypad is easy to watch."}</p>`}
         ${ho.lockBrandGameroom===undefined?"":`
         <div class="tkf" style="margin-top:12px"><label>When you lock a
           machine, its screen says</label></div>

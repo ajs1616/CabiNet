@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.3.0
+- **Log in with a PIN, no card needed.** A machine's player screen now
+  shows ENTER PIN next to "tap your fob": type your PIN on the keypad and
+  you are logged in exactly as if you had tapped your card (wallet,
+  cash-out, log out, hide window). Give a player a PIN on the Players
+  tab (Set PIN; change or clear it there too). PINs are 6 digits by
+  default, never shown again once set, and no two players can share one.
+- **The player screen on a SMIB takes a PIN too** — the screen beside a
+  SAS machine, which has no card reader of its own. The button sits under
+  "tap your fob" there as well, uses the same keypad with the digits
+  masked, and logs the player in exactly as a fob tap does.
+- **Settings ▸ Gameroom ▸ PIN login**: allow 4-digit PINs instead of 6,
+  and choose whether an admin account that logs in by PIN gets the admin
+  menu. Off by default: a PIN typed on a public keypad is easy to watch,
+  so admin stays card-only unless you switch it on.
+- Guessing is throttled per machine: five wrong PINs in a row lock that
+  machine's keypad for a minute, doubling each time it happens again. A
+  right PIN clears it. Wrong attempts are in the hub log; the PIN itself
+  never is.
+- The ENTER PIN button only appears once at least one player has a PIN.
+- **The SMIB player screen now fits a wide, low panel** such as a
+  1280x400 strip display in a player-tracking bracket. Everything moves up
+  into the top of the screen: name and balance in a column on the left,
+  the menu as a grid of buttons beside it, and the amount keypad as two
+  rows instead of a tall tower. A normal 1024x600 screen is unchanged and
+  needs no setting: the screen picks the right layout for the panel it
+  runs on.
+
 ## v0.2.0
 - **The on-glass player screen now fits wide, low windows** such as the
   service window at the bottom of an IGT CrystalCurve (840×292). The hub

@@ -156,6 +156,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #at-note  { position: absolute; left: 12px; top: 930px; width: 232px;
             text-align: center; font-size: 12px; line-height: 16px;
             color: #c98a4f; }
+/* ENTER PIN (2026-09-14): shown on attract only while some player has a
+   PIN (state.pinLogin.available); opens the keypad in PIN mode */
+#at-pin   { position: absolute; left: 40px; top: 620px; width: 176px;
+            height: 56px; line-height: 52px; text-align: center;
+            font-size: 16px; font-weight: bold; letter-spacing: 2px;
+            color: #ffd166; background: #131a24; border: 2px solid #3a4b60;
+            border-radius: 6px; display: none; }
+#at-pin:active { background: #26364a; }
 
 /* --- stacked home (base for everyone, +admin backend stack) ------------ */
 .hd-hello { position: absolute; left: 12px; top: 40px; width: 232px;
@@ -404,6 +412,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                   line-height: 34px; }
 .wide #at-tap br { display: none; }
 .wide #at-note  { left: 0; top: 244px; width: 840px; }
+.wide #at-pin   { left: 340px; top: 200px; width: 160px; height: 38px;
+                  line-height: 34px; font-size: 13px; }
 /* home: text column left, the button stack becomes a 2x4 grid on the right */
 .wide .hd-hello { left: 24px; top: 24px; width: 380px; font-size: 28px; }
 .wide .hd-sub   { left: 24px; top: 62px; width: 380px; }
@@ -515,6 +525,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="at-rule2"></div>
   <div id="at-nick">&nbsp;</div>
   <div id="at-tap">TAP YOUR FOB <br>TO BEGIN</div>
+  <div id="at-pin">ENTER PIN</div>
   <div id="at-note"></div>
 </div>
 
@@ -789,6 +800,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 
   // ---- state: sess lives ONLY here (a closure var, never the URL) ------
   var sess = null, tier = '', who = '', nick = '', sinceIso = '';
+  // PIN login (2026-09-14): the keypad doubles as a PIN pad on attract.
+  // kpMode 'amount' (wallet funding) | 'pin'; pinMin/pinAvail ride the
+  // state poll (pinLogin.minDigits / .available).
+  var kpMode = 'amount', kpPin = '', pinMin = 6, pinAvail = false, pinBusy = false;
   var admin = false;         // the MENU authority: state.admin from the hub
                              // (account.admin, legacy-bridged to operator
                              // fobs) -> shows the backend button stack + badge.
@@ -963,6 +978,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // the money symbol the hub is using (Settings ▸ Gameroom ▸ Currency, or
     // the machine's own currencyId) — repaint the preset chips on a change
     if (s.currency && s.currency !== CUR) { CUR = s.currency; repaintCurrency(); }
+    // PIN login: the button lives on attract only while a PIN exists
+    if (s.pinLogin && typeof s.pinLogin === 'object') {
+      pinMin = s.pinLogin.minDigits || 6;
+      pinAvail = (s.pinLogin.available === true);
+    } else {
+      pinAvail = false;
+    }
+    setStyle($('at-pin'), 'display', pinAvail ? 'block' : 'none');
     // the cabinet's own description of THIS window decides tall vs wide
     if (s.glassWindow && s.glassWindow.w) {
       applyLayout(s.glassWindow.w, s.glassWindow.h, true);
@@ -984,6 +1007,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       s.carded = false;
     }
     if (s.carded) {
+      if (kpMode === 'pin') { closeKeypad(); }   // the PIN worked (or a tap won)
       if (s.sess && s.sess !== deadSess) { deadSess = null; } // superseded
       tier = s.tier || 'player';
       // admin is the MENU authority (account.admin, legacy-bridged to
@@ -1377,6 +1401,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // ---- custom-amount keypad (ATM-style: digits shift in as cents) ---------
   var kpCents = 0;                        // amount being typed, in cents
   function kpRepaint() {
+    if (kpMode === 'pin') {
+      var dots = '', di;
+      for (di = 0; di < kpPin.length; di++) { dots += '\u2022'; }
+      setText('kp-amt', dots || '\u00a0');   // never the digits
+      return;
+    }
     setText('kp-amt', fmtCents(kpCents));
     var msg = '';
     if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
@@ -1385,18 +1415,62 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('kp-msg', msg);
   }
   function kpDigit(d) {
+    if (kpMode === 'pin') {
+      if (kpPin.length >= 8 || pinBusy) { return; }
+      kpPin += String(d); setText('kp-msg', ''); kpRepaint();
+      return;
+    }
     var n = kpCents * 10 + d;
     if (n > 9999999999) { return; }       // 5-byte BCD wire max ($99,999,999.99, SAS_AFT_MAX_CENTS); real bound is the wallet balance (checked above)
     kpCents = n; kpRepaint();
   }
   function openKeypad() {
     if (!coCanFund) { return; }
+    kpMode = 'amount'; kpPin = '';
+    setText('kp-ttl', 'ADD \u00b7 AMOUNT'); setText('kp-msg', '');
     kpCents = 0;                          // START EMPTY — type the amount fresh,
     kpRepaint();                          // no preset to clear first (ATM-style)
     $('kp-scrim').style.display = 'block';
   }
-  function closeKeypad() { $('kp-scrim').style.display = 'none'; }
+  function closeKeypad() {
+    $('kp-scrim').style.display = 'none';
+    kpMode = 'amount'; kpPin = ''; pinBusy = false;
+  }
+  // ---- PIN login (2026-09-14): the same keypad, digits masked, OK posts
+  // POST /api/glass/pinlogin {egm, dev, pin} — the one sessionless write.
+  // On ok the hub cards the player in; the next state poll flips to home
+  // and closes the pad (renderState). Refusals paint on kp-msg.
+  function openPinKeypad() {
+    if (sess) { return; }                 // already carded — nothing to log in
+    kpMode = 'pin'; kpPin = ''; pinBusy = false;
+    setText('kp-ttl', 'ENTER PIN'); setText('kp-msg', '');
+    kpRepaint();
+    $('kp-scrim').style.display = 'block';
+  }
+  function pinSubmit() {
+    if (pinBusy) { return; }
+    if (kpPin.length < pinMin) {
+      setText('kp-msg', 'Enter at least ' + pinMin + ' digits'); return;
+    }
+    pinBusy = true;
+    setText('kp-msg', 'Checking\u2026');
+    xreq('POST', '/api/glass/pinlogin',
+      JSON.stringify({ egm: egmId, dev: devId, pin: kpPin }),
+      function (status, data) {
+        pinBusy = false; kpPin = '';
+        if (kpMode !== 'pin') { return; }   // pad already closed (state flip)
+        kpRepaint();
+        if (status === 200 && data && data.ok) {
+          setText('kp-msg', 'Welcome, ' + (data.name || 'player'));
+        } else if (status === 200 && data && data.error) {
+          setText('kp-msg', String(data.error).toUpperCase());
+        } else {
+          setText('kp-msg', 'NO ANSWER \u2014 TRY AGAIN');
+        }
+      });
+  }
   function kpOk() {
+    if (kpMode === 'pin') { pinSubmit(); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
     paintWalletChips();
@@ -1656,7 +1730,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   for (var kpi = 0; kpi <= 9; kpi++) {
     (function (dgt) { $('kp' + dgt).onclick = function () { kpDigit(dgt); }; })(kpi);
   }
-  $('kp-clr').onclick = function () { kpCents = 0; kpRepaint(); };
+  $('kp-clr').onclick = function () { kpCents = 0; kpPin = ''; kpRepaint(); };
+  $('at-pin').onclick = openPinKeypad;                          // attract -> PIN pad
   $('kp-ok').onclick = kpOk;
   $('kp-cancel').onclick = closeKeypad;
   $('wl-add').onclick = function () {
