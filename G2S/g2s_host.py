@@ -12284,7 +12284,20 @@ class G2SHost:
         if not online:
             return
         if known:
-            self.enqueue_get_game_play_status(assoc, dev)
+            # NOT for the play cycle (GPE101–GPE113: escrow / started / wager /
+            # ended / idle / result). Those narrate every spin, not a config
+            # change, and each one used to cost an extra getGamePlayStatus →
+            # gamePlayStatus round trip. The AVP pays its outbound messages
+            # out one per ~300 ms, so during play the SERVICE-button event
+            # (CBE301) queued behind 4–7 of them and the glass menu arrived
+            # 1–2 s late; idle, 0.03 s (glass_button_trace, 2026-09-18 —
+            # AJ: "I think it's when other stuff is going on, like if I've
+            # been playing"). Config/denom events (GPE0xx, GPE2xx) still
+            # trigger the read — that is what GR-31 was for.
+            code = str(ev.get("eventCode") or "")
+            play_cycle = code.startswith("G2S_GPE1") and code[8:].isdigit()
+            if not play_cycle:
+                self.enqueue_get_game_play_status(assoc, dev)
             # GPE201 = Active Denominations Changed (§6.23.22) — fired when
             # the EGM APPLIES a setActiveDenoms (possibly long after our
             # send, §6.15 deferred-apply) AND when the operator flips denoms
