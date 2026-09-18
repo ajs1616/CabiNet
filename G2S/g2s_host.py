@@ -11809,6 +11809,11 @@ class G2SHost:
         "G2S_GPE110",   # secondary game ended
         "G2S_GPE111",   # game result
         "G2S_GPE113",   # game idle
+        # IGT mediaDisplay vendor events fired by OUR OWN show/hide — ladder
+        # evidence only, never acted on (IGT_MDE102 contentLoaded and
+        # IGT_MDE105 ARE acted on and stay subscribed).
+        "IGT_MDE106",
+        "IGT_MDE107",
     ))
     _EVENT_SUB_FLAGS = ('g2s:sendDeviceStatus="true" g2s:sendTransaction="true" '
                         'g2s:sendClassMeters="false" g2s:sendDeviceMeters="true" '
