@@ -94,9 +94,23 @@ set to taste:
 
 Operator menu: **Setup > Machine > Media Display**. Two settings:
 
-**Media Display Global Options** → **Application handles service button =
-YES** (this is what lets the cabinet's SERVICE button open and close the
-CabiNet menu):
+**Media Display Global Options** → **Application handles service button**.
+This is what lets the cabinet's SERVICE button open and close the CabiNet
+menu, and the right value depends on the cabinet generation:
+
+- **QNX AVP (the original bench machine): YES.** It reports every press to
+  the hub and never drives the window itself.
+- **Windows-era cabinets (CrystalCurve, CrystalSlant, ...): NO.** These
+  only report the service lamp going on or off, never the press. With YES
+  the lamp goes on at the first press and never off again (only IGT's own
+  media content could clear it), so the button works exactly once. With NO
+  the lamp toggles with every press and the hub sees every one; the call
+  lamp on top of the cabinet lights while the menu is open, which is the
+  button's normal function.
+
+If in doubt: press SERVICE three times a few seconds apart and watch the
+hub log for "Service lamp ON" / "Service lamp off" lines. Both alternating
+means the setting is right for that cabinet.
 
 ![Media Display Global Options](img/avp-md-global-options.jpg)
 

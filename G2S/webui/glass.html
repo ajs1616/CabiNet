@@ -156,6 +156,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 #at-note  { position: absolute; left: 12px; top: 930px; width: 232px;
             text-align: center; font-size: 12px; line-height: 16px;
             color: #c98a4f; }
+/* ENTER PIN (2026-09-14): shown on attract only while some player has a
+   PIN (state.pinLogin.available); opens the keypad in PIN mode */
+#at-pin   { position: absolute; left: 40px; top: 620px; width: 176px;
+            height: 56px; line-height: 52px; text-align: center;
+            font-size: 16px; font-weight: bold; letter-spacing: 2px;
+            color: #ffd166; background: #131a24; border: 2px solid #3a4b60;
+            border-radius: 6px; display: none; }
+#at-pin:active { background: #26364a; }
 
 /* --- stacked home (base for everyone, +admin backend stack) ------------ */
 .hd-hello { position: absolute; left: 12px; top: 40px; width: 232px;
@@ -380,6 +388,132 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
              letter-spacing: 2px; color: #9fb2c8; background: #0f151d;
              border: 2px solid #1c2634; cursor: pointer; }
 #kp-cancel:active { background: #1c2634; }
+
+/* ===== WIDE BAND LAYOUT — a bottom Service Window (IGT CrystalCurve:
+   840x292 at the foot of one curved screen; live-read 2026-09-12) instead of
+   the AVP's 256x1024 side strip. Same DOM, a second coordinate set: html.wide
+   is set by applyLayout() when the window the cabinet described in its
+   profile census is wider than it is tall. The tall rules above stay the
+   default, so the proven AVP renderer never sees a changed byte. Lane =
+   840x292, centred by applyLayout when the window is bigger; every rule below
+   stays inside it. Inline tops on the button slots are beaten with !important
+   (stylesheet !important > inline, CSS 2.1 — fine on WebKit 534). */
+.wide .view { width: 840px; height: 292px; }
+.wide #kp-scrim { width: 840px; height: 292px; }
+.wide .nb { width: 196px; height: 60px; line-height: 56px; margin: 0;
+            font-size: 16px; letter-spacing: 1px; }
+.wide .btnslot, .wide .backslot { width: 196px; }
+.wide .backslot { left: 628px; top: 216px; }
+/* attract: one line, centred in the band */
+.wide #at-rule1, .wide #at-rule2 { display: none; }
+.wide #at-brand { top: 52px; width: 840px; font-size: 40px; }
+.wide #at-nick  { left: 0; top: 110px; width: 840px; }
+.wide #at-tap   { left: 0; top: 160px; width: 840px; font-size: 26px;
+                  line-height: 34px; }
+.wide #at-tap br { display: none; }
+.wide #at-note  { left: 0; top: 244px; width: 840px; }
+.wide #at-pin   { left: 340px; top: 200px; width: 160px; height: 38px;
+                  line-height: 34px; font-size: 13px; }
+/* home: text column left, the button stack becomes a 2x4 grid on the right */
+.wide .hd-hello { left: 24px; top: 24px; width: 380px; font-size: 28px; }
+.wide .hd-sub   { left: 24px; top: 62px; width: 380px; }
+.wide #ph-credits { left: 24px; top: 88px; width: 380px; font-size: 20px; }
+.wide #hm-badge { left: 24px; top: 122px; width: 150px; }
+.wide #hm-rule  { display: none; }
+.wide #hm-btns  { left: 420px !important; top: 16px !important; width: 412px; }
+.wide #hm-btns .nb { float: left; margin: 0 8px 8px 0; }
+/* html.many = the admin stack is showing (9 buttons incl. HIDE WINDOW):
+   tall lane — slimmer buttons so the column still clears the footer;
+   wide lane — three columns instead of two. */
+.many .btncol .nb { height: 76px; line-height: 72px; margin-bottom: 8px;
+                    font-size: 17px; }
+.wide.many #hm-btns .nb { width: 128px; font-size: 13px; letter-spacing: 0; }
+.wide .foot     { left: 24px; top: 262px; width: 380px; text-align: left; }
+/* wallet: balances left, fund pad middle, cash-out + back on the right */
+.wide #wl-title { left: 24px; top: 18px; width: 380px; }
+.wide #wl-label { left: 24px; top: 50px; width: 380px; text-align: left; }
+.wide #wl-bal   { left: 24px; top: 66px; width: 380px; text-align: left;
+                  font-size: 38px; }
+.wide #wl-mc-l  { left: 24px; top: 116px; width: 380px; text-align: left; }
+.wide #wl-mc-v  { left: 24px; top: 132px; width: 380px; text-align: left; }
+.wide #wl-sec1  { left: 24px; top: 172px; width: 380px; }
+.wide #wl-chips { left: 24px; top: 192px; width: 236px; }
+.wide #wl-custom { left: 268px; top: 192px; width: 136px; height: 64px;
+                   line-height: 60px; font-size: 24px; }
+.wide #wl-sel   { display: none; }
+.wide #wl-fund-msg { left: 24px; top: 262px !important; width: 380px;
+                     text-align: left; }
+.wide #wl-add-slot { left: 420px; top: 16px !important; }
+.wide #wl-sec2  { left: 420px; top: 92px; width: 196px; }
+.wide #wl-toggle-slot { left: 420px; top: 112px !important; }
+.wide #wl-toggle-hint { left: 420px; top: 178px; width: 196px; }
+.wide #wl-note  { left: 628px; top: 92px; width: 196px; }
+/* cash out */
+.wide #co-title { left: 24px; top: 18px; width: 380px; }
+.wide .co-l { left: 24px; width: 380px; }
+.wide .co-v { left: 24px; width: 380px; }
+.wide #co-mc-l { top: 56px; }   .wide #co-mc-v { top: 74px; }
+.wide #co-wl-l { top: 128px; }  .wide #co-wl-v { top: 146px; }
+.wide #co-sec2 { left: 420px; top: 18px; width: 196px; }
+.wide #co-toggle-slot { left: 420px; top: 40px !important; }
+.wide #co-toggle-hint { left: 420px; top: 106px; width: 196px; }
+.wide #co-note { left: 628px; top: 18px; width: 196px; }
+/* machine info: label/value pairs as rows */
+.wide #mi-title { left: 24px; top: 18px; width: 380px; }
+.wide #mi-rows  { left: 24px; top: 52px; width: 580px; }
+.wide .mi-l { float: left; clear: left; width: 130px; margin: 0 0 6px 0;
+              line-height: 18px; }
+.wide .mi-v { float: left; width: 440px; margin: 0 0 6px 0; font-size: 14px;
+              line-height: 18px; }
+/* logout + money confirm: question on top, the two buttons side by side */
+.wide #lo-q   { left: 0; top: 40px; width: 840px; }
+.wide #lo-sub { left: 120px; top: 84px; width: 600px; }
+.wide #lo-yes { left: 216px; top: 150px; }
+.wide #lo-no  { left: 428px; top: 150px; }
+.wide #lo-note { left: 0; top: 224px; width: 840px; }
+.wide #cf-q   { left: 0; top: 34px; width: 840px; }
+.wide #cf-sub { left: 120px; top: 80px; width: 600px; }
+.wide #cf-yes-slot { left: 216px; top: 140px !important; }
+.wide #cf-no-slot  { left: 428px; top: 140px !important; }
+.wide #cf-note { left: 0; top: 214px; width: 840px; }
+/* stub */
+.wide #st-glyph { top: 16px; width: 840px; }
+.wide #st-title { left: 0; top: 66px; width: 840px; }
+.wide #st-soon  { left: 0; top: 94px; width: 840px; }
+.wide #st-blurb { left: 120px; top: 132px; width: 600px; }
+/* admin lists: title + list left, action buttons right */
+.wide #tk-title, .wide #hp-title, .wide #gm-title, .wide #se-title {
+  left: 24px; top: 18px; width: 580px; }
+.wide #gm-asof { left: 24px; top: 44px; width: 580px; }
+.wide .listbox { left: 24px; width: 580px; }
+.wide #tk-list { top: 52px !important; height: 236px !important; }
+.wide #hp-list { top: 52px !important; height: 236px !important; }
+.wide #gm-list { top: 62px !important; height: 226px !important; }
+.wide .lr-b { width: 560px; }
+.wide .gr-n { width: 470px; }
+.wide #se-rows { left: 24px; top: 52px; width: 580px; }
+.wide #hp-clear-slot, .wide #gm-refresh-slot { left: 628px; top: 16px !important; }
+/* keypad: two rows of six keys, cancel underneath */
+.wide #kp-ttl { left: 0; top: 8px; width: 840px; }
+.wide #kp-amt { left: 0; top: 26px; width: 840px; font-size: 34px;
+                line-height: 40px; }
+.wide #kp-msg { left: 0; top: 68px; width: 840px; }
+.wide #kp-grid { left: 180px; top: 92px; width: 480px; height: 190px; }
+.wide .kp-key { width: 72px; height: 56px; line-height: 52px; font-size: 24px; }
+.wide #kp7 { left: 0 !important; top: 0 !important; }
+.wide #kp8 { left: 80px !important; top: 0 !important; }
+.wide #kp9 { left: 160px !important; top: 0 !important; }
+.wide #kp4 { left: 240px !important; top: 0 !important; }
+.wide #kp5 { left: 320px !important; top: 0 !important; }
+.wide #kp6 { left: 400px !important; top: 0 !important; }
+.wide #kp1 { left: 0 !important; top: 64px !important; }
+.wide #kp2 { left: 80px !important; top: 64px !important; }
+.wide #kp3 { left: 160px !important; top: 64px !important; }
+.wide #kp-clr { left: 240px !important; top: 64px !important; }
+.wide #kp0 { left: 320px !important; top: 64px !important; }
+.wide #kp-ok { left: 400px !important; top: 64px !important; }
+.wide #kp-cancel { left: 0; top: 130px; width: 472px; height: 48px;
+                   line-height: 44px; }
 </style>
 </head>
 <body>
@@ -390,7 +524,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="at-brand">GAME ROOM</div>
   <div id="at-rule2"></div>
   <div id="at-nick">&nbsp;</div>
-  <div id="at-tap">TAP YOUR FOB<br>TO BEGIN</div>
+  <div id="at-tap">TAP YOUR FOB <br>TO BEGIN</div>
+  <div id="at-pin">ENTER PIN</div>
   <div id="at-note"></div>
 </div>
 
@@ -409,8 +544,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
        line hides with it (display:none is the default) -->
   <div id="ph-credits">CREDITS &#8212;</div>
   <div id="hm-badge">ADMIN</div>
-  <div class="hairline" style="top:168px;"></div>
-  <div class="btncol" style="top:180px;">
+  <div class="hairline" id="hm-rule" style="top:168px;"></div>
+  <div class="btncol" id="hm-btns" style="top:180px;">
     <div class="nb nb-gold" id="hb-wallet">MY WALLET</div>
     <div class="nb" id="hb-cashout">CASH OUT</div>
     <div class="nb hm-admin" id="hb-machine" style="display:none;">MACHINE</div>
@@ -418,6 +553,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     <div class="nb hm-admin" id="hb-handpay" style="display:none;">HANDPAY</div>
     <div class="nb hm-admin" id="hb-games" style="display:none;">GAMES</div>
     <div class="nb hm-admin" id="hb-settings" style="display:none;">SETTINGS</div>
+    <!-- HIDE WINDOW (2026-09-14): game full screen, session KEPT — a
+         second fob tap used to be the only way off the screen and it
+         logged the player out. Re-tap or SERVICE brings the menu back. -->
+    <div class="nb" id="hb-hide">HIDE WINDOW</div>
     <div class="nb nb-red" id="hb-logout">LOG OUT</div>
   </div>
   <div class="foot" id="ph-foot">GAME ROOM</div>
@@ -453,10 +592,10 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="wl-custom">$5.00</div>
   <div id="wl-sel">TAP AMOUNT TO ENTER A CUSTOM VALUE</div>
   <div id="wl-fund-msg" style="top:392px;"></div>
-  <div class="btnslot" style="top:414px;">
+  <div class="btnslot" id="wl-add-slot" style="top:414px;">
     <div class="nb nb-gold" id="wl-add">ADD CREDITS</div></div>
   <div id="wl-sec2">CASH OUT TO WALLET</div>
-  <div class="btnslot" style="top:528px;">
+  <div class="btnslot" id="wl-toggle-slot" style="top:528px;">
     <div class="nb" id="wl-toggle">TO WALLET  OFF</div></div>
   <div id="wl-toggle-hint"></div>
   <div id="wl-note"></div>
@@ -501,7 +640,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="co-l" id="co-wl-l">MY WALLET</div>
   <div class="co-v" id="co-wl-v">&#8212;</div>
   <div id="co-sec2">CASH OUT DESTINATION</div>
-  <div class="btnslot" style="top:372px;">
+  <div class="btnslot" id="co-toggle-slot" style="top:372px;">
     <div class="nb" id="co-toggle">TO WALLET  OFF</div></div>
   <div id="co-toggle-hint"></div>
   <div id="co-note"></div>
@@ -521,7 +660,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 <div class="view" id="v-handpay">
   <div id="hp-title">HANDPAY</div>
   <div class="listbox" id="hp-list" style="top:88px; height:640px;"></div>
-  <div class="btnslot" style="top:770px;">
+  <div class="btnslot" id="hp-clear-slot" style="top:770px;">
     <div class="nb nb-gold" id="hp-clear" style="display:none;">CLEAR</div></div>
   <div class="backslot"><div class="nb" id="hp-back">BACK</div></div>
 </div>
@@ -533,7 +672,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div id="gm-title">GAMES</div>
   <div id="gm-asof"></div>
   <div class="listbox" id="gm-list" style="top:100px; height:620px;"></div>
-  <div class="btnslot" style="top:770px;">
+  <div class="btnslot" id="gm-refresh-slot" style="top:770px;">
     <div class="nb" id="gm-refresh">REFRESH</div></div>
   <div class="backslot"><div class="nb" id="gm-back">BACK</div></div>
 </div>
@@ -550,9 +689,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 <div class="view" id="v-confirm">
   <div id="cf-q">CONFIRM?</div>
   <div id="cf-sub"></div>
-  <div class="btnslot" style="top:430px;">
+  <div class="btnslot" id="cf-yes-slot" style="top:430px;">
     <div class="nb nb-gold" id="cf-yes">CONFIRM</div></div>
-  <div class="btnslot" style="top:542px;">
+  <div class="btnslot" id="cf-no-slot" style="top:542px;">
     <div class="nb" id="cf-no">CANCEL</div></div>
   <div id="cf-note"></div>
 </div>
@@ -618,8 +757,53 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var egmId = qp('egm') || pathParam(1);
   var devId = qp('dev') || pathParam(2) || '1';
 
+  // ---- layout: tall strip (AVP 256x1024, the default rules) or wide band
+  // (CrystalCurve 840x292, html.wide). The cabinet's OWN window census
+  // (state.glassWindow, contentWidth x contentHeight) is the authority; the
+  // viewport is only a first guess until that arrives, because a renderer
+  // may report the whole screen rather than its window. Tall = no changes
+  // at all (the proven AVP path stays byte-identical). ES5 only.
+  var LANE_W = 840, LANE_H = 292;
+  var layoutMode = '', layoutW = 256, layoutH = 1024, layoutFromHub = false;
+  function applyLayout(w, h, fromHub) {
+    w = Number(w) || 0; h = Number(h) || 0;
+    if (!(w > 0 && h > 0)) { return; }
+    if (layoutFromHub && !fromHub) { return; }   // census outranks a guess
+    layoutFromHub = layoutFromHub || !!fromHub;
+    layoutW = w; layoutH = h;
+    var mode = (w > h) ? 'wide' : 'tall';
+    if (mode === layoutMode) { return; }
+    layoutMode = mode;
+    var de = document.documentElement, body = document.body;
+    var cls = (de.className || '').replace(/\bwide\b/g, '')
+      .replace(/^\s+|\s+$/g, '');
+    de.className = (mode === 'wide') ? (cls ? cls + ' wide' : 'wide') : cls;
+    var boxes = document.querySelectorAll('.view, #kp-scrim'), i;
+    if (mode === 'wide') {
+      // the band fills the window; the 840x292 lane sits centred in it
+      var ox = Math.max(0, Math.floor((w - LANE_W) / 2));
+      var oy = Math.max(0, Math.floor((h - LANE_H) / 2));
+      de.style.width = w + 'px';   de.style.height = h + 'px';
+      body.style.width = w + 'px'; body.style.height = h + 'px';
+      for (i = 0; i < boxes.length; i++) {
+        boxes[i].style.left = ox + 'px'; boxes[i].style.top = oy + 'px';
+      }
+    } else {
+      de.style.width = ''; de.style.height = '';
+      body.style.width = ''; body.style.height = '';
+      for (i = 0; i < boxes.length; i++) {
+        boxes[i].style.left = ''; boxes[i].style.top = '';
+      }
+    }
+  }
+  applyLayout(window.innerWidth, window.innerHeight, false);
+
   // ---- state: sess lives ONLY here (a closure var, never the URL) ------
   var sess = null, tier = '', who = '', nick = '', sinceIso = '';
+  // PIN login (2026-09-14): the keypad doubles as a PIN pad on attract.
+  // kpMode 'amount' (wallet funding) | 'pin'; pinMin/pinAvail ride the
+  // state poll (pinLogin.minDigits / .available).
+  var kpMode = 'amount', kpPin = '', pinMin = 6, pinAvail = false, pinBusy = false;
   var admin = false;         // the MENU authority: state.admin from the hub
                              // (account.admin, legacy-bridged to operator
                              // fobs) -> shows the backend button stack + badge.
@@ -662,6 +846,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var gmData = null;                 // last games payload (grouped by game)
   var gmGame = -1;                   // drilled-into game index, -1 = list
   var pendingConfirm = null;         // {body, back} armed for the confirm view
+  var CUR = '$';                     // money symbol; the state poll's
+                                     // "currency" (hub setting or the
+                                     // machine's currencyId) overrides it
   var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (what walletFund sends)
@@ -788,6 +975,21 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (s.nick !== undefined) { nick = s.nick || ''; }
     if (s.gameroom !== undefined) { gameroom = s.gameroom || ''; }
     if (s.egmId) { egmId = s.egmId; }   // hub-canonical casing wins
+    // the money symbol the hub is using (Settings ▸ Gameroom ▸ Currency, or
+    // the machine's own currencyId) — repaint the preset chips on a change
+    if (s.currency && s.currency !== CUR) { CUR = s.currency; repaintCurrency(); }
+    // PIN login: the button lives on attract only while a PIN exists
+    if (s.pinLogin && typeof s.pinLogin === 'object') {
+      pinMin = s.pinLogin.minDigits || 6;
+      pinAvail = (s.pinLogin.available === true);
+    } else {
+      pinAvail = false;
+    }
+    setStyle($('at-pin'), 'display', pinAvail ? 'block' : 'none');
+    // the cabinet's own description of THIS window decides tall vs wide
+    if (s.glassWindow && s.glassWindow.w) {
+      applyLayout(s.glassWindow.w, s.glassWindow.h, true);
+    }
     if (s.uiBuild !== undefined && s.uiBuild !== null) {
       // live-redeploy hook: the hub stamps glass.html's mtime into the state;
       // a change means a newer build of THIS page is being served -> reload
@@ -805,6 +1007,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       s.carded = false;
     }
     if (s.carded) {
+      if (kpMode === 'pin') { closeKeypad(); }   // the PIN worked (or a tap won)
       if (s.sess && s.sess !== deadSess) { deadSess = null; } // superseded
       tier = s.tier || 'player';
       // admin is the MENU authority (account.admin, legacy-bridged to
@@ -876,10 +1079,18 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     // balance must parse at a glance). Plain ES5 regex — toLocaleString's
     // grouping options are far too new for this engine (2026-08-17).
     var ds = String(d).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-    return (neg ? '-$' : '$') + ds + '.' + (r < 10 ? '0' + r : '' + r);
+    return (neg ? '-' + CUR : CUR) + ds + '.' + (r < 10 ? '0' + r : '' + r);
   }
   // millicents -> dollars string (1 cent = 1000 millicents, the hub-side rule)
   function fmtMc(mc) { return fmtCents(Math.floor((mc || 0) / 1000)); }
+  // the preset chips are static HTML ("$1 $5 $20"); repaint them and the
+  // live amount button whenever the hub's money symbol changes
+  function repaintCurrency() {
+    for (var i = 0; i < 3; i++) {
+      setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
+    }
+    setText('wl-custom', fmtCents(selCents));
+  }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
   // stylesheet (gold/white per element) so positives repaint exactly as
@@ -888,7 +1099,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function setMoney(id, s) {
     setText(id, s);
     setStyle($(id), 'color',
-      (s && s.indexOf('-$') !== -1) ? '#ff7a6e' : '');
+      (s && s.indexOf('-' + CUR) !== -1) ? '#ff7a6e' : '');
   }
   function sdot(a, b) {
     a = (a === null || a === undefined) ? '' : String(a);
@@ -966,6 +1177,13 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     for (var ai = 0; ai < ADMIN_BTNS.length; ai++) {
       setStyle($(ADMIN_BTNS[ai]), 'display', admin ? 'block' : 'none');
     }
+    // nine buttons on screen (admin stack + HIDE WINDOW) -> html.many, the
+    // denser button geometry in both lanes (see the .many rules)
+    (function () {
+      var de = document.documentElement;
+      var cls = (de.className || '').replace(/\bmany\b/g, '').replace(/^\s+|\s+$/g, '');
+      de.className = admin ? (cls ? cls + ' many' : 'many') : cls;
+    })();
     // ADMIN OVERLAY: hide the money buttons (MY WALLET / CASH OUT) so a
     // supervisor stacked over a friend can't reach the friend's wallet, and
     // relabel the badge + LOG OUT (its POST ends the overlay, not a card-out).
@@ -982,7 +1200,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('mi-who', who ? (who + ' \u00b7 ' + tier) : '\u2014');
     setText('mi-since', fmtSince(sinceIso));
     setText('mi-link', hubOffline ? 'OFFLINE' : 'online');
-    setText('mi-win', 'dev ' + devId + ' \u00b7 256\u00d71024');
+    setText('mi-win', 'dev ' + devId + ' \u00b7 ' + layoutW + '\u00d7' +
+      layoutH + ' \u00b7 ' + (layoutMode || 'tall'));
     setText('mi-build', lastBuild === null ? '\u2014' : String(lastBuild));
   }
 
@@ -1065,6 +1284,26 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function postAction(obj, cb) {
     obj.sess = sess;
     xreq('POST', '/api/glass/action', JSON.stringify(obj), cb);
+  }
+
+  // ---- HIDE WINDOW: the hub hides this window (hideMediaDisplay); the
+  // page stays resident and carded, so a re-tap of the same fob (or the
+  // SERVICE button where the cabinet narrates it) shows the menu again
+  // without a logout (2026-09-14).
+  var hideBusy = false;
+  function doHide() {
+    if (hideBusy || !sess) { return; }
+    hideBusy = true;
+    setText('hb-hide', 'HIDING…');
+    postAction({ action: 'hideGlass' }, function (status, data) {
+      hideBusy = false;
+      if (status === 200 && data && data.ok !== false) {
+        setText('hb-hide', 'HIDE WINDOW');   // the window is gone; nothing to say
+      } else {
+        setText('hb-hide', 'HIDE FAILED');
+        window.setTimeout(function () { setText('hb-hide', 'HIDE WINDOW'); }, 2500);
+      }
+    });
   }
 
   // ---- CASH OUT view: render + chip pad + funding gate ------------------
@@ -1162,6 +1401,12 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // ---- custom-amount keypad (ATM-style: digits shift in as cents) ---------
   var kpCents = 0;                        // amount being typed, in cents
   function kpRepaint() {
+    if (kpMode === 'pin') {
+      var dots = '', di;
+      for (di = 0; di < kpPin.length; di++) { dots += '\u2022'; }
+      setText('kp-amt', dots || '\u00a0');   // never the digits
+      return;
+    }
     setText('kp-amt', fmtCents(kpCents));
     var msg = '';
     if (coWalletMc !== null && kpCents * 1000 > coWalletMc) {
@@ -1170,18 +1415,62 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     setText('kp-msg', msg);
   }
   function kpDigit(d) {
+    if (kpMode === 'pin') {
+      if (kpPin.length >= 8 || pinBusy) { return; }
+      kpPin += String(d); setText('kp-msg', ''); kpRepaint();
+      return;
+    }
     var n = kpCents * 10 + d;
     if (n > 9999999999) { return; }       // 5-byte BCD wire max ($99,999,999.99, SAS_AFT_MAX_CENTS); real bound is the wallet balance (checked above)
     kpCents = n; kpRepaint();
   }
   function openKeypad() {
     if (!coCanFund) { return; }
+    kpMode = 'amount'; kpPin = '';
+    setText('kp-ttl', 'ADD \u00b7 AMOUNT'); setText('kp-msg', '');
     kpCents = 0;                          // START EMPTY — type the amount fresh,
     kpRepaint();                          // no preset to clear first (ATM-style)
     $('kp-scrim').style.display = 'block';
   }
-  function closeKeypad() { $('kp-scrim').style.display = 'none'; }
+  function closeKeypad() {
+    $('kp-scrim').style.display = 'none';
+    kpMode = 'amount'; kpPin = ''; pinBusy = false;
+  }
+  // ---- PIN login (2026-09-14): the same keypad, digits masked, OK posts
+  // POST /api/glass/pinlogin {egm, dev, pin} — the one sessionless write.
+  // On ok the hub cards the player in; the next state poll flips to home
+  // and closes the pad (renderState). Refusals paint on kp-msg.
+  function openPinKeypad() {
+    if (sess) { return; }                 // already carded — nothing to log in
+    kpMode = 'pin'; kpPin = ''; pinBusy = false;
+    setText('kp-ttl', 'ENTER PIN'); setText('kp-msg', '');
+    kpRepaint();
+    $('kp-scrim').style.display = 'block';
+  }
+  function pinSubmit() {
+    if (pinBusy) { return; }
+    if (kpPin.length < pinMin) {
+      setText('kp-msg', 'Enter at least ' + pinMin + ' digits'); return;
+    }
+    pinBusy = true;
+    setText('kp-msg', 'Checking\u2026');
+    xreq('POST', '/api/glass/pinlogin',
+      JSON.stringify({ egm: egmId, dev: devId, pin: kpPin }),
+      function (status, data) {
+        pinBusy = false; kpPin = '';
+        if (kpMode !== 'pin') { return; }   // pad already closed (state flip)
+        kpRepaint();
+        if (status === 200 && data && data.ok) {
+          setText('kp-msg', 'Welcome, ' + (data.name || 'player'));
+        } else if (status === 200 && data && data.error) {
+          setText('kp-msg', String(data.error).toUpperCase());
+        } else {
+          setText('kp-msg', 'NO ANSWER \u2014 TRY AGAIN');
+        }
+      });
+  }
   function kpOk() {
+    if (kpMode === 'pin') { pinSubmit(); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
     paintWalletChips();
@@ -1391,6 +1680,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // base (every account)
   $('hb-wallet').onclick   = openWallet;                        // the money hub
   $('hb-cashout').onclick  = openCashout;                       // NEW: real, live
+  $('hb-hide').onclick     = doHide;                            // game full screen, session kept
   $('hb-logout').onclick   = function () {
     // In OVERLAY mode this button is "DONE": end the supervisor overlay
     // directly (no YES/STAY confirm, no attract flash — the friend is not
@@ -1440,7 +1730,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   for (var kpi = 0; kpi <= 9; kpi++) {
     (function (dgt) { $('kp' + dgt).onclick = function () { kpDigit(dgt); }; })(kpi);
   }
-  $('kp-clr').onclick = function () { kpCents = 0; kpRepaint(); };
+  $('kp-clr').onclick = function () { kpCents = 0; kpPin = ''; kpRepaint(); };
+  $('at-pin').onclick = openPinKeypad;                          // attract -> PIN pad
   $('kp-ok').onclick = kpOk;
   $('kp-cancel').onclick = closeKeypad;
   $('wl-add').onclick = function () {

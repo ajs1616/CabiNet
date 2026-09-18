@@ -690,6 +690,25 @@ def main():
     h7.set_host_setting("gameroom_name", "")
     check("empty gameroom_name DELETES the row (unset = neutral fallback)",
           h7.host_setting("gameroom_name") is None)
+    # PIN login knobs (2026-09-14): whitelisted, value-checked.
+    check("pin_min_digits accepts 4 and 6 only",
+          h7.set_host_setting("pin_min_digits", "4") == "4"
+          and h7.host_setting("pin_min_digits") == "4"
+          and h7.set_host_setting("pin_min_digits", "6") == "6")
+    for bad in ("5", "", "six"):
+        try:
+            h7.set_host_setting("pin_min_digits", bad)
+            check(f"pin_min_digits {bad!r} raises ValueError", False)
+        except ValueError:
+            check(f"pin_min_digits {bad!r} raises ValueError", True)
+    check("pin_admin_allowed accepts 0/1 only",
+          h7.set_host_setting("pin_admin_allowed", "1") == "1"
+          and h7.host_setting("pin_admin_allowed") == "1")
+    try:
+        h7.set_host_setting("pin_admin_allowed", "yes")
+        check("pin_admin_allowed 'yes' raises ValueError", False)
+    except ValueError:
+        check("pin_admin_allowed 'yes' raises ValueError", True)
     hdr = h7.ticket_header()
     check("ticket_header one-shot blob: set fields, cleared None, rev 0 "
           "pre-bump",

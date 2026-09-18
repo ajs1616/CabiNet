@@ -38,6 +38,7 @@ try:
 except ImportError:             # Windows hub (lite mode): no flock, no ioctl
     fcntl = None
 import hashlib
+import hmac
 import html
 import itertools
 import http.client
@@ -123,7 +124,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.1.0"
+CABINET_VERSION = "0.3.0"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -319,7 +320,45 @@ TOURNAMENT_G2S_WON_METERS = ("G2S_egmPaidGameWonAmt",
 # Anything outside these answers an honest 403 — never a 500. The hub ALWAYS
 # forces the egmId from the token (a page can only ever act on its own
 # cabinet) and re-resolves access server-side (a stale glass never decides).
-GLASS_BASE_ACTIONS = ("logout",)
+GLASS_BASE_ACTIONS = ("logout", "hideGlass")
+
+# PIN login on the glass (2026-09-14): a player types a PIN on the window's
+# keypad instead of tapping a fob. The PIN is the identity (no player
+# number), so it is unique across accounts, stored as a keyed hash (never
+# the digits), 4..8 digits with the floor's minimum a host setting
+# (pin_min_digits, default 6). Guessing is throttled per machine: after
+# PIN_LOCK_AFTER wrong PINs the keypad on that machine is refused for
+# PIN_LOCK_BASE_SEC, doubling on every further strike. A PIN session's uid
+# is PIN_UID_PREFIX + accountId ("PINp3") — the fob table never sees it,
+# so every uid->account resolution goes through _session_account.
+PIN_UID_PREFIX = "PIN"
+PIN_MIN_DIGITS_DEFAULT = 6
+PIN_MAX_DIGITS = 8
+PIN_LOCK_AFTER = 5
+PIN_LOCK_BASE_SEC = 60
+
+
+def pin_uid(account_id):
+    """The carded-session uid (and idReader idNumber) of a PIN login."""
+    return PIN_UID_PREFIX + str(account_id or "")
+
+
+def pin_uid_account(uid):
+    """accountId behind a PIN-login uid, else None. Fob uids are hex, so
+    the 'PIN' prefix can never collide with a real card."""
+    u = str(uid or "")
+    if u.startswith(PIN_UID_PREFIX) and len(u) > len(PIN_UID_PREFIX):
+        return u[len(PIN_UID_PREFIX):]
+    return None
+
+
+def pin_min_digits(hub_store):
+    """The floor's shortest allowed PIN (host setting pin_min_digits)."""
+    try:
+        v = int(hub_store.host_setting("pin_min_digits", "") or 0)
+    except Exception:  # noqa: BLE001 — a db fault reads as the default
+        v = 0
+    return v if v in (4, 6) else PIN_MIN_DIGITS_DEFAULT
 GLASS_WALLET_ACTIONS = ("walletFund", "cashOutToWallet", "cashOutNow")
 GLASS_ADMIN_ACTIONS = ("clearHandpay", "refreshGames")
 # 0x74 "available transfers" bit for machine->host cash-out (real SAS 6.02
@@ -889,6 +928,23 @@ def event_meta(code):
             "icon": icon}
 
 
+# ---- money symbol (Settings ▸ Gameroom ▸ Currency) -------------------------
+# ONE process-wide value so the module-level formatters (denom_dollars) and
+# every engine f-string agree. The engine sets it from the host setting at
+# startup / on change, or adopts the cabinet's own currencyId (cabinetProfile)
+# when no setting is stored — a European floor showed "$500,000.00" on the
+# glass next to a machine paying "€29.800,00" (live-hit 2026-09-12).
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CAD": "$", "AUD": "$",
+                    "NZD": "$", "JPY": "¥", "CHF": "CHF ", "SEK": "kr ",
+                    "NOK": "kr ", "DKK": "kr ", "PLN": "zł "}
+_MONEY = {"symbol": "$", "source": "default"}   # source: setting|machine|default
+
+
+def money_symbol():
+    """The symbol every money string on every surface leads with."""
+    return _MONEY["symbol"]
+
+
 def denom_dollars(millicents):
     """G2S millicents -> a human note/denom label: 2000000 -> '$20',
     25000 -> '$0.25'. Best-effort — a garbage value echoes back verbatim
@@ -899,8 +955,8 @@ def denom_dollars(millicents):
     except (TypeError, ValueError):
         return str(millicents)
     if mc % 100000 == 0:
-        return f"${mc // 100000:,}"
-    return f"${mc / 100000:,.2f}"
+        return f"{money_symbol()}{mc // 100000:,}"
+    return f"{money_symbol()}{mc / 100000:,.2f}"
 
 
 # ----------------------------------------------------------------------------
@@ -932,7 +988,16 @@ EVENT_HOOK_CODES = {
     # (~300ms to the hub), so the HUB is the app that controls it: the
     # service_button hook toggles the resident glass menu (AJ's design —
     # the cabinet's own button opens the player panel).
+    # CBE302 Service Lamp Off is a press as well (bench 2026-09-14, IGT
+    # CrystalCurve/CrystalSlant, Windows-era): those cabinets narrate only
+    # LAMP TRANSITIONS, never the press itself. With "application handles
+    # service button" = NO the lamp toggles per press (301, 302, 301, ...)
+    # and every press reaches the hub; with YES the lamp goes on at the
+    # first press and never off again (only EMDI content could clear it),
+    # so the button worked exactly once per cabinet. The hook toggles the
+    # menu off its own visibility belief, never off the lamp state.
     "G2S_CBE301": ("service_button", {}),
+    "G2S_CBE302": ("service_button", {}),
     # tilt — §3.24.9 General Cabinet Tilt (live-proven overnight 2026-07-02)
     # and §3.24.13 Cabinet Tilt Cleared
     "G2S_CBE309": ("tilt", {}),
@@ -1794,7 +1859,12 @@ class EgmAssociation:
         # idempotent). glass_button_ts debounces CBE301 bursts (a press
         # can chirp several events).
         self.glass_visible = False
+        # HIDE WINDOW pressed on the glass (2026-09-14): the ONLY state in
+        # which a same-fob re-tap means 'show my menu again' instead of
+        # card-out. Any hub-driven show/hide clears it.
+        self.glass_hidden_by_player = False
         self.glass_button_ts = 0.0
+        self.glass_button_code = ""     # last event code the hook acted on
         # voucher device picture (G2S-39 companion): nested "status"/
         # "profile" replaced wholesale by the voucherStatus/voucherProfile
         # response handlers — the device-level view beside the VoucherStore's
@@ -1890,7 +1960,12 @@ class EgmAssociation:
         # visibility belief resets to unknown-hidden; the button toggle
         # self-corrects in one press if the window survived visible
         self.glass_visible = False
+        # HIDE WINDOW pressed on the glass (2026-09-14): the ONLY state in
+        # which a same-fob re-tap means 'show my menu again' instead of
+        # card-out. Any hub-driven show/hide clears it.
+        self.glass_hidden_by_player = False
         self.glass_button_ts = 0.0
+        self.glass_button_code = ""     # last event code the hook acted on
         # The window census asks each window ONCE per join (not on a timer —
         # nothing about this class polls). Clearing the asked-set here is
         # what makes a rejoin the retry: a window that stayed silent last
@@ -3446,7 +3521,11 @@ class AccountStore:
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
-        self.state = {"accountSeq": 0, "accounts": {}, "ledger": []}
+        # pinSecret (2026-09-14): the per-hub key the PIN hashes are made
+        # with; "" until the first PIN is set (a load only keeps the keys
+        # listed here, so it MUST be listed to survive a restart).
+        self.state = {"accountSeq": 0, "accounts": {}, "ledger": [],
+                      "pinSecret": ""}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -3501,26 +3580,29 @@ class AccountStore:
             rec = self.state["accounts"].get(str(account_id or ""))
             if rec is None:
                 return None
-            out = dict(rec)
-            # admin (glass-menu backend access) is a forward-only optional
-            # field — a record written before the flag existed reads False,
-            # defaulted at READ so load never mutates the store (§1).
-            out.setdefault("admin", False)
-            return out
+            return self._public(rec)
+
+    @staticmethod
+    def _public(rec):
+        """The copy every reader gets: admin defaulted (a record written
+        before the flag existed reads False — defaulted at READ so load
+        never mutates the store, §1), the PIN hash replaced by a bare
+        hasPin flag (the hash leaves the store for nothing and nobody —
+        2026-09-14)."""
+        out = dict(rec)
+        out.setdefault("admin", False)
+        out["hasPin"] = bool(out.pop("pinHash", None))
+        return out
 
     def snapshot(self):
         """The GET /api/accounts payload: every account (house first, then
         players by creation) + the last 100 ledger entries."""
         with self.lock:
             accounts = sorted(
-                (dict(a) for a in self.state["accounts"].values()),
+                (self._public(a) for a in self.state["accounts"].values()),
                 key=lambda a: (a.get("kind") != "house",
                                a.get("createdAt") or "", a.get("id") or ""))
             ledger = [dict(e) for e in self.state["ledger"][-100:]]
-        for a in accounts:
-            # forward-only admin default at read (legacy record → False),
-            # the same posture as get() — never mutate on load.
-            a.setdefault("admin", False)
         return {"accounts": accounts, "ledger": ledger}
 
     def create(self, name):
@@ -3536,7 +3618,7 @@ class AccountStore:
                    "lastActivity": None, "admin": False}
             self.state["accounts"][aid] = rec
             self._save_locked()
-            return dict(rec), None
+            return self._public(rec), None
 
     def rename(self, account_id, name):
         name = (name or "").strip()
@@ -3549,7 +3631,7 @@ class AccountStore:
             rec["name"] = name
             rec["lastActivity"] = now_iso()
             self._save_locked()
-            return dict(rec), None
+            return self._public(rec), None
 
     def delete(self, account_id):
         with self.lock:
@@ -3570,7 +3652,7 @@ class AccountStore:
                               "the balance first (Players ▸ Remove does)")
             del self.state["accounts"][str(account_id)]
             self._save_locked()
-            return dict(rec), None
+            return self._public(rec), None
 
     def adjust(self, account_id, d_cash=0, d_promo=0, d_non=0, note="",
                ref="", once=False):
@@ -3592,7 +3674,7 @@ class AccountStore:
                 return None, f"unknown account {account_id!r}"
             if once and ref and any(e.get("ref") == ref
                                     for e in self.state["ledger"]):
-                return dict(rec), None
+                return self._public(rec), None
             deltas = (int(d_cash), int(d_promo), int(d_non))
             if rec.get("kind") != "house":
                 for (field, _), d in zip(self.BUCKETS, deltas):
@@ -3612,8 +3694,8 @@ class AccountStore:
                                         " in non-cash credits"}.get(field, "")
                         return None, (
                             f"{rec.get('name') or rec['id']} has "
-                            f"${have / 100000:,.2f}{kindword} — can't take "
-                            f"${-d / 100000:,.2f}. Try a smaller amount.")
+                            f"{money_symbol()}{have / 100000:,.2f}{kindword} — can't take "
+                            f"{money_symbol()}{-d / 100000:,.2f}. Try a smaller amount.")
             ts = now_iso()
             for (field, kind), d in zip(self.BUCKETS, deltas):
                 if d == 0:
@@ -3626,7 +3708,7 @@ class AccountStore:
                 self.state["ledger"] = self.state["ledger"][-self.KEEP_LEDGER:]
             rec["lastActivity"] = ts
             self._save_locked()
-            return dict(rec), None
+            return self._public(rec), None
 
     def ref_totals(self, ref):
         """Summed ledger deltas per credit type under ONE ref — the
@@ -3661,9 +3743,101 @@ class AccountStore:
             rec["admin"] = bool(admin)
             rec["lastActivity"] = now_iso()
             self._save_locked()
-            out = dict(rec)
-            out.setdefault("admin", False)
-            return out, None
+            return self._public(rec), None
+
+
+    # ---- PIN login (2026-09-14) -------------------------------------------
+    # The PIN is the whole identity, so it is stored as an HMAC-SHA256 of the
+    # digits under a per-hub secret that lives in this same state file
+    # (minted on first use). Honest scope: this keeps PINs out of the JSON
+    # in the clear and off every API reply; it is NOT a defence against
+    # someone who holds the file (a 6-digit space is small). Uniqueness is
+    # enforced at set time so a typed PIN resolves to exactly one player.
+
+    def _pin_secret_locked(self):
+        sec = self.state.get("pinSecret")
+        if not isinstance(sec, str) or len(sec) < 32:
+            sec = secrets.token_hex(32)
+            self.state["pinSecret"] = sec
+            self._save_locked()
+        return sec
+
+    def _pin_hash_locked(self, pin):
+        return hmac.new(self._pin_secret_locked().encode("ascii"),
+                        str(pin).encode("ascii"), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def pin_shape_error(pin, min_digits=PIN_MIN_DIGITS_DEFAULT):
+        """None when the PIN has the right shape, else the reason — the
+        one rule the store, the API and the keypad share."""
+        if not isinstance(pin, str) or not pin.isdigit():
+            return "PIN must be digits only"
+        if len(pin) < min_digits:
+            return f"PIN must be at least {min_digits} digits"
+        if len(pin) > PIN_MAX_DIGITS:
+            return f"PIN must be at most {PIN_MAX_DIGITS} digits"
+        return None
+
+    def set_pin(self, account_id, pin, min_digits=PIN_MIN_DIGITS_DEFAULT):
+        """Give a player account a PIN (replaces any earlier one). Refuses
+        a bad shape, an unknown id, the house, and a PIN another account
+        already has — the PIN is the identity, so it must be unique.
+        Returns (public copy, err)."""
+        err = self.pin_shape_error(pin, min_digits)
+        if err:
+            return None, err
+        aid = str(account_id or "")
+        with self.lock:
+            rec = self.state["accounts"].get(aid)
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            if aid == "house" or rec.get("kind") == "house":
+                return None, ("the house account is the bank — it never "
+                              "logs in")
+            h = self._pin_hash_locked(pin)
+            for oid, other in self.state["accounts"].items():
+                if oid != aid and other.get("pinHash") == h:
+                    return None, ("that PIN is already in use by another "
+                                  "player — choose a different one")
+            rec["pinHash"] = h
+            rec["lastActivity"] = now_iso()
+            self._save_locked()
+            return self._public(rec), None
+
+    def clear_pin(self, account_id):
+        aid = str(account_id or "")
+        with self.lock:
+            rec = self.state["accounts"].get(aid)
+            if rec is None:
+                return None, f"unknown account {account_id!r}"
+            if rec.pop("pinHash", None) is not None:
+                rec["lastActivity"] = now_iso()
+                self._save_locked()
+            return self._public(rec), None
+
+    def find_by_pin(self, pin):
+        """The player account behind a typed PIN, or None. Constant-time
+        compares; a store with no PIN yet answers None without minting a
+        secret."""
+        if not isinstance(pin, str) or not pin.isdigit():
+            return None
+        with self.lock:
+            if not self.state.get("pinSecret"):
+                return None
+            h = self._pin_hash_locked(pin)
+            for rec in self.state["accounts"].values():
+                ph = rec.get("pinHash")
+                if isinstance(ph, str) and hmac.compare_digest(ph, h) \
+                        and rec.get("kind") != "house":
+                    return self._public(rec)
+        return None
+
+    def any_pin(self):
+        """True when at least one account has a PIN — the glass shows its
+        ENTER PIN button only then."""
+        with self.lock:
+            return any(r.get("pinHash")
+                       for r in self.state["accounts"].values())
 
 
 class GlassSessionStore:
@@ -3926,6 +4100,9 @@ class G2SHost:
         # tables migrate here in a later phase; this slice is names only.
         self.hub_store = HubStore(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "data", "hub.db"))
+        # Money symbol: the stored setting wins; else the first cabinet's
+        # currencyId adopts it when its profile arrives (refresh_currency).
+        self.refresh_currency()
         # hub.db phase 2: the ONE cross-machine redemption authority — the
         # union of the VoucherStore (G2S-issued ids, delegated untouched)
         # and the hub's SQLite tito ledger (SAS-minted tickets). Every
@@ -4049,6 +4226,9 @@ class G2SHost:
         # actually offers, asked once and cached (see _fleet_verbs).
         self._fleet_verb_cache = {}
         self.card_sessions = {}
+        # PIN login throttle per egmId (2026-09-14): {fails, strikes,
+        # until}; guarded by companion_lock like card_sessions.
+        self._pin_lockouts = {}
         # Admin overlay tap (#?): a transient SUPERVISOR layer stacked OVER a
         # carded player's session — an admin taps their fob on a machine a
         # friend is playing, the admin menu supersedes on the glass, and when
@@ -6405,7 +6585,7 @@ class G2SHost:
             self.event_hooks.fire("money_hold", {
                 "hook": "money_hold", "egmId": machine, "code": None,
                 "label": (f"🚨 UNHOMED cash-out HOLD — "
-                          f"${int(millicents) / 100000:.2f} off {machine} "
+                          f"{money_symbol()}{int(millicents) / 100000:.2f} off {machine} "
                           f"(txn {txn}): {why}"),
                 "category": "money", "icon": "🚨",
                 "dateTime": now_iso(), "device": path,
@@ -6903,6 +7083,19 @@ class G2SHost:
                      prev.get("name"))
             return
         if prev and prev.get("uid") == uid:
+            # Re-tap of the SAME fob: card-OUT — unless the player hid the
+            # menu with the glass's HIDE WINDOW button (2026-09-14). Then
+            # the re-tap means "bring my menu back", never a logout: a tap
+            # that logged out would kill the session the button exists to
+            # protect (and everything tracked against it). A VISIBLE menu
+            # re-tapped still logs out — the fob stays the light switch.
+            if getattr(assoc, "glass_hidden_by_player", False):
+                assoc.glass_hidden_by_player = False
+                self._glass_follow(assoc, True)
+                log.info("💳 [%s] re-tap by %s (%s) — the menu was hidden, "
+                         "showing it again (session kept)", egm_id,
+                         prev.get("name"), uid)
+                return
             self._glass_card_out(egm_id)            # re-tap = card-out
             log.info("💳 [%s] card OUT — %s (%s)", egm_id,
                      prev.get("name"), uid)
@@ -6960,19 +7153,132 @@ class G2SHost:
         # recovery push above ends in its own show).
         self._glass_follow(assoc, True)
 
+    def pin_login(self, egm_id, pin, peer=None):
+        """POST /api/glass/pinlogin — a player types their PIN on the glass
+        keypad instead of tapping a fob (2026-09-14). Same session as a
+        card-in (token minted, card_sessions published, setIdValidation
+        card-IN to the machine's idReader with idNumber = the PIN uid),
+        just no fob: uid = PIN<accountId>, tier player, companionId None.
+        Same account already carded = "show my menu" (no second card-in);
+        another session on the machine = card-out first (a switch, like a
+        different fob). Refused honestly (ok:false, 200): machine offline
+        or without an owned idReader, an admin overlay in progress, a PIN
+        of the wrong shape, a wrong PIN, or a throttled machine (see
+        PIN_LOCK_AFTER). The PIN itself is never logged."""
+        egm_id = str(egm_id or "").strip()
+        if self._pin_lockouts is None:
+            self._pin_lockouts = {}
+        now = time.time()
+        with self.companion_lock:
+            lock = dict(self._pin_lockouts.get(egm_id) or {})
+        until = float(lock.get("until") or 0)
+        if now < until:
+            wait = int(until - now) + 1
+            return {"ok": False, "retryAfterSec": wait,
+                    "error": f"too many wrong PINs — try again in {wait} s"}
+        err = AccountStore.pin_shape_error(pin, pin_min_digits(self.hub_store))
+        if err:
+            return {"ok": False, "error": err}
+        with self.assoc_lock:
+            assoc = self.associations.get(egm_id)
+        if assoc is None or assoc.comms_state != "onLine":
+            return {"ok": False, "error": "this machine is offline"}
+        dev = self.default_id_reader_device(assoc)
+        if dev is None:
+            return {"ok": False,
+                    "error": "this machine can't take a login right now"}
+        acct = self.account_store.find_by_pin(pin)
+        if acct is None:
+            return self._pin_login_failed(egm_id, peer)
+        aid = str(acct.get("id") or "")
+        uid, tier = pin_uid(aid), "player"
+        name = str(acct.get("name") or "").strip() or "Player"
+        with self.companion_lock:
+            self._pin_lockouts.pop(egm_id, None)     # a right PIN clears it
+            prev = self.card_sessions.get(egm_id)
+            prev = dict(prev) if prev else None
+            overlay = self.admin_overlays.get(egm_id)
+        if overlay is not None:
+            return {"ok": False,
+                    "error": "an admin is using this screen right now"}
+        if prev and prev.get("uid") == uid:
+            assoc.glass_hidden_by_player = False
+            self._glass_follow(assoc, True)
+            log.info("🔢 [%s] PIN login by %s — already carded in, showing "
+                     "the menu (session kept)", egm_id, name)
+            return {"ok": True, "name": name, "already": True}
+        if prev:
+            self._glass_card_out(egm_id, hide=False)
+            log.info("💳 [%s] card OUT — %s (PIN login by %s takes the seat)",
+                     egm_id, prev.get("name"), name)
+        # token first, then the session record (see _card_session_tap for
+        # why: a state poll in the gap would read card-with-no-token as an
+        # idle expiry and card the fresh login straight back out)
+        self.glass_sessions.mint(egm_id, tier, uid, name)
+        with self.companion_lock:
+            self.card_sessions[egm_id] = {
+                "uid": uid, "name": name, "accountId": aid, "tier": tier,
+                "admin": self._session_is_admin(uid, tier),
+                "sinceIso": now_iso(), "sinceTs": time.time(),
+                "deviceId": dev, "companionId": None, "via": "pin"}
+        self.enqueue_set_id_validation(
+            assoc, dev, True, id_number=uid, id_type="G2S_player",
+            prefer_name=name, full_name=name, player_id=aid, id_class=tier)
+        log.info("🔢 [%s] card IN — %s by PIN (uid=%s dev=%s%s)", egm_id,
+                 name, uid, dev, f" from {peer}" if peer else "")
+        self._glass_recovery_push(assoc)
+        self._glass_follow(assoc, True)
+        return {"ok": True, "name": name}
+
+    def _pin_login_failed(self, egm_id, peer=None):
+        """Count a wrong PIN against the machine; the PIN_LOCK_AFTER-th one
+        in a row locks its keypad for PIN_LOCK_BASE_SEC, doubling per
+        strike (a right PIN resets everything)."""
+        with self.companion_lock:
+            lock = dict(self._pin_lockouts.get(egm_id) or {})
+            fails = int(lock.get("fails") or 0) + 1
+            strikes = int(lock.get("strikes") or 0)
+            wait = 0
+            if fails >= PIN_LOCK_AFTER:
+                strikes += 1
+                wait = PIN_LOCK_BASE_SEC * (2 ** (strikes - 1))
+                lock = {"fails": 0, "strikes": strikes,
+                        "until": time.time() + wait}
+            else:
+                lock = {"fails": fails, "strikes": strikes, "until": 0}
+            self._pin_lockouts[egm_id] = lock
+        if wait:
+            log.warning("🔢 [%s] %d wrong PINs in a row%s — keypad locked "
+                        "for %d s (strike %d)", egm_id, PIN_LOCK_AFTER,
+                        f" from {peer}" if peer else "", wait, strikes)
+            return {"ok": False, "retryAfterSec": wait,
+                    "error": f"too many wrong PINs — try again in {wait} s"}
+        log.info("🔢 [%s] wrong PIN (%d of %d)%s", egm_id, fails,
+                 PIN_LOCK_AFTER, f" from {peer}" if peer else "")
+        return {"ok": False, "error": "wrong PIN",
+                "triesLeft": PIN_LOCK_AFTER - fails}
+
     def _glass_service_button(self, info):
-        """service_button hook (G2S_CBE301): the cabinet's own SERVICE
-        button toggles the glass menu — AJ's design, live-adjudicated
-        2026-07-10: with the operator's 'app controls service button'
-        enabled the AVP does NOT drive the window itself, it narrates each
-        press as CBE301 (~300ms), so the hub IS the app. Toggle keys off
-        the glass_visible belief (self-correcting — the verbs are
-        idempotent); bursts debounce (one press chirps several CBE301s);
-        and a press with NO resident SPA runs the recovery push instead —
-        the button self-heals the page after a media-system wipe. Runs on
-        the eventReport handler thread OUTSIDE assoc.lock (the hook
-        contract): quick, never raises (fire() also guards)."""
+        """service_button hook (G2S_CBE301 lamp on / CBE302 lamp off):
+        the cabinet's own SERVICE button toggles the glass menu — AJ's
+        design, live-adjudicated 2026-07-10: with the operator's 'app
+        controls service button' enabled the QNX AVP does NOT drive the
+        window itself, it narrates each press as CBE301 (~300ms), so the
+        hub IS the app. The Windows-era cabinets (CrystalCurve/CrystalSlant,
+        bench 2026-09-14) narrate lamp TRANSITIONS only, so there the
+        operator setting must be NO (lamp toggles per press: 301, 302,
+        301, ...) and both codes are a press. Toggle keys off the
+        glass_visible belief (self-correcting — the verbs are idempotent),
+        never off the lamp: HIDE WINDOW on the glass desyncs the two on
+        purpose. Bursts debounce (one press chirps several CBE301s on the
+        AVP) — but only a REPEAT of the same code; the opposite code is a
+        new press by definition, even 1.5s after the last one. A press
+        with NO resident SPA runs the recovery push instead — the button
+        self-heals the page after a media-system wipe. Runs on the
+        eventReport handler thread OUTSIDE assoc.lock (the hook contract):
+        quick, never raises (fire() also guards)."""
         egm_id = info.get("egmId") or ""
+        code = str(info.get("code") or "")
         with self.assoc_lock:
             assoc = self.associations.get(egm_id)
         if assoc is None or assoc.comms_state != "onLine":
@@ -6983,9 +7289,11 @@ class G2SHost:
         dev = self.glass_target_device(assoc)
         now = time.time()
         with assoc.lock:
-            if now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC:
+            if (now - assoc.glass_button_ts < GLASS_BUTTON_DEBOUNCE_SEC
+                    and code == assoc.glass_button_code):
                 return
             assoc.glass_button_ts = now
+            assoc.glass_button_code = code
             push = assoc.glass_push.get(dev)
             resident = bool(push and push.get("stage") == "shown"
                             and GLASS_PAGE in str(push.get("uri") or ""))
@@ -7006,8 +7314,27 @@ class G2SHost:
         else:
             self.enqueue_show_media_display(assoc, dev)
         assoc.glass_visible = not visible
+        assoc.glass_hidden_by_player = False
         log.info("🛎️ [%s] service button: %s the menu (dev=%s)",
                  egm_id, "hide" if visible else "SHOW", dev)
+
+    def _glass_page_live(self, assoc):
+        """True when the glass page is KNOWN to be in the window: a push
+        that completed this epoch, or a fresh src=spa heartbeat from the
+        page itself. The same test _glass_follow applies before touching
+        the wire — factored out for the re-tap rule (2026-09-14)."""
+        if assoc is None:
+            return False
+        dev = self.glass_target_device(assoc)
+        now = time.time()
+        with assoc.lock:
+            push = assoc.glass_push.get(dev)
+            resident = bool(push and push.get("stage") == "shown"
+                            and GLASS_PAGE in str(push.get("uri") or ""))
+        spa = self._glass_spa_seen.get(assoc.egm_id) or {}
+        return resident or (spa.get("dev") == dev
+                            and now - (spa.get("ts") or 0)
+                            <= GLASS_SPA_LIVE_SEC)
 
     def _glass_follow(self, assoc, visible):
         """GLASS_FOLLOW_CARD: show the resident SPA's window at card-IN,
@@ -7038,6 +7365,7 @@ class G2SHost:
         else:
             self.enqueue_hide_media_display(assoc, dev)
         assoc.glass_visible = visible
+        assoc.glass_hidden_by_player = False
         log.info("🪟 [%s] glass follows card: %s dev=%s (game %s)",
                  assoc.egm_id, "show" if visible else "hide", dev,
                  "shares the screen" if visible else "full screen")
@@ -7820,6 +8148,7 @@ class G2SHost:
             players.append({
                 "id": aid, "name": a.get("name"),
                 "admin": bool(a.get("admin")),
+                "hasPin": bool(a.get("hasPin")),
                 "cashableMillicents": int(a.get("cashableMillicents") or 0),
                 "promoMillicents": int(a.get("promoMillicents") or 0),
                 "nonCashMillicents": int(a.get("nonCashMillicents") or 0),
@@ -8138,8 +8467,30 @@ class G2SHost:
             log.info("🔑 player setAdmin %s -> %s (%s)", account.get("id"),
                      admin, account.get("name"))
             return {"ok": True, "player": account}
+        if action == "setPin":
+            # PIN login (2026-09-14): the store owns shape/uniqueness/house
+            # refusals; the floor's minimum length is the host setting.
+            # The PIN never reaches the log.
+            pin = req.get("pin")
+            if not isinstance(pin, str):
+                return {"ok": False, "error": "pin must be a string of digits"}
+            account, err = store.set_pin(req.get("accountId"), pin.strip(),
+                                         pin_min_digits(hs))
+            if err:
+                return {"ok": False, "error": err}
+            log.info("🔢 player setPin %s (%s)", account.get("id"),
+                     account.get("name"))
+            return {"ok": True, "player": account}
+        if action == "clearPin":
+            account, err = store.clear_pin(req.get("accountId"))
+            if err:
+                return {"ok": False, "error": err}
+            log.info("🔢 player clearPin %s (%s)", account.get("id"),
+                     account.get("name"))
+            return {"ok": True, "player": account}
         return {"ok": False, "error": f"unknown action {action!r} — "
-                "create/remove/linkFob/unlinkFob/fund/rename/setAdmin"}
+                "create/remove/linkFob/unlinkFob/fund/rename/setAdmin/"
+                "setPin/clearPin"}
 
     def _glass_ui_build(self):
         """Glass nav v1 uiBuild: int mtime of webui/glass.html — the
@@ -8153,6 +8504,25 @@ class G2SHost:
         except OSError:
             return 0
 
+    _pin_lockouts = None     # instance dict from __init__; see pin_login
+
+    def _session_account(self, uid):
+        """(accountId, account) behind a carded session's uid: a PIN login
+        (uid PIN<accountId>) resolves straight to its account, a fob goes
+        through the fobs table. (None, None) unless a player-kind account
+        is linked; never raises (a db fault just means 'no wallet')."""
+        try:
+            aid = pin_uid_account(uid)
+            if aid is None:
+                fob = self.hub_store.fob_get(uid or "")
+                aid = str((fob or {}).get("accountId") or "").strip()
+            acct = self.account_store.get(aid) if aid else None
+            if acct is not None and acct.get("kind") == "player":
+                return aid, acct
+        except Exception:  # noqa: BLE001 — see docstring
+            pass
+        return None, None
+
     def _session_is_admin(self, uid, tier):
         """Resolve a carded session's BACKEND (admin) access — the glass-
         menu authority (§2), NOT the fob tier. Admin when the fob links to
@@ -8164,6 +8534,20 @@ class G2SHost:
         runs on the 1.5s glass poll and at card-in. Tiers still drive
         hardware/G2S semantics (id_type, reset); they just stop being the
         menu authority."""
+        pin_aid = pin_uid_account(uid)
+        if pin_aid is not None:
+            # A PIN login (2026-09-14): admin ONLY when the collector opted
+            # in (pin_admin_allowed) AND the account carries the flag. Off
+            # by default — a PIN typed on a public keypad is easy to watch,
+            # a card is not. Fails closed on any fault.
+            try:
+                if self.hub_store.host_setting("pin_admin_allowed",
+                                               "0") != "1":
+                    return False
+                acct = self.account_store.get(pin_aid)
+            except Exception:  # noqa: BLE001 — fail closed
+                return False
+            return bool(acct and acct.get("admin"))
         try:
             fob = self.hub_store.fob_get(uid or "")
         except Exception:  # noqa: BLE001 — a db fault FAILS CLOSED, see below
@@ -8184,6 +8568,43 @@ class G2SHost:
         if acct is not None:
             return bool(acct.get("admin"))
         return str(tier or "") in ("attendant", "manager")
+
+    def any_cabinet_currency(self):
+        """The currencyId of the first machine that has reported a
+        cabinetProfile, or None — the floor's own answer to "which money"."""
+        lock = getattr(self, "assoc_lock", None)   # __init__ asks before
+        if lock is None:                            # the floor exists
+            return None
+        with lock:
+            assocs = list(self.associations.values())
+        for a in assocs:
+            with a.lock:
+                code = (a.cabinet.get("profile") or {}).get("currencyId")
+            if code:
+                return str(code)
+        return None
+
+    def refresh_currency(self, cabinet_currency=None):
+        """Settings ▸ Gameroom ▸ Currency. An explicit host setting wins;
+        else the machines' own currencyId (cabinetProfile) is adopted; else
+        '$'. Idempotent, logs only on a change."""
+        try:
+            sym = (self.hub_store.host_setting("currency_symbol", "")
+                   or "").strip()
+        except Exception:   # noqa: BLE001 — a db fault keeps the last symbol
+            sym = ""
+        if sym:
+            new = (sym, "setting")
+        else:
+            code = str(cabinet_currency or self.any_cabinet_currency()
+                       or "").upper()
+            new = ((CURRENCY_SYMBOLS[code], "machine")
+                   if code in CURRENCY_SYMBOLS else ("$", "default"))
+        if (new[0], new[1]) != (_MONEY["symbol"], _MONEY["source"]):
+            _MONEY["symbol"], _MONEY["source"] = new
+            log.info("💱 money symbol %r (%s)%s", new[0], new[1],
+                     " — Settings ▸ Gameroom overrides" if new[1] == "machine"
+                     else "")
 
     def glass_state(self, egm_id, peer=None, src=None, dev=None):
         """GET /api/glass/state?egm= — the resident SPA's ~1.5s poll: the
@@ -8238,7 +8659,33 @@ class G2SHost:
         except Exception:   # noqa: BLE001 — a db fault must not kill the poll
             gameroom = ""
         out = {"ok": True, "egmId": egm_id, "nick": nick, "carded": False,
-               "gameroom": gameroom, "uiBuild": self._glass_ui_build()}
+               "gameroom": gameroom, "uiBuild": self._glass_ui_build(),
+               "currency": money_symbol()}
+        try:
+            # PIN login (2026-09-14): the attract screen shows ENTER PIN
+            # only while some player actually has a PIN; minDigits sizes
+            # the keypad's "enter at least N" check (the hub re-checks).
+            out["pinLogin"] = {"available": bool(self.account_store.any_pin()),
+                               "minDigits": pin_min_digits(self.hub_store)}
+        except Exception:   # noqa: BLE001 — a hint, never the poll
+            pass
+        # The window this page lives in, as the cabinet described it in the
+        # profile census — the page picks its layout (tall strip vs wide
+        # band) from its own viewport first and falls back to this when the
+        # renderer won't say (a CrystalCurve's Service Window is 840x292 at
+        # the bottom, the AVP's is 256x1024 at the left; live-hit 2026-09-12).
+        try:
+            with assoc.lock:
+                prof = dict(((assoc.media.get(str(dev or "")) or {})
+                             .get("mediaDisplayProfile")) or {})
+            gw, gh_ = int(prof.get("contentWidth") or 0), \
+                int(prof.get("contentHeight") or 0)
+            if gw > 0 and gh_ > 0:
+                out["glassWindow"] = {
+                    "dev": str(dev or ""), "w": gw, "h": gh_,
+                    "position": str(prof.get("mediaDisplayPosition") or "")}
+        except Exception:   # noqa: BLE001 — a hint, never the poll
+            pass
         with self.companion_lock:
             card = self.card_sessions.get(egm_id)
             card = dict(card) if card else None
@@ -8324,13 +8771,11 @@ class G2SHost:
         # is the fallback. Guarded: a credits fault must never break
         # token delivery.
         try:
-            fob = self.hub_store.fob_get(card.get("uid") or "")
-            aid = str((fob or {}).get("accountId") or "").strip()
-            acct = self.account_store.get(aid) if aid else None
-            if acct is not None and acct.get("kind") == "player":
+            _aid, acct = self._session_account(card.get("uid"))
+            if acct is not None:
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["creditsMc"] = mc
-                out["credits"] = f"${mc / 100000:,.2f}"
+                out["credits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 if str(acct.get("name") or "").strip():
                     out["name"] = acct.get("name")
         except Exception as e:  # noqa: BLE001 — poll keeps answering
@@ -8533,13 +8978,11 @@ class G2SHost:
                "walletMc": None, "walletCredits": None, "canFund": False,
                "cashOutToWat": False}
         try:
-            fob = self.hub_store.fob_get(uid or "")
-            aid = str((fob or {}).get("accountId") or "").strip()
-            acct = self.account_store.get(aid) if aid else None
-            if acct is not None and acct.get("kind") == "player":
+            _aid, acct = self._session_account(uid)
+            if acct is not None:
                 mc = int(acct.get("cashableMillicents") or 0)
                 out["walletMc"] = mc
-                out["walletCredits"] = f"${mc / 100000:,.2f}"
+                out["walletCredits"] = f"{money_symbol()}{mc / 100000:,.2f}"
                 out["canFund"] = True
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
@@ -8569,7 +9012,7 @@ class G2SHost:
                 amt = v.get("amountMillicents")
                 tickets.append({
                     "id": v.get("validationId"),
-                    "amount": f"${(amt or 0) / 100000:,.2f}"
+                    "amount": f"{money_symbol()}{(amt or 0) / 100000:,.2f}"
                     if amt is not None else "",
                     "state": v.get("state"),
                     "when": (v.get("redeemedAt") or v.get("issuedAt")
@@ -8589,7 +9032,7 @@ class G2SHost:
                     mc = t.get("amountMc")
                     tickets.append({
                         "id": t.get("canonical") or t.get("vn16"),
-                        "amount": f"${(mc or 0) / 100000:,.2f}"
+                        "amount": f"{money_symbol()}{(mc or 0) / 100000:,.2f}"
                         if mc is not None else "",
                         "state": t.get("state"),
                         "when": (t.get("redeemedAt") or t.get("issuedAt")
@@ -8616,7 +9059,7 @@ class G2SHost:
                            + int(r.get("pendingPromoAmt") or 0)
                            + int(r.get("pendingNonCashAmt") or 0))
                     pending.append({
-                        "amount": f"${amt / 100000:,.2f}",
+                        "amount": f"{money_symbol()}{amt / 100000:,.2f}",
                         "type": r.get("handpayType"),
                         "when": r.get("handpayDateTime") or r.get("seenAt")})
                 can_clear = bool(recs) and online
@@ -8768,8 +9211,8 @@ class G2SHost:
         if have < cents * 1000:
             return 400, {"ok": False,
                          "error": f"{acct.get('name') or account_id} has "
-                                  f"${have / 100000:.2f} — can't fund a "
-                                  f"${cents / 100:.2f} push"}
+                                  f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                                  f"{money_symbol()}{cents / 100:.2f} push"}
         # SAS-linked leg = the meter/money authority while linked (the
         # sendCredits `sm` branch): route the push there in CENTS.
         leg = self.sas_links.get(egm_id)
@@ -8795,7 +9238,7 @@ class G2SHost:
                                           f"has ${avail / 100000:.2f} "
                                           "available (a fund is already in "
                                           f"flight) — can't fund a "
-                                          f"${cents / 100:.2f} push"}
+                                          f"{money_symbol()}{cents / 100:.2f} push"}
                 self._glass_fund_reserves.append(resv)
             cmd = {"id": f"glass{next(self._fob_seq)}-{int(time.time())}",
                    "type": "aft_transfer", "cents": cents,
@@ -18620,6 +19063,8 @@ class G2SHost:
                      "timeZone=%s", assoc.egm_id, data.get("currencyId"),
                      data.get("localeId"), data.get("machineNum"),
                      data.get("timeZoneOffset"))
+            # No stored currency setting -> the floor follows its machines.
+            self.refresh_currency(data.get("currencyId"))
 
         elif cmd == "dateTime" and stype == "G2S_response":
             el = req["commandEl"]
@@ -19576,7 +20021,7 @@ class G2SHost:
             }
             dup = self.voucher_store.record_voucher(assoc.egm_id, rec)
             try:
-                dollars = f"${int(rec['voucherAmt']) / 100000:,.2f}"
+                dollars = f"{money_symbol()}{int(rec['voucherAmt']) / 100000:,.2f}"
             except (TypeError, ValueError):
                 dollars = f"amt={rec['voucherAmt']}"
             if dup:
@@ -19668,7 +20113,7 @@ class G2SHost:
                     if id_number:
                         rrec["idNumber"] = id_number
                 try:
-                    dollars = f"${int(dec['amt']) / 100000:,.2f}"
+                    dollars = f"{money_symbol()}{int(dec['amt']) / 100000:,.2f}"
                 except (TypeError, ValueError):
                     dollars = f"amt={dec['amt']}"
                 if exc == 0:
@@ -19770,7 +20215,7 @@ class G2SHost:
                     else:
                         assoc.redeem_rejected_count += 1
             try:
-                dollars = f"${int(rec['transferAmt']) / 100000:,.2f}"
+                dollars = f"{money_symbol()}{int(rec['transferAmt']) / 100000:,.2f}"
             except (TypeError, ValueError):
                 dollars = f"transferAmt={rec['transferAmt']}"
             if dup:
@@ -21621,6 +22066,17 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # host". The product name never appears either way.
                         "lockBrandGameroom": engine.hub_store.host_setting(
                             "lock_brand_gameroom", "0") == "1",
+                        # Money symbol in force + where it came from
+                        # (setting | machine | default) — Settings ▸ Gameroom
+                        # ▸ Currency; "" stored = follow the machines.
+                        "currencySymbol": money_symbol(),
+                        "currencySymbolSource": _MONEY["source"],
+                        "currencySymbolSetting": engine.hub_store.host_setting(
+                            "currency_symbol", "") or "",
+                        # PIN login (2026-09-14): Settings ▸ Gameroom ▸ PIN
+                        "pinMinDigits": pin_min_digits(engine.hub_store),
+                        "pinAdminAllowed": engine.hub_store.host_setting(
+                            "pin_admin_allowed", "0") == "1",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
                         # current balance (so Options ▸ House Bankroll prefills) and
                         # whether it may run negative. The Bank is just bankroll
@@ -22866,6 +23322,32 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         return self._send(200, json.dumps(payload),
                           "application/json", soap=False)
 
+    def _handle_glass_pin_login(self, raw, peer):
+        """POST /api/glass/pinlogin {egm, pin} — the ONE sessionless glass
+        write (2026-09-14): there is no token before a login. Trust posture
+        = the state poll's (the slot VLAN is the boundary) plus the per-
+        machine throttle in pin_login. Always 200 with an honest ok:false
+        (the keypad shows the reason) — never a 500, never the PIN in a
+        log line."""
+        engine = self.host_engine
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError):
+            req = None
+        if not isinstance(req, dict):
+            return self._send(400, '{"ok": false, "error": "invalid JSON"}',
+                              "application/json", soap=False)
+        egm = str(req.get("egm") or "").strip()[:64]
+        pin = req.get("pin")
+        pin = pin.strip()[:PIN_MAX_DIGITS + 1] if isinstance(pin, str) else ""
+        try:
+            body = engine.pin_login(egm, pin, peer=peer)
+        except Exception as e:  # noqa: BLE001 — never-500 (the keypad waits)
+            log.error("PIN login failed on the hub side: %s", e)
+            body = {"ok": False, "error": "login failed on the hub — try again"}
+        return self._send(200, json.dumps(body), "application/json",
+                          soap=False)
+
     def _handle_glass_action(self, raw):
         """POST /api/glass/action {sess, action, ...} — the glass SPA's ONLY
         write path (glass destub v1). The hub is the authority: the token
@@ -22911,15 +23393,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         # The carded player's OWN wallet (fob -> account), resolved server-
         # side — the SESSION is the account authority, never the body. None
         # unless a player-kind account is linked.
-        acct_id = None
-        try:
-            fob = engine.hub_store.fob_get(uid or "")
-            aid = str((fob or {}).get("accountId") or "").strip()
-            acct = engine.account_store.get(aid) if aid else None
-            if acct is not None and acct.get("kind") == "player":
-                acct_id = aid
-        except Exception:  # noqa: BLE001 — a db fault just means "no wallet"
-            acct_id = None
+        acct_id, _acct = engine._session_account(uid)
         # Is THIS token an active admin overlay stacked over a carded friend?
         # The wallet verbs below would otherwise move/disarm the FRIEND's money
         # under the admin's token — the render hides the controls, but a hand-
@@ -22935,6 +23409,26 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             payload.setdefault("egmId", egm_id)
             return self._send(status, json.dumps(payload),
                               "application/json", soap=False)
+
+        if action == "hideGlass":
+            # HIDE WINDOW on the glass (2026-09-14): the game goes full
+            # screen, the SESSION STAYS. A second fob tap used to be the
+            # only way to get the menu off the screen — and that logged the
+            # player out, killing the session (and anything tracked against
+            # it). Reopen: a re-tap of the same fob (see _card_session_tap)
+            # or the cabinet's SERVICE button where it still narrates.
+            with engine.assoc_lock:
+                assoc = engine.associations.get(egm_id)
+            if assoc is None or assoc.comms_state != "onLine":
+                return done(200, {"ok": False,
+                                  "error": "this machine is offline"})
+            dev = engine.glass_target_device(assoc)
+            engine.enqueue_hide_media_display(assoc, dev)
+            assoc.glass_visible = False
+            assoc.glass_hidden_by_player = True
+            log.info("🪟 [%s] glass hidden by the player (%s) — session "
+                     "kept; re-tap or SERVICE brings it back", egm_id, uid)
+            return done(200, {"ok": True, "hidden": True})
 
         if action == "logout":
             if is_overlay_tok:
@@ -23174,7 +23668,7 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 reissued = r["collision"] == "reissued"
                 prior_mc = int(r.get("priorAmountMc") or 0)
                 label = (f"⚠️ Ticket number {vn} was reused — re-issued for "
-                         f"${cents / 100:.2f} (prior ${prior_mc / 100000:.2f} "
+                         f"{money_symbol()}{cents / 100:.2f} (prior {money_symbol()}{prior_mc / 100000:.2f} "
                          f"{r.get('priorState')}); paper is redeemable"
                          if reissued else
                          f"⛔ Ticket number {vn} reused while a live ticket "
@@ -23565,8 +24059,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             have = int(acct.get("cashableMillicents") or 0)
             if have < mc:
                 return bad(400, f"{acct.get('name') or account_id} has "
-                                f"${have / 100000:.2f} — can't fund a "
-                                f"${cents / 100:.2f} push (players can't "
+                                f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                                f"{money_symbol()}{cents / 100:.2f} push (players can't "
                                 "go negative)")
         # C5 parity: an operator-disabled leg refuses at the hub edge (the
         # parked satellite would only answer with an honest rejection).
@@ -23857,8 +24351,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         return self._send(400, json.dumps(
                             {"ok": False, "error":
                              f"{acct.get('name') or account_id} has "
-                             f"${have / 100000:.2f} — can't fund a "
-                             f"${cents / 100:.2f} push (players can't go "
+                             f"{money_symbol()}{have / 100000:.2f} — can't fund a "
+                             f"{money_symbol()}{cents / 100:.2f} push (players can't go "
                              "negative)"}),
                             "application/json", soap=False)
                 cmd["accountId"] = account_id
@@ -24254,6 +24748,38 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                                      f"{MAX_GAMEROOM_NAME_LEN} characters")
                 engine.hub_store.set_host_setting("gameroom_name", gn)
                 out["gameroomName"] = gn or None      # cleared echoes null
+            if "currencySymbol" in req:
+                # Settings ▸ Gameroom ▸ Currency: the symbol every money
+                # string leads with, on every surface (hub UI, glass, SMIB
+                # screen, lock/handpay text). "" clears it -> the floor
+                # follows its machines' currencyId again (refresh_currency).
+                cs = req.get("currencySymbol")
+                if not isinstance(cs, str):
+                    raise ValueError("currencySymbol must be a string")
+                cs = re.sub(r"[\x00-\x1f\x7f]", "", cs).strip()
+                if len(cs) > 4:
+                    raise ValueError("currencySymbol must be <= 4 characters")
+                engine.hub_store.set_host_setting("currency_symbol", cs)
+                engine.refresh_currency()
+                out["currencySymbol"] = money_symbol()
+            if "pinMinDigits" in req:
+                # PIN login (2026-09-14): the shortest PIN players may set
+                # and type — 6 (default) or 4. Existing PINs stay as they
+                # are; the check applies to new PINs and to typed logins.
+                md = req.get("pinMinDigits")
+                if isinstance(md, bool) or md not in (4, 6):
+                    raise ValueError("pinMinDigits must be 4 or 6")
+                engine.hub_store.set_host_setting("pin_min_digits", str(md))
+                out["pinMinDigits"] = md
+            if "pinAdminAllowed" in req:
+                # Whether a PIN login on an admin account gets the admin
+                # menu (default no — see _session_is_admin). Strict bool.
+                pa = req.get("pinAdminAllowed")
+                if not isinstance(pa, bool):
+                    raise ValueError("pinAdminAllowed must be a boolean")
+                engine.hub_store.set_host_setting(
+                    "pin_admin_allowed", "1" if pa else "0")
+                out["pinAdminAllowed"] = pa
             if "boardEnabled" in req:
                 # Gameroom Board toggle (Settings ▸ Gameroom board). Strict
                 # boolean; stored "1"/"0"; the board page reads it live off
@@ -24692,6 +25218,8 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/command"):
             return self._handle_command(raw)
+        if self.path.startswith("/api/glass/pinlogin"):
+            return self._handle_glass_pin_login(raw, peer)
         if self.path.startswith("/api/glass/action"):
             return self._handle_glass_action(raw)
         if self.path.startswith("/api/tito/"):
