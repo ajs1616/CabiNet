@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.1
+- **A machine whose clock runs ahead of the hub can now join.** Such a
+  machine treated every request from the hub as already expired (the
+  "Time-to-live Expired" refusal), including the one that completes the
+  handshake, so it sat at "waiting to join" forever. Found on a Bally
+  Alpha 2 Pro Curve running 70 seconds fast. The hub now measures the
+  lead from the machine's own timestamps and gives its requests that much
+  extra time to live; once the machine has joined, the existing clock
+  sync sets its clock right and the extra time is no longer needed.
+  Machines running behind the hub were never affected.
+
 ## v0.3.0
 - **Log in with a PIN, no card needed.** A machine's player screen now
   shows ENTER PIN next to "tap your fob": type your PIN on the keypad and
