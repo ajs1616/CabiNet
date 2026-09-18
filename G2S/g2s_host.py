@@ -11821,8 +11821,11 @@ class G2SHost:
         before the explicit setEventSub; harmless when nothing matches."""
         def build(a):
             sid = a.next_session_id()
+            # Spec §4.14 Table 4.18: the child is eventSelect (deviceClass /
+            # deviceId / eventCode); all three wildcarded = clear EVERY
+            # subscription this host holds. (eventSubscription → G2S_MSX004.)
             sub = ('<g2s:clearEventSub>'
-                   '<g2s:eventSubscription g2s:deviceClass="G2S_all" '
+                   '<g2s:eventSelect g2s:deviceClass="G2S_all" '
                    'g2s:deviceId="-1" g2s:eventCode="G2S_all"/>'
                    '</g2s:clearEventSub>')
             inner, cid = self.build_inner_request(
