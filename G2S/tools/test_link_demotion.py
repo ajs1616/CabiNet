@@ -432,12 +432,16 @@ def main():
           i_status is not None and i_denoms is not None
           and i_status < i_denoms,
           f"status@{i_status} denoms@{i_denoms}")
-    # A non-201 gamePlay event (GPE103 game-start) re-reads STATUS only —
-    # the denom re-read is GPE201-conditional, not a blanket ride-along.
+    # A non-201, non-play-cycle gamePlay event (GPE001 device disabled)
+    # re-reads STATUS only — the denom re-read is GPE201-conditional, not
+    # a blanket ride-along. Play-cycle events (GPE1xx) are asserted below
+    # to read NOTHING: since 2026-09-18 (177ca26) a per-spin status read
+    # cost a round trip on the AVP's ~300 ms-paced outbound queue and the
+    # SERVICE button queued behind it (1.4-6 s during play vs 0.03 s idle).
     seen_mark = len(AckingEgm.seen)
     engine._game_play_event_refresh(assoc, {
         "deviceClass": "G2S_gamePlay", "deviceId": "77",
-        "eventCode": "G2S_GPE103"})
+        "eventCode": "G2S_GPE001"})
     deadline = time.time() + 5
     while time.time() < deadline:
         if any("getGamePlayStatus" in b
@@ -449,6 +453,18 @@ def main():
     check("non-201 gamePlay event re-read status WITHOUT touching denoms",
           any("getGamePlayStatus" in b for b in bodies)
           and not any("getGameDenoms" in b for b in bodies),
+          f"got {len(bodies)} POST(s)")
+    # Play-cycle events read NOTHING (the SERVICE-button latency law).
+    seen_mark = len(AckingEgm.seen)
+    for code in ("G2S_GPE103", "G2S_GPE112"):
+        engine._game_play_event_refresh(assoc, {
+            "deviceClass": "G2S_gamePlay", "deviceId": "77",
+            "eventCode": code})
+    time.sleep(0.5)
+    bodies = AckingEgm.seen[seen_mark:]
+    check("play-cycle events (GPE103/GPE112) queued NO status or denom read",
+          not any("getGamePlayStatus" in b or "getGameDenoms" in b
+                  for b in bodies),
           f"got {len(bodies)} POST(s)")
 
     print("— linked-leg census nudge: a G2S denom change (GPE201 / the "
