@@ -22,8 +22,11 @@ different costs by design (see _glass_service_button in g2s_host.py):
     recovery         the hub did not believe the page was resident, so the
                      press became a full load->activate->show push (5-8 s),
                      and it is throttled to one per 60 s.
-    debounced        a CBE301 landed inside the 2 s debounce window after
-                     another one — silently ignored by the hook.
+    debounced        the same code landed inside the 2 s debounce window
+                     after another one — silently ignored by the hook.
+                     (Since 0.2.0 CBE302 "lamp off" is a press too, and a
+                     301 then a 302 inside 2 s is NOT debounced: it is a
+                     show followed by a hide.)
     ignored          CBE301 seen but no hook line at all and not inside a
                      debounce window (cabinet not onLine, or the event was a
                      dedupe/backfill — the hub only fires hooks for live,
@@ -259,11 +262,16 @@ def analyse(ev, hooks, glass, acks, outs, ins, edts):
     used_hooks = set()
     used_outs = set()
     last_press_ts = {}
+    last_code = {}
     for e in ev:
-        if e["code"] != "G2S_CBE301":
-            continue
+        # Since 0.2.0 (a3503ae) CBE302 "lamp off" is a press too — Windows-era
+        # cabinets narrate lamp transitions, not presses — and the debounce
+        # only swallows a REPEAT of the same code. On a QNX AVP with
+        # "application handles service button" = YES every press is a
+        # CBE301; a CBE302 there is a lamp clear the hub now also toggles on.
         egm = e["egm"]
         p = {"ts": e["ts"], "egm": egm, "eid": e["eid"], "branch": "ignored",
+             "code": e["code"][-3:],
              "hook_ts": None, "out_ts": None, "in_ts": None, "ack": "",
              "verb": "", "egm_delay": None}
         edt = edts.get(e["eid"])
@@ -304,9 +312,11 @@ def analyse(ev, hooks, glass, acks, outs, ins, edts):
                 elif "residentShowOnly" in g["msg"] or \
                         "show-only short-circuit" in g["msg"]:
                     p["verb"] = "showMediaDisplay("
-        elif lp is not None and secs(lp, e["ts"]) < DEBOUNCE_SEC:
+        elif lp is not None and secs(lp, e["ts"]) < DEBOUNCE_SEC and \
+                last_code.get(egm) == e["code"]:
             p["branch"] = "debounced"
         last_press_ts[egm] = e["ts"]
+        last_code[egm] = e["code"]
         if p["verb"]:
             start = p["hook_ts"] or e["ts"]
             for i, o in enumerate(outs):
@@ -348,8 +358,8 @@ def report(presses, ev, since):
             print(f"  ({n302} CBE302 'lamp off' events were seen — the "
                   "cabinet narrates the lamp, not the button?)")
         return
-    print(f"{'press':<23} {'egm-delay':>9} {'branch':<19} {'queue':>6} "
-          f"{'egm':>6} {'total':>6}  ack")
+    print(f"{'press':<23} {'evt':<4}{'egm-delay':>9} {'branch':<19} "
+          f"{'queue':>6} {'egm':>6} {'total':>6}  ack")
     totals = []
     for p in presses:
         q = e = t = None
@@ -361,7 +371,7 @@ def report(presses, ev, since):
             t = secs(p["ts"], p["in_ts"])
             totals.append(t)
         print(f"{p['ts'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]:<23} "
-              f"{fmt(p['egm_delay']):>9} {p['branch']:<19} {fmt(q):>6} "
+              f"{p['code']:<4}{fmt(p['egm_delay']):>9} {p['branch']:<19} {fmt(q):>6} "
               f"{fmt(e):>6} {fmt(t):>6}  {p['ack']}")
     print()
     by = {}
@@ -373,8 +383,12 @@ def report(presses, ev, since):
         p90 = s[min(len(s) - 1, int(round(0.9 * (len(s) - 1))))]
         print(f"press -> EGM answered: median {statistics.median(s):.2f}s  "
               f"p90 {p90:.2f}s  max {s[-1]:.2f}s  (n={len(s)})")
-    n302 = sum(1 for e in ev if e["code"] == "G2S_CBE302")
-    print(f"CBE301 seen: {len(presses)}   CBE302 (lamp off) seen: {n302}")
+    n301 = sum(1 for p in presses if p["code"] == "301")
+    n302 = sum(1 for p in presses if p["code"] == "302")
+    print(f"CBE301 (lamp on) seen: {n301}   CBE302 (lamp off) seen: {n302}"
+          + ("   <- both toggle the menu since 0.2.0; a 301 followed by a "
+             "302 inside a few seconds is show-then-hide, i.e. NOTHING"
+             if n302 else ""))
 
     # --- the smells --------------------------------------------------------
     smells = []
@@ -382,11 +396,15 @@ def report(presses, ev, since):
     for p in presses:
         if prev and prev["branch"] == "show" and p["branch"] == "hide" and \
                 secs(prev["ts"], p["ts"]) <= RETOGGLE_WINDOW_SEC:
+            why = (f"a lamp-off CBE302 re-toggled the menu the CBE301 press "
+                   f"had just opened (0.2.0 hooks both)"
+                   if p["code"] != prev["code"] else
+                   f"if that was ONE physical press, a late chirp escaped "
+                   f"the {DEBOUNCE_SEC:.0f}s debounce and closed the menu it "
+                   f"had just opened")
             smells.append(
                 f"{p['ts'].strftime('%H:%M:%S')} hide {secs(prev['ts'], p['ts']):.1f}s "
-                f"after a show — if that was ONE physical press, a late "
-                f"chirp escaped the {DEBOUNCE_SEC:.0f}s debounce and closed the "
-                f"menu it had just opened")
+                f"after a show — {why}")
         if p["branch"] in ("show", "hide") and p["ack"] == "never POSTed":
             smells.append(f"{p['ts'].strftime('%H:%M:%S')} {p['branch']} "
                           "decided but no matching POST left the hub within "
@@ -403,7 +421,7 @@ def report(presses, ev, since):
                           "— the hub had lost track of the resident page "
                           "(hub restart / rejoin / no SPA heartbeat)")
         if p["branch"] == "ignored":
-            smells.append(f"{p['ts'].strftime('%H:%M:%S')} CBE301 with no "
+            smells.append(f"{p['ts'].strftime('%H:%M:%S')} CBE{p['code']} with no "
                           "hook decision and outside any debounce window — "
                           "cabinet not onLine at that moment, or a "
                           "deduped/backfilled event")
