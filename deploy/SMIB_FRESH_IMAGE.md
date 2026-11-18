@@ -330,16 +330,17 @@ urgent on the 424Mi board.
   a **SAS machine there is nothing to bind**: the reader auto-binds by co-location
   with the SAS SMIB and is deliberately not listed. This replaces baking
   `--g2s-egm`/`--sas-*` into the unit.
-- Enroll fobs at the **hub's own reader ONLY**: add (or pick) the player in **💳 The
-  Players**, hit **+ Add a card**, and tap the card on the reader **attached to the
-  hub Pi** (install one with
+- Enroll fobs one of two ways. **At the hub's own reader:** add (or pick) the
+  player in **💳 The Players**, hit **+ Add a card**, and tap the card on the reader
+  **attached to the hub Pi** (install one with
   `deploy/companion_setup.sh <you>@localhost --hub http://127.0.0.1:8081` — the
-  co-located form; same PN532 wiring as every reader). **Floor readers never
-  register cards** — out there a tap is always a *player* action (card-in/out,
-  handpay reset), so giving it a second "claim this card" meaning would race an
-  innocent tap onto the wrong account; unknown fobs on floor readers are
-  record-only. No reader on the hub? Type the card's UID into the **Cards** card
-  in 💳 The Players instead.
+  co-located form; same PN532 wiring as every reader). **At a machine with a
+  touchscreen:** card in as an admin, **ADMIN ▸ PLAYERS**, pick the player, **ADD
+  FOB**, and tap the new fob on that machine's reader within 20 seconds. That is
+  the only time a floor reader registers a card — otherwise a tap out there is
+  always a *player* action (card-in/out, handpay reset), and unknown fobs on floor
+  readers are record-only. No reader on the hub and no touchscreen? Type the
+  card's UID into the **Cards** card in 💳 The Players instead.
 - **Dual-protocol cabinet** (BB2 on SAS *and* G2S): link its G2S card to its SAS leg in
   the machine's Settings so meters/credits count once — task #20, `sasLink`.
 

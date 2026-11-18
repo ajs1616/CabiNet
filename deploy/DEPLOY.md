@@ -134,7 +134,9 @@ that only that account can read.
 Two limits, so nobody is surprised. The hub speaks plain HTTP, so a
 password crosses your network unencrypted. And the lock is for people: a
 device on the slot network can still talk to the hub the way a machine
-does. Keep strangers off the slot network as before.
+does, and while an admin is carded in at a machine it can act through
+that machine's screen as the admin does. Keep strangers off the slot
+network as before.
 
 ## Host hardware — any Linux box
 
@@ -322,6 +324,12 @@ Machines appear on the floor as they join: **Connecting…** (amber) while the
 handshake runs, **LIVE** once joined. Registered machines never disappear —
 a powered-off cabinet just shows dark.
 
+**Handpays.** The hub can put a handpay on the machine's credit meter: the
+Floor page's reset button, or CLEAR on a machine's screen for an admin. A
+handpay cleared with the attendant key at the machine lands in the wallet
+of the player who is carded in there. If no player is carded in it goes to
+the House.
+
 ## Companion Pis (RFID readers / SAS SMIBs)
 
 Build the Pi from a fresh SD card — it's just Raspberry Pi OS Lite plus one
@@ -342,6 +350,51 @@ power it from the cabinet's USB. That's the whole install:
   `casinonet-companion` unit, old I2C overlay form, a tree outside
   `~/CabiNet`), and `deploy/update.py` names any reader it cannot update and
   points you back at it.
+
+## On the machines' screens
+
+A machine with one of our screens (the digital glass on an IGT AVP, the
+touchscreen on a companion Pi) shows a player who taps a fob or types a
+PIN the same three things: **MY WALLET** (move credits between the wallet
+and the machine: three one-tap amounts, or type one), **CASH OUT** and
+**LOG OUT**.
+
+**Admins.** Make a player an admin on the Players page. Their fob then
+does two more things:
+
+- **Tapped over a friend who is carded in**, it opens **SERVICE** for that
+  friend on either kind of screen: their balances, CLEAR HANDPAY when one
+  is waiting, ADD TO WALLET, ADD FREE SLOT PLAY, SET PIN and DONE. The
+  friend stays carded in, and DONE hands their screen back.
+- **Carded in on a companion touchscreen**, it adds an **ADMIN** button:
+  HANDPAY for that machine, PLAYERS and NEW PLAYER. A player's page has
+  ADD FUNDS, TAKE BACK, ADD FREE SLOT PLAY, SET PIN, CLEAR PIN, ADD FOB,
+  REMOVE FOB and RENAME; names are typed on a keyboard on the screen. The
+  digital glass is too narrow for that, so an admin carded in there gets
+  HANDPAY, and the SERVICE screen on a tap-over.
+
+**ADD FOB** waits 20 seconds for the new fob to be tapped on that
+machine's reader and gives it to the player. That tap cards nobody in. A
+fob that already belongs to someone is refused.
+
+Money added from a screen comes from the House, as on the Players page,
+and the ledger names the admin and the machine. Making someone an admin
+and deleting a player are done on the web page only.
+
+**The one-tap amounts are yours.** Settings ▸ Host options has two rows of
+three: the admin's add pad (it starts as 20, 50, 100) and a player's MY
+WALLET (1, 5, 20). Whole amounts; from 10,000 use round thousands, from
+1,000,000 round hundred thousands, so they fit on a chip (25K, 2.5M).
+
+**PINs.** A player with a PIN can log in at a machine without a fob: ENTER
+PIN on the attract screen. Set one on the Players page or from either
+admin screen. A PIN login does not get the admin menus unless you switch
+that on (Settings ▸ PIN login).
+
+**Cash out to wallet waits for a busy machine.** On a SAS machine, CASH
+OUT TO WALLET asks the machine for its credits. If it is mid-game the hub
+tries again every second for up to fifteen seconds, with nothing held
+meanwhile, and the screen says it is waiting.
 
 ## Already running CabiNet? Read this first
 

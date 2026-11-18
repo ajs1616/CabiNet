@@ -3759,7 +3759,7 @@ function renderPlayerLink(){
   setHTML(box, `<div style="margin-top:14px;border-top:1px solid var(--line2);padding-top:12px">
     <div class="nm" style="font:600 14.5px var(--sans)">Add a card to ${esc(lk.name)}</div>
     <p class="none" style="margin:6px 0 8px">${hasHub
-      ?"Tap their card on the hub's reader — or pick one below. (Floor readers never register cards — a tap out there is always a player action.)"
+      ?"Tap their card on the hub's reader — or pick one below. (A floor reader registers a card only from ADD FOB on a machine's ADMIN screen — otherwise a tap out there is always a player action.)"
       :"No reader is attached to the hub — pick an unassigned card below, or add it by UID in the Cards card on this tab."}</p>
     <div class="chips">${chips||'<span class="chip">no unassigned player card'+(hasHub?" — tap a new one on the hub reader":"")+'</span>'}</div>
     ${tap}

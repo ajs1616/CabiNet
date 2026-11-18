@@ -4,8 +4,13 @@ This tree is the host side of CabiNet's SAS leg: a small Raspberry Pi "SMIB"
 (a used **3B+** is the recommended board — built-in Ethernet) sits on the
 machine's SAS serial port, runs `sas_host.py`, and bridges the machine to the
 CabiNet host over Ethernet. Live-proven daily on a WMS BB2 — meters, AFT credit
-transfers both directions, cross-machine TITO, legacy bonusing, and handpay
-reset all run on real iron.
+transfers both directions, cross-machine TITO, legacy bonusing, and handpays
+(the machine's own record of each one: its amount, a reset to the credit
+meter, and how it ended) all run on real iron. A handpay cleared with the
+attendant key lands in the wallet of the player who is carded in; if no
+player is carded in it goes to the House. A cash-out the machine is too
+busy to make is tried again every second for up to fifteen, with the poll
+loop running as usual in between.
 
 ## What is SAS?
 
