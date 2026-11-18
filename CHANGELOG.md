@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.31
+- **The three preset amounts on a player's MY WALLET are yours to set**:
+  Settings, Host options, under the admin's quick amounts. They start as
+  $1, $5 and $20, and follow the same rules as the admin's (whole
+  amounts; large ones show short on the chip).
+- **A machine whose own card reader device is disabled is no longer sent
+  cards.** The hub pushes each card-in and card-out to the machine's own
+  card reader device. A machine with no reader fitted (an IGT AVP here)
+  refuses every one, "Command Not Processed, Device Disabled", and the
+  hub logged a warning each time. After the first refusal the hub stops
+  sending that device cards until the machine signs on again or says the
+  device is enabled, and says so once, as information. Nothing changes
+  for the player: the card session, the wallet and the glass are the
+  hub's own.
+
 ## v0.3.30
 New admin menus on the machines' screens. The old admin buttons were
 mostly read-only information nobody uses on the floor.

@@ -1227,6 +1227,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // "currency" (hub setting or the
                                      // machine's currencyId) overrides it
   var CHIPS = [100, 500, 2000];      // preset chips (cents): $1 / $5 / $20
+                                     // until the hub sends the owner's own
+                                     // (Settings) in the wallet data's
+                                     // chipCents
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (walletFund sends it)
   var lastPlayerSince = '';          // sinceIso of the last PLAYER we saw the
@@ -1556,9 +1559,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   // quick amounts); repaint them and the live amount button whenever the
   // hub's money symbol changes
   function repaintCurrency() {
-    for (var i = 0; i < 3; i++) {
-      setText('wl-chip' + i, CUR + String(CHIPS[i] / 100));
-    }
+    paintChipLabels();
     paintGiveChips();
     setText('wl-custom', fmtCents(selCents));
   }
@@ -1579,19 +1580,42 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       fitText('kp-chip' + i, isStrip() ? 240 : 148, 26, 14);
     }
   }
-  // The owner's quick amounts as the hub sends them: three whole positive
-  // numbers of cents. Anything else and the page keeps what it has.
-  function takeQuick(q) {
+  // Three chip amounts as the hub sends them (the owner's own, from
+  // Settings): three whole positive numbers of cents that differ from what
+  // the page has. Anything else is null, and the page keeps what it has.
+  function threeCents(q, have) {
     var i;
-    if (!q || q.length !== 3) { return; }
+    if (!q || q.length !== 3) { return null; }
     for (i = 0; i < 3; i++) {
       if (typeof q[i] !== 'number' || !(q[i] >= 1) ||
-          q[i] !== Math.floor(q[i])) { return; }
+          q[i] !== Math.floor(q[i])) { return null; }
     }
-    if (q[0] === GIVE_CHIPS[0] && q[1] === GIVE_CHIPS[1] &&
-        q[2] === GIVE_CHIPS[2]) { return; }
-    GIVE_CHIPS = [q[0], q[1], q[2]];
-    paintGiveChips();
+    if (q[0] === have[0] && q[1] === have[1] && q[2] === have[2]) {
+      return null;
+    }
+    return [q[0], q[1], q[2]];
+  }
+  // the admin pad's quick amounts
+  function takeQuick(q) {
+    var t = threeCents(q, GIVE_CHIPS);
+    if (t) { GIVE_CHIPS = t; paintGiveChips(); }
+  }
+  // MY WALLET's presets. A preset that is selected follows its new amount;
+  // an amount typed on the keypad stays as typed.
+  function takeChips(q) {
+    var t = threeCents(q, CHIPS);
+    if (!t) { return; }
+    CHIPS = t;
+    if (selIdx >= 0) { selCents = CHIPS[selIdx]; }
+    paintChipLabels();
+    paintWalletChips();
+  }
+  function paintChipLabels() {
+    for (var i = 0; i < 3; i++) {
+      setText('wl-chip' + i, chipLabel(CHIPS[i]));
+      // a preset chip is 88px wide, 22px type
+      fitText('wl-chip' + i, 76, 22, 12);
+    }
   }
   // paint a money string; a below-zero amount goes RED (house rule: negative
   // balances read red on every surface). '' hands the color back to the
@@ -1839,6 +1863,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   //      arm state); wl-bal is painted by updateTexts from the state poll's
   //      "credits". Reuses walletFund + cashOutToWallet verbatim. -----------
   function renderWallet(d) {
+    takeChips(d.chipCents);
     coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
     coPending = (d.cashOutPending === true);
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
