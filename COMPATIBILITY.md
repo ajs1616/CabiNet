@@ -95,6 +95,7 @@ Which slot machines can talk **direct G2S over IP** to CabiNet, and which need t
 
 | Vendor / Family | G2S Status | Notes |
 |---|---|---|
+| Ainsworth / A560 | SAS only [V] | Pre-G2S era. |
 | Atronic Cashline / E-motion | SAS only [V] | Pre-G2S era. |
 | Spielo (post-Atronic) INTELLIGEN / G3 cabinet | Direct G2S [V] | INTELLIGEN was first G2S-compatible system on government VLTs (2010). |
 | AGS (Orion, ICON, Curve, Starwall) | SAS standard; G2S on newer Orion variants [V/U] | |
