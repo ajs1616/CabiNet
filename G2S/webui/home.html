@@ -3640,7 +3640,8 @@ function renderPlayers(){
     if(Number(p.promoMillicents)) b2.push("promo "+fmtAmt(p.promoMillicents));
     if(Number(p.nonCashMillicents)) b2.push("restricted "+fmtAmt(p.nonCashMillicents));
     const fobs=(p.fobs||[]).map(f=>{
-      // human-first: the LABEL when set, else "card ·<last 4 of uid>";
+      // human-first: the LABEL when set, else "card ·<end of the uid>"
+      // (cardTail: enough of it to tell this card from the others);
       // the full UID stays one hover away in title/aria
       const uid=String(f.uid||"");
       const face=cardFace(uid, f.label);
@@ -5625,11 +5626,30 @@ function renderTournament(){
    auto-creates a fob. */
 const TIERWORD={player:"player card", attendant:"attendant key",
                 manager:"manager key", reset:"reset fob"};
+function cardTail(uid){
+  /* The end of a card's number, long enough to tell it from every other
+     card this page knows of: four characters, and a byte more at a time
+     while another card ends the same way. Cards from one batch often do:
+     B0765C3D, 7A3D5C3D and 29655C3D all end 5C3D, and with a fixed four
+     characters two players looked as if they held the same card
+     (2026-11-18). */
+  uid=String(uid||"");
+  const mine=uid.toUpperCase(), others=new Set();
+  for(const f of (S.fobs.list||[])) others.add(String(f.uid||"").toUpperCase());
+  for(const f of (S.players.unassigned||[])) others.add(String(f.uid||"").toUpperCase());
+  for(const p of (S.players.list||[]))
+    for(const f of (p.fobs||[])) others.add(String(f.uid||"").toUpperCase());
+  others.delete(mine); others.delete("");
+  let n=4;
+  while(n<uid.length && [...others].some(u=>u.slice(-n)===mine.slice(-n))) n+=2;
+  return uid.slice(-n);
+}
 function cardFace(uid,label){
   /* toast/confirm face for a card — the fob-chip convention: the label
-     when set, else "card ·<last4>". The full UID stays in title/aria
-     and the hub's own log, never in guest-facing feedback. */
-  return label?String(label):("card ·"+String(uid||"").slice(-4));
+     when set, else "card ·" and the end of its number (cardTail). The
+     full UID stays in title/aria and the hub's own log, never in
+     guest-facing feedback. */
+  return label?String(label):("card ·"+cardTail(uid));
 }
 function fobOwnerName(accountId){
   /* owner line for a card row — prefer the player list (human names),
@@ -6295,7 +6315,7 @@ function fobPrefill(uid){
   if(S.tab!=="players") goTab("players"); else renderFobs();
   const el=$("pl-fob-new-uid");
   if(el){ el.value=String(uid||""); el.focus(); }
-  toast("Card ·"+String(uid||"").slice(-4)
+  toast("Card ·"+cardTail(uid)
     +" ready — choose what kind of card it is, then Add card", true);
 }
 async function fobPost(body,label){
