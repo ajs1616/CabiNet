@@ -150,6 +150,10 @@ HOST_SETTING_KEYS = ("sysval_fallback", "house_allow_negative",
                      # written (g2s_host.quick_add_error), and reads
                      # anything it cannot use as absent (2026-11-18).
                      "quick_add_cents",
+                     # ...and the three presets on a player's MY WALLET
+                     # screen (wallet to machine), the same shape; absent
+                     # = 1, 5 and 20.
+                     "wallet_chip_cents",
                      # The money symbol every amount leads with, on every
                      # surface; "" = follow the machines' own currencyId
                      # (a European floor showed "$" next to a machine paying

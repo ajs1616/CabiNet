@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.30"
+CABINET_VERSION = "0.3.31"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -424,18 +424,45 @@ def quick_add_error(cents):
     return None
 
 
-def quick_add_cents(hub_store):
-    """The three quick amounts in force, in cents (host setting
-    quick_add_cents, stored as "a,b,c"). What a hub starts with when the
-    setting is unset or cannot be read as three good amounts."""
+def _three_amounts(hub_store, key, default):
+    """A host setting that holds three chip amounts, stored as "a,b,c" in
+    cents. `default` when it is unset or cannot be read as three good
+    amounts (or there is no store to read)."""
     try:
         vals = [int(x) for x in str(
-            hub_store.host_setting("quick_add_cents", "") or "").split(",")]
+            hub_store.host_setting(key, "") or "").split(",")]
     except Exception:  # noqa: BLE001 — a store fault reads as the default
         vals = []
     if len(vals) == 3 and all(quick_add_error(v) is None for v in vals):
         return vals
-    return list(QUICK_ADD_DEFAULT_CENTS)
+    return list(default)
+
+
+def quick_add_cents(hub_store):
+    """The three quick amounts on the admin's amount pad, in cents (host
+    setting quick_add_cents)."""
+    return _three_amounts(hub_store, "quick_add_cents",
+                          QUICK_ADD_DEFAULT_CENTS)
+
+
+# The three preset amounts on a player's MY WALLET screen (wallet to
+# machine), in cents: what a hub starts with. The owner sets their own in
+# Settings, as with the admin's quick amounts above (2026-11-18: "do what
+# we did for the quick select in the admin menu ... to the wallet quick
+# transfer presets"). The same rule for what a chip can show applies.
+WALLET_CHIP_DEFAULT_CENTS = (100, 500, 2000)
+
+
+def wallet_chip_cents(hub_store):
+    """The three preset amounts on MY WALLET, in cents (host setting
+    wallet_chip_cents)."""
+    return _three_amounts(hub_store, "wallet_chip_cents",
+                          WALLET_CHIP_DEFAULT_CENTS)
+
+
+#: the two settings of three chip amounts, by their /api/settings name
+CHIP_SETTINGS = {"quickAddCents": "quick_add_cents",
+                 "walletChipCents": "wallet_chip_cents"}
 # The longest name the on-screen keyboard can give a player.
 GLASS_NAME_MAX = 16
 # ADD FOB: how long the screen counts down for a tap on the reader.
@@ -2329,6 +2356,12 @@ class EgmAssociation:
         # egmPhysicallyControls=true, where the document has the machine
         # go by the ID at its own reader (§18.11).
         self.id_readers = {}
+        # {deviceId: the machine's words}: card reader devices this
+        # machine refused a pushed card for because the device is disabled
+        # at the machine (G2SHost._card_push_refused). Not sent another
+        # until the next sign-on (new_epoch) or until the machine says the
+        # device is enabled.
+        self.id_push_off = {}
         self.bill_ins = []
         self.bill_in_count = 0
         self.bill_in_session_amt = 0
@@ -2516,6 +2549,7 @@ class EgmAssociation:
         so cross-epoch attribution is impossible."""
         self.epoch += 1
         self.established = False
+        self.id_push_off = {}       # it may have been enabled since
         self.host_command_id = 0
         self.set_comms_state_sent = 0.0
         self.keepalive_sent = False
@@ -10898,7 +10932,11 @@ class G2SHost:
         out = {"ok": True, "view": "cashout", "egmId": egm_id,
                "machineCreditsMc": self._machine_credits_mc(assoc),
                "walletMc": None, "walletCredits": None, "canFund": False,
-               "cashOutToWat": False}
+               "cashOutToWat": False,
+               # MY WALLET's three preset amounts (the owner's own, from
+               # Settings). getattr: the gates' stand-ins have no store.
+               "chipCents": wallet_chip_cents(
+                   getattr(self, "hub_store", None))}
         aid = None
         try:
             aid, acct = self._session_account(uid)
@@ -18455,7 +18493,36 @@ class G2SHost:
             merged = dict(assoc.id_readers.get(str(dev)) or {})
             merged.update(data)
             assoc.id_readers[str(dev)] = merged
+            if data["egmEnabled"] == "true" and data["hostEnabled"] == "true":
+                # the machine says the reader is enabled: cards go to it
+                # again (see _card_push_refused)
+                (getattr(assoc, "id_push_off", None) or {}).pop(
+                    str(dev), None)
         return data
+
+    def _card_push_refused(self, assoc, dev, code, text):
+        """The machine refused a pushed card (setIdValidation) because its
+        own card reader device is disabled.
+
+        The owner's AVP, 2026-11-18: no reader is fitted to it, both its
+        idReader devices report egmEnabled=false, and it answered every
+        card-in and card-out push "Command Not Processed, Device Disabled"
+        (G2S_APX016), which the hub logged as a warning each time. Nothing
+        on the hub's side needs that push: the card session, the wallet
+        and the screen are the hub's own. So the device is not sent
+        another card until the machine signs on again, or says the device
+        is enabled (an idReaderStatus, in an answer or an event). Said
+        as information: with no more pushes there is no second refusal
+        to say it for."""
+        dev = str(dev or "")
+        with assoc.lock:
+            assoc.id_push_off[dev] = text or code
+        log.info("💳 [%s] this machine's own card reader device %s is "
+                 "disabled at the machine: it answered the card push "
+                 "\"%s\". Cards are not sent to it again until it signs "
+                 "on again or says the device is enabled. The card "
+                 "session, the wallet and the screen do not need it.",
+                 assoc.egm_id, dev or "?", text or code)
 
     def default_id_reader_device(self, assoc):
         """The carded-session target: the LOWEST owned idReader device, or
@@ -18549,6 +18616,8 @@ class G2SHost:
         machine that has not said)."""
         if self.linked_leg(assoc):
             return                  # the linked-machine rule: no card push
+        if str(device_id) in (getattr(assoc, "id_push_off", None) or {}):
+            return                  # the machine said that reader is disabled
         if locale_id is None:
             locale_id = self.cabinet_locale(assoc) or "en_US"
 
@@ -21438,10 +21507,18 @@ class G2SHost:
                 answered = assoc.sent_requests.get(str(req["sessionId"]))
             ans_cmd = (answered or {}).get("command")
             ans_attrs = (answered or {}).get("attrs") or {}
-            log.warning("[%s] %s.%s carried class-level errorCode=%s — the EGM "
-                        "REJECTED our %s%s", assoc.egm_id, req["class"],
-                        cmd, rerr, ans_cmd or "request",
-                        f' (errorText="{rtext}")' if rtext else "")
+            if req["class"] == "idReader" and ans_cmd == "setIdValidation" \
+                    and (rerr == "G2S_APX016"
+                         or "disabled" in str(rtext or "").lower()):
+                # a card pushed to a reader device the machine has
+                # disabled: not a fault, and not pushed again
+                self._card_push_refused(
+                    assoc, (answered or {}).get("deviceId"), rerr, rtext)
+            else:
+                log.warning("[%s] %s.%s carried class-level errorCode=%s — "
+                            "the EGM REJECTED our %s%s", assoc.egm_id,
+                            req["class"], cmd, rerr, ans_cmd or "request",
+                            f' (errorText="{rtext}")' if rtext else "")
             # wat + "Invalid Device Identifier" = the join-window rejection. A
             # cabinet can refuse reads for its OWN active, host-owned wat
             # devices for a moment after commsOnLine (a tester's floor,
@@ -27113,6 +27190,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                         # Settings ▸ Gameroom ▸ Quick amounts: the three
                         # one-tap amounts on the admin's amount pad
                         "quickAddCents": quick_add_cents(engine.hub_store),
+                        # ...and the three presets on a player's MY WALLET
+                        "walletChipCents": wallet_chip_cents(
+                            engine.hub_store),
                         "pinAdminAllowed": engine.hub_store.host_setting(
                             "pin_admin_allowed", "0") == "1",
                         # Collector economy (2026-07-13, de-caged 07-15): the bank's
@@ -29975,21 +30055,25 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     raise ValueError("pinMinDigits must be 4 or 6")
                 engine.hub_store.set_host_setting("pin_min_digits", str(md))
                 out["pinMinDigits"] = md
-            if "quickAddCents" in req:
-                # The three quick amounts on the admin's amount pad on a
-                # machine's screen (2026-11-18). Exactly three, each one
-                # an amount a chip can show exactly (quick_add_error). The
-                # screens pick it up on their next poll.
-                qa = req.get("quickAddCents")
+            # The three one-tap amounts on a machine's screen
+            # (2026-11-18): quickAddCents on the admin's amount pad,
+            # walletChipCents on a player's MY WALLET. Exactly three,
+            # each an amount a chip can show exactly (quick_add_error).
+            # Both are checked before either is written. The screens
+            # pick them up on their next poll.
+            chips = {name: req.get(name) for name in CHIP_SETTINGS
+                     if name in req}
+            for qa in chips.values():
                 if not isinstance(qa, list) or len(qa) != 3:
                     raise ValueError("Give three quick amounts.")
                 for v in qa:
                     why = quick_add_error(v)
                     if why:
                         raise ValueError(why)
+            for name, qa in chips.items():
                 engine.hub_store.set_host_setting(
-                    "quick_add_cents", ",".join(str(v) for v in qa))
-                out["quickAddCents"] = list(qa)
+                    CHIP_SETTINGS[name], ",".join(str(v) for v in qa))
+                out[name] = list(qa)
             if "pinAdminAllowed" in req:
                 # Whether a PIN login on an admin account gets the admin
                 # menu (default no — see _session_is_admin). Strict bool.

@@ -2468,6 +2468,57 @@ def admin_menu_quick_amounts():
     check("three the same is the owner's business", st == 200
           and gh.quick_add_cents(eng.hub_store) == [2000, 2000, 2000])
 
+    print("— the presets on a player's MY WALLET are the owner's to set "
+          "too (the owner: \"do what we did for the quick select in the "
+          "admin menu ... to the wallet quick transfer presets\")")
+    check("a hub starts with 1, 5 and 20",
+          gh.wallet_chip_cents(eng.hub_store) == [100, 500, 2000]
+          and gh.WALLET_CHIP_DEFAULT_CENTS == (100, 500, 2000))
+    st, v = eng.glass_data(tok_of(eng, "M2"), "cashout")
+    check("the wallet's data on a machine's screen carries them",
+          st == 200 and v.get("chipCents") == [100, 500, 2000], v)
+    st, r = settings({"walletChipCents": [500, 2000, 10000]})
+    check("Settings takes three amounts for the wallet and answers with "
+          "them", st == 200 and r.get("ok") is True
+          and r.get("walletChipCents") == [500, 2000, 10000], (st, r))
+    st, v = eng.glass_data(tok_of(eng, "M2"), "cashout")
+    check("and the screen is told the new ones",
+          gh.wallet_chip_cents(eng.hub_store) == [500, 2000, 10000]
+          and st == 200 and v.get("chipCents") == [500, 2000, 10000], v)
+    check("the admin's quick amounts are a separate setting: untouched",
+          gh.quick_add_cents(eng.hub_store) == [2000, 2000, 2000])
+    st, r = settings({"quickAddCents": [100, 200, 300]})
+    check("and setting those leaves the wallet's alone", st == 200
+          and gh.wallet_chip_cents(eng.hub_store) == [500, 2000, 10000]
+          and gh.quick_add_cents(eng.hub_store) == [100, 200, 300])
+    for bad, why in (([500, 2000], "two"), ("5,20,100", "text"),
+                     ([500, 2000, 2050], "one with cents"),
+                     ([500, 2000, 1_050_000], "one a chip cannot write")):
+        st, r = settings({"walletChipCents": bad})
+        check(f"for the wallet, {why} is refused in words and changes "
+              "nothing", st == 400 and r.get("ok") is False
+              and isinstance(r.get("error"), str) and r["error"]
+              and gh.wallet_chip_cents(eng.hub_store)
+              == [500, 2000, 10000], (st, r))
+    st, r = settings({"quickAddCents": [700, 800, 900],
+                      "walletChipCents": [500, 2000, 2050]})
+    check("both sent together with one of them bad: neither is changed",
+          st == 400 and gh.quick_add_cents(eng.hub_store) == [100, 200, 300]
+          and gh.wallet_chip_cents(eng.hub_store) == [500, 2000, 10000],
+          (st, r))
+    st, r = settings({"quickAddCents": [700, 800, 900],
+                      "walletChipCents": [100, 200, 300]})
+    check("both sent together and good: both are changed", st == 200
+          and gh.quick_add_cents(eng.hub_store) == [700, 800, 900]
+          and gh.wallet_chip_cents(eng.hub_store) == [100, 200, 300],
+          (st, r))
+    eng.hub_store.set_host_setting("wallet_chip_cents", "5,abc")
+    check("a stored wallet value that cannot be used reads as what a hub "
+          "starts with",
+          gh.wallet_chip_cents(eng.hub_store) == [100, 500, 2000])
+    check("with no store to read (a test stand-in) it is the same",
+          gh.wallet_chip_cents(None) == [100, 500, 2000])
+
 
 def admin_menu_logs():
     eng, svc, adm_tok, chris, sam = admin_menu_pins_names_fobs()

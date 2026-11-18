@@ -205,7 +205,7 @@ class Egm:
                     out[gh.localname(cmd.tag)] = flag
         return out
 
-    def refuse(self, cls, session_id, code, device="1"):
+    def refuse(self, cls, session_id, code, device="1", text="refused"):
         """An error response (§1.18.3.3): the class element with the
         request's sessionId and an errorCode, and NO command inside."""
         self.cid += 1
@@ -217,7 +217,7 @@ class Egm:
             f'<g2s:{cls} g2s:deviceId="{device}" g2s:commandId="{self.cid}" '
             f'g2s:sessionType="G2S_response" g2s:sessionId="{session_id}" '
             f'g2s:timeToLive="0" g2s:dateTime="{ts}" '
-            f'g2s:errorCode="{code}" g2s:errorText="refused"/>'
+            f'g2s:errorCode="{code}" g2s:errorText="{text}"/>'
             f'</g2s:g2sBody></g2s:g2sMessage>')
         return self._deliver(inner)
 
@@ -4967,6 +4967,133 @@ def sas_handpays_have_an_amount_and_are_booked():
           and "amount" not in entry["lastHandpay"], entry["lastHandpay"])
 
 
+def a_disabled_card_reader_is_not_sent_cards():
+    print("— a card pushed to a card reader device the machine has "
+          "disabled (the owner's AVP has no reader fitted: both its "
+          "idReader devices say egmEnabled=false, and it answered every "
+          "card-in and card-out \"Command Not Processed, Device "
+          "Disabled\"; the hub warned each time and kept sending)")
+    import logging
+    WORDS = "Command Not Processed, Device Disabled"
+    host = make_host()
+    egm = online(joined(host, "BTB_card_off"))
+    a = egm.assoc
+
+    def push(present=True, dev="1"):
+        drain(host, a)
+        mark = len(host.sent)
+        host.enqueue_set_id_validation(a, dev, present, id_number="77")
+        drain(host, a)
+        return len(asks(sent_since(host, mark), "setIdValidation"))
+
+    def newest(command="setIdValidation"):
+        return [s for s, r in a.sent_requests.items()
+                if r["command"] == command][-1]
+
+    def heard(fn):
+        """(warnings, information lines about the card reader) from fn."""
+        warns, infos = [], []
+
+        class Keep(logging.Handler):
+            def emit(self, record):
+                (warns if record.levelno >= logging.WARNING
+                 else infos).append(record.getMessage())
+        h = Keep()
+        was = gh.log.level
+        gh.log.addHandler(h)
+        gh.log.setLevel(logging.INFO)
+        try:
+            fn()
+        finally:
+            gh.log.setLevel(was)
+            gh.log.removeHandler(h)
+        return warns, [m for m in infos if "card reader device" in m]
+
+    check("a card-in is pushed to the machine's card reader device",
+          push() == 1)
+    warns, infos = heard(lambda: egm.refuse("idReader", newest(),
+                                            "G2S_APX016", text=WORDS))
+    check("the machine refusing it because that device is disabled is "
+          "said once, as information, in the machine's own words; it is "
+          "not a warning", warns == [] and len(infos) == 1
+          and WORDS in infos[0] and "device 1" in infos[0], (warns, infos))
+    check("the card-out that follows is not pushed, and neither is the "
+          "next card-in", push(False) == 0 and push() == 0)
+    check("another reader device of the same machine is still sent cards",
+          push(dev="2") == 1)
+    warns, infos = heard(lambda: egm.refuse("idReader", newest(),
+                                            "G2S_APX016", text=WORDS))
+    check("and is stopped in its turn when the machine says the same of "
+          "it", len(infos) == 1 and "device 2" in infos[0]
+          and push(dev="2") == 0, infos)
+
+    print("— it is tried again when the machine may have changed")
+    host.enqueue_get_id_reader_status(a, "1")
+    drain(host, a)
+    answer_to(egm, "idReader", "getIdReaderStatus",
+              '<g2s:idReaderStatus g2s:idNumber="" g2s:idType="G2S_none" '
+              'g2s:egmEnabled="false" g2s:hostEnabled="true"/>',
+              device="1")
+    check("a status that still says disabled changes nothing",
+          push() == 0)
+    host.enqueue_get_id_reader_status(a, "1")
+    drain(host, a)
+    answer_to(egm, "idReader", "getIdReaderStatus",
+              '<g2s:idReaderStatus g2s:idNumber="" g2s:idType="G2S_none" '
+              'g2s:egmEnabled="true" g2s:hostEnabled="true"/>', device="1")
+    check("a status that says the device is enabled: cards go to it "
+          "again (and still not to the other device)",
+          push() == 1 and push(dev="2") == 0)
+    egm.refuse("idReader", newest(), "G2S_APX016", text=WORDS)
+    check("(refused again: stopped again)", push() == 0)
+    egm.comms_online()
+    online(egm)
+    warns, infos = [], []
+    check("the machine signing on again: the next card-in is pushed, to "
+          "either device", push() == 1 and push(dev="2") == 1)
+    warns, infos = heard(lambda: egm.refuse("idReader", newest(),
+                                            "G2S_APX016", text=WORDS))
+    check("and a refusal after that is said again, once",
+          warns == [] and len(infos) == 1, (warns, infos))
+
+    print("— only that refusal does it")
+    host = make_host()
+    egm = online(joined(host, "BTB_card_other"))
+    a = egm.assoc
+    push()
+    warns, infos = heard(lambda: egm.refuse("idReader", newest(),
+                                            "G2S_APX010"))
+    check("a card push refused for any other reason is a warning as "
+          "before, and the next card is still pushed",
+          len(warns) == 1 and "REJECTED our setIdValidation" in warns[0]
+          and infos == [] and push() == 1, (warns, infos))
+    host.enqueue_get_id_reader_status(a, "1")
+    drain(host, a)
+    warns, infos = heard(lambda: egm.refuse(
+        "idReader", newest("getIdReaderStatus"), "G2S_APX016", text=WORDS))
+    check("a status READ refused with those words stops no card (it is "
+          "not a card push)", len(warns) == 1 and infos == []
+          and push() == 1, (warns, infos))
+    host = make_host()
+    egm = online(joined(host, "BTB_card_code"))
+    a = egm.assoc
+    push()
+    warns, infos = heard(lambda: egm.refuse("idReader", newest(),
+                                            "G2S_APX016"))
+    check("the code alone (G2S_APX016), whatever the words with it, "
+          "stops the cards", warns == [] and len(infos) == 1
+          and push() == 0, (warns, infos))
+    host = make_host()
+    egm = online(joined(host, "BTB_card_words"))
+    a = egm.assoc
+    push()
+    warns, infos = heard(lambda: egm.refuse(
+        "idReader", newest(), "XYZ_ERR042", text="Reader is DISABLED"))
+    check("a machine that says the device is disabled under another "
+          "code is understood the same way",
+          warns == [] and len(infos) == 1 and push() == 0, (warns, infos))
+
+
 def a_cash_out_the_machine_cannot_make_yet_is_tried_again():
     print("— CASH OUT TO WALLET on a machine that is busy at that moment "
           "(the owner: \"why doesnt the hub hold it for up to 15 seconds "
@@ -5379,6 +5506,7 @@ def main():
     linked_machines_use_sas()
     sas_handpays_have_an_amount_and_are_booked()
     a_cash_out_the_machine_cannot_make_yet_is_tried_again()
+    a_disabled_card_reader_is_not_sent_cards()
     print("=" * 50)
     print(f"RESULT: {_p} passed, {_f} failed")
     return 1 if _f else 0
