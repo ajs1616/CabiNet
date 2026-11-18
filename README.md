@@ -26,15 +26,26 @@ whole casino *experience*, at home, for friends.
   individual game titles: turn any machine-enabled title on or off from the host.
 - **SAS via a small Pi bridge** (a used Pi 3B+ is perfect — Ethernet built
   in) — meters, AFT credit transfers both directions, TITO, legacy
-  bonusing, handpay reset.
+  bonusing, and handpays: the amount shows on the floor and the hub can
+  put one on the credit meter. A handpay cleared with the attendant key
+  lands in the wallet of the player who is carded in; if no player is
+  carded in it goes to the House.
 - **Cross-machine TITO** — print a ticket on one machine, redeem it in another.
 - **Player wallets + RFID cards or a PIN** — tap a fob (or type a PIN on the
   machine's screen), the machine knows who's playing;
-  fund friends from the House bank; wallet↔machine transfers.
+  fund friends from the House bank; wallet↔machine transfers with one-tap
+  amounts you choose; cash a machine out to your wallet from its screen.
 - **On-glass UI** (IGT mediaDisplay) and a touchscreen kiosk for SAS machines —
   both showing *your* game room's name in lights.
+- **Host your friends from the machine** — tap your admin fob over a friend
+  who is carded in and a quick SERVICE screen opens for them: clear their
+  handpay, add to their wallet or Free Slot Play, set their PIN. On a
+  touchscreen kiosk an admin can also make a new player, hand them a fob by
+  tapping it on that machine's reader, and look after wallets and PINs,
+  with no trip to the web page.
 - **Dual-protocol cabinets** — a machine that speaks both G2S and SAS is
-  linked into one tile with SAS as the money authority.
+  linked into one tile. SAS carries the money and every command; G2S is
+  read for events and status.
 - **The Gameroom Board** — a wall-TV spectator page at `/board` off the host:
   your game room's name in lights, an attract rotation (now playing,
   standings, record to beat), moment call-outs written as sentences, and
@@ -46,6 +57,11 @@ whole casino *experience*, at home, for friends.
   [`deploy/TOURNAMENT.md`](deploy/TOURNAMENT.md).
 - **Floor lock** — one switch in Settings locks or unlocks every machine on
   the floor at once.
+- **Held to the protocol documents** — in November 2026 both stacks were
+  gone through against SAS 6.02 and G2S 1.0.3: 114 differences found and
+  settled. The test suite keeps a pretend machine for each protocol that
+  follows the documents in the uncommon cases (a memory reset, a transfer
+  that ends late, a machine that is busy when asked).
 
 ## ⬆️ Already running CabiNet? Updating is one command
 

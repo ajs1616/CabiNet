@@ -93,10 +93,10 @@ pending: a machine with no G2S side showed no amount and booked nothing.
   handpay paid by the attendant is. The satellite reads both meters a
   few seconds after the reset. If neither moved by the win it says so
   and nothing is booked.
-- **A handpay paid by hand is booked**: to the wallet of whoever is
-  carded in at the machine, the House when nobody is. Once, however
-  many times it is reported. The same rule a G2S machine's hand-paid
-  key-off already had.
+- **A handpay cleared with the attendant key lands in the wallet of the
+  player who is carded in at the machine.** If no player is carded in
+  it goes to the House. Once, however many times it is reported. The
+  same rule a G2S machine's hand-paid key-off already had.
 - **A machine with both sides is booked from its SAS side.** Its G2S
   key-off is then information only. With a satellite older than this,
   which reports no record, the G2S key-off books it as before.
