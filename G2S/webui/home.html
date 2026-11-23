@@ -536,6 +536,15 @@
   }
 
   /* ---- kiosk compaction (800x480 DSI) + small screens ------------------------- */
+  /* Small kiosk panels have shallow blacks: the lounge's brown-on-brown
+     secondary text and hairlines melt into the cards. Same mahogany, wider
+     spread — darker floor, lifted cards, brighter rules and quiet text. */
+  html.kiosk{
+    --bg:#100b08; --inset:#080504;
+    --card:#271b13; --card2:#34251a;
+    --line:#6a5033; --line2:#4d3a25;
+    --dim:#d6c3a1; --faint:#b09a7a;
+  }
   html.kiosk #hdr{padding:6px 12px}
   html.kiosk .brand{font-size:13px}
   html.kiosk .brand .sub{display:none}
