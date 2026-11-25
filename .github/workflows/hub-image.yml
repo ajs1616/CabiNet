@@ -1,0 +1,39 @@
+# Builds the ready-to-flash hub SD card image and attaches it to the release.
+# Runs when a release is published, or by hand from the Actions tab (the image
+# is then kept as a build artifact for a week instead).
+name: Hub image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static binfmt-support parted e2fsprogs xz-utils
+      - name: Build the image
+        run: sudo deploy/image/build_hub_image.sh --out "$RUNNER_TEMP/out"
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "$RUNNER_TEMP"/out/cabinet-hub-*.img.xz "$RUNNER_TEMP"/out/cabinet-hub-*.img.xz.sha256 --clobber
+      - name: Keep as a build artifact
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cabinet-hub-image
+          path: ${{ runner.temp }}/out/cabinet-hub-*.img.xz*
+          retention-days: 7
+          compression-level: 0

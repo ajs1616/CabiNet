@@ -1,0 +1,28 @@
+[Unit]
+Description=CabiNet hub first boot (set this card up as the hub)
+# After the network manager the installer drives and the stage of the base
+# OS's first-boot setup that follows the account being made. Retries until
+# the hub is up; the marker makes every later boot a no-op.
+# NOT After=cloud-final.service: that unit is ordered after
+# multi-user.target, which waits for this one — a loop, and systemd breaks a
+# loop by dropping a job. It dropped this one, silently, on every boot
+# (found on a Pi 4, 2026-11-25: no hub, no log, a bare login prompt).
+After=cloud-config.service NetworkManager.service systemd-user-sessions.service
+# ...and after the boot itself is complete. Without this, multi-user.target
+# waits for this unit, and the kiosk this unit starts is ordered after
+# multi-user.target: the kiosk's start waited for the boot, the boot waited
+# for this unit, and this unit waited for the kiosk's start — for ever, at
+# "A start job is running" (same Pi 4, same night). Being after the target
+# also means first boot never holds up the login prompt.
+After=multi-user.target
+ConditionPathExists=!/var/lib/cabinet/hub-firstboot.done
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cabinet-hub-firstboot.sh
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
