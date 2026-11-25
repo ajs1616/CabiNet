@@ -5492,17 +5492,64 @@ class G2SHost:
             for k in ("denom", "amt", "currencyId"):
                 if bill.get(k) not in (None, ""):
                     extras[k] = bill[k]
+        label = ev.get("label")
+        if hook in ("handpay_pending", "handpay_keyed_off"):
+            label = self._handpay_moment(assoc, hook, extras) or label
         self.event_hooks.fire(hook, {
             "hook": hook,
             "egmId": assoc.egm_id,
             "code": ev.get("eventCode"),
-            "label": ev.get("label"),
+            "label": label,
             "category": ev.get("category"),
             "icon": ev.get("icon"),
             "dateTime": ev.get("eventDateTime"),
             "device": f'{ev.get("deviceClass")}/{ev.get("deviceId")}',
             "extras": extras,
         })
+
+    #: how a handpay ended, as the Activity feed says it. The machine sends
+    #: the same event (G2S_JPE104) for every ending; which one it was is in
+    #: its keyedOff message, kept on the handpay's record.
+    HANDPAY_ENDINGS = {
+        "G2S_remoteCredit": "🎉 Handpay reset to credits",
+        "G2S_localCredit": "🎉 Handpay reset to credits · attendant key",
+        "G2S_remoteHandpay": "🎉 Handpay paid by hand · reset from the hub",
+        "G2S_localHandpay": "🎉 Handpay paid by hand · attendant key",
+        "G2S_remoteVoucher": "🎉 Handpay paid by ticket",
+        "G2S_localVoucher": "🎉 Handpay paid by ticket · attendant key",
+        "G2S_cancelled": "Handpay cancelled · play resumed",
+    }
+
+    def _handpay_moment(self, assoc, hook, extras):
+        """The Activity feed's line for a handpay event, from the handpay's
+        own record: the amount (added to `extras` as amt, millicents) and,
+        for the ending, HOW it ended (the owner, 2026-11-25: the feed read
+        "Handpay KEYED OFF" whether it went to credits from a screen or
+        was paid on the attendant key). None when the record is not there
+        (the caller keeps the event's plain label). Never raises."""
+        try:
+            txn = str(extras.get("transactionId") or "")
+            if not txn:
+                return None
+            ended = hook == "handpay_keyed_off"
+            with assoc.lock:
+                rec = None if ended else assoc.handpays_pending.get(txn)
+                if rec is None:
+                    rec = next((h for h in reversed(assoc.handpays)
+                                if str(h.get("transactionId")) == txn), None)
+                rec = dict(rec) if rec is not None else None
+            if rec is None:
+                return None
+            pre = "keyOff" if ended else "pending"
+            amt = sum(int(rec.get(pre + k) or 0)
+                      for k in ("CashableAmt", "PromoAmt", "NonCashAmt"))
+            if amt > 0:
+                extras["amt"] = amt
+            if not ended:
+                return None
+            return self.HANDPAY_ENDINGS.get(rec.get("keyOffType"))
+        except Exception:  # noqa: BLE001 — a feed line, never a fault
+            return None
 
     def _activity_hook(self, info):
         """Default "*" hook: one structured INFO line per semantic event (the
@@ -11128,6 +11175,7 @@ class G2SHost:
                     "amount": hp.get("amount") or "Handpay",
                     "type": hp.get("type") or "",
                     "canClear": bool(hp.get("canClear")),
+                    "toCredits": hp.get("toCredits") is not False,
                     "more": int(hp.get("more") or 0)})
             except Exception:  # noqa: BLE001 — never-500 read
                 continue
@@ -11141,9 +11189,13 @@ class G2SHost:
         amt = (int(r.get("pendingCashableAmt") or 0)
                + int(r.get("pendingPromoAmt") or 0)
                + int(r.get("pendingNonCashAmt") or 0))
-        return {"amount": f"{money_symbol()}{amt / 100000:,.2f}",
-                "type": r.get("handpayType"),
-                "when": r.get("handpayDateTime") or r.get("seenAt")}
+        out = {"amount": f"{money_symbol()}{amt / 100000:,.2f}",
+               "type": r.get("handpayType"),
+               "when": r.get("handpayDateTime") or r.get("seenAt")}
+        # the machine did not offer credits for this one (over the meter)
+        if str(r.get("remoteCredit")).lower() == "false":
+            out["toCredits"] = False
+        return out
 
     # ------------------------------------------------- the admin menus
     # What the two player screens need for the tap-over service screen and,
@@ -11175,7 +11227,11 @@ class G2SHost:
             row, more = self._g2s_handpay_row(recs[txn]), len(recs) - 1
         return {"pending": True, "amount": row.get("amount") or "Handpay",
                 "type": str(row.get("type") or ""),
-                "canClear": bool(view.get("canClear")), "more": more}
+                "canClear": bool(view.get("canClear")), "more": more,
+                # False = too big for the credit meter: the reset pays it
+                # by hand, to the wallet of whoever is carded in (the
+                # House when nobody is). SAS resets go to the meter.
+                "toCredits": row.get("toCredits") is not False}
 
     def _glass_service_block(self, egm_id, assoc, card):
         """The `service` object: the friend under a tap-over, as the quick

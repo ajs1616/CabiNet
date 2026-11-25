@@ -2183,7 +2183,8 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       r = hpRows[i];
       off = (r.canClear !== true) || hpIsSent(r.key);
       tag = hpIsSent(r.key) ? 'RESET SENT'
-        : (r.canClear !== true) ? 'NOT ANSWERING' : 'TAP TO RESET';
+        : (r.canClear !== true) ? 'NOT ANSWERING'
+        : (r.toCredits === false) ? 'TAP TO PAY TO WALLET' : 'TAP TO RESET';
       html += '<div class="hpc' + (i % 2 ? ' hpc-r' : '') +
         (off ? ' hpc-off' : '') + '" data-i="' + i + '">' +
         '<div class="hpc-m">' + esc(r.machine || 'Machine') + '</div>' +
@@ -2198,7 +2199,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     }
     setText('hp-note', (n === 1 ? '1 handpay pending.' : n + ' handpays pending.') +
       (n > max ? ' Showing the first ' + max + '.' : '') +
-      ' Tap a machine to reset its handpay to credits.');
+      ' Tap a machine to reset its handpay.');
   }
   // LIVE, like cash out: one request in flight, asked again every ~2s only
   // while this view is up (show() drops the re-arm on any view flip).
@@ -3014,6 +3015,16 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     r = hpRows[parseInt(t.getAttribute('data-i'), 10)];
     if (!r || r.canClear !== true || hpIsSent(r.key)) { return; }
     who = (r.machine || 'this machine') + (r.player ? ' · ' + r.player : '');
+    // too big for the credit meter: the hub pays it by hand instead, to the
+    // wallet of whoever is carded in there (the House when nobody is)
+    if (r.toCredits === false) {
+      askConfirm('PAY HANDPAY TO WALLET?',
+        (hpAmount(r) ? hpAmount(r) + ' on ' : 'On ') + who +
+        '. Too big for the credit meter: it goes to ' +
+        (r.player ? r.player + '’s wallet.' : 'the House, nobody is carded in.'),
+        { action: 'clearHandpay', machine: r.key }, 'handpay');
+      return;
+    }
     askConfirm('RESET HANDPAY TO CREDITS?',
       (hpAmount(r) ? hpAmount(r) + ' on ' : 'On ') + who + '.',
       { action: 'clearHandpay', machine: r.key }, 'handpay');
