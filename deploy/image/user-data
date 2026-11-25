@@ -1,0 +1,18 @@
+#cloud-config
+# CabiNet hub image — the first-boot defaults, used when the card was flashed
+# without filling in Raspberry Pi Imager's settings. Imager replaces this file
+# when you do fill them in (your own name, password, Wi-Fi), and the hub
+# follows whatever account it creates.
+#
+# Default login, for the rare day you plug in a keyboard:  cabinet / cabinet
+# (remote login is off unless you turn it on).
+hostname: cabinet
+manage_etc_hosts: true
+users:
+  - name: cabinet
+    gecos: CabiNet hub
+    groups: [adm, dialout, cdrom, audio, users, sudo, video, games, plugdev, input, gpio, spi, i2c, netdev, render, lpadmin]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: cabinet

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.33
+- **Wi-Fi in Settings.** A new card puts the hub on your house Wi-Fi so
+  a phone on the couch can open these pages: the networks the hub can
+  hear, join with a password (the on-screen keyboard works), forget. A
+  Raspberry Pi keeps its radio off until it knows its country; the card
+  asks. The machines stay on the hub's cable either way. Hidden on a hub
+  with no Wi-Fi radio. Re-run `sudo ./deploy/hub_setup.sh` once on an
+  existing hub if the card says it is not allowed to change the Wi-Fi.
+- **A ready-to-flash hub image.** `deploy/image/` builds an SD card
+  image from Raspberry Pi OS Lite (64-bit): flash it, put it in a Pi
+  with its Ethernet on the slot switch, and it sets itself up as the hub
+  on first boot, with the touch kiosk when a screen is attached. No
+  typing on the Pi and no internet needed; Wi-Fi is then set from the
+  card above. Publishing a release builds the image and attaches it.
+  First boot keeps its own log on the card
+  (`/var/log/cabinet-hub-firstboot.log`). Proven on a Pi 4.
+
 ## v0.3.32
 - **HANDPAY on a companion screen lists every machine, and stays
   current.** An admin's HANDPAY screen showed this machine's handpays,
