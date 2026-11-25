@@ -17,7 +17,8 @@
             var, NEVER in the URL; during a tap-over it also carries the
             friend's figures in "service")
        GET  /api/glass/data?sess=...&view=...   (cashout live ~2s while open;
-            handpay and players fetch-on-open; players once a second while
+            handpays live ~2s while HANDPAY or ADMIN is up; players
+            fetch-on-open, and once a second while
             ADD FOB waits for a tap)
        POST /api/glass/action {sess, action, ...} (logout, the wallet verbs,
             clearHandpay. The hub re-resolves admin and forces egmId FROM
@@ -41,7 +42,7 @@
        * every account: MY WALLET / CASH OUT / LOG OUT
        * an admin carded in normally (state.admin): the same, plus ONE
          button, ADMIN, leading to
-           HANDPAY     this machine's pending handpay + CLEAR
+           HANDPAY     every machine's pending handpay; tap one to reset
            PLAYERS     the list with balances -> one player's page: ADD
                        FUNDS, TAKE BACK, ADD FREE SLOT PLAY, RENAME, SET
                        PIN, CLEAR PIN, ADD FOB (tap it on this machine's
@@ -117,9 +118,9 @@
          hint y=272 (w584, lh19 x2)->310; sec3 y=330, the CASH OUT button
          switch y=358..442, its hint y=454 (w280, up to 5 lines ->549);
          funding moved to MY WALLET, BACK 492..576                   OK
-       handpay: list x=32 w=656 y=88 h=460 = 10 x 46px rows EXACT
-         -> ends 548; CLEAR (720,392..476) + BACK (720,492..576),
-         gap 16                                                      OK
+       handpay: cards in x=32 w=656 y=88 h=460: 2 x 320 + 16 = 656,
+         3 x 140 + 2 x 20 = 460 -> ends 548; note (720,92) w280;
+         BACK (720,492..576)                                         OK
        left panel of SERVICE / ADMIN / PLAYER (the home panel's own
          heights): title y=40->66, name y=76(h40)->116, hairline y=140,
          wallet y=164 / 188(lh44)->232, Free Slot Play y=250 /
@@ -404,6 +405,32 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
 .lr-empty { text-align: center; font-size: 17px; color: #55708a;
             padding-top: 48px; }
 
+/* --- HANDPAY cards: one per machine with a handpay pending, two across.
+   656 = 2 x 320 + 16; 460 = 3 x 140 + 2 x 20. The whole card is the
+   button: tap it, confirm, and the handpay is reset to credits. */
+.hpc { position: relative; float: left; width: 320px; height: 140px;
+       margin: 0 16px 20px 0; border: 2px solid #8a6a1f; border-radius: 12px;
+       background: #1a2230; overflow: hidden; }
+.hpc.hpc-r { margin-right: 0; }
+.hpc:active { background: #26364a; }
+.hpc-m { position: absolute; left: 16px; top: 12px; width: 288px;
+         font-size: 22px; line-height: 28px; font-weight: bold;
+         color: #f0f4f8; white-space: nowrap; overflow: hidden;
+         text-overflow: ellipsis; }
+.hpc-p { position: absolute; left: 16px; top: 42px; width: 288px;
+         font-size: 16px; line-height: 22px; color: #9fb2c8;
+         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hpc-a { position: absolute; left: 16px; top: 78px; width: 288px;
+         font-size: 32px; line-height: 40px; font-weight: bold;
+         color: #e8c266; white-space: nowrap; overflow: hidden; }
+.hpc-t { position: absolute; right: 14px; top: 110px; font-size: 12px;
+         letter-spacing: 1px; color: #8a6a1f; white-space: nowrap; }
+.hpc.hpc-off { border-color: #2a3646; background: #121820; }
+.hpc.hpc-off .hpc-m, .hpc.hpc-off .hpc-a { color: #55708a; }
+.hpc.hpc-off .hpc-t { color: #55708a; }
+#hp-note { position: absolute; left: 720px; top: 92px; width: 280px;
+           font-size: 15px; line-height: 21px; color: #9fb2c8; }
+
 /* --- the left panel of SERVICE, ADMIN and PLAYER --------------------------
    A name, then label + figure pairs at the home panel's own heights
    (hairline y=140, wallet y=164/188, Free Slot Play y=250/274). The name
@@ -681,12 +708,14 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   /* --- shared slots + titles ------------------------------------------ */
   .vt { top: 22px; }
   .backslot { top: 300px; }
-  /* CLEAR sits above BACK (224..288, then 300..364). It used to share
-     BACK's own spot here and was drawn underneath it. */
-  #hp-btn { top: 224px !important; }
-  /* whole rows only — a half-drawn row at the cut looks broken.
-     46px rows (handpay) x 5. */
+  /* whole cards only: 230 = 2 x 107 + 16 (handpay, two rows of two) */
   .listbox { height: 230px !important; }
+  .hpc { height: 107px; margin-bottom: 16px; }
+  .hpc-m { top: 8px; font-size: 20px; line-height: 24px; }
+  .hpc-p { top: 32px; font-size: 14px; line-height: 20px; }
+  .hpc-a { top: 58px; font-size: 28px; line-height: 36px; }
+  .hpc-t { top: 82px; }
+  #hp-note { top: 64px; }
 
   /* --- MY WALLET ------------------------------------------------------- */
   /* one balance: label y=72, figure y=92 (the row box starts at 64) */
@@ -951,13 +980,15 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   <div class="backslot"><div class="nb" id="co-back">BACK</div></div>
 </div>
 
-<!-- HANDPAY: admin, reached from the ADMIN menu. This machine's pending
-     handpays + CLEAR (money, confirm) when canClear. BACK returns to ADMIN. -->
+<!-- HANDPAY: admin, reached from the ADMIN menu. One card per machine on
+     the floor with a handpay pending (machine, who is carded in, amount),
+     read again every couple of seconds while this is up, so a handpay that
+     is gone leaves the screen. Tap a card: confirm, reset to credits.
+     BACK returns to ADMIN. -->
 <div class="view" id="v-handpay">
   <div class="vt">HANDPAY</div>
   <div class="listbox" id="hp-list" style="top:88px; height:460px;"></div>
-  <div class="btnslot" id="hp-btn" style="top:392px;">
-    <div class="nb nb-gold" id="hp-clear" style="display:none;">CLEAR</div></div>
+  <div id="hp-note"></div>
   <div class="backslot"><div class="nb" id="hp-back">BACK</div></div>
 </div>
 
@@ -1232,6 +1263,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // chipCents
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (walletFund sends it)
+  var selTouched = false;            // this player picked or typed an amount
+                                     // this session: the hub's "last amount"
+                                     // no longer replaces it
   var lastPlayerSince = '';          // sinceIso of the last PLAYER we saw the
                                      // seat held by — resets the FUND amount
                                      // only when a DIFFERENT player sits down
@@ -1250,7 +1284,6 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   var coCashToWat = false;           // current cash-out-to-wallet arm state
   var coArmBusy = false;             // a switch tap is waiting on the hub
   var coArmMsg = '';                 // the hub's last refusal, kept on screen
-  var hpCanClear = false;            // handpay CLEAR gate (from the data view)
 
   // ---- what an admin does for a player ------------------------------------
   var GIVE_CHIPS = [2000, 5000, 10000];  // quick amounts (cents) on the
@@ -1493,6 +1526,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+        selTouched = false;                     // ...their own last amount may come
         coUseRestr = false;
       }
       // a confirm that was opened from SERVICE / from an admin's view
@@ -1608,6 +1642,20 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     CHIPS = t;
     if (selIdx >= 0) { selCents = CHIPS[selIdx]; }
     paintChipLabels();
+    paintWalletChips();
+  }
+  // The amount this player last added, on any machine (the hub keeps it
+  // with their wallet): MY WALLET opens on it. Once they pick or type an
+  // amount in this session, that stands instead.
+  function takeLastAdd(c) {
+    var i;
+    if (selTouched || typeof c !== 'number' || !(c >= 1) || c !== Math.floor(c)) {
+      return;
+    }
+    selTouched = true;
+    if (c === selCents) { return; }
+    selCents = c; selIdx = -1;
+    for (i = 0; i < CHIPS.length; i++) { if (CHIPS[i] === c) { selIdx = i; } }
     paintWalletChips();
   }
   function paintChipLabels() {
@@ -1864,6 +1912,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   //      "credits". Reuses walletFund + cashOutToWallet verbatim. -----------
   function renderWallet(d) {
     takeChips(d.chipCents);
+    takeLastAdd(d.lastAddCents);
     coPullMsg = d.cashOutError ? String(d.cashOutError) : '';
     coPending = (d.cashOutPending === true);
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
@@ -1955,7 +2004,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function selectWalletChip(i) {
     if (!coCanFund) { return; }
-    selIdx = i; selCents = CHIPS[i];
+    selIdx = i; selCents = CHIPS[i]; selTouched = true;
     paintWalletChips();
     setText('wl-fund-msg', '');
   }
@@ -2074,6 +2123,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (kpMode === 'give') { giveOk(kpCents); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
+    selTouched = true;
     paintWalletChips();
     setText('wl-fund-msg', '');
     closeKeypad();
@@ -2098,40 +2148,76 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     pollWallet();           // fetches immediately, then re-arms every ~2s
   }
 
-  // ---- HANDPAY (this machine): row builders + renderer ---------------------
-  function listRow(a, s, b) {
-    return '<div class="lr"><div class="lr-a">' + esc(a) + '</div>' +
-      '<div class="lr-s">' + esc(s) + '</div>' +
-      '<div class="lr-b">' + esc(b) + '</div></div>';
-  }
+  // ---- HANDPAY (every machine): cards + renderer ---------------------
   function emptyRow(msg) { return '<div class="lr-empty">' + esc(msg) + '</div>'; }
 
-  function renderHandpay(status, d) {
-    var el = $('hp-list');
-    hpCanClear = false;
-    $('hp-clear').style.display = 'none';
-    if (status !== 200 || !d) { el.innerHTML = emptyRow(dataErr(status)); return; }
-    var arr = d.pending || [], html = '', i, p;
-    if (!arr.length) { el.innerHTML = emptyRow('No pending handpays'); }
-    else {
-      for (i = 0; i < arr.length && i < 10; i++) {
-        p = arr[i];
-        html += listRow(p.amount, p.type, p.when);
-      }
-      el.innerHTML = html;
-    }
-    hpCanClear = (d.canClear === true);
-    $('hp-clear').style.display = hpCanClear ? 'block' : 'none';
+  // One card per machine. hpRows is what is on screen (the tap handler
+  // reads it, never the DOM); hpSent holds the machines a reset was just
+  // sent to, so a second tap cannot send another before the machine has
+  // answered and its card has gone.
+  var hpRows = [], hpSent = {};
+  var HP_SENT_MS = 8000;
+  function hpPerPage() { return isStrip() ? 4 : 6; }
+  function hpIsSent(key) {
+    var t = hpSent[key];
+    if (!t) { return false; }
+    if (Date.now() - t > HP_SENT_MS) { delete hpSent[key]; return false; }
+    return true;
   }
-  // fetch-on-open (glass.html parity): show, paint loading, GET, render. A
-  // hub 403 paints dataErr and the state poll's admin fall-home handles a
-  // mid-session demotion.
-  function openHandpay() {
-    show('handpay'); $('hp-list').innerHTML = emptyRow('Loading…');
-    $('hp-clear').style.display = 'none';
-    fetchData('handpay', function (s, d) {
-      if (view === 'handpay') { renderHandpay(s, d); }
+  function renderHandpay(status, d) {
+    var el = $('hp-list'), html = '', i, r, off, tag, n, max = hpPerPage();
+    if (status !== 200 || !d || d.ok === false) {
+      hpRows = [];
+      el.innerHTML = emptyRow(dataErr(status));
+      setText('hp-note', '');
+      return;
+    }
+    hpRows = d.rows || [];
+    n = hpRows.length;
+    if (!n) {
+      el.innerHTML = emptyRow('No handpays pending on any machine');
+      setText('hp-note', '');
+      return;
+    }
+    for (i = 0; i < n && i < max; i++) {
+      r = hpRows[i];
+      off = (r.canClear !== true) || hpIsSent(r.key);
+      tag = hpIsSent(r.key) ? 'RESET SENT'
+        : (r.canClear !== true) ? 'NOT ANSWERING'
+        : (r.toCredits === false) ? 'TAP TO PAY TO WALLET' : 'TAP TO RESET';
+      html += '<div class="hpc' + (i % 2 ? ' hpc-r' : '') +
+        (off ? ' hpc-off' : '') + '" data-i="' + i + '">' +
+        '<div class="hpc-m">' + esc(r.machine || 'Machine') + '</div>' +
+        '<div class="hpc-p">' + esc(r.player || 'No one carded in') + '</div>' +
+        '<div class="hpc-a">' + esc(hpAmount(r) || 'Handpay') + '</div>' +
+        '<div class="hpc-t">' + tag + '</div></div>';
+    }
+    // the same cards again: leave the DOM alone, so a finger that is down
+    // on a card when the poll lands still gets its tap
+    if (el.getAttribute('data-html') !== html) {
+      el.innerHTML = html; el.setAttribute('data-html', html);
+    }
+    setText('hp-note', (n === 1 ? '1 handpay pending.' : n + ' handpays pending.') +
+      (n > max ? ' Showing the first ' + max + '.' : '') +
+      ' Tap a machine to reset its handpay.');
+  }
+  // LIVE, like cash out: one request in flight, asked again every ~2s only
+  // while this view is up (show() drops the re-arm on any view flip).
+  function pollHandpays() {
+    var tok = sess;
+    fetchData('handpays', function (s, d) {
+      if (sess !== tok || view !== 'handpay') { return; }
+      renderHandpay(s, d);
+      dataTimer = window.setTimeout(pollHandpays, DATA_MS);
     });
+  }
+  function openHandpay() {
+    show('handpay');
+    hpRows = [];
+    $('hp-list').innerHTML = emptyRow('Loading…');
+    $('hp-list').setAttribute('data-html', '');
+    setText('hp-note', '');
+    pollHandpays();
   }
 
   // ==== WHAT AN ADMIN DOES FOR A PLAYER ====================================
@@ -2414,25 +2500,31 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   function backToAdmin() {
     if (admin && !overlay) { openAdmin(); } else { show(home()); }
   }
-  // One handpay read on opening fills the pending line; any failure leaves
-  // it hidden (HANDPAY itself says what went wrong).
+  // The pending line counts the handpays on EVERY machine and is read
+  // again every ~2s while the menu is up; none, or any failure, hides it
+  // (HANDPAY itself says what went wrong).
+  function pollAdminHandpays() {
+    var tok = sess;
+    fetchData('handpays', function (status, d) {
+      if (sess !== tok || view !== 'admin') { return; }
+      var arr = (status === 200 && d && d.ok !== false && d.rows)
+        ? d.rows : [];
+      var on = arr.length ? 'block' : 'none';
+      if (arr.length) {
+        // one: its amount. More: how many, since none is "the" handpay.
+        setText('am-hp-v', (arr.length === 1 && hpAmount(arr[0]))
+          ? hpAmount(arr[0]) : (arr.length + ' pending'));
+      }
+      setStyle($('am-hp-l'), 'display', on);
+      setStyle($('am-hp-v'), 'display', on);
+      dataTimer = window.setTimeout(pollAdminHandpays, DATA_MS);
+    });
+  }
   function openAdmin() {
     setStyle($('am-hp-l'), 'display', 'none');
     setStyle($('am-hp-v'), 'display', 'none');
     show('admin');
-    var tok = sess;
-    fetchData('handpay', function (status, d) {
-      if (sess !== tok || view !== 'admin') { return; }
-      var arr = (status === 200 && d && d.ok !== false && d.pending)
-        ? d.pending : [];
-      if (!arr.length) { return; }
-      // one record: its amount. More than one (a machine can hold one per
-      // credit type): how many, since no single amount is "the" handpay.
-      var amt = (arr.length === 1) ? hpAmount(arr[0]) : '';
-      setText('am-hp-v', amt || (arr.length + ' pending'));
-      setStyle($('am-hp-l'), 'display', 'block');
-      setStyle($('am-hp-v'), 'display', 'block');
-    });
+    pollAdminHandpays();
   }
 
   // ---- PLAYERS: the list, a page at a time ---------------------------------
@@ -2790,6 +2882,11 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
         // a cash-out to wallet is on its way from this tap; the next poll
         // carries the hub's own word on it
         if (pc.body && pc.body.action === 'cashOutNow') { coPending = true; }
+        // a reset just sent to a machine from the HANDPAY cards: its card
+        // waits (no second tap) until the machine reports the handpay gone
+        if (pc.body && pc.body.action === 'clearHandpay' && pc.body.machine) {
+          hpSent[pc.body.machine] = Date.now();
+        }
         // the hub has no sentence for a handpay clear: it only knows that
         // it asked the machine. CLEAR goes when the machine reports it gone.
         returnFrom(pc.back, data, data.msg ? data.msg
@@ -2906,12 +3003,31 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       { action: 'cashOutNow' }, 'wallet');
   };
 
-  // HANDPAY CLEAR: admin, money -> confirm (server re-checks admin + egmId)
-  $('hp-clear').onclick = function () {
-    if (!hpCanClear) { return; }
-    askConfirm('CLEAR HANDPAY?',
-      'Resets the pending handpay to credits on this machine.',
-      { action: 'clearHandpay' }, 'handpay');
+  // HANDPAY: tap a machine's card -> confirm -> reset to credits. The hub
+  // re-checks the admin and that it knows the machine; this page only says
+  // which card was tapped.
+  $('hp-list').onclick = function (ev) {
+    var t = ev.target || ev.srcElement, r, who;
+    while (t && t !== this && !(t.className && /(^| )hpc( |$)/.test(t.className))) {
+      t = t.parentNode;
+    }
+    if (!t || t === this) { return; }
+    r = hpRows[parseInt(t.getAttribute('data-i'), 10)];
+    if (!r || r.canClear !== true || hpIsSent(r.key)) { return; }
+    who = (r.machine || 'this machine') + (r.player ? ' · ' + r.player : '');
+    // too big for the credit meter: the hub pays it by hand instead, to the
+    // wallet of whoever is carded in there (the House when nobody is)
+    if (r.toCredits === false) {
+      askConfirm('PAY HANDPAY TO WALLET?',
+        (hpAmount(r) ? hpAmount(r) + ' on ' : 'On ') + who +
+        '. Too big for the credit meter: it goes to ' +
+        (r.player ? r.player + '’s wallet.' : 'the House, nobody is carded in.'),
+        { action: 'clearHandpay', machine: r.key }, 'handpay');
+      return;
+    }
+    askConfirm('RESET HANDPAY TO CREDITS?',
+      (hpAmount(r) ? hpAmount(r) + ' on ' : 'On ') + who + '.',
+      { action: 'clearHandpay', machine: r.key }, 'handpay');
   };
 
   // SERVICE (a tap-over)

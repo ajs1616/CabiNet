@@ -1054,6 +1054,9 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
                                      // keeps its own limit whatever we send
   var selIdx = 1;                    // selected chip index (default $5)
   var selCents = CHIPS[selIdx];      // its value in cents (what walletFund sends)
+  var selTouched = false;            // this player picked or typed an amount
+                                     // this session: the hub's "last amount"
+                                     // no longer replaces it
   var lastPlayerSince = '';          // sinceIso of the last PLAYER we saw the
                                      // seat held by — resets the FUND amount
                                      // only when a DIFFERENT player sits down
@@ -1286,6 +1289,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
       if (!overlay && sinceIso && sinceIso !== lastPlayerSince) {
         lastPlayerSince = sinceIso;
         selIdx = 1; selCents = CHIPS[selIdx];   // no carryover between players
+        selTouched = false;                     // ...their own last amount may come
         coUseRestr = false;
       }
       if (fresh) { svMsg = ''; }   // the last session's result is not this one's
@@ -1545,6 +1549,20 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     paintChipLabels();
     paintWalletChips();
   }
+  // The amount this player last added, on any machine (the hub keeps it
+  // with their wallet): MY WALLET opens on it. Once they pick or type an
+  // amount in this session, that stands instead.
+  function takeLastAdd(c) {
+    var i;
+    if (selTouched || typeof c !== 'number' || !(c >= 1) || c !== Math.floor(c)) {
+      return;
+    }
+    selTouched = true;
+    if (c === selCents) { return; }
+    selCents = c; selIdx = -1;
+    for (i = 0; i < CHIPS.length; i++) { if (CHIPS[i] === c) { selIdx = i; } }
+    paintWalletChips();
+  }
   function paintChipLabels() {
     for (var i = 0; i < 3; i++) {
       setText('wl-chip' + i, chipLabel(CHIPS[i]));
@@ -1773,6 +1791,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   //      poll's "credits". Reuses walletFund + cashOutToWallet verbatim. ------
   function renderWallet(d) {
     takeChips(d.chipCents);
+    takeLastAdd(d.lastAddCents);
     coMachineMc = (d.machineCreditsMc === undefined || d.machineCreditsMc === null)
       ? 0 : d.machineCreditsMc;
     coWalletMc = (d.walletMc === undefined || d.walletMc === null)
@@ -1931,7 +1950,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
   }
   function selectWalletChip(i) {
     if (!coCanFund) { return; }
-    selIdx = i; selCents = CHIPS[i];
+    selIdx = i; selCents = CHIPS[i]; selTouched = true;
     paintWalletChips();
     setText('wl-fund-msg', '');
   }
@@ -2057,6 +2076,7 @@ div { -webkit-box-sizing: border-box; box-sizing: border-box; }
     if (kpMode === 'give') { giveAsk(kpCents); return; }
     if (kpCents < 1) { setText('kp-msg', 'Enter an amount'); return; }
     selCents = kpCents; selIdx = -1;      // custom -> no preset chip highlighted
+    selTouched = true;
     paintWalletChips();
     setText('wl-fund-msg', '');
     closeKeypad();

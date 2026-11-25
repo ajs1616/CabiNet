@@ -125,7 +125,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.31"
+CABINET_VERSION = "0.3.32"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -4673,6 +4673,21 @@ class AccountStore:
             self._save_locked()
             return self._public(rec), None
 
+    def set_last_add(self, account_id, cents):
+        """Remember the amount a player last moved from their wallet to a
+        machine, so MY WALLET opens on it next time, on any machine. A
+        convenience, not a money field: no bucket, no ledger, and it does
+        not count as activity. Unknown ids and the house are ignored."""
+        aid = str(account_id or "")
+        if isinstance(cents, bool) or not isinstance(cents, int) or cents < 1:
+            return
+        with self.lock:
+            rec = self.state["accounts"].get(aid)
+            if rec is None or rec.get("kind") != "player" \
+                    or rec.get("lastAddCents") == cents:
+                return
+            rec["lastAddCents"] = cents
+            self._save_locked()
 
     # ---- PIN login (2026-09-14) -------------------------------------------
     # The PIN is the whole identity, so it is stored as an HMAC-SHA256 of the
@@ -5477,17 +5492,64 @@ class G2SHost:
             for k in ("denom", "amt", "currencyId"):
                 if bill.get(k) not in (None, ""):
                     extras[k] = bill[k]
+        label = ev.get("label")
+        if hook in ("handpay_pending", "handpay_keyed_off"):
+            label = self._handpay_moment(assoc, hook, extras) or label
         self.event_hooks.fire(hook, {
             "hook": hook,
             "egmId": assoc.egm_id,
             "code": ev.get("eventCode"),
-            "label": ev.get("label"),
+            "label": label,
             "category": ev.get("category"),
             "icon": ev.get("icon"),
             "dateTime": ev.get("eventDateTime"),
             "device": f'{ev.get("deviceClass")}/{ev.get("deviceId")}',
             "extras": extras,
         })
+
+    #: how a handpay ended, as the Activity feed says it. The machine sends
+    #: the same event (G2S_JPE104) for every ending; which one it was is in
+    #: its keyedOff message, kept on the handpay's record.
+    HANDPAY_ENDINGS = {
+        "G2S_remoteCredit": "🎉 Handpay reset to credits",
+        "G2S_localCredit": "🎉 Handpay reset to credits · attendant key",
+        "G2S_remoteHandpay": "🎉 Handpay paid by hand · reset from the hub",
+        "G2S_localHandpay": "🎉 Handpay paid by hand · attendant key",
+        "G2S_remoteVoucher": "🎉 Handpay paid by ticket",
+        "G2S_localVoucher": "🎉 Handpay paid by ticket · attendant key",
+        "G2S_cancelled": "Handpay cancelled · play resumed",
+    }
+
+    def _handpay_moment(self, assoc, hook, extras):
+        """The Activity feed's line for a handpay event, from the handpay's
+        own record: the amount (added to `extras` as amt, millicents) and,
+        for the ending, HOW it ended (the owner, 2026-11-25: the feed read
+        "Handpay KEYED OFF" whether it went to credits from a screen or
+        was paid on the attendant key). None when the record is not there
+        (the caller keeps the event's plain label). Never raises."""
+        try:
+            txn = str(extras.get("transactionId") or "")
+            if not txn:
+                return None
+            ended = hook == "handpay_keyed_off"
+            with assoc.lock:
+                rec = None if ended else assoc.handpays_pending.get(txn)
+                if rec is None:
+                    rec = next((h for h in reversed(assoc.handpays)
+                                if str(h.get("transactionId")) == txn), None)
+                rec = dict(rec) if rec is not None else None
+            if rec is None:
+                return None
+            pre = "keyOff" if ended else "pending"
+            amt = sum(int(rec.get(pre + k) or 0)
+                      for k in ("CashableAmt", "PromoAmt", "NonCashAmt"))
+            if amt > 0:
+                extras["amt"] = amt
+            if not ended:
+                return None
+            return self.HANDPAY_ENDINGS.get(rec.get("keyOffType"))
+        except Exception:  # noqa: BLE001 — a feed line, never a fault
+            return None
 
     def _activity_hook(self, info):
         """Default "*" hook: one structured INFO line per semantic event (the
@@ -10599,6 +10661,8 @@ class G2SHost:
                    own wallet. Refused (403) for a tap-over token: it
                    would answer the ADMIN's wallet on the friend's screen.
           handpay  an admin carded in normally, and a tap-over.
+          handpays an admin carded in normally only: the pending handpay
+                   on EVERY machine (_glass_data_handpays).
           players  an admin carded in normally only. It also carries
                    `fobWait`: how the ADD FOB wait this token armed is
                    going (_fob_wait_view; `now` is that wait's clock).
@@ -10612,7 +10676,7 @@ class G2SHost:
             allowed = who["own"] and kind != "service"
         elif view == "handpay":
             allowed = kind in ("admin", "service")
-        elif view == "players":
+        elif view in ("players", "handpays"):
             allowed = kind == "admin"
         else:
             return 400, {"ok": False, "error": "unknown view",
@@ -10622,6 +10686,8 @@ class G2SHost:
                          "egmId": egm_id}
         if view == "players":
             return 200, self._glass_data_players(egm_id, who["tok"], now)
+        if view == "handpays":
+            return 200, self._glass_data_handpays(egm_id)
         with self.assoc_lock:
             assoc = self.associations.get(egm_id)
         if view == "cashout":
@@ -10949,6 +11015,12 @@ class G2SHost:
                 # can offer to load it (0 = nothing to offer)
                 out["walletRestrictedMc"] = int(
                     acct.get("nonCashMillicents") or 0)
+                # what this player last added, on any machine: MY WALLET
+                # opens on it (absent until they have added once)
+                last = acct.get("lastAddCents")
+                if isinstance(last, int) and not isinstance(last, bool) \
+                        and last > 0:
+                    out["lastAddCents"] = last
         except Exception:  # noqa: BLE001 — no wallet, not a fault
             pass
         # cashOutToWat: is this machine's own CASH OUT button going to THIS
@@ -11059,15 +11131,71 @@ class G2SHost:
         return {"ok": True, "view": "handpay", "egmId": egm_id,
                 "pending": pending, "canClear": can_clear}
 
+    def _glass_handpay_machines(self):
+        """Every machine key a handpay can be pending on, each machine
+        once: the G2S machines, then the SAS machines that are not the
+        SAS side of one of those. -> (keys, {egmId: assoc})."""
+        with self.assoc_lock:
+            assocs = dict(self.associations)
+        with self.sas_lock:
+            sas_keys = list(self.sas_machines)
+        legs = set((getattr(self, "sas_links", None) or {}).values())
+        keys = list(assocs) + [k for k in sas_keys
+                               if k not in assocs and k not in legs]
+        return keys, assocs
+
+    def _glass_data_handpays(self, egm_id):
+        """handpays view: the pending handpay on every machine on the
+        floor, for the admin menu's HANDPAY screen (the owner, 2026-11-24:
+        one screen to reset any machine's handpay from, that does not keep
+        showing one that is gone). One row per machine: the handpay CLEAR
+        resets next, exactly what the service screen shows for it
+        (_glass_service_handpay), with the machine's name and who is
+        carded in there. The asking machine first, then by name. Read
+        fresh on every call; the screen asks every couple of seconds while
+        it is up. A machine that cannot be read is left out, never a 500."""
+        keys, assocs = self._glass_handpay_machines()
+        try:
+            cards = self.card_sessions_snapshot()
+        except Exception:  # noqa: BLE001 — names are a courtesy
+            cards = {}
+        rows = []
+        for k in keys:
+            try:
+                hp = self._glass_service_handpay(k, assocs.get(k))
+                if not hp.get("pending"):
+                    continue
+                leg = self.linked_leg(k)
+                card = cards.get(k) or (cards.get(leg) if leg else None) \
+                    or {}
+                rows.append({
+                    "key": k, "here": k == egm_id,
+                    "machine": self._glass_machine_name(k),
+                    "player": str(card.get("name") or "").strip(),
+                    "amount": hp.get("amount") or "Handpay",
+                    "type": hp.get("type") or "",
+                    "canClear": bool(hp.get("canClear")),
+                    "toCredits": hp.get("toCredits") is not False,
+                    "more": int(hp.get("more") or 0)})
+            except Exception:  # noqa: BLE001 — never-500 read
+                continue
+        rows.sort(key=lambda r: (not r["here"], r["machine"].lower()))
+        return {"ok": True, "view": "handpays", "egmId": egm_id,
+                "rows": rows}
+
     @staticmethod
     def _g2s_handpay_row(r):
         """One G2S handpay record as the handpay view lists it."""
         amt = (int(r.get("pendingCashableAmt") or 0)
                + int(r.get("pendingPromoAmt") or 0)
                + int(r.get("pendingNonCashAmt") or 0))
-        return {"amount": f"{money_symbol()}{amt / 100000:,.2f}",
-                "type": r.get("handpayType"),
-                "when": r.get("handpayDateTime") or r.get("seenAt")}
+        out = {"amount": f"{money_symbol()}{amt / 100000:,.2f}",
+               "type": r.get("handpayType"),
+               "when": r.get("handpayDateTime") or r.get("seenAt")}
+        # the machine did not offer credits for this one (over the meter)
+        if str(r.get("remoteCredit")).lower() == "false":
+            out["toCredits"] = False
+        return out
 
     # ------------------------------------------------- the admin menus
     # What the two player screens need for the tap-over service screen and,
@@ -11099,7 +11227,11 @@ class G2SHost:
             row, more = self._g2s_handpay_row(recs[txn]), len(recs) - 1
         return {"pending": True, "amount": row.get("amount") or "Handpay",
                 "type": str(row.get("type") or ""),
-                "canClear": bool(view.get("canClear")), "more": more}
+                "canClear": bool(view.get("canClear")), "more": more,
+                # False = too big for the credit meter: the reset pays it
+                # by hand, to the wallet of whoever is carded in (the
+                # House when nobody is). SAS resets go to the meter.
+                "toCredits": row.get("toCredits") is not False}
 
     def _glass_service_block(self, egm_id, assoc, card):
         """The `service` object: the friend under a tap-over, as the quick
@@ -28617,6 +28749,9 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                 status, payload = engine.glass_wallet_fund(
                     egm_id, acct_id, req.get("cents"),
                     restricted=req.get("restricted") is True)
+                if status == 200 and payload.get("ok") is not False:
+                    engine.account_store.set_last_add(
+                        acct_id, req.get("cents"))
                 return done(status, payload)
             if action == "cashOutNow":
                 # HOST-CONTROL immediate cash-out (SAS/BB2): the panel button
@@ -28646,8 +28781,26 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                     "application/json", soap=False)
             if who["kind"] not in ("admin", "service"):
                 return done(403, {"ok": False, "error": "not authorized"})
-            log.info("🧑‍💼 [%s] handpay clear asked by %s", egm_id,
-                     engine._glass_by(who))
+            # `machine`: the admin menu's HANDPAY screen lists every
+            # machine and resets the one that was tapped. Only an admin
+            # carded in normally may name another machine (a tap-over's
+            # screen is for the friend at THIS one), and only a machine
+            # the hub knows. Without it: this machine, as ever.
+            target = req.get("machine")
+            if target is not None and str(target) != egm_id:
+                if who["kind"] != "admin":
+                    return done(403, {"ok": False,
+                                      "error": "not authorized"})
+                target = str(target)
+                if target not in engine._glass_handpay_machines()[0]:
+                    return done(404, {"ok": False,
+                                      "error": "machine not known"})
+                log.info("🧑‍💼 [%s] handpay clear on %s asked by %s",
+                         egm_id, target, engine._glass_by(who))
+                egm_id = target
+            else:
+                log.info("🧑‍💼 [%s] handpay clear asked by %s", egm_id,
+                         engine._glass_by(who))
             # A machine with a SAS side is reset over SAS (the
             # linked-machine rule), whether or not it has a G2S side
             # and whether or not that side is up.
