@@ -1126,6 +1126,75 @@ def admin_menu_callers():
           st == 200 and r.get("pending") == [], (st, r))
     everyone(who, tok)
 
+    print("— admin menus: HANDPAY lists every machine")
+    t_admin, t_tap, t_player = (tok_of(eng, "M_ADMIN"), tok_of(eng, "M_TAP"),
+                                tok_of(eng, "M_PLAYER"))
+    st, r = eng.glass_data(t_admin, "handpays")
+    check("an admin: the every-machine view answers, empty",
+          st == 200 and r.get("ok") is True and r.get("rows") == [], (st, r))
+    check("a tap-over and a player are refused the every-machine view",
+          eng.glass_data(t_tap, "handpays")[0] == 403
+          and eng.glass_data(t_player, "handpays")[0] == 403)
+    HP = {"transactionId": "77", "deviceId": "1",
+          "handpayType": "G2S_gameWin", "pendingCashableAmt": "125000000",
+          "pendingPromoAmt": "0", "pendingNonCashAmt": "0",
+          "handpayDateTime": "2026-11-18T03:00:00Z"}
+    eng.associations["M_PLAYER"].handpays_pending = {"77": dict(HP)}
+    eng.associations["M_ADMIN"].handpays_pending = {
+        "5": dict(HP, transactionId="5", pendingCashableAmt="20000000")}
+    st, r = eng.glass_data(t_admin, "handpays")
+    got = r.get("rows") or []
+    seated = eng.card_sessions_snapshot().get("M_PLAYER", {}).get("name")
+    check("one card per machine with a handpay, this machine first, each "
+          "with its machine, who is carded in there and the amount",
+          st == 200 and [(x["key"], x["here"], x["amount"]) for x in got] == [
+              ("M_ADMIN", True, "$200.00"), ("M_PLAYER", False, "$1,250.00")]
+          and got[1]["player"] == seated and bool(seated)
+          and got[1]["machine"] == eng._glass_machine_name("M_PLAYER")
+          and all(set(x) == {"key", "here", "machine", "player", "amount",
+                             "type", "canClear", "more"} for x in got),
+          (st, r))
+    eng.associations["M_ADMIN"].handpays_pending = {}
+    st, r = eng.glass_data(t_admin, "handpays")
+    check("a handpay that is gone is gone from the next read",
+          [x["key"] for x in r.get("rows") or []] == ["M_PLAYER"], r)
+    before = books(eng)
+    st, r = act(eng, t_tap, "clearHandpay", machine="M_PLAYER")
+    check("a tap-over cannot reset another machine's handpay",
+          (st, r.get("error")) == (403, "not authorized"), (st, r))
+    st, r = act(eng, t_player, "clearHandpay", machine="M_ADMIN")
+    check("a player cannot either", st == 403, (st, r))
+    st, r = act(eng, t_admin, "clearHandpay", machine="NOPE")
+    check("an admin naming a machine the hub does not know is refused",
+          (st, r.get("error")) == (404, "machine not known"), (st, r))
+    st, r = act(eng, t_admin, "clearHandpay", machine="M_PLAYER")
+    check("an admin's reset goes to the machine that was tapped",
+          st == 200 and r.get("egmId") == "M_PLAYER"
+          and r.get("ok") is not False, (st, r))
+    st, r = act(eng, t_admin, "clearHandpay", machine="M_ADMIN")
+    check("naming this machine is the same as naming none",
+          st == 200 and r.get("egmId") == "M_ADMIN"
+          and r.get("error") == "no pending handpay", (st, r))
+    check("none of that moved any money", books(eng) == before)
+    eng.associations["M_PLAYER"].handpays_pending = {}
+
+    print("— MY WALLET opens on the player's last amount")
+    st, r = eng.glass_data(t_admin, "cashout")
+    check("nothing remembered yet: the wallet view sends no last amount",
+          st == 200 and "lastAddCents" not in r, r)
+    for junk in (0, -5, True, "700", 7.5, None):
+        eng.account_store.set_last_add(aj, junk)
+    eng.account_store.set_last_add("house", 700)
+    eng.account_store.set_last_add("nobody", 700)
+    check("junk amounts, the house and unknown ids are ignored",
+          "lastAddCents" not in eng.glass_data(t_admin, "cashout")[1]
+          and "lastAddCents" not in (eng.account_store.get("house") or {}))
+    money = (cash(eng, aj), free(eng, aj), len(rows(eng)))
+    eng.account_store.set_last_add(aj, 1234)
+    check("a remembered amount rides the wallet view and touches no money",
+          eng.glass_data(t_admin, "cashout")[1].get("lastAddCents") == 1234
+          and (cash(eng, aj), free(eng, aj), len(rows(eng))) == money)
+
     print("— admin menus: that admin after their admin flag is cleared, "
           "same token")
     eng.account_store.set_admin(dana, False)
