@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.3.32
+- **HANDPAY on a companion screen lists every machine, and stays
+  current.** An admin's HANDPAY screen showed this machine's handpays,
+  read once when it opened, so one on another machine never showed and
+  one that had been cleared stayed until you left and came back. It is
+  now one card per machine with a handpay pending: the machine, who is
+  carded in there and the amount. Tap a card, confirm, and that
+  machine's handpay is reset. The list is read again every two seconds.
+  A card just reset shows RESET SENT until the machine answers. Only an
+  admin carded in normally can reset another machine's handpay.
+- **A handpay too big for the credit meter says where it goes.** The
+  machine will not put it on the meter, so the reset pays it by hand and
+  the hub books it to the wallet of whoever is carded in there (the
+  House when nobody is). Its card reads TAP TO PAY TO WALLET and the
+  confirm names the wallet.
+- **MY WALLET opens on your last amount.** The amount a player last
+  added from their wallet is kept with their account, and both screens
+  (the companion screen and the IGT glass) open on it, on any machine,
+  instead of the middle preset.
+- **Activity says how a handpay ended.** The machine sends the same
+  event however a handpay ends, so the feed read "Handpay KEYED OFF"
+  for all of them. It now reads "Handpay reset to credits", "Handpay
+  paid by hand · attendant key" and so on, with the amount.
+
 ## v0.3.31
 - **The three preset amounts on a player's MY WALLET are yours to set**:
   Settings, Host options, under the admin's quick amounts. They start as
