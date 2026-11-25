@@ -355,6 +355,21 @@ cat > /etc/sudoers.d/cabinet <<EOF
 # CabiNet — written by hub_setup.sh so Settings ▸ Updates can restart the hub
 $RUSER ALL=(root) NOPASSWD: $SYSCTL restart cabinet-g2s, $SYSCTL stop cabinet-g2s, $SYSCTL start cabinet-g2s
 EOF
+# Settings ▸ Wi-Fi joins the house Wi-Fi the same way — from inside the hub
+# service, for someone with no keyboard on the hub. Exactly the commands
+# G2S/hub_wifi.py runs, and only on a box that has them.
+NMCLI="$(command -v nmcli || true)"
+if [[ -n "$NMCLI" ]]; then
+    WIFI_CMDS="$NMCLI --wait 40 device wifi connect *, $NMCLI connection delete id *, $NMCLI radio wifi on"
+    RFKILL="$(command -v rfkill || true)"
+    [[ -n "$RFKILL" ]] && WIFI_CMDS="$WIFI_CMDS, $RFKILL unblock wifi"
+    RASPI="$(command -v raspi-config || true)"
+    [[ -n "$RASPI" ]] && WIFI_CMDS="$WIFI_CMDS, $RASPI nonint do_wifi_country [A-Z][A-Z]"
+    cat >> /etc/sudoers.d/cabinet <<EOF
+# ...and so Settings ▸ Wi-Fi can join the house Wi-Fi
+$RUSER ALL=(root) NOPASSWD: $WIFI_CMDS
+EOF
+fi
 chmod 440 /etc/sudoers.d/cabinet
 if ! visudo -cf /etc/sudoers.d/cabinet >/dev/null 2>&1; then
     rm -f /etc/sudoers.d/cabinet

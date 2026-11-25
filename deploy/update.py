@@ -83,6 +83,7 @@ G2S_GATES = (
     "test_machine_linking.py",
     "test_satellite_catchup.py",
     "test_web_auth.py",
+    "test_hub_wifi.py",
     "test_update_verify.py",
     "test_emoji_font.py",
     "test_support_bundle.py",

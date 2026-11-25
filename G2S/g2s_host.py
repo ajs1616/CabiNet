@@ -111,6 +111,7 @@ except ImportError:
 # that already-validated JSON (64 names × worst-case JSON escaping < 4096).
 import hub_store as _hub_store_mod  # noqa: E402  (sibling module, above)
 import web_auth  # noqa: E402  (sibling module: the optional hub login)
+import hub_wifi  # noqa: E402  (sibling module: Settings ▸ Wi-Fi)
 if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
     _hub_store_mod.HOST_SETTING_KEYS = (
         _hub_store_mod.HOST_SETTING_KEYS + ("tournament_names",))
@@ -125,7 +126,7 @@ if "tournament_names" not in _hub_store_mod.HOST_SETTING_KEYS:
 # the MINOR bump per the repo's version rule). Surfaced in engine_meta() ->
 # /api/status ["_engine"]["version"]; bump this and add a CHANGELOG.md
 # section on every commit with a user-visible change.
-CABINET_VERSION = "0.3.32"
+CABINET_VERSION = "0.3.33"
 
 WSDL_NS = "http://www.gamingstandards.com/wsdl/g2s/v1.0"
 SCHEMA_NS = "http://www.gamingstandards.com/g2s/schemas/v1.0.3"
@@ -27464,6 +27465,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
                  "hint": "append to ~/.ssh/authorized_keys on each satellite; "
                          "deploy/smib_setup.sh does it for you"}),
                 "application/json", soap=False)
+        elif path.startswith("/api/wifi"):
+            # Settings ▸ Wi-Fi: what the hub can hear and what it is joined
+            # to. ?scan=0 skips the listen (the card's quiet refresh).
+            scan = "scan=0" not in self.path.split("?", 1)[-1]
+            self._json(200, hub_wifi.status(scan=scan))
         elif path.startswith("/api/accounts"):
             # G2S-39: the enthusiast WAT accounts + last-100 ledger tail.
             # Compact — polled endpoint, indent would force the pure-Python
@@ -29873,6 +29879,33 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
         return self._send(200 if reply.get("ok") else 400,
                           json.dumps(reply), "application/json", soap=False)
 
+    def _handle_wifi(self, raw):
+        """POST /api/wifi {action: "join", ssid, password?, country?},
+        {action: "forget", ssid} or {action: "on", country?} — put the hub on (or take it off) the house
+        Wi-Fi. Admin only (web_auth closes unknown /api/ posts by default).
+        The slot network is the wired port and is never touched here."""
+        try:
+            req = json.loads(raw) if raw.strip() else {}
+            if not isinstance(req, dict):
+                raise ValueError("payload must be an object")
+        except (ValueError, TypeError) as e:
+            return self._json(400, {"ok": False, "error": f"invalid JSON: {e}"})
+        action = req.get("action")
+        ssid = req.get("ssid")
+        if action == "join":
+            res = hub_wifi.join(ssid, req.get("password") or "",
+                                str(req.get("country") or ""))
+        elif action == "forget":
+            res = hub_wifi.forget(ssid)
+        elif action == "on":
+            res = hub_wifi.radio_on(str(req.get("country") or ""))
+        else:
+            return self._json(400, {"ok": False,
+                                    "error": "action must be join, forget or on"})
+        log.info("wifi %s %r -> %s", action, ssid,
+                 "ok" if res.get("ok") else res.get("error"))
+        return self._json(200 if res.get("ok") else 409, res)
+
     def _handle_set_name(self, raw):
         """POST /api/names {machineKey, name} — set (or clear, with empty
         name) a machine's operator nickname in hub.db, and/or its SAS
@@ -30672,6 +30705,11 @@ class G2SRequestHandler(BaseHTTPRequestHandler):
             wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
                       self.path.split("?", 1)[0], peer, len(raw))
             return self._handle_auth_post(raw, peer)
+        # A Wi-Fi password is in this body: same routing, same reason.
+        if self.path.startswith("/api/wifi"):
+            wire.info("IN  <<< POST %s from %s (%d bytes, body withheld)",
+                      self.path.split("?", 1)[0], peer, len(raw))
+            return self._handle_wifi(raw)
         # A typed PIN is in these two bodies (a new PIN from a screen's
         # admin menu, the PIN of a login), so they too are routed here,
         # ahead of the wire logger. Until the admin menus work the login

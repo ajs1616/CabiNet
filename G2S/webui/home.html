@@ -752,6 +752,11 @@
            operator's call, not ours. -->
       <div class="card"><h2>Updates <span class="hn" id="st-upd-n"></span></h2>
         <div class="body" id="st-updates"></div></div>
+      <!-- Wi-Fi: put the hub on the house Wi-Fi so a phone can open these
+           pages (hub_wifi.py). Hidden until the hub says it has a radio. -->
+      <div class="card" id="card-wifi" style="display:none">
+        <h2>Wi-Fi <span class="hn" id="st-wifi-n"></span></h2>
+        <div class="body" id="st-wifi"></div></div>
       <!-- Hub login: the optional lock on these pages (web_auth.py). Hidden
            until the hub answers /api/auth/state — an older hub has none. -->
       <div class="card wide" id="card-login" style="display:none">
@@ -5089,6 +5094,7 @@ function hintToggle(id){
 }
 function renderSettings(){
   renderUpdates();
+  wifiTick();
   // Card readers repaint on their OWN guards (armed-node + focused reader
   // input), ahead of this function's early returns — otherwise a half-typed
   // ticket-header field would also freeze the reader list, which has nothing
@@ -6607,6 +6613,143 @@ function renderLogin(){
 }
 /* Enter in one of the login forms presses that form's main button — the
    on-screen keyboard covers the button on the hub's small touchscreen. */
+/* ---- Settings ▸ Wi-Fi ------------------------------------------------------
+   The slot network is the hub's cable; Wi-Fi is only how a phone reaches these
+   pages. The hub answers /api/wifi with what it can hear and what it is on.
+   Listening takes the radio a few seconds, so it is asked at most twice a
+   minute and only while the card is on screen. */
+const WIFI={st:null, at:0, busy:false, quick:0};
+async function wifiFetch(){
+  if(WIFI.busy) return; WIFI.busy=true;
+  try{
+    const r=await fetch("/api/wifi",{cache:"no-store"});
+    if(r.ok){ WIFI.st=await r.json(); }
+  }catch(e){}
+  WIFI.busy=false; WIFI.at=Date.now(); renderWifi();
+}
+function wifiTick(){
+  const card=$("card-wifi"); if(!card) return;
+  if(WIFI.st===null){ if(!WIFI.at) wifiFetch(); return; }
+  /* radio on but nothing heard yet (it has only just come on): ask again
+     every few seconds for a while, then settle to the slow beat */
+  const w=WIFI.st, empty=w.available&&!w.radioOff&&!w.connected&&!(w.networks||[]).length;
+  if(!empty) WIFI.quick=0;
+  const every=(empty&&WIFI.quick<10)?4000:30000;
+  if(card.offsetParent!==null && Date.now()-WIFI.at>every){
+    if(empty) WIFI.quick++;
+    wifiFetch();
+  }
+  renderWifi();
+}
+/* The card keeps its own beat. It used to be refreshed only when the
+   Settings tab was painted, and that tab is painted on a tab switch, not
+   while you sit on it: the list stayed empty until you left and came back
+   (seen on a Pi 4, 2026-11-25). */
+setInterval(function(){ try{ wifiTick(); }catch(e){} }, 2000);
+async function wifiPost(body){
+  try{
+    const r=await fetch("/api/wifi",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const j=await r.json().catch(()=>({}));
+    if(j.ok===true) return j;
+    return {ok:false,error:String(j.error||("HTTP "+r.status))};
+  }catch(e){
+    /* joining can move the hub's own address out from under this page */
+    return {ok:false,error:"Lost the hub while it changed networks. Give it a moment, then reload this page."};
+  }
+}
+function wifiBars(sig){ return sig>=75?"▂▄▆█":sig>=50?"▂▄▆":sig>=25?"▂▄":"▂"; }
+function renderWifi(){
+  const card=$("card-wifi"), box=$("st-wifi"), w=WIFI.st;
+  if(!card||!box) return;
+  if(!w||!w.available){ card.style.display="none"; return; }
+  card.style.display="";
+  if(ARM && box.contains(ARM.btn)) return;
+  const admin=isAdmin();
+  setHTML($("st-wifi-n"), w.connected?"ON":w.radioOff?"off":"not joined");
+  let top;
+  if(w.connected){
+    top=`<p class="none" style="margin:0 0 10px">On <b style="color:var(--ivory)">${esc(w.ssid)}</b>.${
+      w.ip?` From a phone on that Wi-Fi, open <b style="color:var(--ivory)">http://${esc(w.ip)}:8081</b>`:""}</p>`;
+  }else if(w.radioOff){
+    top=`<p class="none" style="margin:0 0 10px">The hub's Wi-Fi is switched off.</p>
+      ${admin?`<div class="btnrow"><button class="btn slim gold" onclick="wifiOnOpen()">
+        <span class="bl">Turn Wi-Fi on</span></button></div>`:""}`;
+  }else{
+    top=`<p class="none" style="margin:0 0 10px">Not on Wi-Fi. Join your house network and a phone on the couch can open these pages. The machines stay on the hub's cable either way.</p>`;
+  }
+  const nets=(w.networks||[]).slice(0,8).map(n=>`
+    <div class="lgrow"><span class="nm" style="font-family:var(--sans)">${n.secure?"🔒 ":""}${esc(n.ssid)}
+        <small>${wifiBars(n.signal)}${n.inUse?" · joined":""}</small></span>
+      ${!admin?"":n.inUse
+        ?`<button class="btn slim danger" onclick="wifiForget(this,'${jsq(n.ssid)}')"><span class="bl">Forget</span></button>`
+        :`<button class="btn slim" onclick="wifiJoinOpen('${jsq(n.ssid)}',${n.secure?1:0})"><span class="bl">Join</span></button>`}
+    </div>`).join("");
+  const none=WIFI.quick<10
+    ?'<p class="none" style="margin:0">Listening for networks…</p>'
+    :`<p class="none" style="margin:0 0 10px">No networks heard.</p>
+      <div class="btnrow"><button class="btn slim" onclick="wifiLook()"><span class="bl">Look again</span></button></div>`;
+  setHTML(box, top+(w.radioOff?"":(nets||none)));
+}
+function wifiLook(){ WIFI.quick=0; WIFI.at=0; wifiTick(); }
+function wifiCountrySelect(){
+  const w=WIFI.st||{};
+  return `<select id="wf-cc" aria-label="Country">
+    <option value="">Which country is this hub in?</option>
+    ${(w.countries||[]).map(c=>`<option value="${esc(c.code)}">${esc(c.name)}</option>`).join("")}
+  </select>`;
+}
+function wifiJoinOpen(ssid, secure){
+  S.modal={kind:"wifi", id:ssid};
+  $("m-title").textContent="Join "+ssid;
+  setHTML($("m-body"),`
+    <div class="lgform" onkeydown="lgEnter(event)">
+      ${secure?`<input type="text" id="wf-pw" maxlength="64" autocapitalize="none" autocomplete="off"
+        spellcheck="false" placeholder="Wi-Fi password" aria-label="Wi-Fi password">`:""}
+    </div>
+    <p class="none" style="margin:0 0 10px">${secure
+      ?"The password is shown as you type so you can check it."
+      :"This network has no password."}</p>
+    <div class="btnrow"><button class="btn slim gold" data-enter onclick="wifiJoin(this,'${jsq(ssid)}')">
+      <span class="bl">Join</span></button></div>`);
+  $("modal").classList.add("on");
+  const i=$("wf-pw"); if(i) i.focus();
+}
+async function wifiJoin(btn, ssid){
+  const pw=($("wf-pw")||{}).value||"";
+  if($("wf-pw")&&pw.length<8){toast("A Wi-Fi password is 8 or more characters",false); return;}
+  btn.disabled=true; btn.querySelector(".bl").textContent="Joining…";
+  const j=await wifiPost({action:"join", ssid:ssid, password:pw});
+  btn.disabled=false; btn.querySelector(".bl").textContent="Join";
+  if(!j.ok){toast(j.error.slice(0,160),false); return;}
+  toast("On "+ssid+" ✓",true);
+  closeModal(); WIFI.st=Object.assign({},WIFI.st,j); wifiFetch();
+}
+async function wifiForget(btn, ssid){
+  if(!armCheck(btn,"forget "+ssid)) return;
+  const j=await wifiPost({action:"forget", ssid:ssid});
+  if(!j.ok){toast(j.error.slice(0,160),false); return;}
+  toast("Left "+ssid,true); wifiFetch();
+}
+function wifiOnOpen(){
+  S.modal={kind:"wifi", id:""};
+  $("m-title").textContent="Turn Wi-Fi on";
+  setHTML($("m-body"),`
+    <div class="lgform">${wifiCountrySelect()}</div>
+    <p class="none" style="margin:0 0 10px">The radio stays off until the hub knows which country's channels to use.</p>
+    <div class="btnrow"><button class="btn slim gold" onclick="wifiOn(this)">
+      <span class="bl">Turn Wi-Fi on</span></button></div>`);
+  $("modal").classList.add("on");
+}
+async function wifiOn(btn){
+  const cc=$("wf-cc").value;
+  if(!cc){toast("Pick your country",false); return;}
+  btn.disabled=true;
+  const j=await wifiPost({action:"on", country:cc});
+  btn.disabled=false;
+  if(!j.ok){toast(j.error.slice(0,160),false); return;}
+  closeModal(); WIFI.st=j; WIFI.quick=0; WIFI.at=Date.now(); renderWifi();
+}
 function lgEnter(e){
   if(e.key!=="Enter"||e.target.tagName!=="INPUT") return;
   const b=$("m-body").querySelector("button[data-enter]");
